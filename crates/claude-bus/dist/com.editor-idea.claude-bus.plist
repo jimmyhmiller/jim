@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.editor-idea.claude-bus</string>
+
+    <!-- @INSTALL_BIN@ is substituted by dist/install.sh. The bus binary
+         must NOT live under ~/Documents/: macOS TCC blocks launchd-
+         spawned processes there with a Documents-folder prompt that
+         launchd can't surface, causing the process to hang in dyld
+         forever. install.sh copies it to ~/Library/Application Support
+         which is unrestricted. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>@INSTALL_BIN@</string>
+    </array>
+
+    <!-- Foreground mode skips the daemonize double-fork: launchd needs
+         to own the PID it spawned in order to track + restart it. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CLAUDE_BUS_FOREGROUND</key>
+        <string>1</string>
+        <key>CLAUDE_BUS_LOG</key>
+        <string>@HOME@/.claude/bus.log</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- KeepAlive without conditions = "restart whenever it exits".
+         If we ever want to be gentler about crash loops we can switch
+         to KeepAlive: {SuccessfulExit: false}. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't relaunch faster than every 10s — gives a crashing bus a
+         chance to be debugged via the log file. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/.claude/bus.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/.claude/bus.log</string>
+</dict>
+</plist>
