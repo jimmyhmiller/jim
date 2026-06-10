@@ -1,22 +1,22 @@
-//! `tbwidget` — spawn a new widget pane in the running `terminal-bevy`
-//! app. Mirrors `tbopen`'s socket dance.
+//! `jimctl widget` — spawn a new widget pane in the running `terminal-bevy`
+//! app. Mirrors `open`'s socket dance.
 //!
 //! Usage:
-//!     tbwidget [--title T] [--cwd D] [--project P] -- <cmd> [args...]
-//!     tbwidget [--title T] [--cwd D] [--project P] <cmd-with-spaces>
+//!     jimctl widget [--title T] [--cwd D] [--project P] -- <cmd> [args...]
+//!     jimctl widget [--title T] [--cwd D] [--project P] <cmd-with-spaces>
 //!
 //! Two argv shapes are accepted:
 //!   - Everything after `--` is taken as `argv` for the child (no shell).
-//!     Example: `tbwidget --title issues -- gh-issues.sh`.
+//!     Example: `jimctl widget --title issues -- gh-issues.sh`.
 //!   - No `--` → the remaining single positional arg is the command line
 //!     and is run through `sh -c`. Example:
-//!     `tbwidget --title issues "gh issue list | jq -c '...'"`.
+//!     `jimctl widget --title issues "gh issue list | jq -c '...'"`.
 //!
 //! `--cwd` defaults to the caller's current directory so relative paths
 //! and scripts that read `$PWD` keep working.
 //!
 //! Wire format is duplicated here on purpose (same rationale as
-//! `tbopen`): a same-package bin links the lib's dylib transitively
+//! `open`): a same-package bin links the lib's dylib transitively
 //! and we don't want to ship the @rpath dance with this CLI.
 
 use std::io::Write;
@@ -53,7 +53,7 @@ fn socket_path() -> Option<PathBuf> {
     Some(Path::new(&home).join(".jim").join("socket"))
 }
 
-fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let args = match Args::parse() {
         Ok(a) => a,
         Err(msg) => {
@@ -64,7 +64,7 @@ fn main() -> ExitCode {
     };
 
     let Some(sock) = socket_path() else {
-        eprintln!("tbwidget: $HOME not set; can't locate socket");
+        eprintln!("jimctl widget: $HOME not set; can't locate socket");
         return ExitCode::from(1);
     };
 
@@ -72,7 +72,7 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbwidget: connect {}: {} (is the terminal-bevy app running?)",
+                "jimctl widget: connect {}: {} (is the terminal-bevy app running?)",
                 sock.display(),
                 e
             );
@@ -91,12 +91,12 @@ fn main() -> ExitCode {
     let body = match serde_json::to_vec(&req) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("tbwidget: serialize: {}", e);
+            eprintln!("jimctl widget: serialize: {}", e);
             return ExitCode::from(1);
         }
     };
     if let Err(e) = stream.write_all(&body) {
-        eprintln!("tbwidget: write: {}", e);
+        eprintln!("jimctl widget: write: {}", e);
         return ExitCode::from(1);
     }
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -122,7 +122,7 @@ impl Args {
         let mut argv_mode = false;
         let mut argv_after_dash: Vec<String> = Vec::new();
 
-        let mut it = std::env::args().skip(1);
+        let mut it = crate::sub_args();
         while let Some(arg) = it.next() {
             if argv_mode {
                 argv_after_dash.push(arg);
@@ -206,8 +206,8 @@ impl Args {
 
 fn print_usage() {
     eprintln!(
-        "tbwidget [--title T] [--cwd D] [--project P] [--kind K] -- <cmd> [args...]\n\
-         tbwidget [--title T] [--cwd D] [--project P] [--kind K] <shell-line>\n\
+        "jimctl widget [--title T] [--cwd D] [--project P] [--kind K] -- <cmd> [args...]\n\
+         jimctl widget [--title T] [--cwd D] [--project P] [--kind K] <shell-line>\n\
          \n\
          Spawn a new widget pane in the running terminal-bevy app. The\n\
          child speaks the widget NDJSON protocol over stdout/stdin.\n\

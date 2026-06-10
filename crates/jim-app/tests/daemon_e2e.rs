@@ -72,6 +72,7 @@ fn fresh_daemon_attach_runs_child_then_exits() {
         80,
         24,
         vec!["/bin/echo".to_string(), "hello-daemon".to_string()],
+        None,
     )
     .expect("open daemon");
     assert!(!client.attached_existing, "fresh daemon should be spawned");
@@ -100,7 +101,7 @@ fn reattach_replays_history() {
     // while we detach and reconnect.
     let cmd = vec!["/bin/cat".to_string()];
 
-    let mut c1 = DaemonClient::open(session, 80, 24, cmd.clone()).expect("first attach");
+    let mut c1 = DaemonClient::open(session, 80, 24, cmd.clone(), None).expect("first attach");
     assert!(!c1.attached_existing);
 
     // Write something into the child via Input; cat echoes it back.
@@ -122,7 +123,7 @@ fn reattach_replays_history() {
     std::thread::sleep(Duration::from_millis(150));
 
     // Reattach: the daemon was already running, history should replay.
-    let mut c2 = DaemonClient::open(session, 80, 24, cmd).expect("reattach");
+    let mut c2 = DaemonClient::open(session, 80, 24, cmd, None).expect("reattach");
     assert!(c2.attached_existing, "expected to reattach to live daemon");
     let (frames2, _) = drain_for(&mut c2, Duration::from_millis(800));
 

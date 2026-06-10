@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build a self-contained TerminalBevy.app — copies the binary and the
+# Build a self-contained Jim.app — copies the binary and the
 # libghostty-vt dylib INTO the bundle and bakes an rpath so the .app
 # launches without DYLD env vars and survives `cargo clean`.
 #
@@ -10,7 +10,7 @@
 #   ./scripts/make-bundle.sh                 # bundle from target/debug
 #   ./scripts/make-bundle.sh --release       # bundle from target/release
 #
-# Drop a 1024x1024 icon at TerminalBevy.app/Contents/Resources/icon.icns
+# Drop a 1024x1024 icon at Jim.app/Contents/Resources/icon.icns
 # (or generate one from a PNG via `iconutil`) and macOS will pick it up
 # next launch.
 
@@ -31,8 +31,11 @@ CONTENTS="$BUNDLE/Contents"
 MACOS="$CONTENTS/MacOS"
 FRAMEWORKS="$CONTENTS/Frameworks"
 RES="$CONTENTS/Resources"
+# FROZEN: LaunchServices/Dock identity. The crate was renamed
+# terminal-bevy -> jim-app, but changing this id would lose the Dock pin
+# and reset the app's identity. Leave it as the legacy string.
 BUNDLE_ID="com.jimmyhmiller.terminal-bevy"
-EXEC_NAME="terminal"
+EXEC_NAME="jim"
 SRC_BIN="target/$PROFILE/$EXEC_NAME"
 
 if [ ! -x "$SRC_BIN" ]; then

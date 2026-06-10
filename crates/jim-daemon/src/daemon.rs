@@ -54,7 +54,7 @@ const GRACE_PERIOD: Duration = Duration::from_secs(30);
 /// we treat the client as wedged and force-disconnect.
 const ZOMBIE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Public entry point used by the `terminal-daemon` binary.
+/// Public entry point used by the `jim-daemon` binary.
 ///
 /// Daemonizes the current process (double-fork + setsid), opens the
 /// listener, spawns the child, and runs the main loop until exit. Never
@@ -66,23 +66,23 @@ pub fn run(session_id: u64, command: Vec<String>) -> ! {
     let foreground = std::env::var_os("TERMINAL_DAEMON_FOREGROUND").is_some();
     if !foreground {
         if let Err(e) = daemonize() {
-            eprintln!("[terminal-daemon] daemonize failed: {}", e);
+            eprintln!("[jim-daemon] daemonize failed: {}", e);
             std::process::exit(1);
         }
     }
     eprintln!(
-        "[terminal-daemon {}] starting; pid={}, command={:?}",
+        "[jim-daemon {}] starting; pid={}, command={:?}",
         session_id,
         std::process::id(),
         command
     );
     match run_loop(session_id, command) {
         Ok(()) => {
-            eprintln!("[terminal-daemon {}] exiting cleanly", session_id);
+            eprintln!("[jim-daemon {}] exiting cleanly", session_id);
             std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("[terminal-daemon {}] error: {}", session_id, e);
+            eprintln!("[jim-daemon {}] error: {}", session_id, e);
             std::process::exit(1);
         }
     }
@@ -219,7 +219,7 @@ fn spawn_in_pty(
             cmd.env(k, v);
         }
         let err = cmd.exec();
-        eprintln!("[terminal-daemon] exec '{}' failed: {}", program, err);
+        eprintln!("[jim-daemon] exec '{}' failed: {}", program, err);
         std::process::exit(127);
     }
 

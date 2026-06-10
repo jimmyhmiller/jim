@@ -1,11 +1,11 @@
-//! `tbclose` — close (despawn) panes in a project from the shell.
+//! `jimctl close` — close (despawn) panes in a project from the shell.
 //!
 //! Routes through the normal pane-close path (the kind's `on_close` +
 //! despawn), i.e. the scriptable equivalent of clicking each pane's close
-//! button. Handy for cleaning up panes spawned via `tbwidget`/`tbopen`.
+//! button. Handy for cleaning up panes spawned via `widget`/`open`.
 //!
 //! Usage:
-//!   tbclose --project P [--kind K]
+//!   jimctl close --project P [--kind K]
 //!
 //!   --project P   project name (or `active`). Required.
 //!   --kind K      only close panes of this kind (e.g. `rhai_widget`,
@@ -21,8 +21,8 @@ fn socket_path() -> Option<PathBuf> {
     Some(Path::new(&home).join(".jim").join("socket"))
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+pub fn run() -> ExitCode {
+    let args: Vec<String> = crate::sub_args().collect();
     let mut project: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut i = 0;
@@ -37,19 +37,19 @@ fn main() -> ExitCode {
                 i += 1;
             }
             "-h" | "--help" => {
-                eprintln!("usage: tbclose --project P [--kind K]");
+                eprintln!("usage: jimctl close --project P [--kind K]");
                 return ExitCode::SUCCESS;
             }
             other => {
-                eprintln!("tbclose: unexpected arg `{}`", other);
-                eprintln!("usage: tbclose --project P [--kind K]");
+                eprintln!("jimctl close: unexpected arg `{}`", other);
+                eprintln!("usage: jimctl close --project P [--kind K]");
                 return ExitCode::from(2);
             }
         }
         i += 1;
     }
     if project.is_none() {
-        eprintln!("tbclose: --project is required");
+        eprintln!("jimctl close: --project is required");
         return ExitCode::from(2);
     }
 
@@ -60,14 +60,14 @@ fn main() -> ExitCode {
     });
 
     let Some(sock) = socket_path() else {
-        eprintln!("tbclose: $HOME not set; can't locate socket");
+        eprintln!("jimctl close: $HOME not set; can't locate socket");
         return ExitCode::from(1);
     };
     let mut stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbclose: connect {}: {} (is the terminal-bevy app running?)",
+                "jimctl close: connect {}: {} (is the terminal-bevy app running?)",
                 sock.display(),
                 e
             );
@@ -77,12 +77,12 @@ fn main() -> ExitCode {
     let body = match serde_json::to_vec(&req) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("tbclose: serialize: {}", e);
+            eprintln!("jimctl close: serialize: {}", e);
             return ExitCode::from(1);
         }
     };
     if let Err(e) = stream.write_all(&body) {
-        eprintln!("tbclose: write: {}", e);
+        eprintln!("jimctl close: write: {}", e);
         return ExitCode::from(1);
     }
     let _ = stream.shutdown(std::net::Shutdown::Write);

@@ -1,15 +1,15 @@
-//! `tbinbox` — push a message into the running terminal-bevy app's
+//! `jimctl inbox` — push a message into the running terminal-bevy app's
 //! per-project inbox over its Unix socket.
 //!
 //! Usage:
-//!     tbinbox --body "hello" [--project NAME] [--sender X] [--subject Y]
-//!     echo "stdin body" | tbinbox --project alpha
+//!     jimctl inbox --body "hello" [--project NAME] [--sender X] [--subject Y]
+//!     echo "stdin body" | jimctl inbox --project alpha
 //!
 //! `--project` defaults to whichever project is currently active. The
 //! body can be passed via `--body` OR piped on stdin (stdin wins when
 //! both are present).
 //!
-//! Like `tbopen`, this binary deliberately stays lib-free: the parent
+//! Like `open`, this binary deliberately stays lib-free: the parent
 //! `jim_app` crate links a dylib (libghostty-vt) we don't want
 //! to pull into a tiny CLI.
 
@@ -41,12 +41,12 @@ fn socket_path() -> Option<PathBuf> {
 
 fn print_usage() {
     eprintln!(
-        "usage: tbinbox [--project NAME] [--sender X] [--subject Y] (--body TEXT | < stdin)"
+        "usage: jimctl inbox [--project NAME] [--sender X] [--subject Y] (--body TEXT | < stdin)"
     );
 }
 
-fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1).collect::<Vec<_>>().into_iter();
+pub fn run() -> ExitCode {
+    let mut args = crate::sub_args().collect::<Vec<_>>().into_iter();
     let mut project: Option<String> = None;
     let mut sender: Option<String> = None;
     let mut subject: Option<String> = None;
@@ -63,7 +63,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             other => {
-                eprintln!("tbinbox: unknown arg {:?}", other);
+                eprintln!("jimctl inbox: unknown arg {:?}", other);
                 print_usage();
                 return ExitCode::from(2);
             }
@@ -76,7 +76,7 @@ fn main() -> ExitCode {
         _ => match body_arg {
             Some(s) => s,
             None => {
-                eprintln!("tbinbox: need --body TEXT or piped stdin");
+                eprintln!("jimctl inbox: need --body TEXT or piped stdin");
                 print_usage();
                 return ExitCode::from(2);
             }
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
     };
 
     let Some(path) = socket_path() else {
-        eprintln!("tbinbox: $HOME not set");
+        eprintln!("jimctl inbox: $HOME not set");
         return ExitCode::from(1);
     };
 
@@ -92,7 +92,7 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbinbox: connect {}: {}\n  (is terminal-bevy running?)",
+                "jimctl inbox: connect {}: {}\n  (is terminal-bevy running?)",
                 path.display(),
                 e
             );
@@ -109,12 +109,12 @@ fn main() -> ExitCode {
     let bytes = match serde_json::to_vec(&req) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("tbinbox: serialize: {}", e);
+            eprintln!("jimctl inbox: serialize: {}", e);
             return ExitCode::from(1);
         }
     };
     if let Err(e) = sock.write_all(&bytes) {
-        eprintln!("tbinbox: write: {}", e);
+        eprintln!("jimctl inbox: write: {}", e);
         return ExitCode::from(1);
     }
     // EOF tells the app side we're done — it expects single-shot

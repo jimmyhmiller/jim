@@ -1,4 +1,4 @@
-//! `tbinject` — send keystrokes into a running terminal-bevy session.
+//! `jimctl inject` — send keystrokes into a running terminal-bevy session.
 //!
 //! Connects to the daemon's inject side-channel (`<id>.inject`),
 //! writes the requested bytes, closes. The PTY treats the bytes as
@@ -6,12 +6,12 @@
 //! submission, an `Esc` to cancel generation, etc.
 //!
 //! Usage:
-//!     tbinject --session 27 --text "hello\n"
-//!     tbinject --project beagle --text "/compact\n"
-//!     tbinject --session 27 --bytes 1b           # raw byte 0x1b (Esc)
-//!     tbinject --session 27 --text "..." --text "..."  # multiple frames
+//!     jimctl inject --session 27 --text "hello\n"
+//!     jimctl inject --project beagle --text "/compact\n"
+//!     jimctl inject --session 27 --bytes 1b           # raw byte 0x1b (Esc)
+//!     jimctl inject --session 27 --text "..." --text "..."  # multiple frames
 //!
-//! Session/project resolution mirrors `tbwidget`: `--session <id>` is
+//! Session/project resolution mirrors `widget`: `--session <id>` is
 //! the literal numeric `TerminalSession`; `--project <name>` picks
 //! the most-recently-created terminal in that project from
 //! `~/.jim/terminals.json`.
@@ -137,7 +137,7 @@ impl Args {
         let mut project: Option<String> = None;
         let mut payload: Vec<u8> = Vec::new();
 
-        let mut it = std::env::args().skip(1);
+        let mut it = crate::sub_args();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "-h" | "--help" => {
@@ -182,25 +182,25 @@ impl Args {
 
 fn print_usage() {
     eprintln!(
-        "tbinject (--session ID | --project NAME) [--text STR] [--bytes HEX] [--stdin]\n\
+        "jimctl inject (--session ID | --project NAME) [--text STR] [--bytes HEX] [--stdin]\n\
          \n\
          Inject bytes into a terminal-bevy session's PTY. Each --text\n\
          and --bytes flag appends to the payload; they may be repeated.\n\
          --text supports \\n \\r \\t \\\\ \\e (= ESC) \\xHH.\n\
          \n\
          Examples:\n\
-           tbinject -s 27 -t 'hello\\n'\n\
-           tbinject -p beagle -b 03           # Ctrl-C\n\
-           tbinject -s 27 -b 1b               # Esc (cancel generation)\n\
-           echo /compact | tbinject -s 27 --stdin\n"
+           jimctl inject -s 27 -t 'hello\\n'\n\
+           jimctl inject -p beagle -b 03           # Ctrl-C\n\
+           jimctl inject -s 27 -b 1b               # Esc (cancel generation)\n\
+           echo /compact | jimctl inject -s 27 --stdin\n"
     );
 }
 
-fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let args = match Args::parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("tbinject: {}", e);
+            eprintln!("jimctl inject: {}", e);
             print_usage();
             return ExitCode::from(2);
         }
@@ -209,13 +209,13 @@ fn main() -> ExitCode {
     let session = match resolve_session(&args) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("tbinject: {}", e);
+            eprintln!("jimctl inject: {}", e);
             return ExitCode::from(1);
         }
     };
 
     let Some(sock) = jim_daemon::inject_socket_path(session) else {
-        eprintln!("tbinject: HOME unset, can't locate socket");
+        eprintln!("jimctl inject: HOME unset, can't locate socket");
         return ExitCode::from(1);
     };
 
@@ -223,7 +223,7 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbinject: connect {}: {} (is the session daemon running?)",
+                "jimctl inject: connect {}: {} (is the session daemon running?)",
                 sock.display(),
                 e
             );
@@ -232,7 +232,7 @@ fn main() -> ExitCode {
     };
 
     if let Err(e) = stream.write_all(&args.payload) {
-        eprintln!("tbinject: write: {}", e);
+        eprintln!("jimctl inject: write: {}", e);
         return ExitCode::from(1);
     }
     // Half-close so the daemon sees EOF and stops reading. This is

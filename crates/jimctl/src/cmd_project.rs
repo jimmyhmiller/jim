@@ -1,4 +1,4 @@
-//! `tbproject` — manage projects in the running terminal-bevy app
+//! `jimctl project` — manage projects in the running terminal-bevy app
 //! over its Unix socket.
 //!
 //! Today there's one subcommand: `set-cwd`, which writes a project's
@@ -7,13 +7,13 @@
 //! explicit path, the current shell cwd is used.
 //!
 //! Usage:
-//!     tbproject set-cwd                     # active project ← $PWD
-//!     tbproject set-cwd .                   # same, explicit
-//!     tbproject set-cwd /some/path
-//!     tbproject set-cwd --project Recursion /some/path
-//!     tbproject set-cwd --project Recursion --clear
+//!     jimctl project set-cwd                     # active project ← $PWD
+//!     jimctl project set-cwd .                   # same, explicit
+//!     jimctl project set-cwd /some/path
+//!     jimctl project set-cwd --project Recursion /some/path
+//!     jimctl project set-cwd --project Recursion --clear
 //!
-//! Stays lib-free for the same reason as `tbopen` / `tbinbox` — we don't
+//! Stays lib-free for the same reason as `open` / `inbox` — we don't
 //! want to drag libghostty-vt into a tiny CLI.
 
 use std::io::Write;
@@ -41,7 +41,7 @@ fn socket_path() -> Option<PathBuf> {
 
 fn print_usage() {
     eprintln!(
-        "usage: tbproject set-cwd [--project NAME] [PATH | --clear]\n\
+        "usage: jimctl project set-cwd [--project NAME] [PATH | --clear]\n\
          \n\
          Sets a project's default_cwd. PATH defaults to the current\n\
          shell directory. --project defaults to the active project.\n\
@@ -49,8 +49,8 @@ fn print_usage() {
     );
 }
 
-fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
+pub fn run() -> ExitCode {
+    let mut args = crate::sub_args();
     let Some(sub) = args.next() else {
         print_usage();
         return ExitCode::from(2);
@@ -62,7 +62,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         other => {
-            eprintln!("tbproject: unknown subcommand {:?}", other);
+            eprintln!("jimctl project: unknown subcommand {:?}", other);
             print_usage();
             ExitCode::from(2)
         }
@@ -79,7 +79,7 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
             "--project" => match it.next() {
                 Some(v) => project = Some(v),
                 None => {
-                    eprintln!("tbproject: --project needs a value");
+                    eprintln!("jimctl project: --project needs a value");
                     return ExitCode::from(2);
                 }
             },
@@ -89,12 +89,12 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             other if other.starts_with("--") => {
-                eprintln!("tbproject set-cwd: unknown flag {:?}", other);
+                eprintln!("jimctl project set-cwd: unknown flag {:?}", other);
                 return ExitCode::from(2);
             }
             _ => {
                 if path_arg.is_some() {
-                    eprintln!("tbproject set-cwd: extra positional arg {:?}", a);
+                    eprintln!("jimctl project set-cwd: extra positional arg {:?}", a);
                     return ExitCode::from(2);
                 }
                 path_arg = Some(a);
@@ -103,7 +103,7 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
     }
 
     if clear && path_arg.is_some() {
-        eprintln!("tbproject set-cwd: --clear can't be combined with a PATH");
+        eprintln!("jimctl project set-cwd: --clear can't be combined with a PATH");
         return ExitCode::from(2);
     }
 
@@ -118,7 +118,7 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
             match std::env::current_dir() {
                 Ok(cwd) => cwd.join(&p),
                 Err(e) => {
-                    eprintln!("tbproject set-cwd: getcwd: {}", e);
+                    eprintln!("jimctl project set-cwd: getcwd: {}", e);
                     return ExitCode::from(1);
                 }
             }
@@ -131,7 +131,7 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
     };
 
     let Some(socket) = socket_path() else {
-        eprintln!("tbproject: $HOME not set");
+        eprintln!("jimctl project: $HOME not set");
         return ExitCode::from(1);
     };
 
@@ -139,7 +139,7 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbproject: connect {}: {}\n  (is terminal-bevy running?)",
+                "jimctl project: connect {}: {}\n  (is terminal-bevy running?)",
                 socket.display(),
                 e
             );
@@ -154,21 +154,21 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
     let bytes = match serde_json::to_vec(&req) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("tbproject: serialize: {}", e);
+            eprintln!("jimctl project: serialize: {}", e);
             return ExitCode::from(1);
         }
     };
     if let Err(e) = sock.write_all(&bytes) {
-        eprintln!("tbproject: write: {}", e);
+        eprintln!("jimctl project: write: {}", e);
         return ExitCode::from(1);
     }
     let _ = sock.shutdown(std::net::Shutdown::Write);
 
     match (&project, &cwd) {
-        (Some(p), Some(c)) => println!("tbproject: project {:?} default_cwd ← {}", p, c.display()),
-        (None, Some(c)) => println!("tbproject: active project default_cwd ← {}", c.display()),
-        (Some(p), None) => println!("tbproject: project {:?} default_cwd cleared", p),
-        (None, None) => println!("tbproject: active project default_cwd cleared"),
+        (Some(p), Some(c)) => println!("jimctl project: project {:?} default_cwd ← {}", p, c.display()),
+        (None, Some(c)) => println!("jimctl project: active project default_cwd ← {}", c.display()),
+        (Some(p), None) => println!("jimctl project: project {:?} default_cwd cleared", p),
+        (None, None) => println!("jimctl project: active project default_cwd cleared"),
     }
     ExitCode::SUCCESS
 }

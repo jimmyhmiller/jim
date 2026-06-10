@@ -1,4 +1,4 @@
-//! `tbmsg` — talk to the widget↔widget message bus from the shell.
+//! `jimctl msg` — talk to the widget↔widget message bus from the shell.
 //!
 //! The bus lets widget panes in the same editor project coordinate (an
 //! editor pane tells a results pane "run this query", the results pane
@@ -7,11 +7,11 @@
 //! or verifying message flow without the GUI. It mirrors `claude-bus-tail`.
 //!
 //! Usage:
-//!   tbmsg emit --project P --topic T [--json '{...}'] [--retain]
-//!   tbmsg tail [--project P]
+//!   jimctl msg emit --project P --topic T [--json '{...}'] [--retain]
+//!   jimctl msg tail [--project P]
 //!
 //!   emit   Publish one message. Delivered to every widget in project P
-//!          as `on_message(topic, payload, "tbmsg")`. `--retain` keeps it
+//!          as `on_message(topic, payload, "jimctl msg")`. `--retain` keeps it
 //!          as the topic's last value for widgets that spawn later.
 //!   tail   Follow the bus live, printing each delivered message as a
 //!          JSON line. `--project P` filters to that project.
@@ -36,13 +36,13 @@ fn bus_log_path() -> Option<PathBuf> {
 fn print_usage() {
     eprintln!(
         "usage:\n  \
-         tbmsg emit --project P --topic T [--json '{{...}}'] [--retain]\n  \
-         tbmsg tail [--project P]"
+         jimctl msg emit --project P --topic T [--json '{{...}}'] [--retain]\n  \
+         jimctl msg tail [--project P]"
     );
 }
 
-fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+pub fn run() -> ExitCode {
+    let args: Vec<String> = crate::sub_args().collect();
     let Some(sub) = args.first() else {
         print_usage();
         return ExitCode::from(2);
@@ -55,7 +55,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         other => {
-            eprintln!("tbmsg: unknown subcommand `{}`", other);
+            eprintln!("jimctl msg: unknown subcommand `{}`", other);
             print_usage();
             ExitCode::from(2)
         }
@@ -92,7 +92,7 @@ fn get<'a>(named: &'a [(String, String)], key: &str) -> Option<&'a str> {
 fn cmd_emit(args: &[String]) -> ExitCode {
     let (named, switches) = parse_flags(args);
     let Some(topic) = get(&named, "topic") else {
-        eprintln!("tbmsg emit: --topic is required");
+        eprintln!("jimctl msg emit: --topic is required");
         print_usage();
         return ExitCode::from(2);
     };
@@ -100,7 +100,7 @@ fn cmd_emit(args: &[String]) -> ExitCode {
         Some(raw) => match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("tbmsg emit: --json is not valid JSON: {}", e);
+                eprintln!("jimctl msg emit: --json is not valid JSON: {}", e);
                 return ExitCode::from(2);
             }
         },
@@ -117,14 +117,14 @@ fn cmd_emit(args: &[String]) -> ExitCode {
     });
 
     let Some(sock) = socket_path() else {
-        eprintln!("tbmsg: $HOME not set; can't locate socket");
+        eprintln!("jimctl msg: $HOME not set; can't locate socket");
         return ExitCode::from(1);
     };
     let mut stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbmsg: connect {}: {} (is the terminal-bevy app running?)",
+                "jimctl msg: connect {}: {} (is the terminal-bevy app running?)",
                 sock.display(),
                 e
             );
@@ -134,12 +134,12 @@ fn cmd_emit(args: &[String]) -> ExitCode {
     let body = match serde_json::to_vec(&req) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("tbmsg: serialize: {}", e);
+            eprintln!("jimctl msg: serialize: {}", e);
             return ExitCode::from(1);
         }
     };
     if let Err(e) = stream.write_all(&body) {
-        eprintln!("tbmsg: write: {}", e);
+        eprintln!("jimctl msg: write: {}", e);
         return ExitCode::from(1);
     }
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -154,7 +154,7 @@ fn cmd_tail(args: &[String]) -> ExitCode {
         Some(name) => match resolve_project_id(name) {
             Ok(id) => Some(id),
             Err(e) => {
-                eprintln!("tbmsg tail: {}", e);
+                eprintln!("jimctl msg tail: {}", e);
                 return ExitCode::from(1);
             }
         },
@@ -162,7 +162,7 @@ fn cmd_tail(args: &[String]) -> ExitCode {
     };
 
     let Some(log) = bus_log_path() else {
-        eprintln!("tbmsg: $HOME not set; can't locate bus log");
+        eprintln!("jimctl msg: $HOME not set; can't locate bus log");
         return ExitCode::from(1);
     };
 

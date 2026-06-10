@@ -1,11 +1,11 @@
-//! `tbopen` — like `subl` but for the running `terminal-bevy` app.
+//! `jimctl open` — like `subl` but for the running `terminal-bevy` app.
 //!
 //! Sends a single JSON line over the app's Unix socket asking it to
 //! open a file in an editor pane. The app must already be running
 //! (we don't auto-launch it).
 //!
 //! Usage:
-//!     tbopen <file> [--project <name>]
+//!     jimctl open <file> [--project <name>]
 //!
 //! Default project is whichever project is currently active in the
 //! running app. `--project NAME` does a case-insensitive match against
@@ -15,7 +15,7 @@
 //! The wire format is duplicated here on purpose: the parent
 //! `jim_app` lib depends on libghostty-vt (a dylib), and a bin
 //! in the same package links against the lib by default. Keeping this
-//! bin lib-free means no @rpath dance to ship `tbopen` alongside the
+//! bin lib-free means no @rpath dance to ship `jimctl open` alongside the
 //! main app.
 
 use std::io::Write;
@@ -40,7 +40,7 @@ fn socket_path() -> Option<PathBuf> {
     Some(Path::new(&home).join(".jim").join("socket"))
 }
 
-fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let args = match Args::parse() {
         Ok(a) => a,
         Err(msg) => {
@@ -53,13 +53,13 @@ fn main() -> ExitCode {
     let abs = match args.path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("tbopen: {}: {}", args.path.display(), e);
+            eprintln!("jimctl open: {}: {}", args.path.display(), e);
             return ExitCode::from(1);
         }
     };
 
     let Some(sock) = socket_path() else {
-        eprintln!("tbopen: $HOME not set; can't locate socket");
+        eprintln!("jimctl open: $HOME not set; can't locate socket");
         return ExitCode::from(1);
     };
 
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbopen: connect {}: {} (is the terminal-bevy app running?)",
+                "jimctl open: connect {}: {} (is the terminal-bevy app running?)",
                 sock.display(),
                 e
             );
@@ -82,12 +82,12 @@ fn main() -> ExitCode {
     let body = match serde_json::to_vec(&req) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("tbopen: serialize: {}", e);
+            eprintln!("jimctl open: serialize: {}", e);
             return ExitCode::from(1);
         }
     };
     if let Err(e) = stream.write_all(&body) {
-        eprintln!("tbopen: write: {}", e);
+        eprintln!("jimctl open: write: {}", e);
         return ExitCode::from(1);
     }
     // Half-close so the app sees EOF and parses our message.
@@ -104,7 +104,7 @@ impl Args {
     fn parse() -> Result<Self, String> {
         let mut path: Option<PathBuf> = None;
         let mut project: Option<String> = None;
-        let mut it = std::env::args().skip(1);
+        let mut it = crate::sub_args();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "-h" | "--help" => {
@@ -137,7 +137,7 @@ impl Args {
 
 fn print_usage() {
     eprintln!(
-        "tbopen <file> [--project NAME]\n\
+        "jimctl open <file> [--project NAME]\n\
          \n\
          Send <file> to the running terminal-bevy app, which opens it in a\n\
          new editor pane. Default project is whichever is currently active."

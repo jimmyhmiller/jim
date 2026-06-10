@@ -1,4 +1,4 @@
-//! `terminal-daemon` — long-lived per-session shell host.
+//! `jim-daemon` — long-lived per-session shell host.
 //!
 //! Spawned by the editor when no daemon for a given `TerminalSession` is
 //! alive. Detaches into the background and serves the session over a
@@ -8,7 +8,7 @@
 //! Usage:
 //!
 //! ```text
-//! terminal-daemon <session_id> <program> [args...]
+//! jim-daemon <session_id> <program> [args...]
 //! ```
 //!
 //! Internal — the editor process is the only intended caller. argv is
@@ -20,14 +20,14 @@ fn main() {
         Some(id) => id,
         None => {
             eprintln!(
-                "usage: terminal-daemon <session_id> <program> [args...]"
+                "usage: jim-daemon <session_id> <program> [args...]"
             );
             std::process::exit(2);
         }
     };
     let command: Vec<String> = args.collect();
     if command.is_empty() {
-        eprintln!("terminal-daemon: missing program to run");
+        eprintln!("jim-daemon: missing program to run");
         std::process::exit(2);
     }
     jim_daemon::daemon::run(session_id, command);

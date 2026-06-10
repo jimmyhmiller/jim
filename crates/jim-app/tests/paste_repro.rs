@@ -53,6 +53,7 @@ fn keystroke_after_large_paste_reaches_pty() {
     let handle = WorkerHandle::spawn(
         session,
         jim_app::default_shell_command(),
+        None,
         SIZE,
         1000,
         None,
@@ -100,6 +101,7 @@ fn keystroke_after_100_line_paste_reaches_pty() {
     let handle = WorkerHandle::spawn(
         session,
         jim_app::default_shell_command(),
+        None,
         SIZE,
         1000,
         None,

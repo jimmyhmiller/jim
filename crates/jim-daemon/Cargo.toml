@@ -20,5 +20,5 @@ name = "jim_daemon"
 path = "src/lib.rs"
 
 [[bin]]
-name = "terminal-daemon"
-path = "src/bin/terminal-daemon.rs"
+name = "jim-daemon"
+path = "src/bin/jim-daemon.rs"

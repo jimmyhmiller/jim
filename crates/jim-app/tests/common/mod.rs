@@ -30,11 +30,11 @@ pub fn setup_isolated_daemon_env() -> DaemonTestEnv {
     let daemon_bin = test_exe
         .parent()
         .and_then(|p| p.parent())
-        .map(|p| p.join("terminal-daemon"))
+        .map(|p| p.join("jim-daemon"))
         .expect("derive daemon binary path");
     assert!(
         daemon_bin.exists(),
-        "terminal-daemon binary not built at {}",
+        "jim-daemon binary not built at {}",
         daemon_bin.display()
     );
 

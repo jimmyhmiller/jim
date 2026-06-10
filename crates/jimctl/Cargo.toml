@@ -1,5 +1,5 @@
 [package]
-name = "tbinject"
+name = "jimctl"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
@@ -10,5 +10,5 @@ serde_json = "1"
 jim_daemon = { path = "../jim-daemon" }
 
 [[bin]]
-name = "tbinject"
+name = "jimctl"
 path = "src/main.rs"

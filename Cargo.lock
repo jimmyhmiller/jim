@@ -3682,6 +3682,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jimctl"
+version = "0.1.0"
+dependencies = [
+ "jim_daemon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jni"
 version = "0.21.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5794,15 +5803,6 @@ dependencies = [
  "grid",
  "serde",
  "slotmap",
-]
-
-[[package]]
-name = "tbinject"
-version = "0.1.0"
-dependencies = [
- "jim_daemon",
- "serde",
- "serde_json",
 ]
 
 [[package]]

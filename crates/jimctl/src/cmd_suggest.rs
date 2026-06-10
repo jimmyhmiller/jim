@@ -1,4 +1,4 @@
-//! `tbsuggest` — park a *suggested* pane in the running app's drawer
+//! `jimctl suggest` — park a *suggested* pane in the running app's drawer
 //! (the Quake-style dropdown), instead of spawning it on the canvas.
 //!
 //! The AI calls this when it infers a pane might be useful but doesn't
@@ -7,10 +7,10 @@
 //! pulls the drawer down (Cmd+J) later and picks it.
 //!
 //! Usage:
-//!     tbsuggest --command "cargo test" [--title "Run tests"] [--cwd DIR]
+//!     jimctl suggest --command "cargo test" [--title "Run tests"] [--cwd DIR]
 //!               [--reason "you just ran this in a side terminal"]
 //!               [--project NAME]
-//!     tbsuggest --kind editor --config '{"path":"/abs/file.rs"}' --title "open foo"
+//!     jimctl suggest --kind editor --config '{"path":"/abs/file.rs"}' --title "open foo"
 //!
 //! With a bare `--command` and no `--kind`, the suggestion becomes a
 //! `run-button` pre-filled with the command (and `--cwd`/`--title`).
@@ -19,7 +19,7 @@
 //!
 //! The app must already be running. The wire format is duplicated here
 //! on purpose so this bin stays free of the libghostty-vt dylib (see
-//! `tbopen.rs` for the rationale).
+//! `open` for the rationale).
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -46,7 +46,7 @@ enum IpcRequest {
         config: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         project: Option<String>,
-        /// The dir tbsuggest was invoked in. The app maps it to the
+        /// The dir jimctl suggest was invoked in. The app maps it to the
         /// owning project (by `default_cwd`) when `project` isn't given,
         /// so a suggestion fired from a side terminal lands in that
         /// terminal's project, not whatever's active in the GUI.
@@ -60,7 +60,7 @@ fn socket_path() -> Option<PathBuf> {
     Some(Path::new(&home).join(".jim").join("socket"))
 }
 
-fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let args = match Args::parse() {
         Ok(a) => a,
         Err(msg) => {
@@ -71,7 +71,7 @@ fn main() -> ExitCode {
     };
 
     if args.kind.is_none() && args.command.is_none() {
-        eprintln!("tbsuggest: need --command or --kind");
+        eprintln!("jimctl suggest: need --command or --kind");
         print_usage();
         return ExitCode::from(2);
     }
@@ -80,7 +80,7 @@ fn main() -> ExitCode {
         Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("tbsuggest: --config is not valid JSON: {}", e);
+                eprintln!("jimctl suggest: --config is not valid JSON: {}", e);
                 return ExitCode::from(2);
             }
         },
@@ -98,7 +98,7 @@ fn main() -> ExitCode {
     };
 
     let Some(sock) = socket_path() else {
-        eprintln!("tbsuggest: $HOME not set; can't locate socket");
+        eprintln!("jimctl suggest: $HOME not set; can't locate socket");
         return ExitCode::from(1);
     };
 
@@ -106,7 +106,7 @@ fn main() -> ExitCode {
         Ok(s) => s,
         Err(e) => {
             eprintln!(
-                "tbsuggest: connect {}: {} (is the terminal-bevy app running?)",
+                "jimctl suggest: connect {}: {} (is the terminal-bevy app running?)",
                 sock.display(),
                 e
             );
@@ -129,12 +129,12 @@ fn main() -> ExitCode {
     let body = match serde_json::to_vec(&req) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("tbsuggest: serialize: {}", e);
+            eprintln!("jimctl suggest: serialize: {}", e);
             return ExitCode::from(1);
         }
     };
     if let Err(e) = stream.write_all(&body) {
-        eprintln!("tbsuggest: write: {}", e);
+        eprintln!("jimctl suggest: write: {}", e);
         return ExitCode::from(1);
     }
     let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -155,7 +155,7 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut a = Args::default();
-        let mut it = std::env::args().skip(1);
+        let mut it = crate::sub_args();
         while let Some(arg) = it.next() {
             let mut take = |name: &str| -> Result<String, String> {
                 it.next().ok_or_else(|| format!("{} requires a value", name))
@@ -181,8 +181,8 @@ impl Args {
 
 fn print_usage() {
     eprintln!(
-        "tbsuggest --command CMD [--title T] [--cwd DIR] [--reason R] [--project NAME]\n\
-         tbsuggest --kind KIND --config JSON [--title T] [--reason R] [--project NAME]\n\
+        "jimctl suggest --command CMD [--title T] [--cwd DIR] [--reason R] [--project NAME]\n\
+         jimctl suggest --kind KIND --config JSON [--title T] [--reason R] [--project NAME]\n\
          \n\
          Park a suggested pane in the running app's drawer (Cmd+J to open).\n\
          A bare --command becomes a run-button; other kinds need --config.\n\
