@@ -22,12 +22,12 @@
     warn: "#dfb06b",
     err: "#d06b4d",
 
-    // --- pane chrome (SDF material). Focus changes ONLY title-bar
-    // text + title-bar background; border/glow stay stable so the
-    // pane body doesn't visually shift under focus.
+    // --- pane chrome (SDF material). Focus is QUIET: the title strip +
+    // margin ring (chrome_title_bg_focused) lighten a step; the border
+    // never changes — no bright outline, no glow, no body shift.
     pane_bg: "#181f20",
-    pane_border: "#293032",
-    pane_border_focused: "#293032",
+    pane_border: "#1e2527",
+    pane_border_focused: "#1e2527",
     pane_focus_glow: "#00000000",
     pane_corner_radius: 8.0,
     pane_border_width: 1.0,
@@ -41,8 +41,13 @@
     // --- chrome text + title-strip fill ---
     chrome_title: "#80818c",
     chrome_title_focused: "#e8e4dd",
-    chrome_title_bg: "#0d1013",
-    chrome_title_bg_focused: "#2a2e37",
+    // chrome_title_bg paints the title strip + the margin ring around
+    // the content. At rest it matches pane_bg (flat, no frame); on
+    // focus it lightens one quiet step — that shade shift IS the focus
+    // indicator. Themes that want a standing frame set the resting
+    // value to a distinct shade (style-muse `frame` border gene).
+    chrome_title_bg: "#181f20",
+    chrome_title_bg_focused: "#222b2d",
     chrome_divider: "#272a32",
     chrome_close: "#80818c",
     chrome_handle: "#383b42",

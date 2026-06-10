@@ -84,6 +84,7 @@ impl Plugin for PresetsPlugin {
             .add_systems(
                 Update,
                 (
+                    drain_rescan_requests,
                     sync_active_preset_from_project,
                     drain_preset_messages,
                     sync_active_theme_from_preset,
@@ -487,6 +488,14 @@ fn write_seed_full(
 }
 
 fn discover_presets(mut registry: ResMut<StylePresetRegistry>) {
+    rescan_presets(&mut registry);
+}
+
+/// Re-read `~/.jim/styles/` into the registry. Runs at startup and again
+/// on-demand when a script asks for a preset name we haven't seen (so a
+/// preset written mid-session — e.g. Style Lab's "Keep" — works without
+/// a restart).
+pub(crate) fn rescan_presets(registry: &mut StylePresetRegistry) {
     let Some(dir) = styles_dir() else { return };
     let mut found: Vec<StylePreset> = Vec::new();
     let read = match std::fs::read_dir(&dir) {
@@ -599,7 +608,7 @@ fn sync_active_preset_from_project(
 fn sync_active_theme_from_preset(
     preset: Res<ActiveStylePreset>,
     project: Res<ActiveProject>,
-    registry: Res<StylePresetRegistry>,
+    mut registry: ResMut<StylePresetRegistry>,
     data_dir: Option<Res<StyleDataDir>>,
     mut active_theme: ResMut<ActiveThemePath>,
 ) {
@@ -607,6 +616,11 @@ fn sync_active_theme_from_preset(
         return;
     }
     if let Some(name) = preset.0.as_deref() {
+        // Unknown name? The preset may have been written after startup
+        // (Style Lab "Keep") — rescan the styles dir once before giving up.
+        if !registry.presets.iter().any(|p| p.name == name) {
+            rescan_presets(&mut registry);
+        }
         if let Some(p) = registry.presets.iter().find(|p| p.name == name) {
             active_theme.0 = Some(p.theme_path.clone());
             return;
@@ -684,10 +698,19 @@ struct PresetMsg(pub Option<String>);
 static PRESET_TX: OnceLock<Mutex<Sender<PresetMsg>>> = OnceLock::new();
 static PRESET_RX: OnceLock<Mutex<Receiver<PresetMsg>>> = OnceLock::new();
 
+/// Channel for `refresh_styles()` calls — signals the main thread to rescan.
+static RESCAN_TX: OnceLock<Mutex<Sender<()>>> = OnceLock::new();
+static RESCAN_RX: OnceLock<Mutex<Receiver<()>>> = OnceLock::new();
+
 fn ensure_channel() {
     PRESET_TX.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<PresetMsg>();
         let _ = PRESET_RX.set(Mutex::new(rx));
+        Mutex::new(tx)
+    });
+    RESCAN_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<()>();
+        let _ = RESCAN_RX.set(Mutex::new(rx));
         Mutex::new(tx)
     });
 }
@@ -714,6 +737,13 @@ pub fn register_preset_host_fns(engine: &mut Engine) {
             }
         }
     });
+    engine.register_fn("refresh_styles", || {
+        if let Some(tx) = RESCAN_TX.get() {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(());
+            }
+        }
+    });
     engine.register_fn("active_style", || -> Dynamic {
         // We don't have a global mirror of the active preset (it
         // could be stale across the wakeups). Reading from a snapshot
@@ -721,6 +751,18 @@ pub fn register_preset_host_fns(engine: &mut Engine) {
         // scripts track it via state_set if they want UI highlight.
         Dynamic::UNIT
     });
+}
+
+fn drain_rescan_requests(mut registry: ResMut<StylePresetRegistry>) {
+    let Some(rx) = RESCAN_RX.get() else { return };
+    let Ok(rx) = rx.lock() else { return };
+    let mut requested = false;
+    while rx.try_recv().is_ok() {
+        requested = true;
+    }
+    if requested {
+        rescan_presets(&mut registry);
+    }
 }
 
 fn drain_preset_messages(

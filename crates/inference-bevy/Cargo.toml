@@ -25,3 +25,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "infer-classify-cwd"
 path = "src/bin/classify_cwd.rs"
+
+# Generative theme engine for the Style Lab widget: expands compact
+# theme "genomes" into full token sets + chrome shaders, samples new
+# genomes (taste-weighted random or DeepSeek), and records feedback.
+[[bin]]
+name = "style-muse"
+path = "src/bin/style_muse.rs"

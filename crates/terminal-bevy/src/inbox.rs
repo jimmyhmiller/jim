@@ -20,7 +20,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use bevy::input::mouse::MouseButton;
+use bevy::input::mouse::{MouseButton, MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use bevy::text::{LineHeight, TextLayout};
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use pane_bevy::{
-    content_area, pt_to_content_local, PaneContentPressed, PaneFont, PaneHotZones, PaneKindSpec,
+    content_area, PaneContentPressed, PaneFont, PaneHotZones, PaneKindSpec,
     PaneRect, PaneRegistry, PaneTitle,
 };
 
@@ -226,6 +226,13 @@ pub struct InboxPane {
     /// ones drop out of the list the moment they're marked read. Toggled
     /// on to reveal the full history.
     pub show_read: bool,
+    /// Vertical scroll offset in canvas units (≥ 0; 0 = top). The whole
+    /// content_root is translated up by this amount.
+    pub scroll: f32,
+    /// Total laid-out content height in canvas units, written by
+    /// `rebuild_rows`. Used to clamp `scroll` so the last row can't be
+    /// dragged off the bottom.
+    pub content_height: f32,
 }
 
 #[derive(Component, Copy, Clone, Debug)]
@@ -258,8 +265,10 @@ impl Plugin for InboxPanePlugin {
                 Update,
                 (
                     poll_disk.run_if(on_timer(std::time::Duration::from_millis(1000))),
+                    scroll_inbox,
                     handle_content_press,
                     rebuild_rows,
+                    sync_inbox_content_root,
                     update_inbox_hot_zones,
                 )
                     .chain(),
@@ -294,6 +303,8 @@ fn inbox_spawn(world: &mut World, entity: Entity, _content_root: Entity, config:
         project_id,
         dirty_layout: true,
         show_read: false,
+        scroll: 0.0,
+        content_height: 0.0,
     });
     world.resource_mut::<InboxStore>().ensure_loaded(project_id);
 }
@@ -343,28 +354,40 @@ fn poll_disk(
 
 fn handle_content_press(
     mut events: MessageReader<PaneContentPressed>,
-    mut panes: Query<&mut InboxPane>,
-    hits: Query<(&InboxHit, &HitSize)>,
-    pane_rects: Query<&PaneRect>,
+    mut panes: Query<(&mut InboxPane, &pane_bevy::PaneChrome)>,
+    hits: Query<(&InboxHit, &HitSize, &ChildOf)>,
     mut store: ResMut<InboxStore>,
 ) {
     for ev in events.read() {
-        let Ok(mut pane) = panes.get_mut(ev.pane) else {
-            continue;
-        };
-        let Ok(_rect) = pane_rects.get(ev.pane) else {
+        let Ok((mut pane, chrome)) = panes.get_mut(ev.pane) else {
             continue;
         };
         // `ev.local_pt` is already content-local in canvas-space;
         // recomputing from window_pt + canvas-space rect would
         // mis-hit the moment the canvas is panned/zoomed.
         let local = ev.local_pt;
+        // `HitSize.local_origin` is stored in unscrolled layout coords;
+        // `local_pt` is the visual content-local click. When scrolled down
+        // by S the content_root is shifted up by S, so a layout-y row
+        // appears at visual y = layout_y - S. Recover layout coords by
+        // adding scroll back to the click's y.
+        let probe_y = local.y + pane.scroll;
+        // The hits query is global across every open inbox pane, and all
+        // panes lay their rows out in the same local coordinate space
+        // (rows start at (0, 27), buttons at fixed x). Without filtering
+        // by parent, a click on one pane matches an overlapping hit-rect
+        // from another pane and toggles a message id that isn't even in
+        // this project's inbox — a silent no-op. Restrict to children of
+        // the clicked pane's content_root.
         let mut picked: Option<InboxHit> = None;
-        for (hit, size) in &hits {
+        for (hit, size, child_of) in &hits {
+            if child_of.0 != chrome.content_root {
+                continue;
+            }
             if local.x >= size.local_origin.x
                 && local.x <= size.local_origin.x + size.size.x
-                && local.y >= size.local_origin.y
-                && local.y <= size.local_origin.y + size.size.y
+                && probe_y >= size.local_origin.y
+                && probe_y <= size.local_origin.y + size.size.y
             {
                 picked = Some(*hit);
                 break;
@@ -381,26 +404,94 @@ fn handle_content_press(
 /// number of inbox panes is tiny, and avoids any stale-mapping risk
 /// when the pane is closed and respawned.
 fn update_inbox_hot_zones(
-    panes: Query<(Entity, &pane_bevy::PaneChrome), With<InboxPane>>,
+    panes: Query<(Entity, &InboxPane, &pane_bevy::PaneChrome)>,
     mut zones_q: Query<&mut PaneHotZones>,
     hits: Query<(&HitSize, &ChildOf), With<InboxHit>>,
 ) {
-    let by_root: std::collections::HashMap<Entity, Entity> = panes
+    // content_root → (pane entity, scroll). PaneHotZones live in visual
+    // content-local coords (scroll already subtracted), so shift each
+    // hit-rect up by the pane's scroll to match where it's drawn.
+    let by_root: std::collections::HashMap<Entity, (Entity, f32)> = panes
         .iter()
-        .map(|(e, c)| (c.content_root, e))
+        .map(|(e, p, c)| (c.content_root, (e, p.scroll)))
         .collect();
-    for (e, _) in panes.iter() {
+    for (e, _, _) in panes.iter() {
         if let Ok(mut z) = zones_q.get_mut(e) {
             z.clear();
         }
     }
     for (size, child_of) in &hits {
-        let Some(&pane) = by_root.get(&child_of.0) else { continue };
+        let Some(&(pane, scroll)) = by_root.get(&child_of.0) else { continue };
         let Ok(mut z) = zones_q.get_mut(pane) else { continue };
-        z.push(Rect::from_corners(
-            size.local_origin,
-            size.local_origin + size.size,
-        ));
+        let origin = Vec2::new(size.local_origin.x, size.local_origin.y - scroll);
+        z.push(Rect::from_corners(origin, origin + size.size));
+    }
+}
+
+/// Mouse-wheel scroll on the inbox pane under the cursor. Only the
+/// topmost pane of any kind wins, so scrolling over an inbox that's
+/// occluded by another pane doesn't move it. Cmd+scroll is reserved for
+/// the host's canvas-pan gesture.
+fn scroll_inbox(
+    mut wheel: MessageReader<MouseWheel>,
+    windows: Query<&Window>,
+    keys: Res<ButtonInput<KeyCode>>,
+    viewport: Res<pane_bevy::PaneViewport>,
+    all_panes: Query<(Entity, &PaneRect, Option<&Visibility>), With<pane_bevy::PaneTag>>,
+    mut inboxes: Query<(&mut InboxPane, &PaneRect)>,
+) {
+    if keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight) {
+        wheel.clear();
+        return;
+    }
+    let mut dy_px = 0.0;
+    for ev in wheel.read() {
+        dy_px += match ev.unit {
+            MouseScrollUnit::Pixel => ev.y,
+            MouseScrollUnit::Line => ev.y * ROW_H,
+        };
+    }
+    if dy_px == 0.0 {
+        return;
+    }
+    let Ok(win) = windows.single() else { return };
+    let Some(pt) = win.cursor_position() else { return };
+    let pt_canvas = viewport.window_to_canvas(pt);
+    let all_rects: Vec<(Entity, PaneRect)> = all_panes
+        .iter()
+        .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
+        .map(|(e, r, _)| (e, *r))
+        .collect();
+    let Some(target) = pane_bevy::topmost_pane_at(pt_canvas, &all_rects) else {
+        return;
+    };
+    let Ok((mut pane, rect)) = inboxes.get_mut(target) else {
+        return;
+    };
+    let (_, content_size) = content_area(rect);
+    let y_max = (pane.content_height - content_size.y).max(0.0);
+    // Wheel delta is in screen pixels; scroll lives in canvas units.
+    let dy_canvas = dy_px / viewport.zoom.max(0.0001);
+    pane.scroll = (pane.scroll - dy_canvas).clamp(0.0, y_max);
+}
+
+/// Translate each inbox pane's `content_root` up by its scroll offset.
+/// content_root's resting transform (set at spawn) is
+/// `(MARGIN, -(TITLE_H + MARGIN))`; adding `scroll` to y moves content up
+/// (Bevy is y-up), revealing rows further down. Cheap, and avoids
+/// rebuilding the row entities on every wheel tick.
+fn sync_inbox_content_root(
+    inboxes: Query<(&InboxPane, &pane_bevy::PaneChrome)>,
+    mut t_q: Query<&mut Transform>,
+) {
+    for (pane, chrome) in &inboxes {
+        let Ok(mut t) = t_q.get_mut(chrome.content_root) else {
+            continue;
+        };
+        let want_y = -(pane_bevy::TITLE_H + pane_bevy::MARGIN) + pane.scroll;
+        if t.translation.y != want_y {
+            t.translation.y = want_y;
+        }
     }
 }
 
@@ -488,6 +579,7 @@ fn rebuild_rows(
     existing_rows: Query<(Entity, &ChildOf), With<InboxRowEntity>>,
     store: Res<InboxStore>,
     font: Res<PaneFont>,
+    font_metrics: Res<pane_bevy::PaneFontMetrics>,
     theme: Res<style_bevy::Theme>,
 ) {
     let theme_changed = theme.is_changed();
@@ -688,6 +780,8 @@ fn rebuild_rows(
                 Anchor::CENTER_LEFT,
                 Transform::from_xyz(ROW_PAD_X, -(y + ROW_H * 0.5), 0.1),
             ));
+            pane.content_height = y + ROW_H;
+            pane.scroll = pane.scroll.clamp(0.0, (pane.content_height - content_size.y).max(0.0));
             continue;
         }
 
@@ -743,8 +837,14 @@ fn rebuild_rows(
                 Transform::from_xyz(ROW_PAD_X, -(y + ROW_H * 0.5), 0.1),
             ));
 
-            // Sender + subject summary.
-            let summary = format_summary(m);
+            // Sender + subject summary. Truncate to fit before the right-anchored
+            // timestamp. Use measured cell_width so the truncation is exact.
+            let summary_x = ROW_PAD_X + 18.0;
+            let char_w = font_metrics.char_width(TEXT_FONT_SIZE);
+            let ts_reserve = font_metrics.measure("100d ago", SMALL_FONT_SIZE) + ROW_PAD_X + 8.0;
+            let avail_w = (content_w - ts_reserve - summary_x).max(0.0);
+            let max_chars = ((avail_w / char_w) as usize).max(10);
+            let summary = truncate(&format_summary(m), max_chars);
             let title_color = if m.read { fg_muted } else { fg };
             commands.spawn((
                 InboxRowEntity,
@@ -760,7 +860,7 @@ fn rebuild_rows(
                 Anchor::CENTER_LEFT,
                 TextLayout::new_with_no_wrap(),
                 pane_bevy::PaneContentNoClip,
-                Transform::from_xyz(ROW_PAD_X + 18.0, -(y + ROW_H * 0.5), 0.1),
+                Transform::from_xyz(summary_x, -(y + ROW_H * 0.5), 0.1),
             ));
 
             // Right-edge timestamp.
@@ -910,6 +1010,12 @@ fn rebuild_rows(
             ));
             y += 1.0;
         }
+
+        // Total laid-out height; clamp scroll so the last row can't be
+        // dragged off the bottom (e.g. after marking messages read shrinks
+        // the list out from under a deep scroll position).
+        pane.content_height = y;
+        pane.scroll = pane.scroll.clamp(0.0, (y - content_size.y).max(0.0));
     }
 }
 

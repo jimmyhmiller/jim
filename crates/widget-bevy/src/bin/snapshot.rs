@@ -37,6 +37,11 @@ struct SnapshotConfig {
     show_tooltip: bool,
     /// If set, force this `Popover` open before snapshotting.
     open_popover: Option<String>,
+    /// If set, send a `HostEvent::Toggle { id, checked: true }` to the widget
+    /// `toggle_lead` frames before the snapshot — captures a `transition`
+    /// animation mid-flight.
+    toggle: Option<String>,
+    toggle_lead: u32,
 }
 
 /// The single widget pane the snapshot spawned (for forcing a select open).
@@ -66,6 +71,8 @@ fn main() -> ExitCode {
     let mut open_select: Option<String> = None;
     let mut show_tooltip = false;
     let mut open_popover: Option<String> = None;
+    let mut toggle: Option<String> = None;
+    let mut toggle_lead: u32 = 10;
 
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -74,6 +81,12 @@ fn main() -> ExitCode {
             "--open-select" => open_select = args.next(),
             "--open-popover" => open_popover = args.next(),
             "--show-tooltip" => show_tooltip = true,
+            "--toggle" => toggle = args.next(),
+            "--toggle-lead" => {
+                if let Some(n) = args.next().and_then(|s| s.parse().ok()) {
+                    toggle_lead = n;
+                }
+            }
             "--size" => {
                 if let Some(s) = args.next().and_then(|s| parse_size(&s)) {
                     size = s;
@@ -119,6 +132,8 @@ fn main() -> ExitCode {
         open_select,
         show_tooltip,
         open_popover,
+        toggle,
+        toggle_lead,
     };
 
     let mut app = App::new();
@@ -174,6 +189,7 @@ fn main() -> ExitCode {
                 force_open_select,
                 force_show_tooltip,
                 force_open_popover,
+                force_toggle,
             ),
         );
 
@@ -323,6 +339,36 @@ fn force_show_tooltip(
             });
             *done = true;
         }
+    }
+}
+
+/// Send a real `toggle` host event shortly before the capture so a Glaze
+/// `transition checked …` is photographed mid-flight.
+fn force_toggle(
+    config: Res<SnapshotConfig>,
+    state: Res<SnapshotState>,
+    pane: Option<Res<SnapshotPane>>,
+    io: Query<&widget_bevy::WidgetIO>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    let (Some(id), Some(pane)) = (config.toggle.as_ref(), pane) else {
+        return;
+    };
+    if state.frames_seen + config.toggle_lead < config.wait_frames {
+        return;
+    }
+    if let Ok(io) = io.get(pane.0) {
+        let evt = serde_json::to_string(&widget_bevy::protocol::HostEvent::Toggle {
+            id: id.clone(),
+            checked: true,
+        })
+        .expect("HostEvent::Toggle serializes");
+        let _ = io.tx.send(evt);
+        eprintln!("widget-snapshot: sent toggle {:?}", id);
+        *done = true;
     }
 }
 

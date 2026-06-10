@@ -214,6 +214,7 @@ impl Plugin for CanvasPlugin {
         app.insert_resource(CanvasView::default())
             .insert_resource(CanvasConfig::default())
             .insert_resource(PanDragState::default())
+            .init_resource::<PanPresetStep>()
             .add_systems(
                 Update,
                 (handle_pan_zoom_input, cycle_config_hotkey, jump_to_double_clicked_pane).chain(),
@@ -551,9 +552,13 @@ fn handle_pan_zoom_input(
 /// A/B different setups without rebuilding. Bindings (all require Cmd
 /// + Shift to avoid colliding with terminal input):
 ///
-/// - **Cmd+Shift+P** — cycle pan-gesture preset
 /// - **Cmd+Shift+Z** — toggle zoom on/off
 /// - **Cmd+Shift+0** — reset active project's view (pan=0, zoom=1)
+///
+/// Pan-preset cycling moved to the command palette
+/// ("canvas.cycle_pan_preset") — its old Cmd+Shift+P chord collided
+/// with the palette-open key (see the NOTE in `cycle_config_hotkey`).
+///
 /// Double-click a pane → jump-to-pane. Resets zoom to 1× and pans so
 /// the pane's top-left sits at (margin, margin) in screen coords. The
 /// pan-clamp keeps the canvas wall in view when the pane is already
@@ -594,7 +599,6 @@ fn cycle_config_hotkey(
     owner: Res<pane_bevy::KeyboardOwner>,
     mut view: ResMut<CanvasView>,
     projects: Res<Projects>,
-    mut step: Local<usize>,
 ) {
     if owner.is_modal() {
         events.clear();
@@ -602,7 +606,6 @@ fn cycle_config_hotkey(
     }
     let cmd = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    let mut fire_pan = false;
     let mut fire_zoom = false;
     let mut fire_reset = false;
     for ev in events.read() {
@@ -612,20 +615,19 @@ fn cycle_config_hotkey(
         if !(cmd && shift) {
             continue;
         }
+        // NOTE: no Cmd+Shift+P binding here. That chord OPENS the command
+        // palette, and the modal guard above lags one frame (KeyboardOwner
+        // is computed in PreUpdate from last frame's palette state), so a
+        // binding on the same chord silently fires on every palette open —
+        // which is exactly how the pan preset used to end up on
+        // "middle-only" (trackpad_scroll: false), killing cmd+scroll.
+        // Pan-preset cycling is a palette action now
+        // ("canvas.cycle_pan_preset").
         match &ev.logical_key {
-            Key::Character(s) if s.eq_ignore_ascii_case("p") => fire_pan = true,
             Key::Character(s) if s.eq_ignore_ascii_case("z") => fire_zoom = true,
             Key::Character(s) if s.as_str() == "0" || s.as_str() == ")" => fire_reset = true,
             _ => {}
         }
-    }
-    if fire_pan {
-        *step = (*step + 1) % PAN_PRESETS.len();
-        config.pan = PAN_PRESETS[*step].1;
-        eprintln!(
-            "[canvas] pan preset → {} ({:?})",
-            PAN_PRESETS[*step].0, config.pan
-        );
     }
     if fire_zoom {
         config.zoom_enabled = !config.zoom_enabled;
@@ -801,6 +803,22 @@ fn sync_origin_indicators(
             t.translation = want_t;
         }
     }
+}
+
+/// Index into [`PAN_PRESETS`] for [`cycle_pan_preset`]. A resource (not
+/// a system Local) because the cycle is driven by a palette action.
+#[derive(Resource, Default)]
+pub struct PanPresetStep(usize);
+
+/// Advance to the next pan-gesture preset. Invoked by the
+/// "canvas.cycle_pan_preset" palette action.
+pub fn cycle_pan_preset(world: &mut World) {
+    let mut step = world.resource_mut::<PanPresetStep>();
+    step.0 = (step.0 + 1) % PAN_PRESETS.len();
+    let idx = step.0;
+    let (name, gestures) = PAN_PRESETS[idx];
+    world.resource_mut::<CanvasConfig>().pan = gestures;
+    eprintln!("[canvas] pan preset → {} ({:?})", name, gestures);
 }
 
 const PAN_PRESETS: &[(&str, PanGestures)] = &[

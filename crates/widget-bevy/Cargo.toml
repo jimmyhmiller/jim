@@ -37,6 +37,11 @@ bevy = { version = "0.18", default-features = false, features = [
     "wayland",
 ] }
 
+[dev-dependencies]
+# The Style Lab generator (style-muse) emits protocol-shaped JSON; the
+# muse_pack test pins the two crates' serde shapes together.
+inference_bevy = { path = "../inference-bevy" }
+
 [lib]
 name = "widget_bevy"
 path = "src/lib.rs"

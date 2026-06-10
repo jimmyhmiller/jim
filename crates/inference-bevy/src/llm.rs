@@ -118,6 +118,19 @@ pub fn classify<T: DeserializeOwned>(
     system: &str,
     user: &str,
 ) -> Result<T, LlmError> {
+    // Low temperature for classifier-shaped outputs.
+    complete_json(cfg, system, user, 0.0)
+}
+
+/// Same JSON-object call shape as [`classify`] but with a caller-chosen
+/// temperature, for generative uses (e.g. `style-muse` proposing theme
+/// genomes) where determinism is exactly wrong.
+pub fn complete_json<T: DeserializeOwned>(
+    cfg: &LlmConfig,
+    system: &str,
+    user: &str,
+    temperature: f32,
+) -> Result<T, LlmError> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let body = ChatRequest {
         model: &cfg.model,
@@ -134,10 +147,13 @@ pub fn classify<T: DeserializeOwned>(
         response_format: ResponseFormat {
             kind: "json_object",
         },
-        // Low temperature for classifier-shaped outputs.
-        temperature: 0.0,
+        temperature,
     };
     let res = ureq::post(&url)
+        // Hard cap: a hung connection must surface as an error the caller
+        // can show, not block its thread (the Style Lab's "New batch"
+        // once sat busy forever on a stalled call).
+        .timeout(std::time::Duration::from_secs(60))
         .set("Authorization", &format!("Bearer {}", cfg.api_key))
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(&body).expect("serialize request"));

@@ -7,7 +7,7 @@
 use crate::protocol::{
     BarStyle, CheckboxStyle, DialogStyle, Edges, GlazeLayer, GradientStop, PopoverStyle,
     RadioGroupStyle, SelectStyle, Sides, SliderStyle, StepperStyle, Style, TableStyle, TabsStyle,
-    ToastStyle, ToggleStyle, TooltipStyle,
+    ToastStyle, ToggleStyle, TooltipStyle, TransitionSpec,
 };
 use glaze::{CompiledSlots, CompiledStyle, Dim, Dir, Layer, Program, Rgba};
 use std::collections::HashMap;
@@ -115,6 +115,15 @@ pub fn to_style(c: &CompiledStyle) -> Style {
             },
         })
         .collect();
+    s.transitions = c
+        .transitions
+        .iter()
+        .map(|t| TransitionSpec {
+            state: t.state.clone(),
+            duration_ms: t.duration_ms,
+            easing: t.easing.name().to_string(),
+        })
+        .collect();
     s
 }
 
@@ -148,11 +157,37 @@ pub fn to_bar_style(slots: &CompiledSlots) -> Result<BarStyle, String> {
 /// `track`/`knob` plans should be resolved with the right discrete state in
 /// `slots` (i.e. the widget passes `["checked"]` when the toggle is on, so a
 /// `track { fill muted; :checked { fill accent } }` lands the on/off color).
+/// Single-state: no crossfade plans, so a declared `transition checked` can
+/// only slide the knob. Prefer [`resolve_toggle_style`] for the full effect.
 pub fn to_toggle_style(slots: &CompiledSlots) -> Result<ToggleStyle, String> {
     validate_slots(slots, ToggleStyle::SLOTS, "toggle")?;
     Ok(ToggleStyle {
         track: slots.slot("track").map(to_style),
         knob: slots.slot("knob").map(to_style),
+        track_checked: None,
+        knob_checked: None,
+    })
+}
+
+/// Resolve a `toggle` slot style into a typed [`ToggleStyle`] carrying BOTH
+/// the resting and `:checked` plans (one resolve per state — the same
+/// dual-resolve model as Tabs). With both plans present the renderer animates
+/// a declared `transition checked …` by crossfading track/knob between them
+/// while the knob slides.
+pub fn resolve_toggle_style(prog: &Program, style: &str) -> Result<ToggleStyle, String> {
+    let empty: HashMap<String, String> = HashMap::new();
+    let base = prog
+        .resolve_slots(style, &empty, &[])
+        .map_err(|e| e.to_string())?;
+    validate_slots(&base, ToggleStyle::SLOTS, "toggle")?;
+    let checked = prog
+        .resolve_slots(style, &empty, &["checked"])
+        .map_err(|e| e.to_string())?;
+    Ok(ToggleStyle {
+        track: base.slot("track").map(to_style),
+        knob: base.slot("knob").map(to_style),
+        track_checked: checked.slot("track").map(to_style),
+        knob_checked: checked.slot("knob").map(to_style),
     })
 }
 

@@ -21,6 +21,7 @@
 
 pub mod classifiers;
 pub mod llm;
+pub mod muse;
 
 /// Event-kind constants shared with consumers. Keeping them here so
 /// publishers and subscribers can match on the same strings without

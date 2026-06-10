@@ -1739,10 +1739,16 @@ pub fn assert_pane_project_invariant(
     }
 }
 
-/// Hide panes whose project is not the active one.
+/// Hide panes whose project is not the active one. Panes mid-close
+/// (`PaneClosing`) are excluded: they were force-hidden by the close
+/// and despawn at the start of next frame — flipping one back to
+/// Inherited here would show it for its final frame.
 pub fn sync_visibility(
     projects: Res<Projects>,
-    mut panes: Query<(&PaneProject, &mut Visibility), With<PaneTag>>,
+    mut panes: Query<
+        (&PaneProject, &mut Visibility),
+        (With<PaneTag>, Without<pane_bevy::PaneClosing>),
+    >,
 ) {
     let active = projects.active;
     for (m, mut vis) in &mut panes {

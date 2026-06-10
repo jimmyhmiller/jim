@@ -231,8 +231,14 @@ impl ChromeStyle {
             focus_width: self.focus_width,
             time: 0.0,
             cover_mode: 0.0,
-            title_h: 0.0,
+            // body quads carry the title height too: the two-tone ring
+            // (title strip + content margin) starts below it
+            title_h: crate::TITLE_H,
             title_bg: if focused { self.title_bg_focused } else { self.title_bg },
+            content_margin: crate::MARGIN,
+            _pad_r0: 0.0,
+            _pad_r1: 0.0,
+            _pad_r2: 0.0,
         }
     }
 
@@ -332,16 +338,23 @@ pub struct ChromeParams {
     /// returns transparent in the content area when this is set, so
     /// the cover overpaints the title region only.
     pub cover_mode: f32,
-    /// Title-region height in pixels. Used by the shader (when
-    /// `cover_mode > 0`) to know where the title region ends and the
-    /// content area begins. Set to `pane_bevy::TITLE_H` on the cover;
-    /// 0.0 on the regular pane body.
+    /// Title-region height in pixels: where the title strip ends and
+    /// (after `content_margin` more) the content rect begins. Set on
+    /// body and cover quads alike.
     pub title_h: f32,
-    /// Title-bar background fill (linear RGB + alpha). Only consulted
-    /// in cover mode. Picking a different shade for the title strip is
-    /// how focus is signalled now that the body / border stay stable
-    /// across focus state.
+    /// "Outline" fill (linear RGB + alpha): the title strip and the
+    /// margin ring around the content rect. Focus swaps this (and the
+    /// border) while `bg` — the content backdrop — stays put, so
+    /// focusing a pane never shifts the area behind its content.
     pub title_bg: Vec4,
+    /// Content inset from the pane's left/right/bottom edges in px
+    /// (`pane_bevy::MARGIN`); the content rect's top edge sits at
+    /// `title_h + content_margin`. `0` disables the two-tone body
+    /// (everything paints `bg`).
+    pub content_margin: f32,
+    pub _pad_r0: f32,
+    pub _pad_r1: f32,
+    pub _pad_r2: f32,
 }
 
 // Look is driven by the `ChromeStyle` resource (built from theme

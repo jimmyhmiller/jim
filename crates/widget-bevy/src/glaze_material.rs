@@ -42,6 +42,9 @@ pub struct GlazeUniforms {
     pub hover: f32,
     pub focus: f32,
     pub press: f32,
+    /// eased 0..1 amount of the element's `checked` discrete state, fed from
+    /// the `anim::WidgetAnim` store (Glaze `transition checked …`).
+    pub checked: f32,
     /// element corner radius (px) — the assembled shader masks its output to a
     /// rounded-rect of this radius so shaders don't overpaint rounded corners.
     pub radius: f32,
@@ -58,6 +61,7 @@ impl Default for GlazeUniforms {
             hover: 0.0,
             focus: 0.0,
             press: 0.0,
+            checked: 0.0,
             radius: 0.0,
             mouse: Vec2::ZERO,
             size: Vec2::splat(1.0),
@@ -142,7 +146,7 @@ pub fn assemble_wgsl(body: &str) -> String {
          \n\
          struct GlazeUniforms {{\n\
          \x20   time: f32,\n\x20   dt: f32,\n\x20   hover: f32,\n\x20   focus: f32,\n\
-         \x20   press: f32,\n\x20   radius: f32,\n\x20   mouse: vec2<f32>,\n\x20   size: vec2<f32>,\n\x20   resolution: vec2<f32>,\n\
+         \x20   press: f32,\n\x20   checked: f32,\n\x20   radius: f32,\n\x20   mouse: vec2<f32>,\n\x20   size: vec2<f32>,\n\x20   resolution: vec2<f32>,\n\
          }};\n\
          @group(#{{MATERIAL_BIND_GROUP}}) @binding(0) var<uniform> u: GlazeUniforms;\n\
          \n\
@@ -190,6 +194,7 @@ fn update_glaze_materials(
     time: Res<Time>,
     windows: Query<&Window>,
     viewport: Option<Res<pane_bevy::PaneViewport>>,
+    anim: Option<Res<crate::anim::WidgetAnim>>,
     buttons: Res<ButtonInput<bevy::input::mouse::MouseButton>>,
     panes: Query<
         (
@@ -267,6 +272,13 @@ fn update_glaze_materials(
         );
         if let Some(pt) = pointer {
             m.u.mouse = normalized_mouse(target.rect, pt);
+        }
+        // `checked` is driven by the keyed animation store (eased there, not
+        // here) so it stays continuous across full widget re-renders.
+        if let (Some(anim), Some(id)) = (anim.as_deref(), target.element_id.as_deref()) {
+            if let Some(v) = anim.eased(target.pane, id, "checked") {
+                m.u.checked = v;
+            }
         }
     }
 }

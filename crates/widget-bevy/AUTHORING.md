@@ -358,10 +358,12 @@ as parameters. (See `project_editor_idea_rhai_scoping` in memory.)
 `request_render`, `set_animating`, `time`, `rand`, `rand_int`,
 `hash_str`, `host_env`, `host_log`, `clipboard_set`, `widget_asset`, the
 widget↔widget bus `emit` / `emit_retained` / `my_id` (see "[The
-widget↔widget bus](#the-widgetwidget-bus)"), and the generic subprocess
+widget↔widget bus](#the-widgetwidget-bus)"), the generic subprocess
 primitives `proc_spawn` / `proc_write` / `proc_read` / `proc_alive` /
 `proc_kill` (plus the push handlers `on_proc_output` / `on_proc_exit` —
-see "Driving a subprocess").
+see "Driving a subprocess"), and the JSON bridge `parse_json(s)` →
+map/array/scalar (`()` on bad input) / `to_json(v)` → compact string,
+for talking JSON protocols with subprocesses (see `style_lab.rhai`).
 
 ---
 

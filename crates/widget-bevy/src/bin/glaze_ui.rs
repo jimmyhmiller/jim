@@ -8,9 +8,9 @@ use std::io::{self, BufRead, Write};
 
 use glaze::{Program, parse};
 use widget_bevy::glaze_style::{
-    hex, resolve_select_style, resolve_tabs_style, to_bar_style, to_checkbox_style, to_dialog_style,
-    to_popover_style, to_radio_style, to_slider_style, to_stepper_style, to_style, to_toast_style,
-    to_toggle_style, to_tooltip_style,
+    hex, resolve_select_style, resolve_tabs_style, resolve_toggle_style, to_bar_style,
+    to_checkbox_style, to_dialog_style, to_popover_style, to_radio_style, to_slider_style,
+    to_stepper_style, to_style, to_toast_style, to_tooltip_style,
 };
 use widget_bevy::glaze_style::to_table_style;
 use widget_bevy::protocol::{
@@ -170,11 +170,52 @@ const SHEET: &str = r#"
     }
 
     // ---- Phase 1d: retrofit components, styled by slots + discrete state ----
+    // `transition <state> <duration> [easing]` turns the discrete state change
+    // into a continuous eased input: the knob slides and the track crossfades
+    // muted→teal instead of snapping.
     style toggle {
         track {
             fill   surf2
             radius 999px
+            transition checked 180ms ease_in_out
             :checked { fill teal }   // discrete state: on → teal track
+        }
+        knob {
+            fill   fg
+            radius 999px
+        }
+    }
+
+    // ---- Animation showcase: same component, different transitions ----
+    // a slow linear crossfade (deliberately exaggerated to read on screen)
+    style toggle_slow {
+        track {
+            fill   surf2
+            radius 999px
+            transition checked 700ms linear
+            :checked { fill violet }
+        }
+        knob {
+            fill   fg
+            radius 999px
+        }
+    }
+    // the eased `checked` builtin reaching a SHADER: a soft halo centred on
+    // the knob — its position AND intensity ride the same eased clock the
+    // knob slides on, so the light travels with the dot. State animation on
+    // the GPU, no per-frame style recompute.
+    style toggle_glow {
+        track {
+            fill   surf2
+            radius 999px
+            transition checked 450ms ease_in_out
+            :checked { fill rose }
+            overlay shader {
+                let c = vec2(0.26 + 0.47 * checked, 0.5)
+                let p = (uv - c) * vec2(size.x / size.y, 1.0)
+                let halo = smoothstep(1.2, 0.2, length(p))
+                emit vec4(1.0, 0.78, 0.6, halo * checked * 0.85)
+            }
         }
         knob {
             fill   fg
@@ -618,15 +659,12 @@ fn glaze_checkbox(prog: &Program, id: &str, label: &str, checked: bool) -> Eleme
     }
 }
 
-/// A slot-styled Toggle. The track's `:checked` state is resolved here (CPU
-/// discrete-state model): we pass `["checked"]` when on so Glaze lands the
-/// teal track; the knob's value-driven x-position is the renderer's job.
-fn glaze_toggle(prog: &Program, id: &str, label: &str, checked: bool) -> Element {
-    let states: &[&str] = if checked { &["checked"] } else { &[] };
-    let style = prog
-        .resolve_slots("toggle", &HashMap::new(), states)
-        .ok()
-        .and_then(|s| to_toggle_style(&s).ok());
+/// A slot-styled Toggle. `resolve_toggle_style` carries BOTH the resting and
+/// `:checked` plans (dual-resolve), so the renderer can animate a declared
+/// `transition checked …` by crossfading the track while the knob slides —
+/// the on/off state itself just sets the transition's target.
+fn glaze_toggle(prog: &Program, style_name: &str, id: &str, label: &str, checked: bool) -> Element {
+    let style = resolve_toggle_style(prog, style_name).ok();
     Element::Toggle {
         id: id.into(),
         label: label.into(),
@@ -900,8 +938,8 @@ fn build_ui(
                     20.0,
                     Align::Center,
                     vec![
-                        glaze_toggle(prog, "notifications", "Notifications", checked("notifications")),
-                        glaze_toggle(prog, "autosync", "Auto-sync", checked("autosync")),
+                        glaze_toggle(prog, "toggle", "notifications", "Notifications", checked("notifications")),
+                        glaze_toggle(prog, "toggle", "autosync", "Auto-sync", checked("autosync")),
                     ],
                 ),
             ],
@@ -920,6 +958,31 @@ fn build_ui(
                 tab,
             ),
             tab_panel,
+        ],
+    );
+
+    // Glaze-declared animation: `transition checked …` tweens the knob and
+    // crossfades the track instead of snapping. Three transitions on the same
+    // component; the glow toggle feeds the eased `checked` builtin to a shader.
+    let animation = col(
+        8.0,
+        vec![
+            text("ANIMATED STATE · GLAZE `transition` — click the toggles", &muted, 10.0, true),
+            text(
+                "transition checked 180ms ease_in_out · 700ms linear · 450ms + checked-driven shader glow",
+                &muted,
+                11.0,
+                false,
+            ),
+            row(
+                20.0,
+                Align::Center,
+                vec![
+                    glaze_toggle(prog, "toggle", "anim-eased", "Eased", checked("anim-eased")),
+                    glaze_toggle(prog, "toggle_slow", "anim-slow", "Slow linear", checked("anim-slow")),
+                    glaze_toggle(prog, "toggle_glow", "anim-glow", "Shader glow", checked("anim-glow")),
+                ],
+            ),
         ],
     );
 
@@ -1034,19 +1097,64 @@ fn build_ui(
     Element::Vstack {
         gap: 18.0,
         pad: 4.0,
-        children: vec![header, stats, middle, layers, slots, retrofit, phase2, phase3, badges],
+        children: vec![header, stats, middle, layers, slots, retrofit, animation, phase2, phase3, badges],
         style: None,
     }
 }
 
+/// Sheet token → editor theme token. The showcase compiles its palette to
+/// literal hex, which would ignore the active app theme entirely; instead
+/// we resolve each sheet token's compiled hex (via a probe style) and
+/// rewrite those colors to theme token NAMES in the emitted frames. The
+/// host resolves token names against the live theme at paint time, so the
+/// whole showcase follows theme switches — including Style Lab "Try Live".
+const THEME_MAP: &[(&str, &str)] = &[
+    ("surface", "surface_1"),
+    ("surf2", "surface_2"),
+    ("line", "pane_border"),
+    ("fg", "fg"),
+    ("muted", "fg_muted"),
+    ("gold", "accent"),
+    ("teal", "accent_600"),
+    ("violet", "accent_300"),
+    ("green", "status_success"),
+    ("rose", "err"),
+];
+
+/// `[("\"#hex\"", "\"theme_token\"")]` replacement pairs, built once.
+fn theme_remap(prog: &Program) -> Vec<(String, String)> {
+    THEME_MAP
+        .iter()
+        .filter_map(|(probe, theme)| {
+            let compiled = prog
+                .resolve(&format!("__probe_{probe}"), &HashMap::new(), &[])
+                .ok()?;
+            let style = to_style(&compiled);
+            style.glaze_layers.iter().find_map(|l| match l {
+                widget_bevy::protocol::GlazeLayer::Fill { color } => {
+                    Some((format!("\"{color}\""), format!("\"{theme}\"")))
+                }
+                _ => None,
+            })
+        })
+        .collect()
+}
+
 fn main() {
-    let prog = match parse(SHEET) {
+    // probe styles expose each palette token's compiled hex for theme_remap
+    let probes: String = THEME_MAP
+        .iter()
+        .map(|(p, _)| format!("style __probe_{p} {{ fill {p} }}\n"))
+        .collect();
+    let sheet = format!("{SHEET}\n{probes}");
+    let prog = match parse(&sheet) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("glaze_ui: stylesheet failed to compile: {e}");
             std::process::exit(1);
         }
     };
+    let remap = theme_remap(&prog);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let _ = writeln!(
@@ -1065,6 +1173,9 @@ fn main() {
         ("beta".into(), true),
         ("notifications".into(), true),
         ("autosync".into(), false),
+        ("anim-eased".into(), false),
+        ("anim-slow".into(), false),
+        ("anim-glow".into(), true),
     ]);
     let mut radio = "pro".to_string();
     let mut qty = 3.0_f32;
@@ -1072,7 +1183,7 @@ fn main() {
     // Default open when GLAZE_DIALOG is set (for the static snapshot).
     let mut dialog_open = std::env::var("GLAZE_DIALOG").is_ok();
     let mut toast_shown = true;
-    emit(&mut out, &prog, width, &tab, slider, &checks, &radio, qty, &country, dialog_open, toast_shown);
+    emit(&mut out, &prog, &remap, width, &tab, slider, &checks, &radio, qty, &country, dialog_open, toast_shown);
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let Ok(evt) = serde_json::from_str::<HostEvent>(&line) else { continue };
@@ -1096,7 +1207,7 @@ fn main() {
             }
             _ => {}
         }
-        emit(&mut out, &prog, width, &tab, slider, &checks, &radio, qty, &country, dialog_open, toast_shown);
+        emit(&mut out, &prog, &remap, width, &tab, slider, &checks, &radio, qty, &country, dialog_open, toast_shown);
     }
 }
 
@@ -1104,6 +1215,7 @@ fn main() {
 fn emit<W: Write>(
     out: &mut W,
     prog: &Program,
+    remap: &[(String, String)],
     width: f32,
     tab: &str,
     slider: f32,
@@ -1117,7 +1229,12 @@ fn emit<W: Write>(
     if let Ok(s) = serde_json::to_string(&WidgetMsg::Frame {
         root: build_ui(prog, width, tab, slider, checks, radio, qty, country, dialog_open, toast_shown),
     }) {
-        let _ = writeln!(out, "{s}");
+        // swap baked palette hexes for theme token names (quoted JSON
+        // strings, so WGSL bodies and text content can't false-match)
+        let themed = remap
+            .iter()
+            .fold(s, |acc, (from, to)| acc.replace(from.as_str(), to));
+        let _ = writeln!(out, "{themed}");
         let _ = out.flush();
     }
 }

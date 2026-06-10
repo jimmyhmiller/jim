@@ -435,3 +435,106 @@ fn non_slotted_style_still_resolves_flat() {
     assert_eq!(flat.box_.radius, 999.0);
     assert!(flat.layers.is_empty());
 }
+
+// ---------- transitions ----------
+
+#[test]
+fn transition_parses_into_compiled_style() {
+    let prog = parse(
+        r#"
+        style toggle {
+            track {
+                fill #333333
+                transition checked 150ms ease_in_out
+                :checked { fill #00ccaa }
+            }
+            knob {
+                fill #ffffff
+                transition checked 220ms
+            }
+        }
+    "#,
+    )
+    .unwrap();
+    let s = prog.resolve_slots("toggle", &variant(&[]), &[]).unwrap();
+    let track = s.slot("track").unwrap();
+    assert_eq!(track.transitions.len(), 1);
+    assert_eq!(track.transitions[0].state, "checked");
+    assert_eq!(track.transitions[0].duration_ms, 150.0);
+    assert_eq!(track.transitions[0].easing, glaze::Easing::EaseInOut);
+    // easing defaults to ease_out; bare seconds also accepted
+    let knob = s.slot("knob").unwrap();
+    assert_eq!(knob.transitions[0].duration_ms, 220.0);
+    assert_eq!(knob.transitions[0].easing, glaze::Easing::EaseOut);
+}
+
+#[test]
+fn transition_seconds_unit_and_last_wins() {
+    let prog = parse(
+        r#"
+        style s {
+            fill #333333
+            transition checked 1s
+            transition checked 300ms linear
+        }
+    "#,
+    )
+    .unwrap();
+    let s = prog.resolve("s", &variant(&[]), &[]).unwrap();
+    assert_eq!(s.transitions.len(), 1);
+    assert_eq!(s.transitions[0].duration_ms, 300.0);
+    assert_eq!(s.transitions[0].easing, glaze::Easing::Linear);
+}
+
+#[test]
+fn transition_rejects_unknown_state_easing_and_unit() {
+    let bad_state = parse("style s { transition wiggly 100ms }")
+        .unwrap()
+        .resolve("s", &variant(&[]), &[])
+        .unwrap_err();
+    assert!(bad_state.to_string().contains("wiggly"), "{bad_state}");
+
+    let bad_ease = parse("style s { transition checked 100ms bouncy }")
+        .unwrap()
+        .resolve("s", &variant(&[]), &[])
+        .unwrap_err();
+    assert!(bad_ease.to_string().contains("bouncy"), "{bad_ease}");
+
+    let bad_unit = parse("style s { transition checked 100px }")
+        .unwrap()
+        .resolve("s", &variant(&[]), &[])
+        .unwrap_err();
+    assert!(bad_unit.to_string().contains("ms"), "{bad_unit}");
+}
+
+#[test]
+fn checked_builtin_reaches_shader_uniforms() {
+    let prog = parse(
+        r#"
+        style s {
+            overlay shader { emit vec4(0.2, 0.8, 0.7, 1.0) * checked }
+        }
+    "#,
+    )
+    .unwrap();
+    let s = prog.resolve("s", &variant(&[]), &[]).unwrap();
+    let Layer::Shader(cs) = &s.layers[0] else {
+        panic!("expected shader layer")
+    };
+    assert!(cs.used.contains(&glaze::Builtin::Checked));
+    assert!(cs.wgsl_body.contains("u.checked"), "{}", cs.wgsl_body);
+}
+
+#[test]
+fn easing_curves_are_monotonic_endpoints() {
+    for e in [
+        glaze::Easing::Linear,
+        glaze::Easing::EaseIn,
+        glaze::Easing::EaseOut,
+        glaze::Easing::EaseInOut,
+    ] {
+        assert_eq!(e.apply(0.0), 0.0);
+        assert_eq!(e.apply(1.0), 1.0);
+        assert!(e.apply(0.5) > 0.0 && e.apply(0.5) < 1.0);
+    }
+}

@@ -110,6 +110,10 @@ pub struct LayoutCtx {
     /// region). Render fns compare against their element id to pick
     /// hover-state colors.
     pub hovered_click_id: Option<String>,
+    /// Eased per-element state values for this pane (Glaze `transition`s).
+    /// Render arms read mid-flight values here and declare targets by
+    /// pushing `AnimRequest`s into `WidgetTargets.anims`.
+    pub anim: crate::anim::AnimSnapshot,
 }
 
 impl LayoutCtx {
@@ -170,6 +174,14 @@ impl LayoutCtx {
         }
         Some(self.fonts.resolve(family))
     }
+}
+
+/// The style's `text_color` (token name or literal) when set, else the
+/// component's default label color.
+pub(crate) fn style_text_color(ctx: &LayoutCtx, text_color: Option<&str>, default: Color) -> Color {
+    text_color
+        .and_then(|c| ctx.resolve_color(c))
+        .unwrap_or(default)
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +413,7 @@ fn render_node(
             value,
             color,
             selectable,
+            style,
             ..
         } => {
             render_badge_at(
@@ -410,6 +423,7 @@ fn render_node(
                 value,
                 color.as_deref(),
                 *selectable,
+                style.as_ref(),
                 origin,
                 size,
                 z,
@@ -542,7 +556,14 @@ fn render_node(
                     ..default()
                 },
                 LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
-                TextColor(ctx.palette.text),
+                TextColor(style_text_color(
+                    ctx,
+                    style
+                        .as_ref()
+                        .and_then(|s| s.trigger.as_ref())
+                        .and_then(|t| t.text_color.as_deref()),
+                    ctx.palette.text,
+                )),
                 Anchor::CENTER_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 Transform::from_xyz(origin.x + SELECT_PAD_X, -cy, z + 0.01),
@@ -867,7 +888,6 @@ fn render_divider_at(commands: &mut Commands, ctx: &LayoutCtx, origin: Vec2, siz
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn render_badge_at(
     commands: &mut Commands,
     ctx: &LayoutCtx,
@@ -875,6 +895,7 @@ fn render_badge_at(
     value: &str,
     color: Option<&str>,
     selectable: bool,
+    style: Option<&Style>,
     origin: Vec2,
     size: Vec2,
     z: f32,
@@ -902,7 +923,11 @@ fn render_badge_at(
             ..default()
         },
         LineHeight::Px(line_height(BADGE_FONT_SIZE)),
-        TextColor(ctx.palette.badge_label),
+        TextColor(style_text_color(
+            ctx,
+            style.and_then(|s| s.text_color.as_deref()),
+            ctx.palette.badge_label,
+        )),
         Anchor::TOP_LEFT,
         bevy::text::TextLayout::new_with_no_wrap(),
         Transform::from_xyz(origin.x + BADGE_PAD_X, -(origin.y + BADGE_PAD_Y), z + 0.01),
@@ -963,12 +988,43 @@ fn render_button_at(
         ),
     };
 
+    let is_hovered = ctx.hovered_click_id.as_deref() == Some(id);
+
+    // Style-level `:hover` plan: merge the overlay's paint fields over the
+    // base and — when the base declares `transition hover` — crossfade with
+    // the eased per-element value from the anim store, exactly like the
+    // toggle's `checked` tween. An explicit hover plan replaces the
+    // built-in theme-token substitution below.
+    let hovered_style: Option<Style> = match style {
+        Some(s) if s.hover.is_some() => {
+            let target = if is_hovered { 1.0 } else { 0.0 };
+            let transition = s.transitions.iter().find(|tr| tr.state == "hover").cloned();
+            let t = match &transition {
+                Some(_) => ctx.anim.value(id, "hover").unwrap_or(target),
+                None => target,
+            };
+            if let Some(tr) = &transition {
+                targets.anims.push(crate::anim::AnimRequest {
+                    element_id: id.to_string(),
+                    state: "hover".into(),
+                    target,
+                    duration_ms: tr.duration_ms,
+                    easing: glaze::Easing::from_name(&tr.easing)
+                        .unwrap_or(glaze::Easing::EaseOut),
+                });
+            }
+            let on = s.hover_overlaid();
+            animated_slot_plan(ctx, Some(s), Some(&on), is_hovered, t)
+        }
+        _ => None,
+    };
+    let style = hovered_style.as_ref().or(style);
+
     let mut bg_color = style
         .and_then(|s| s.background.as_deref())
         .and_then(|c| ctx.resolve_color(c))
         .unwrap_or(default_bg);
-    let is_hovered = ctx.hovered_click_id.as_deref() == Some(id);
-    if is_hovered {
+    if is_hovered && hovered_style.is_none() {
         // Hover state: substitute the theme's hover bg for the kind's
         // default opaque bg, or lift a transparent bg (Outline / Ghost)
         // toward the hover color at a low alpha so the affordance is
@@ -1020,6 +1076,7 @@ fn render_button_at(
             Vec2::new(w, h),
             z,
             Some(id),
+            0.0,
         );
     } else {
         paint_rounded_panel(
@@ -1047,7 +1104,11 @@ fn render_button_at(
             ..default()
         },
         LineHeight::Px(DEFAULT_FONT_SIZE * LINE_HEIGHT_MUL),
-        TextColor(default_label),
+        TextColor(style_text_color(
+            ctx,
+            style.and_then(|s| s.text_color.as_deref()),
+            default_label,
+        )),
         Anchor::TOP_LEFT,
         bevy::text::TextLayout::new_with_no_wrap(),
         Transform::from_xyz(
@@ -1148,12 +1209,30 @@ pub fn paint_style_background(
     size: Vec2,
     z: f32,
 ) {
+    paint_style_background_for(commands, ctx, style, origin, size, z, None, 0.0);
+}
+
+/// [`paint_style_background`] with per-element state context: `element_id`
+/// lets shader layers receive their interaction + state uniforms, and
+/// `checked` seeds the eased `checked` uniform so a state shader paints the
+/// right value on its very first frame.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_style_background_for(
+    commands: &mut Commands,
+    ctx: &LayoutCtx,
+    style: Option<&Style>,
+    origin: Vec2,
+    size: Vec2,
+    z: f32,
+    element_id: Option<&str>,
+    checked: f32,
+) {
     let Some(style) = style else { return };
     if size.x <= 0.0 || size.y <= 0.0 {
         return;
     }
     if !style.glaze_layers.is_empty() {
-        paint_glaze_layers(commands, ctx, style, origin, size, z, None);
+        paint_glaze_layers(commands, ctx, style, origin, size, z, element_id, checked);
         return;
     }
     let bg = style
@@ -1257,11 +1336,13 @@ pub fn paint_style_background(
             size,
             radius,
             z - 0.004,
-            None,
+            element_id,
+            checked,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_glaze_layers(
     commands: &mut Commands,
     ctx: &LayoutCtx,
@@ -1270,6 +1351,7 @@ fn paint_glaze_layers(
     size: Vec2,
     z: f32,
     element_id: Option<&str>,
+    checked: f32,
 ) {
     let radius = style
         .radius
@@ -1305,7 +1387,7 @@ fn paint_glaze_layers(
                 // existing shader path (which masks to the rounded rect for us).
                 let body = gradient_wgsl(ctx, *angle, stops);
                 paint_shader_layer(
-                    commands, ctx, &body, origin, size, radius, layer_z, element_id,
+                    commands, ctx, &body, origin, size, radius, layer_z, element_id, checked,
                 );
             }
             GlazeLayer::Border {
@@ -1338,7 +1420,7 @@ fn paint_glaze_layers(
                     // Inner shadow → generated SDF body on the shader path.
                     let body = inset_shadow_wgsl(shadow, *blur, *offset_x, *offset_y, *spread);
                     paint_shader_layer(
-                        commands, ctx, &body, origin, size, radius, layer_z, element_id,
+                        commands, ctx, &body, origin, size, radius, layer_z, element_id, checked,
                     );
                 } else {
                     // Outset drop shadow: grow the box by `spread`, fold offset_x
@@ -1363,7 +1445,7 @@ fn paint_glaze_layers(
             }
             GlazeLayer::Shader { body, .. } => {
                 paint_shader_layer(
-                    commands, ctx, body, origin, size, radius, layer_z, element_id,
+                    commands, ctx, body, origin, size, radius, layer_z, element_id, checked,
                 );
             }
         }
@@ -1373,6 +1455,7 @@ fn paint_glaze_layers(
 /// Paint a compiled Glaze shader layer on a quad at the element's rect. The
 /// fragment body comes from the `glaze` compiler; the material's per-instance
 /// shader handle is cached by body hash and pinned in `specialize`.
+#[allow(clippy::too_many_arguments)]
 fn paint_shader_layer(
     commands: &mut Commands,
     ctx: &LayoutCtx,
@@ -1382,6 +1465,7 @@ fn paint_shader_layer(
     radius: f32,
     z: f32,
     element_id: Option<&str>,
+    checked: f32,
 ) {
     use crate::button_material::WidgetButtonMesh;
     use crate::glaze_material::{
@@ -1427,6 +1511,7 @@ fn paint_shader_layer(
                     size,
                     resolution: size,
                     radius,
+                    checked,
                     ..Default::default()
                 },
                 fragment: handle,
@@ -1809,7 +1894,13 @@ fn render_select_trigger_at(
             ..default()
         },
         LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
-        TextColor(color),
+        TextColor(style_text_color(
+            ctx,
+            style
+                .and_then(|s| s.trigger.as_ref())
+                .and_then(|t| t.text_color.as_deref()),
+            color,
+        )),
         Anchor::CENTER_LEFT,
         bevy::text::TextLayout::new_with_no_wrap(),
         Transform::from_xyz(origin.x + SELECT_PAD_X, -cy, z + 0.01),
@@ -1956,11 +2047,19 @@ fn render_stepper_at(
     } else {
         format!("{value:.1}")
     };
-    let glyph = ctx
-        .resolve_color("accent")
-        .unwrap_or(Color::srgb(0.42, 0.62, 0.92));
+    let glyph = style_text_color(
+        ctx,
+        button_plan.and_then(|b| b.text_color.as_deref()),
+        ctx.resolve_color("accent")
+            .unwrap_or(Color::srgb(0.42, 0.62, 0.92)),
+    );
+    let value_color = style_text_color(
+        ctx,
+        field_plan.and_then(|f| f.text_color.as_deref()),
+        ctx.palette.text,
+    );
     spawn_centered_text(commands, ctx, "-", minus_origin, btn_size, glyph, 18.0, z + 0.01);
-    spawn_centered_text(commands, ctx, &value_str, field_origin, field_size, ctx.palette.text, DEFAULT_FONT_SIZE, z + 0.01);
+    spawn_centered_text(commands, ctx, &value_str, field_origin, field_size, value_color, DEFAULT_FONT_SIZE, z + 0.01);
     spawn_centered_text(commands, ctx, "+", plus_origin, btn_size, glyph, 18.0, z + 0.01);
 
     // click targets carry the clamped target value
@@ -2109,11 +2208,16 @@ fn render_tabs_at(
         if let Some(plan) = tab_plan {
             paint_style_background(commands, ctx, Some(plan), cell_pos, cell_size, z);
         }
-        let label_color = if is_selected {
-            accent
+        let label_slot = if is_selected {
+            style.and_then(|s| s.tab_selected.as_ref().or(s.tab.as_ref()))
         } else {
-            ctx.palette.text_muted
+            style.and_then(|s| s.tab.as_ref())
         };
+        let label_color = style_text_color(
+            ctx,
+            label_slot.and_then(|s| s.text_color.as_deref()),
+            if is_selected { accent } else { ctx.palette.text_muted },
+        );
         commands.spawn((
             ChildOf(ctx.content_root),
             Text2d::new(tab.label.clone()),
@@ -2268,7 +2372,13 @@ fn render_radio_at(
                 ..default()
             },
             LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
-            TextColor(if is_selected { ctx.palette.text } else { ctx.palette.text_muted }),
+            TextColor(style_text_color(
+                ctx,
+                style
+                    .and_then(|s| s.ring.as_ref())
+                    .and_then(|r| r.text_color.as_deref()),
+                if is_selected { ctx.palette.text } else { ctx.palette.text_muted },
+            )),
             Anchor::TOP_LEFT,
             bevy::text::TextLayout::new_with_no_wrap(),
             Transform::from_xyz(
@@ -2292,6 +2402,180 @@ fn render_radio_at(
         });
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+/// Lerp two colors in linear space (light-accumulation mixing, matching
+/// Glaze's `+`/`*` color arithmetic).
+fn mix_linear(a: Color, b: Color, t: f32) -> Color {
+    let (la, lb) = (a.to_linear(), b.to_linear());
+    Color::LinearRgba(bevy::color::LinearRgba {
+        red: la.red + (lb.red - la.red) * t,
+        green: la.green + (lb.green - la.green) * t,
+        blue: la.blue + (lb.blue - la.blue) * t,
+        alpha: la.alpha + (lb.alpha - la.alpha) * t,
+    })
+}
+
+/// Re-encode a color as the `#rrggbbaa` literal the style parser accepts.
+fn hex_of(c: Color) -> String {
+    let s = c.to_srgba();
+    let b = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}{:02x}",
+        b(s.red),
+        b(s.green),
+        b(s.blue),
+        b(s.alpha)
+    )
+}
+
+/// Interpolate between two resolved Glaze plans for a state crossfade.
+/// Requires structurally matching layer stacks (same length, same kinds);
+/// colors mix in linear space, scalars lerp, identical shader bodies pass
+/// through (their motion is uniform-driven). Returns `None` on a structure
+/// mismatch — the caller then snaps to the nearer plan.
+fn lerp_glaze_style(ctx: &LayoutCtx, a: &Style, b: &Style, t: f32) -> Option<Style> {
+    if a.glaze_layers.len() != b.glaze_layers.len() {
+        return None;
+    }
+    let mix_str = |ca: &str, cb: &str| -> Option<String> {
+        Some(hex_of(mix_linear(
+            ctx.resolve_color(ca)?,
+            ctx.resolve_color(cb)?,
+            t,
+        )))
+    };
+    let lerp1 = |x: f32, y: f32| x + (y - x) * t;
+    let mut out = b.clone();
+    let res_r = |s: &Style| {
+        s.radius
+            .as_deref()
+            .and_then(|r| ctx.resolve_f32(r))
+            .unwrap_or(0.0)
+    };
+    let (ra, rb) = (res_r(a), res_r(b));
+    if ra != rb {
+        out.radius = Some(format!("{}", lerp1(ra, rb)));
+    }
+    out.glaze_layers = a
+        .glaze_layers
+        .iter()
+        .zip(&b.glaze_layers)
+        .map(|(la, lb)| {
+            Some(match (la, lb) {
+                (GlazeLayer::Fill { color: ca }, GlazeLayer::Fill { color: cb }) => {
+                    GlazeLayer::Fill {
+                        color: mix_str(ca, cb)?,
+                    }
+                }
+                (
+                    GlazeLayer::Border {
+                        color: ca,
+                        width: wa,
+                        sides: sa,
+                    },
+                    GlazeLayer::Border {
+                        color: cb,
+                        width: wb,
+                        sides: sb,
+                    },
+                ) if (sa.top, sa.right, sa.bottom, sa.left)
+                    == (sb.top, sb.right, sb.bottom, sb.left) =>
+                {
+                    GlazeLayer::Border {
+                        color: mix_str(ca, cb)?,
+                        width: lerp1(*wa, *wb),
+                        sides: *sb,
+                    }
+                }
+                (
+                    GlazeLayer::Shadow {
+                        color: ca,
+                        blur: bla,
+                        offset_x: oxa,
+                        offset_y: oya,
+                        spread: spa,
+                        inset: ia,
+                    },
+                    GlazeLayer::Shadow {
+                        color: cb,
+                        blur: blb,
+                        offset_x: oxb,
+                        offset_y: oyb,
+                        spread: spb,
+                        inset: ib,
+                    },
+                ) if ia == ib => GlazeLayer::Shadow {
+                    color: mix_str(ca, cb)?,
+                    blur: lerp1(*bla, *blb),
+                    offset_x: lerp1(*oxa, *oxb),
+                    offset_y: lerp1(*oya, *oyb),
+                    spread: lerp1(*spa, *spb),
+                    inset: *ib,
+                },
+                (
+                    GlazeLayer::LinearGradient {
+                        angle: aa,
+                        stops: sa,
+                    },
+                    GlazeLayer::LinearGradient {
+                        angle: ab,
+                        stops: sb,
+                    },
+                ) if sa.len() == sb.len() => GlazeLayer::LinearGradient {
+                    angle: lerp1(*aa, *ab),
+                    stops: sa
+                        .iter()
+                        .zip(sb)
+                        .map(|(ga, gb)| {
+                            Some(crate::protocol::GradientStop {
+                                offset: lerp1(ga.offset, gb.offset),
+                                color: mix_str(&ga.color, &gb.color)?,
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                },
+                (GlazeLayer::Shader { body: ba, .. }, GlazeLayer::Shader { body: bb, .. })
+                    if ba == bb =>
+                {
+                    lb.clone()
+                }
+                _ => return None,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(out)
+}
+
+/// Pick/blend the plan for a state-aware slot. `(base, on_plan)` are the slot
+/// resolved without/with the state (the dual-resolve model); `t` is the eased
+/// state amount. A single-state style (no `on_plan`) was resolved by the
+/// caller and paints as-is.
+fn animated_slot_plan(
+    ctx: &LayoutCtx,
+    base: Option<&Style>,
+    on_plan: Option<&Style>,
+    on: bool,
+    t: f32,
+) -> Option<Style> {
+    match (base, on_plan) {
+        (Some(a), Some(b)) => Some(if t <= 0.0 {
+            a.clone()
+        } else if t >= 1.0 {
+            b.clone()
+        } else {
+            lerp_glaze_style(ctx, a, b, t)
+                .unwrap_or_else(|| if t < 0.5 { a.clone() } else { b.clone() })
+        }),
+        (Some(a), None) => Some(a.clone()),
+        (None, Some(b)) => on.then(|| b.clone()),
+        (None, None) => None,
+    }
+}
+
+/// Built-in slide duration for toggles with no Glaze style (Glaze-styled
+/// toggles animate only when they declare a `transition checked …`).
+const TOGGLE_ANIM_MS: f32 = 160.0;
 
 #[allow(clippy::too_many_arguments)]
 fn render_toggle_at(
@@ -2329,7 +2613,13 @@ fn render_toggle_at(
                     ..default()
                 },
                 LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
-                TextColor(ctx.palette.text),
+                TextColor(style_text_color(
+                    ctx,
+                    style
+                        .and_then(|s| s.track.as_ref())
+                        .and_then(|t| t.text_color.as_deref()),
+                    ctx.palette.text,
+                )),
                 Anchor::TOP_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 Transform::from_xyz(
@@ -2350,17 +2640,58 @@ fn render_toggle_at(
         }
     };
 
-    // Track slot: from its Glaze plan (resolved with the `:checked` state) when
-    // present, else the hardcoded accent/muted pill.
-    let track_plan = style.and_then(|s| s.track.as_ref());
-    if let Some(plan) = track_plan {
-        paint_style_background(commands, ctx, Some(plan), track_pos, track_size, z);
+    // --- animated `checked` state ---
+    // A Glaze `transition checked …` on any toggle slot drives the tween;
+    // unstyled toggles get the built-in slide. The eased value comes from the
+    // keyed store (via ctx.anim) so it survives the full re-render; the
+    // request below declares the new target for the post-render sync.
+    let transition = style
+        .into_iter()
+        .flat_map(|s| {
+            [
+                s.track.as_ref(),
+                s.track_checked.as_ref(),
+                s.knob.as_ref(),
+                s.knob_checked.as_ref(),
+            ]
+        })
+        .flatten()
+        .flat_map(|s| s.transitions.iter())
+        .find(|tr| tr.state == "checked")
+        .cloned()
+        .or_else(|| {
+            style.is_none().then(|| crate::protocol::TransitionSpec {
+                state: "checked".into(),
+                duration_ms: TOGGLE_ANIM_MS,
+                easing: "ease_out".into(),
+            })
+        });
+    let target = if checked { 1.0 } else { 0.0 };
+    let t = match &transition {
+        Some(_) => ctx.anim.value(id, "checked").unwrap_or(target),
+        None => target,
+    };
+    if let Some(tr) = &transition {
+        targets.anims.push(crate::anim::AnimRequest {
+            element_id: id.to_string(),
+            state: "checked".into(),
+            target,
+            duration_ms: tr.duration_ms,
+            easing: glaze::Easing::from_name(&tr.easing).unwrap_or(glaze::Easing::EaseOut),
+        });
+    }
+
+    // Track slot: crossfade between the resting and `:checked` Glaze plans
+    // when both are present (dual-resolve), else the single resolved plan,
+    // else the hardcoded accent/muted pill (color-mixed by the same t).
+    let track_plan =
+        style.and_then(|s| animated_slot_plan(ctx, s.track.as_ref(), s.track_checked.as_ref(), checked, t));
+    if let Some(plan) = &track_plan {
+        paint_style_background_for(
+            commands, ctx, Some(plan), track_pos, track_size, z, Some(id), t,
+        );
     } else {
-        let track_color = if checked {
-            accent
-        } else {
-            ctx.palette.bar_track
-        };
+        let track_color = mix_linear(ctx.palette.bar_track, accent, t);
         paint_rounded_panel(
             commands,
             ctx,
@@ -2376,19 +2707,22 @@ fn render_toggle_at(
             z,
         );
     }
-    // Knob slot: value-driven x-position (left when off, right when on); the
-    // slot plan styles the dot itself.
+    // Knob slot: value-driven x-position slides with the eased t (left when
+    // off, right when on); the slot plan styles the dot itself.
     let knob_d = track_size.y - TOGGLE_KNOB_PAD * 2.0;
-    let knob_x = if checked {
-        track_pos.x + track_size.x - knob_d - TOGGLE_KNOB_PAD
-    } else {
-        track_pos.x + TOGGLE_KNOB_PAD
+    let knob_x = {
+        let x_off = track_pos.x + TOGGLE_KNOB_PAD;
+        let x_on = track_pos.x + track_size.x - knob_d - TOGGLE_KNOB_PAD;
+        x_off + (x_on - x_off) * t
     };
     let knob_pos = Vec2::new(knob_x, track_pos.y + TOGGLE_KNOB_PAD);
     let knob_size = Vec2::new(knob_d, knob_d);
-    let knob_plan = style.and_then(|s| s.knob.as_ref());
-    if let Some(plan) = knob_plan {
-        paint_style_background(commands, ctx, Some(plan), knob_pos, knob_size, z + 0.01);
+    let knob_plan =
+        style.and_then(|s| animated_slot_plan(ctx, s.knob.as_ref(), s.knob_checked.as_ref(), checked, t));
+    if let Some(plan) = &knob_plan {
+        paint_style_background_for(
+            commands, ctx, Some(plan), knob_pos, knob_size, z + 0.01, Some(id), t,
+        );
     } else {
         paint_rounded_panel(
             commands,
@@ -2454,7 +2788,13 @@ fn render_checkbox_at(
                     ..default()
                 },
                 LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
-                TextColor(ctx.palette.text),
+                TextColor(style_text_color(
+                    ctx,
+                    style
+                        .and_then(|s| s.square.as_ref())
+                        .and_then(|sq| sq.text_color.as_deref()),
+                    ctx.palette.text,
+                )),
                 Anchor::TOP_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 Transform::from_xyz(
@@ -2572,7 +2912,7 @@ fn render_input_at(
         ctx.palette.divider
     };
     if let Some(style) = style.filter(|s| !s.glaze_layers.is_empty()) {
-        paint_glaze_layers(commands, ctx, style, origin, size, z, Some(id));
+        paint_glaze_layers(commands, ctx, style, origin, size, z, Some(id), 0.0);
     } else {
         paint_rounded_panel(
             commands,
@@ -2606,7 +2946,11 @@ fn render_input_at(
                     ..default()
                 },
                 LineHeight::Px(line_h),
-                TextColor(ctx.palette.text_muted),
+                TextColor(style_text_color(
+                    ctx,
+                    style.and_then(|s| s.text_color.as_deref()),
+                    ctx.palette.text_muted,
+                )),
                 Anchor::TOP_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 bevy::text::TextBounds {
@@ -2639,7 +2983,11 @@ fn render_input_at(
                     ..default()
                 },
                 LineHeight::Px(line_h),
-                TextColor(ctx.palette.text),
+                TextColor(style_text_color(
+                    ctx,
+                    style.and_then(|s| s.text_color.as_deref()),
+                    ctx.palette.text,
+                )),
                 Anchor::TOP_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 bevy::text::TextBounds {
@@ -2712,7 +3060,7 @@ fn render_textarea_at(
         ctx.palette.divider
     };
     if let Some(style) = style.filter(|s| !s.glaze_layers.is_empty()) {
-        paint_glaze_layers(commands, ctx, style, origin, size, z, Some(id));
+        paint_glaze_layers(commands, ctx, style, origin, size, z, Some(id), 0.0);
     } else {
         paint_rounded_panel(
             commands,
@@ -2745,7 +3093,11 @@ fn render_textarea_at(
                     ..default()
                 },
                 LineHeight::Px(line_h),
-                TextColor(ctx.palette.text_muted),
+                TextColor(style_text_color(
+                    ctx,
+                    style.and_then(|s| s.text_color.as_deref()),
+                    ctx.palette.text_muted,
+                )),
                 Anchor::TOP_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 Transform::from_xyz(
@@ -2777,7 +3129,11 @@ fn render_textarea_at(
                     ..default()
                 },
                 LineHeight::Px(line_h),
-                TextColor(ctx.palette.text),
+                TextColor(style_text_color(
+                    ctx,
+                    style.and_then(|s| s.text_color.as_deref()),
+                    ctx.palette.text,
+                )),
                 Anchor::TOP_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 Transform::from_xyz(
@@ -3090,7 +3446,19 @@ fn render_table_at(
                 ..default()
             },
             LineHeight::Px(line_h),
-            TextColor(ctx.palette.text),
+            TextColor(style_text_color(
+                ctx,
+                if r == 0 {
+                    style
+                        .and_then(|s| s.header.as_ref().or(s.panel.as_ref()))
+                        .and_then(|h| h.text_color.as_deref())
+                } else {
+                    style
+                        .and_then(|s| s.panel.as_ref())
+                        .and_then(|p| p.text_color.as_deref())
+                },
+                ctx.palette.text,
+            )),
             Anchor::TOP_LEFT,
             TextBounds {
                 width: bounds_w,

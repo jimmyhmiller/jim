@@ -44,8 +44,8 @@ pub mod shader;
 
 pub use ast::{Expr, FnDef, Item, Program, ShaderBody, StyleDef, TokenDef};
 pub use eval::{
-    BoxStyle, CompiledSlots, CompiledStyle, Dim, Dir, GradientStop, Layer, Length, Rgba, Sides,
-    Value,
+    BoxStyle, CompiledSlots, CompiledStyle, Dim, Dir, Easing, GradientStop, Layer, Length, Rgba,
+    Sides, Transition, Value,
 };
 pub use parser::parse;
 pub use shader::{Builtin, CompiledShader};

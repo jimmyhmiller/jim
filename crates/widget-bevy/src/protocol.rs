@@ -217,6 +217,77 @@ pub struct Style {
     /// [`Style::glaze_layers`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shader: Option<ShaderSpec>,
+
+    /// Declared state transitions (from Glaze `transition <state> <dur>
+    /// [easing]`). The host animates the named discrete state as a
+    /// continuous eased 0..1 value instead of snapping.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<TransitionSpec>,
+
+    /// Paint overlay applied while the element is hovered (the `:hover`
+    /// discrete-state plan). Only paint fields participate — `background`,
+    /// `background_image`, `radius`, `border`, `shadow`, `glaze_layers`,
+    /// `shader`, `text_color` — layout fields are ignored. Declare a
+    /// `transitions: [{state: "hover", …}]` on the *base* style to
+    /// crossfade between the plans instead of snapping. When set, this
+    /// replaces the renderer's built-in theme-token hover substitution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hover: Option<Box<Style>>,
+
+    /// Color for the element's own label/text (token name or literal).
+    /// Components normally pull label colors from theme tokens
+    /// (`button_label`, `fg`, …); set this when the element's background
+    /// comes from somewhere else than the active theme — e.g. the Style
+    /// Lab painting candidates in their own palettes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_color: Option<String>,
+}
+
+impl Style {
+    /// The style as it paints in the `:hover` state: the base with the
+    /// hover overlay's *paint* fields merged on top. Layout fields always
+    /// come from the base so hovering can never reflow.
+    pub fn hover_overlaid(&self) -> Style {
+        let mut out = self.clone();
+        let Some(h) = self.hover.as_deref() else {
+            return out;
+        };
+        if h.background.is_some() {
+            out.background = h.background.clone();
+        }
+        if h.background_image.is_some() {
+            out.background_image = h.background_image.clone();
+        }
+        if h.radius.is_some() {
+            out.radius = h.radius.clone();
+        }
+        if h.border.is_some() {
+            out.border = h.border.clone();
+        }
+        if h.shadow.is_some() {
+            out.shadow = h.shadow.clone();
+        }
+        if !h.glaze_layers.is_empty() {
+            out.glaze_layers = h.glaze_layers.clone();
+        }
+        if h.shader.is_some() {
+            out.shader = h.shader.clone();
+        }
+        if h.text_color.is_some() {
+            out.text_color = h.text_color.clone();
+        }
+        out
+    }
+}
+
+/// One `transition` declaration carried on a [`Style`]: animate changes of
+/// `state` over `duration_ms` with the named easing (`linear`, `ease_in`,
+/// `ease_out`, `ease_in_out`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TransitionSpec {
+    pub state: String,
+    pub duration_ms: f32,
+    pub easing: String,
 }
 
 /// Which edges a [`GlazeLayer::Border`] paints. Defaults to all four (a uniform
@@ -294,12 +365,23 @@ impl SliderStyle {
 /// Per-slot styling for an `Element::Toggle`. `track` is the pill groove (style
 /// its `:checked` state in Glaze for the on/off color); `knob` is the sliding
 /// dot (its x-position is value-driven by `checked`, computed by the renderer).
+///
+/// `track_checked`/`knob_checked` are the same slots resolved with the
+/// `:checked` state (the dual-resolve model Tabs uses). When present, the
+/// renderer can crossfade between the two plans for an animated toggle —
+/// produced by `glaze_style::resolve_toggle_style`. When absent (a hand-built
+/// or single-state style), the caller resolved the current state itself and
+/// `track`/`knob` are painted as-is.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ToggleStyle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track: Option<Style>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knob: Option<Style>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_checked: Option<Style>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knob_checked: Option<Style>,
 }
 
 impl ToggleStyle {

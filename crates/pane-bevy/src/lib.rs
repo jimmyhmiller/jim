@@ -174,6 +174,29 @@ pub struct PaneProject(pub u64);
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct PanePinned;
 
+/// A pane between close request and actual despawn. Close is two-phase:
+/// the frame the close is processed (`apply_pending_pane_actions`) the
+/// pane runs its `on_close`, is hidden, and gains this marker; the
+/// despawn itself happens at the START of the next frame
+/// (`finalize_closing_panes`, `First` schedule).
+///
+/// Why not despawn immediately: kind systems that already ran this
+/// frame (widget rerender, editor span rebuild, ...) may have QUEUED
+/// `spawn((..., ChildOf(content_root)))` commands that apply after the
+/// exclusive close system. Despawning now makes those parents dead at
+/// apply time — Bevy strips the invalid `ChildOf` with a warning and
+/// leaves the content alive, unparented, at content-local coordinates
+/// interpreted as world space: garbage rendered by the main camera in
+/// the bottom-right quadrant of the window, forever. Deferring the
+/// despawn one frame guarantees every straggler command lands under a
+/// live parent and dies with the tree.
+///
+/// Host systems that write pane `Visibility` (e.g. per-project
+/// visibility sync) MUST skip panes carrying this marker, or they'd
+/// un-hide the pane for its final frame.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct PaneClosing;
+
 /// Per-pane list of interactive rects in **content-local visual coords**
 /// (same frame as [`PaneContentPressed::local_pt`] — i.e. with the
 /// kind's scroll offset already subtracted). Any kind that has
@@ -651,6 +674,12 @@ impl Plugin for PanePlugin {
                     // only systems in the set are members of this chain.
                     .in_set(PaneViewportReaders),
             )
+            // Phase 2 of pane close: the actual despawn, one frame after
+            // the close was processed. `First` so it runs before any
+            // system can observe (or spawn content into) the dying pane
+            // this frame, and after the previous frame's command buffers
+            // have all applied. See [`PaneClosing`].
+            .add_systems(First, finalize_closing_panes)
             .add_systems(
                 PreUpdate,
                 camera::spawn_pane_cameras,
@@ -808,25 +837,34 @@ fn update_pane_cursor(
             };
             let pt_canvas = viewport.window_to_canvas(pt);
             let mut best: Option<(SystemCursorIcon, f32)> = None;
+            // Highest z whose BODY (title/content — not an edge) covers the
+            // point. A resize edge belonging to a pane underneath that is
+            // occluded here, so it must not draw a resize cursor through the
+            // pane (or widget) the user is actually hovering.
+            let mut covered_z: Option<f32> = None;
             for (rect, vis, pinned) in &panes {
                 if matches!(vis, Some(Visibility::Hidden)) || pinned {
                     continue;
                 }
                 // Only resize edges get a special cursor. The title
                 // bar stays default — no hand / grab indicator there.
-                let icon = match region_at(pt_canvas, rect) {
-                    Some(PaneRegion::ResizeEdge(e)) => Some(cursor_for_edges(e)),
-                    _ => None,
-                };
-                if let Some(i) = icon
-                    && best.map_or(true, |(_, z)| rect.z > z)
-                {
-                    best = Some((i, rect.z));
+                match region_at(pt_canvas, rect) {
+                    Some(PaneRegion::ResizeEdge(e)) => {
+                        if best.map_or(true, |(_, z)| rect.z > z) {
+                            best = Some((cursor_for_edges(e), rect.z));
+                        }
+                    }
+                    Some(_) => {
+                        if covered_z.map_or(true, |z| rect.z > z) {
+                            covered_z = Some(rect.z);
+                        }
+                    }
+                    None => {}
                 }
             }
             match best {
-                Some((i, _)) => i,
-                None => {
+                Some((i, z)) if covered_z.map_or(true, |cz| z >= cz) => i,
+                _ => {
                     commands.entity(win_entity).remove::<bevy::window::CursorIcon>();
                     return;
                 }
@@ -1921,6 +1959,10 @@ fn apply_pending_pane_actions(world: &mut World) {
         if world.get_entity(entity).is_err() {
             continue;
         }
+        // Already mid-close (queued twice in consecutive frames).
+        if world.get::<PaneClosing>(entity).is_some() {
+            continue;
+        }
         // Look up the kind, then the spec's on_close callback.
         let on_close = world
             .get::<PaneKindMarker>(entity)
@@ -1929,6 +1971,33 @@ fn apply_pending_pane_actions(world: &mut World) {
         if let Some(cb) = on_close {
             cb(world, entity);
         }
+        // Phase 1 of the two-phase close: hide + mark. The despawn (and
+        // the camera/layer reclaim, which must not happen while the
+        // content still exists) runs next frame in
+        // `finalize_closing_panes` — see [`PaneClosing`] for why
+        // despawning here would leak orphaned content.
+        world
+            .entity_mut(entity)
+            .insert((PaneClosing, Visibility::Hidden));
+        let mut focused = world.resource_mut::<FocusedPane>();
+        if focused.0 == Some(entity) {
+            focused.0 = None;
+        }
+    }
+}
+
+/// Phase 2 of the pane close: despawn panes marked [`PaneClosing`] last
+/// frame, reclaim their RenderLayer ids, and despawn their per-pane
+/// cameras. Runs in `First`, after every command buffer queued in the
+/// previous frame has applied — so any content a kind system spawned
+/// under the pane's `content_root` during the close frame is parented
+/// (not orphaned) and dies with the tree here.
+fn finalize_closing_panes(world: &mut World) {
+    let closing: Vec<Entity> = world
+        .query_filtered::<Entity, With<PaneClosing>>()
+        .iter(world)
+        .collect();
+    for entity in closing {
         // Reclaim this pane's RenderLayer id + despawn its per-pane
         // camera. Read the layer BEFORE the pane is despawned (after
         // despawn the component is gone and we can't recover the id).
@@ -1948,10 +2017,6 @@ fn apply_pending_pane_actions(world: &mut World) {
         }
         if world.get_entity(entity).is_ok() {
             world.entity_mut(entity).despawn();
-        }
-        let mut focused = world.resource_mut::<FocusedPane>();
-        if focused.0 == Some(entity) {
-            focused.0 = None;
         }
     }
 }

@@ -491,6 +491,28 @@ impl Plugin for TerminalPlugin {
         })
         // ----- Pane / view control (formerly nothing — new global chords) -----
         .add_action(Action {
+            id: "style.glaze_ui_showcase",
+            title: "Glaze UI Showcase",
+            category: "Style",
+            keywords: &["design", "components", "gallery", "atelier"],
+            radial_icon: None,
+            default_keys: const { &[] },
+            run: ActionRun::Custom(action_open_glaze_ui),
+        })
+        .add_action(Action {
+            id: "canvas.cycle_pan_preset",
+            title: "Cycle Canvas Pan Preset",
+            category: "View",
+            keywords: &["trackpad", "scroll", "drag", "gesture", "pan"],
+            radial_icon: None,
+            // Deliberately unbound: its old Cmd+Shift+P chord collided
+            // with the palette-open key, so every palette open silently
+            // advanced the preset (eventually onto one with
+            // trackpad_scroll off — killing cmd+scroll).
+            default_keys: const { &[] },
+            run: ActionRun::Custom(action_cycle_pan_preset),
+        })
+        .add_action(Action {
             id: "pane.close_focused",
             title: "Close Focused Pane",
             category: "Pane",
@@ -2797,6 +2819,52 @@ fn action_toggle_cube(ctx: &mut actions::ActionCtx) {
     ctx.world.resource_mut::<cube::Prism>().pending_toggle = true;
 }
 
+/// `canvas.cycle_pan_preset` — advance to the next pan-gesture preset.
+fn action_cycle_pan_preset(ctx: &mut actions::ActionCtx) {
+    canvas::cycle_pan_preset(ctx.world);
+}
+
+/// `style.glaze_ui_showcase` — open the Glaze design-system showcase.
+/// `glaze_ui` is a *subprocess widget* (NDJSON `WidgetMsg` on stdio), so
+/// it spawns as a widget pane in the active project, not as its own
+/// window. The binary is looked up next to the running executable
+/// first, then in the dev target dir this build came from.
+fn action_open_glaze_ui(ctx: &mut actions::ActionCtx) {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("glaze_ui"));
+        }
+    }
+    candidates.push(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/glaze_ui"),
+    );
+    let Some(bin) = candidates.iter().find(|p| p.exists()) else {
+        error!(
+            "glaze_ui binary not found (looked in {:?}) — build it with \
+             `cargo build --release -p widget_bevy --bin glaze_ui`",
+            candidates
+        );
+        return;
+    };
+    let Some(active) = ctx.world.resource::<projects::Projects>().active else {
+        return;
+    };
+    ctx.world
+        .resource_mut::<projects::PendingActions>()
+        .new_panes
+        .push(projects::NewPaneRequest {
+            kind: widget_bevy::PANE_KIND,
+            project_id: active,
+            origin: None,
+            size: Some(Vec2::new(820.0, 900.0)),
+            config: serde_json::json!({
+                "command": bin.to_string_lossy(),
+                "title": "Glaze UI",
+            }),
+        });
+}
+
 /// `pane.close_focused` — route the focused pane through the normal close
 /// path (runs the kind's `on_close`, then despawns). No-op when nothing is
 /// focused.
@@ -2916,6 +2984,7 @@ fn maintain_winit_mode_for_animation(
     prism: Res<cube::Prism>,
     palette: Res<command_palette::CommandPalette>,
     rhai_widgets: Query<&widget_bevy::rhai_widget::RhaiWidget>,
+    widget_anim: Res<widget_bevy::anim::WidgetAnim>,
     mut settings: ResMut<bevy::winit::WinitSettings>,
 ) {
     let preset_animates = preset.0.as_deref().map_or(false, |name| {
@@ -2938,6 +3007,11 @@ fn maintain_winit_mode_for_animation(
     // repaint instead of staying black.
     let want_continuous = preset_animates
         || widget_animating
+        // A Glaze `transition` mid-flight (toggle knob slide, track
+        // crossfade) needs per-frame ticks for its ~100-700ms duration.
+        // If the loop stalls anyway (unfocused), the tween self-heals:
+        // the next wake's large dt snaps it to its end state.
+        || widget_anim.any_in_flight()
         || drawer.animating()
         || prism.active
         || prism.continuous_cooldown > 0

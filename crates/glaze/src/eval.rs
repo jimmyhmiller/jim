@@ -143,10 +143,66 @@ pub enum Layer {
     Shader(crate::shader::CompiledShader),
 }
 
+/// Easing curve for a [`Transition`]. `apply` maps linear progress 0..1 to the
+/// eased output — shared math so every host animates identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Easing {
+    Linear,
+    EaseIn,
+    EaseOut,
+    EaseInOut,
+}
+
+impl Easing {
+    pub fn from_name(s: &str) -> Option<Easing> {
+        Some(match s {
+            "linear" => Easing::Linear,
+            "ease_in" => Easing::EaseIn,
+            "ease_out" => Easing::EaseOut,
+            "ease_in_out" => Easing::EaseInOut,
+            _ => return None,
+        })
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Easing::Linear => "linear",
+            Easing::EaseIn => "ease_in",
+            Easing::EaseOut => "ease_out",
+            Easing::EaseInOut => "ease_in_out",
+        }
+    }
+    pub fn apply(self, t: f32) -> f32 {
+        let t = t.clamp(0.0, 1.0);
+        match self {
+            Easing::Linear => t,
+            Easing::EaseIn => t * t,
+            Easing::EaseOut => 1.0 - (1.0 - t) * (1.0 - t),
+            Easing::EaseInOut => t * t * (3.0 - 2.0 * t),
+        }
+    }
+}
+
+/// `transition <state> <duration> [easing]` — declares that changes of a
+/// discrete state animate as a continuous eased 0..1 input instead of
+/// snapping. The host keeps the per-element animation clock; this is the
+/// declaration of intent (which state, how long, what curve).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transition {
+    pub state: String,
+    pub duration_ms: f32,
+    pub easing: Easing,
+}
+
+/// Discrete states a `transition` may animate (also the `:state {}` overlay
+/// vocabulary that's meaningful to animate).
+const TRANSITION_STATES: &[&str] = &["checked", "selected", "hover", "focus", "press", "disabled"];
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompiledStyle {
     pub box_: BoxStyle,
     pub layers: Vec<Layer>,
+    /// Declared state transitions, last declaration per state wins.
+    pub transitions: Vec<Transition>,
 }
 
 /// A resolved multi-slot style: the component's root box (`base`, the top-level
@@ -394,6 +450,14 @@ fn apply_prop(
     ctx: &mut Ctx,
     out: &mut CompiledStyle,
 ) -> Result<(), GlazeError> {
+    // `transition` is a special form: its args are a state keyword, a duration
+    // literal, and an easing keyword — parsed structurally, not evaluated.
+    if name == "transition" {
+        let tr = parse_transition(args)?;
+        out.transitions.retain(|t| t.state != tr.state);
+        out.transitions.push(tr);
+        return Ok(());
+    }
     let vals: Vec<Value> = args.iter().map(|e| eval(e, ctx)).collect::<Result<_, _>>()?;
     let want = |n: usize| -> Result<(), GlazeError> {
         if vals.len() == n {
@@ -526,6 +590,59 @@ fn apply_prop(
         other => return Err(GlazeError::Eval(format!("unknown property `{}`", other))),
     }
     Ok(())
+}
+
+/// Parse `transition <state> <duration> [easing]`:
+/// `transition checked 150ms ease_out`. Duration takes `ms` or `s`; easing
+/// defaults to `ease_out`. Unknown states/easings/units are loud errors.
+fn parse_transition(args: &[Expr]) -> Result<Transition, GlazeError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(GlazeError::Eval(
+            "`transition` expects <state> <duration> [easing], e.g. `transition checked 150ms ease_out`"
+                .into(),
+        ));
+    }
+    let state = match &args[0] {
+        Expr::Ident(s) if TRANSITION_STATES.contains(&s.as_str()) => s.clone(),
+        Expr::Ident(s) => {
+            return Err(GlazeError::Eval(format!(
+                "`transition` has no state `{s}` (known: {})",
+                TRANSITION_STATES.join(", ")
+            )));
+        }
+        other => {
+            return Err(GlazeError::Eval(format!(
+                "`transition` expects a state name first, got {other:?}"
+            )));
+        }
+    };
+    let duration_ms = match &args[1] {
+        Expr::Num(v, Some(u)) if u == "ms" => *v as f32,
+        Expr::Num(v, Some(u)) if u == "s" => (*v * 1000.0) as f32,
+        other => {
+            return Err(GlazeError::Eval(format!(
+                "`transition` duration needs an `ms` or `s` unit (e.g. `150ms`), got {other:?}"
+            )));
+        }
+    };
+    let easing = match args.get(2) {
+        None => Easing::EaseOut,
+        Some(Expr::Ident(s)) => Easing::from_name(s).ok_or_else(|| {
+            GlazeError::Eval(format!(
+                "unknown easing `{s}` (known: linear, ease_in, ease_out, ease_in_out)"
+            ))
+        })?,
+        Some(other) => {
+            return Err(GlazeError::Eval(format!(
+                "`transition` easing must be a name, got {other:?}"
+            )));
+        }
+    };
+    Ok(Transition {
+        state,
+        duration_ms,
+        easing,
+    })
 }
 
 fn as_color(v: &Value, prop: &str) -> Result<Rgba, GlazeError> {

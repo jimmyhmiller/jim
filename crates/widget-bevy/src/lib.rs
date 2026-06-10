@@ -53,6 +53,7 @@ use pane_bevy::{
 };
 use serde_json::Value;
 
+pub mod anim;
 pub mod button_material;
 pub mod glaze_material;
 pub mod glaze_style;
@@ -213,6 +214,10 @@ pub struct WidgetTargets {
     pub popovers: Vec<PopoverTarget>,
     /// `Toast` notifications collected this frame.
     pub toasts: Vec<ToastTarget>,
+    /// Animated-state declarations collected this frame (Glaze `transition`s
+    /// plus built-in component defaults). Synced into [`anim::WidgetAnim`]
+    /// after the render so state changes tween instead of snapping.
+    pub anims: Vec<anim::AnimRequest>,
 }
 
 /// A draggable `Element::Slider` hit-region collected during render. `rect` is
@@ -424,6 +429,10 @@ pub struct SelectMenuHits {
     /// The trigger's window-space rect — the dismiss handler ignores the click
     /// that lands here (it's the toggle, handled by the pane press handler).
     pub trigger_rect: Rect,
+    /// The full menu surface in window space (panel incl. padding, not just
+    /// the item rows) — the cursor override owns this whole region so a pane
+    /// resize edge underneath can't bleed a resize cursor through the menu.
+    pub menu_rect: Rect,
 }
 
 /// One run of rendered, selectable text, collected during render so a
@@ -764,6 +773,7 @@ fn render_select_overlay(
     hits.select_id.clear();
     hits.pane = None;
     hits.trigger_rect = Rect::default();
+    hits.menu_rect = Rect::default();
 
     let Some(os) = open.0.as_ref() else {
         return;
@@ -829,6 +839,7 @@ fn render_select_overlay(
         focused_input: None,
         caret_visible: false,
         hovered_click_id: None,
+        anim: Default::default(),
     };
     let transparent = Color::srgba(0.0, 0.0, 0.0, 0.0);
 
@@ -919,11 +930,15 @@ fn render_select_overlay(
                 0.015,
             );
         }
-        let color = if is_sel || is_hovered {
-            octx.palette.text
-        } else {
-            octx.palette.text_muted
-        };
+        let color = render::style_text_color(
+            &octx,
+            plan.and_then(|p| p.text_color.as_deref()),
+            if is_sel || is_hovered {
+                octx.palette.text
+            } else {
+                octx.palette.text_muted
+            },
+        );
         commands.spawn((
             ChildOf(root),
             Text2d::new(opt.label.clone()),
@@ -952,6 +967,12 @@ fn render_select_overlay(
     }
     hits.select_id = os.id.clone();
     hits.pane = Some(os.pane);
+    hits.menu_rect = Rect::new(
+        menu_top_window.x,
+        menu_top_window.y,
+        menu_top_window.x + menu_w,
+        menu_top_window.y + menu_h,
+    );
 }
 
 /// Stamp the overlay `RenderLayers` onto every descendant of each overlay root,
@@ -1142,6 +1163,7 @@ fn render_dialog_overlay(
             focused_input: None,
             caret_visible: false,
             hovered_click_id: None,
+            anim: Default::default(),
         };
         render::paint_style_background(
             &mut commands,
@@ -1186,6 +1208,7 @@ fn render_dialog_overlay(
         focused_input: None,
         caret_visible: false,
         hovered_click_id: None,
+        anim: Default::default(),
     };
 
     // Build the content element: title + arbitrary body.
@@ -1194,7 +1217,11 @@ fn render_dialog_overlay(
     if !dialog.title.is_empty() {
         kids.push(E::Text {
             value: dialog.title.clone(),
-            color: None,
+            color: dialog
+                .style
+                .as_ref()
+                .and_then(|s| s.title.as_ref())
+                .and_then(|t| t.text_color.clone()),
             size: Some(16.0),
             weight: Some(Weight::Bold),
             family: None,
@@ -1400,6 +1427,7 @@ fn render_popover_overlay(
         focused_input: None,
         caret_visible: false,
         hovered_click_id: hovered_id,
+        anim: Default::default(),
     };
     let content = target
         .content
@@ -1509,15 +1537,55 @@ fn render_toast_overlay(
     panes: Query<(Entity, &WidgetTargets), With<pane_bevy::PaneTag>>,
     existing: Query<Entity, With<WidgetToastRoot>>,
     mut hits: ResMut<ToastHits>,
+    time: Res<bevy::time::Time>,
+    widgets: Query<(Option<&WidgetIO>, Option<&crate::rhai_widget::RhaiWidget>)>,
+    // (first_seen, dismiss_sent) per live toast — drives TTL auto-dismiss
+    mut ages: Local<std::collections::HashMap<(Entity, String), (f32, bool)>>,
 ) {
+    /// Toasts dismiss themselves after this long; the owning widget gets the
+    /// same `ToastDismiss` event a click would send.
+    const TOAST_TTL_SECS: f32 = 4.5;
+    /// Never stack more than this many at once — oldest are hidden (they're
+    /// expiring soonest anyway).
+    const TOAST_MAX_VISIBLE: usize = 5;
+
     for e in &existing {
         commands.entity(e).try_despawn();
     }
     hits.items.clear();
-    let toasts: Vec<(Entity, ToastTarget)> = panes
+    let now = time.elapsed_secs();
+    let mut toasts: Vec<(Entity, ToastTarget)> = panes
         .iter()
         .flat_map(|(p, t)| t.toasts.iter().cloned().map(move |toast| (p, toast)))
         .collect();
+    // Forget ages of toasts the widgets no longer render (so an id can be
+    // reused later for a fresh toast).
+    ages.retain(|key, _| toasts.iter().any(|(p, t)| *p == key.0 && t.id == key.1));
+    // TTL: expired toasts stop rendering immediately and the owner is told
+    // once (so its state catches up; a dead worker's toast still disappears).
+    toasts.retain(|(pane, toast)| {
+        let entry = ages.entry((*pane, toast.id.clone())).or_insert((now, false));
+        if now - entry.0 <= TOAST_TTL_SECS {
+            return true;
+        }
+        if !entry.1 {
+            entry.1 = true;
+            if let Ok((io, rhai)) = widgets.get(*pane) {
+                send_host_event(io, rhai, &HostEvent::ToastDismiss { id: toast.id.clone() });
+            }
+        }
+        false
+    });
+    // Cap the stack: keep the newest few.
+    if toasts.len() > TOAST_MAX_VISIBLE {
+        toasts.sort_by(|a, b| {
+            let fa = ages.get(&(a.0, a.1.id.clone())).map(|e| e.0).unwrap_or(now);
+            let fb = ages.get(&(b.0, b.1.id.clone())).map(|e| e.0).unwrap_or(now);
+            fa.total_cmp(&fb)
+        });
+        let skip = toasts.len() - TOAST_MAX_VISIBLE;
+        toasts.drain(..skip);
+    }
     if toasts.is_empty() {
         return;
     }
@@ -1568,6 +1636,7 @@ fn render_toast_overlay(
             focused_input: None,
             caret_visible: false,
             hovered_click_id: None,
+            anim: Default::default(),
         };
         if let Some(plan) = toast.style.as_ref().and_then(|s| s.surface.as_ref()) {
             render::paint_style_background(&mut commands, &octx, Some(plan), Vec2::ZERO, Vec2::new(toast_w, th), 0.0);
@@ -1596,7 +1665,15 @@ fn render_toast_overlay(
                 ..default()
             },
             LineHeight::Px(render::line_height(render::DEFAULT_FONT_SIZE)),
-            TextColor(octx.palette.text),
+            TextColor(render::style_text_color(
+                &octx,
+                toast
+                    .style
+                    .as_ref()
+                    .and_then(|s| s.surface.as_ref())
+                    .and_then(|su| su.text_color.as_deref()),
+                octx.palette.text,
+            )),
             bevy::sprite::Anchor::CENTER_LEFT,
             bevy::text::TextLayout::new_with_no_wrap(),
             // Hard cap on width so the label can never spill past the toast
@@ -1661,8 +1738,15 @@ fn override_overlay_cursor(
         } else {
             I::Default
         })
-    } else if !select.select_id.is_empty() && select.items.iter().any(|h| h.rect.contains(pt)) {
-        Some(I::Pointer)
+    } else if !select.select_id.is_empty() && select.menu_rect.contains(pt) {
+        // The whole floating menu owns the cursor: pointer on the rows,
+        // plain arrow on the panel chrome — never an underlying pane's
+        // resize cursor bleeding through.
+        Some(if select.items.iter().any(|h| h.rect.contains(pt)) {
+            I::Pointer
+        } else {
+            I::Default
+        })
     } else if toast.items.iter().any(|(r, _, _)| r.contains(pt)) {
         Some(I::Pointer)
     } else {
@@ -1816,6 +1900,7 @@ fn render_tooltip_overlay(
         focused_input: None,
         caret_visible: false,
         hovered_click_id: None,
+        anim: Default::default(),
     };
     if let Some(plan) = tip.style.as_ref().and_then(|s| s.bubble.as_ref()) {
         render::paint_style_background(&mut commands, &octx, Some(plan), Vec2::ZERO, Vec2::new(bubble_w, bubble_h), 0.0);
@@ -1844,7 +1929,14 @@ fn render_tooltip_overlay(
             ..default()
         },
         LineHeight::Px(render::line_height(render::DEFAULT_FONT_SIZE)),
-        TextColor(octx.palette.text),
+        TextColor(render::style_text_color(
+            &octx,
+            tip.style
+                .as_ref()
+                .and_then(|s| s.bubble.as_ref())
+                .and_then(|b| b.text_color.as_deref()),
+            octx.palette.text,
+        )),
         bevy::sprite::Anchor::CENTER_LEFT,
         bevy::text::TextLayout::new_with_no_wrap(),
         Transform::from_xyz(pad, -(bubble_h * 0.5), 0.02),
@@ -1968,6 +2060,7 @@ impl Plugin for WidgetPlugin {
             .init_resource::<WidgetOpenPopover>()
             .init_resource::<PopoverHits>()
             .init_resource::<ToastHits>()
+            .init_resource::<anim::WidgetAnim>()
             .add_plugins(WidgetButtonMaterialPlugin)
             .add_plugins(glaze_material::GlazeMaterialPlugin)
             .add_plugins(msgbus::WidgetMsgBusPlugin)
@@ -1981,6 +2074,9 @@ impl Plugin for WidgetPlugin {
                     // Hover runs BEFORE rerender so a hover-change this
                     // frame is reflected in the same-frame redraw.
                     update_widget_hover,
+                    // Advance in-flight transitions and force_render their
+                    // panes so the eased repaint lands this frame.
+                    anim::tick_widget_anims,
                     rerender_widgets,
                     blur_inputs_on_focus_change,
                     handle_widget_press,
@@ -2039,7 +2135,12 @@ fn update_widget_hover(
             Entity,
             &pane_bevy::PaneKindMarker,
             &mut WidgetHover,
-            &mut WidgetRender,
+            // subprocess panes carry WidgetRender, rhai panes RhaiWidget —
+            // requiring either one non-optionally would silently skip the
+            // other kind (rhai widgets had NO hover at all for exactly
+            // that reason)
+            Option<&mut WidgetRender>,
+            Option<&mut rhai_widget::RhaiWidget>,
             Option<&WidgetScroll>,
         ),
         With<pane_bevy::PaneTag>,
@@ -2065,7 +2166,7 @@ fn update_widget_hover(
     });
 
     let mut want_pointer = false;
-    for (pane, kind, mut hover, mut render_state, scroll) in &mut widgets {
+    for (pane, kind, mut hover, render_state, rhai, scroll) in &mut widgets {
         let is_widget_kind = kind.0 == PANE_KIND || kind.0 == rhai_widget::PANE_KIND;
         if !is_widget_kind {
             continue;
@@ -2094,7 +2195,12 @@ fn update_widget_hover(
         }
         if hover.click_id != new_id {
             hover.click_id = new_id;
-            render_state.force_render = true;
+            if let Some(mut rs) = render_state {
+                rs.force_render = true;
+            }
+            if let Some(mut rw) = rhai {
+                rw.force_render = true;
+            }
         }
     }
     use bevy::window::{CursorIcon, SystemCursorIcon};
@@ -2701,6 +2807,7 @@ fn rerender_widgets(
     time: Res<Time>,
     pane_zoom: Res<pane_bevy::PaneZoom>,
     mut clip_dirty: ResMut<WidgetClipDirty>,
+    mut anim_store: ResMut<anim::WidgetAnim>,
     mut images: ResMut<Assets<Image>>,
     mut image_cache: ResMut<WidgetImageCache>,
     mut q: Query<(
@@ -2792,6 +2899,7 @@ fn rerender_widgets(
         targets.dialogs.clear();
         targets.popovers.clear();
         targets.toasts.clear();
+        targets.anims.clear();
 
         let frame_clone = render_state.current_frame.clone().unwrap();
 
@@ -2823,6 +2931,7 @@ fn rerender_widgets(
                 focused_input: input_focus.cloned(),
                 caret_visible,
                 hovered_click_id: hover.and_then(|h| h.click_id.clone()),
+                anim: anim_store.snapshot_for(pane),
             };
             let consumed = render::render(
                 &mut commands,
@@ -2833,6 +2942,7 @@ fn rerender_widgets(
                 content_size.x,
                 0.0,
             );
+            anim_store.apply_requests(pane, &targets.anims);
             let new_max = (consumed.y - content_size.y).max(0.0);
             if (scroll.max_y - new_max).abs() > 0.1 {
                 scroll.max_y = new_max;

@@ -6739,6 +6739,7 @@ dependencies = [
  "editor_bevy",
  "glaze",
  "image",
+ "inference_bevy",
  "notify",
  "pane_bevy",
  "rhai",

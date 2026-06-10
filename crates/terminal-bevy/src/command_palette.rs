@@ -666,6 +666,7 @@ fn render_palette(world: &mut World) {
         focused_input: None,
         caret_visible: true,
         hovered_click_id: None,
+        anim: Default::default(),
     };
     let mut targets = WidgetTargets::default();
     {

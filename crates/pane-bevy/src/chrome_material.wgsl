@@ -41,13 +41,19 @@ struct ChromeParams {
     // region — masking any pane content scrolled up under the title
     // bar. 0.0 for the regular pane body.
     cover_mode: f32,
-    // Title-region height in pixels. Only consulted when
-    // cover_mode > 0.5.
+    // Title-region height in pixels: where the title strip ends and
+    // (after content_margin more) the content rect begins.
     title_h: f32,
-    // Title-bar background fill (linear RGB + alpha). Only consulted
-    // in cover mode — that's how focus is signalled now that the body
-    // and border stay stable across focus state.
+    // "Outline" fill (linear RGB + alpha): the title strip + the margin
+    // ring around the content rect. Focus swaps this; `bg` (the content
+    // backdrop) stays stable across focus.
     title_bg: vec4<f32>,
+    // Content inset from left/right/bottom edges, px; content starts
+    // title_h + content_margin from the top. 0 disables the two-tone.
+    content_margin: f32,
+    _pad_r0: f32,
+    _pad_r1: f32,
+    _pad_r2: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: ChromeParams;
@@ -95,16 +101,38 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // light source without being obvious unless you look for it.
     let v = in.uv.y;  // 0 at top, 1 at bottom in this mesh
     let tone = mix(1.06, 0.97, v);
-    // Title-cover paints its own fill color; body uses bg.
-    let fill_rgb = select(params.bg.rgb * tone, params.title_bg.rgb, params.cover_mode > 0.5);
+    // Two-tone body: the title strip + margin ring around the content
+    // (the pane's "outline") paint title_bg; the content backdrop keeps
+    // bg. Focus re-colors title_bg + border only, so clicking a pane
+    // never shifts the area behind its content.
+    var base_rgb = params.bg.rgb;
+    if (params.cover_mode < 0.5 && params.content_margin > 0.0 && params.title_bg.a > 0.0) {
+        let px = in.uv * params.size;
+        let m = params.content_margin;
+        let c_min = vec2<f32>(m, params.title_h + m);
+        let c_max = params.size - vec2<f32>(m, m);
+        let cd = max(
+            max(c_min.x - px.x, px.x - c_max.x),
+            max(c_min.y - px.y, px.y - c_max.y),
+        );
+        let ring = smoothstep(-0.5, 0.5, cd);
+        base_rgb = mix(params.bg.rgb, params.title_bg.rgb, ring);
+    }
+    // Title-cover paints its own fill color; body uses the two-tone base.
+    let fill_rgb = select(base_rgb * tone, params.title_bg.rgb, params.cover_mode > 0.5);
     var color = fill_rgb;
 
     // Border band: from the rect edge inward by border_width. d is
-    // negative inside, so the band lives in (-border_width .. 0).
+    // negative inside, so the band lives in (-border_width .. 0):
+    // smoothstep is ~0 deep inside and ramps to 1 across the band's
+    // inner edge. (The historical `1.0 - smoothstep(...)` was inverted —
+    // it painted the border color over the ENTIRE interior, so the
+    // pane "body" was actually the border color and any focused-border
+    // change re-colored the whole window.)
     let bw = params.border_width;
     let border_coverage = select(
         0.0,
-        1.0 - smoothstep(-bw - 0.5, -bw + 0.5, d),
+        smoothstep(-bw - 0.5, -bw + 0.5, d),
         bw > 0.0,
     );
     color = mix(color, params.border.rgb, border_coverage);

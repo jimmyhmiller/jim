@@ -779,6 +779,10 @@ pub struct RhaiWidget {
     /// no per-element `WidgetTargets`, so they'd otherwise be
     /// click-through when pinned). Recomputed on reload.
     pub wants_clicks: bool,
+    /// Set by `anim::tick_widget_anims` while a state transition is in
+    /// flight, so the next `apply_latest_frames` pass re-renders with the
+    /// advanced eased values even though the frame itself didn't change.
+    pub force_render: bool,
 }
 
 /// Does this AST define any pointer-interaction handler? (Cheap
@@ -920,7 +924,10 @@ pub struct RhaiWidgetPlugin;
 
 impl Plugin for RhaiWidgetPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (register_kind, setup_watcher))
+        // Idempotent: WidgetPlugin also inits + ticks the store; this keeps
+        // rhai-only hosts working.
+        app.init_resource::<crate::anim::WidgetAnim>()
+            .add_systems(Startup, (register_kind, setup_watcher))
             .add_systems(
                 Update,
                 (
@@ -1152,6 +1159,7 @@ fn rhai_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity, c
             sprite_entities: HashMap::new(),
             last_focus_sig: None,
             wants_clicks,
+            force_render: false,
         },
         WidgetTargets::default(),
         crate::WidgetScroll::default(),
@@ -1542,6 +1550,7 @@ fn apply_latest_frames(
     mut images: ResMut<Assets<Image>>,
     mut image_cache: ResMut<WidgetImageCache>,
     mut clip_dirty: ResMut<WidgetClipDirty>,
+    mut anim_store: ResMut<crate::anim::WidgetAnim>,
     pane_font: Res<PaneFont>,
     pane_metrics: Res<pane_bevy::PaneFontMetrics>,
     theme: Res<style_bevy::Theme>,
@@ -1577,12 +1586,14 @@ fn apply_latest_frames(
         let focus_sig = input_focus.map(|f| (f.value.clone(), f.caret, caret_visible));
         let focus_changed = focus_sig != w.last_focus_sig;
         // Theme changes also re-emit so widgets pick up new palette colors.
-        if current_gen == w.applied_frame_gen && !theme_changed && !focus_changed {
+        let forced = w.force_render;
+        if current_gen == w.applied_frame_gen && !theme_changed && !focus_changed && !forced {
             continue;
         }
         let _prof = pane_bevy::prof::pane_span(entity.to_bits(), "widget");
         w.applied_frame_gen = current_gen;
         w.last_focus_sig = focus_sig;
+        w.force_render = false;
 
         // Grab the frame the worker last produced.
         let frame = w
@@ -1657,13 +1668,23 @@ fn apply_latest_frames(
                     focused_input: input_focus.cloned(),
                     caret_visible,
                     hovered_click_id: hover.and_then(|h| h.click_id.clone()),
+                    anim: anim_store.snapshot_for(entity),
                 };
-                // Wipe last frame's click targets so a stale button
-                // rect from before a script reload doesn't keep
-                // matching clicks.
+                // Wipe ALL of last frame's element-derived targets so
+                // stale entries from before a re-render don't keep
+                // matching clicks — or, for toasts/dialogs, keep
+                // rendering forever (toasts used to accumulate one copy
+                // per re-render because they were missing here).
                 targets.clicks.clear();
                 targets.links.clear();
                 targets.spans.clear();
+                targets.sliders.clear();
+                targets.selects.clear();
+                targets.tooltips.clear();
+                targets.dialogs.clear();
+                targets.popovers.clear();
+                targets.toasts.clear();
+                targets.anims.clear();
                 let consumed = crate::render::render(
                     &mut commands,
                     &ctx,
@@ -1673,6 +1694,7 @@ fn apply_latest_frames(
                     content_size.x,
                     0.0,
                 );
+                anim_store.apply_requests(entity, &targets.anims);
                 // Update scroll bounds based on what the render
                 // actually consumed. Clamp current scroll to new max
                 // so resizing the pane shorter doesn't strand the
@@ -2155,6 +2177,28 @@ fn register_host_functions(
 
     engine.register_fn("host_env", |name: &str| -> String {
         std::env::var(name).unwrap_or_default()
+    });
+
+    // JSON bridge for subprocess protocols (`proc_*` lines are plain
+    // text): `parse_json(s)` → map/array/scalar, `()` on bad input;
+    // `to_json(v)` → compact JSON string.
+    engine.register_fn("parse_json", |s: &str| -> Dynamic {
+        match serde_json::from_str::<Value>(s) {
+            Ok(v) => rhai::serde::to_dynamic(&v).unwrap_or(Dynamic::UNIT),
+            Err(e) => {
+                eprintln!("[rhai_widget] parse_json failed: {e}");
+                Dynamic::UNIT
+            }
+        }
+    });
+    engine.register_fn("to_json", |v: Dynamic| -> String {
+        match rhai::serde::from_dynamic::<Value>(&v) {
+            Ok(v) => v.to_string(),
+            Err(e) => {
+                eprintln!("[rhai_widget] to_json failed: {e}");
+                String::new()
+            }
+        }
     });
 
     engine.register_fn("clipboard_set", |text: &str| -> bool {
