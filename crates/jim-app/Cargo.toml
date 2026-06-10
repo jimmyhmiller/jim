@@ -5,18 +5,16 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-arboard = "3.4"
-bytemuck = { version = "1", features = ["derive"] }
 jim_editor = { path = "../jim-editor" }
 editor_core = { path = "../editor-core" }
 jim_pane = { path = "../jim-pane" }
 jim_style = { path = "../jim-style" }
 jim_daemon = { path = "../jim-daemon" }
+jim_terminal = { path = "../jim-terminal" }
 jim_widget = { path = "../jim-widget" }
 claude-bus-bevy = { path = "../claude-bus-bevy" }
 claude-bus = { path = "../claude-bus" }
 jim_inference = { path = "../jim-inference" }
-libghostty-vt = "0.1.1"
 # Native file dialog for Cmd+O. Synchronous on macOS — opens the
 # system NSOpenPanel on the calling (main) thread.
 rfd = "0.15"
@@ -26,7 +24,6 @@ serde_json = "1"
 # Hot-reloadable runtime tuning for the project-prism (cube.rs):
 # ~/.jim/cube.rhai is evaluated to a params map.
 rhai = { version = "1.21", features = ["sync"] }
-bincode = { version = "2", features = ["serde"] }
 libc = "0.2"
 # File-watching for garden sprite hot reload — picks up edits to text
 # files under ~/.jim/garden-art/ and rebuilds the relevant
@@ -35,11 +32,6 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 # PNG decoding for the embedded garden sprite sheet (CC0 OpenGameArt
 # "Flowers" plant pack, 78 12x24 plants on a 936x24 strip).
 image = { version = "0.25", default-features = false, features = ["png"] }
-skrifa = "0.39"
-# Glyph rasterization for our own atlas — bypasses cosmic-text/Text2d
-# entirely. Already a transitive dep via Bevy's cosmic-text, declared
-# here so we can import it directly.
-swash = "0.2"
 bevy = { version = "0.18", default-features = false, features = [
     "2d",
     # Real perspective 3D (Camera3d + PBR meshes + StandardMaterial),
@@ -61,12 +53,6 @@ objc2-foundation = "0.2"
 # Obj-C block support, for the AVCaptureDevice mic-access completion
 # handler (see request_microphone_access). 0.5 matches objc2 0.5.
 block2 = "0.5"
-# CoreText for system-cascade glyph fallback — instead of a hardcoded
-# list of font paths, ask the OS "which font has this codepoint?" and
-# load its bytes. Same model real terminals (Terminal.app, Alacritty,
-# kitty) use, just less surprising as the user installs/removes fonts.
-core-text = "21"
-core-foundation = "0.10"
 
 [lib]
 name = "jim_app"
@@ -78,3 +64,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"
+# Terminal integration tests (daemon_e2e, paste_repro, vt_replay) exercise
+# the terminal widget crate's vt / pty / worker / daemon_client modules.
+jim_terminal = { path = "../jim-terminal" }
+# vt_replay drives `libghostty_vt::Terminal` directly.
+libghostty-vt = "0.1.1"

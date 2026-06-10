@@ -31,7 +31,7 @@ use jim_pane::{PaneKindMarker, PaneKindSpec, PaneRect, PaneRegistry, PaneTitle};
 use serde_json::Value;
 
 use crate::graph_view::{self, GEdge, GNode, GraphModel, GraphPalette, GraphView, NodeStatus};
-use crate::{MonoFont, FONT_SIZE};
+use jim_terminal::{MonoFont, FONT_SIZE};
 
 pub const PANE_KIND: &str = "workflow-graph";
 

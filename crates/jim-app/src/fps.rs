@@ -34,7 +34,8 @@ use jim_pane::prof;
 use jim_pane::{PaneProject, PaneTitle};
 
 use crate::projects::Projects;
-use crate::{MonoFont, FONT_SIZE, MENU_OVERLAY_LAYER};
+use jim_terminal::{MonoFont, FONT_SIZE};
+use crate::MENU_OVERLAY_LAYER;
 
 const MARGIN: f32 = 8.0;
 // Above context_menu's MENU_Z (700) so the meter doesn't get hidden

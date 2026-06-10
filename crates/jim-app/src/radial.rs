@@ -29,7 +29,7 @@ use jim_pane::{topmost_pane_at, InputConsumed, PaneRect, PaneTag};
 
 use crate::actions::{ActionInvocations, ActionRegistry};
 use crate::projects::Sidebar;
-use crate::MonoFont;
+use jim_terminal::MonoFont;
 
 const RADIAL_Z: f32 = 600.0;
 

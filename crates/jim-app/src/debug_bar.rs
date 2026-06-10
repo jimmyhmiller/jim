@@ -16,7 +16,8 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
-use crate::{MonoFont, MENU_OVERLAY_LAYER};
+use jim_terminal::MonoFont;
+use crate::MENU_OVERLAY_LAYER;
 
 const BAR_H: f32 = 22.0;
 // Above panes; same band as the fps meter (Z=950), well inside the

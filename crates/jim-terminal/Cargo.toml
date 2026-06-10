@@ -1,0 +1,40 @@
+[package]
+name = "jim_terminal"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+jim_pane = { path = "../jim-pane" }
+jim_style = { path = "../jim-style" }
+jim_daemon = { path = "../jim-daemon" }
+# Worker thread publishes terminal.cwd_changed / terminal.command_executed
+# events to the Claude Code bus (best-effort, fire-and-forget).
+claude-bus = { path = "../claude-bus" }
+arboard = "3.4"
+bytemuck = { version = "1", features = ["derive"] }
+libghostty-vt = "0.1.1"
+nix = { version = "0.31", features = ["term", "fs", "signal", "process", "user", "ioctl", "poll"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+libc = "0.2"
+skrifa = "0.39"
+swash = "0.2"
+bevy = { version = "0.18", default-features = false, features = [
+    "2d",
+    "3d",
+    "x11",
+    "wayland",
+    "file_watcher",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
+objc2-foundation = "0.2"
+core-text = "21"
+core-foundation = "0.10"
+
+[lib]
+name = "jim_terminal"
+path = "src/lib.rs"

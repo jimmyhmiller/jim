@@ -49,7 +49,7 @@ use jim_pane::{InputConsumed, PaneRegistry};
 use serde::{Deserialize, Serialize};
 
 use crate::projects::{kind_to_static, NewPaneRequest, PendingActions, Projects, Sidebar};
-use crate::MonoFont;
+use jim_terminal::MonoFont;
 
 /// Drawer sits above the sidebar but below the radial / context menus,
 /// all on `MENU_OVERLAY_LAYER` so it composites over canvas + panes.

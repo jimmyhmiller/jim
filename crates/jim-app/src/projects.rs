@@ -40,11 +40,11 @@ use jim_pane::{
     PaneRegistry, PaneSnapshot, PaneTag, PaneTitle, MIN_PANE_SIZE,
 };
 
-use crate::TerminalSession;
+use jim_terminal::TerminalSession;
 
 use jim_editor::EditorFilePath;
 
-use crate::{MonoFont, MonoMetrics, FONT_SIZE};
+use jim_terminal::{MonoFont, MonoMetrics, FONT_SIZE};
 
 pub const SIDEBAR_DEFAULT_WIDTH: f32 = 220.0;
 pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
@@ -652,7 +652,7 @@ impl Plugin for ProjectsPlugin {
             .insert_resource(PendingActions::default())
             .add_systems(
                 Startup,
-                load_or_seed_projects.after(crate::setup_camera_and_font),
+                load_or_seed_projects.after(jim_terminal::setup_terminal_font),
             )
             .add_systems(
                 Update,
@@ -1800,8 +1800,8 @@ fn refocus_on_project_change(
         .iter()
         .filter(|(_, p, _, _)| p.0 == active)
         .max_by(|a, b| {
-            let a_term = a.2.0 == crate::PANE_KIND;
-            let b_term = b.2.0 == crate::PANE_KIND;
+            let a_term = a.2.0 == jim_terminal::PANE_KIND;
+            let b_term = b.2.0 == jim_terminal::PANE_KIND;
             a_term
                 .cmp(&b_term)
                 .then(a.3.z.partial_cmp(&b.3.z).unwrap_or(std::cmp::Ordering::Equal))
@@ -1929,7 +1929,7 @@ const INFERENCE_AUTO_APPLY_THRESHOLD: f32 = 0.7;
 /// every verdict so the user can see what was filtered out.
 fn apply_inference_suggestions(
     mut events: MessageReader<claude_bus_bevy::ClaudeBusEvent>,
-    panes: Query<(&crate::TerminalSession, Option<&ProjectMembership>)>,
+    panes: Query<(&jim_terminal::TerminalSession, Option<&ProjectMembership>)>,
     mut projects: ResMut<Projects>,
 ) {
     for ev in events.read() {

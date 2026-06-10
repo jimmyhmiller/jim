@@ -1,5 +1,5 @@
 use bevy::prelude::*;
-use jim_app::TerminalPlugin;
+use jim_app::AppShellPlugin;
 
 fn main() {
     // Self-exec daemon mode: when the editor needs a per-session daemon
@@ -59,7 +59,7 @@ fn main() {
     // scales it — see window_geometry). Captured here, before any system
     // can overwrite window.json with the wrong creation-time size.
     app.insert_resource(jim_app::window_geometry::RestoredGeometry(saved));
-    app.add_plugins(TerminalPlugin);
+    app.add_plugins(AppShellPlugin);
     // Subscribe to Claude Code hook events from the central bus. Any
     // system in this app (or its panes) can react by reading
     // MessageReader<claude_bus_bevy::ClaudeBusEvent>. If the bus isn't

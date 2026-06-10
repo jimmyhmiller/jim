@@ -33,9 +33,10 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
-use crate::term_material::TermMaterial;
-use crate::worker::SnapCell;
-use crate::{MonoFont, TerminalStore, FONT_SIZE, MENU_OVERLAY_LAYER};
+use jim_terminal::term_material::TermMaterial;
+use jim_terminal::worker::SnapCell;
+use jim_terminal::{MonoFont, TerminalStore, FONT_SIZE};
+use crate::MENU_OVERLAY_LAYER;
 
 /// How often both recorders sample. 5 s keeps the log small (a full day
 /// is a few MB) while still catching a runaway that doubles in minutes.

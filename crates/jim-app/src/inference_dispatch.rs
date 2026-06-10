@@ -35,7 +35,7 @@ use jim_inference::llm::LlmConfig;
 
 use crate::drawer::Drawer;
 use crate::projects::Projects;
-use crate::TerminalSession;
+use jim_terminal::TerminalSession;
 use jim_pane::PaneProject;
 
 pub struct InferenceDispatchPlugin;

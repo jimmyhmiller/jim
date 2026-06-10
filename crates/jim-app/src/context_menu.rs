@@ -21,7 +21,7 @@ use jim_pane::{
 };
 
 use crate::projects::{Projects, Sidebar};
-use crate::MonoFont;
+use jim_terminal::MonoFont;
 
 /// Above the radial menu's RADIAL_Z (=600) so a context menu opened on
 /// a pane never sits behind a wedge.

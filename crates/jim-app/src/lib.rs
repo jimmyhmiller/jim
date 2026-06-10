@@ -1,64 +1,34 @@
-//! Minimal Bevy-native terminal emulator built on libghostty-vt.
+//! Application shell for the Jim editor: the floating-pane canvas that
+//! hosts the terminal emulator (now extracted to the `jim_terminal`
+//! crate), the text editor, widgets, projects sidebar, cube overview,
+//! radial menu, drawer, and IPC.
 //!
-//! Multi-instance: each terminal is an Entity with chrome (bg, title bar,
-//! content root, cursor, resize handle), draggable and resizable like the
-//! editors in `editor-bevy`. Focus + mouse logic mirror that crate so the
-//! two will later share a `text-surface-bevy` extraction (step 2 of the
-//! plan). For now this is a fork, not a refactor.
-//!
-//! ## Threading
-//!
-//! `libghostty_vt::Terminal` is `!Send + !Sync`, so we can't store it as a
-//! Bevy `Component`. Instead a single `NonSend<TerminalStore>` resource
-//! owns a `HashMap<Entity, TerminalData>`. Entities still carry Send
-//! components (rect, chrome, rev counter, row-entity pool); the
-//! non-Send runtime lives in the store keyed by the same entity. Systems
-//! that need both iterate entities and look up the store by id.
-//!
-//! ## Rendering
-//!
-//! Each cell is a textured sprite that samples its glyph from a shared
-//! `GlyphAtlas`. Two sprite pools per terminal (`bg` for solid quads,
-//! `fg` for glyph quads) sized exactly `cols * rows`; resized only on
-//! grid resize. Per-frame work for an unchanged grid is one
-//! `render_state.update` + cursor position; for a partial-dirty grid it's
-//! a few hundred component mutations. No cosmic-text shaping in the hot
-//! path.
-//!
-//! ## v0 scope
-//!
-//! - Direct key encoding (no libghostty key encoder / Kitty kb protocol):
-//!   printable chars, Enter/Tab/Backspace/Escape, arrows (xterm style),
-//!   Home/End/PageUp/PageDown, Delete, ctrl+letter → control codes.
-//! - no wide-char handling (1 cell per char assumed; CJK/emoji get
-//!   rasterized into a normal-width slot and look squished)
-//! - no mouse reporting to the child, no selection / scrollback panning
+//! The terminal widget itself lives in `jim_terminal`; this crate adds
+//! `jim_terminal::TerminalPlugin` and keeps only the shell integration
+//! glue that couples the terminal to project state (scroll into the
+//! active project, bell / Claude-notification badge pulses).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
-use bevy::image::{Image, TextureAtlasLayout};
-use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
-use bevy::sprite::Anchor;
 
-use libghostty_vt::style::RgbColor;
 use jim_pane::{
-    spawn_pane, FocusedPane, PaneChrome, PaneContentPressed, PaneFont, PaneKindMarker,
-    PanePlugin, PaneRect, PaneRegistry, PaneTag, SpawnedPane, MARGIN, TITLE_H,
+    PaneKindMarker, PanePlugin, PaneRect, PaneTag,
 };
 use serde_json::Value;
 
+use jim_terminal::worker::WorkerMsg;
+use jim_terminal::{
+    BellPulse, TerminalSession, TerminalStore, LINE_HEIGHT, PANE_KIND,
+};
+
 pub mod actions;
-pub mod atlas;
 pub mod canvas;
 pub mod command_palette;
 pub mod claude_events_pane;
-pub mod command_watch;
 pub mod context_menu;
 pub mod cube;
-pub mod daemon_client;
 pub mod debug_bar;
 pub mod diagnostics;
 pub mod drawer;
@@ -68,86 +38,20 @@ pub mod inference_dispatch;
 pub mod inbox;
 pub mod inferences_pane;
 pub mod issues_pane;
-pub mod osc7;
 /// Re-export of the daemon protocol from the headless crate so existing
 /// callers can continue to write `jim_app::daemon_proto::*`.
 pub use jim_daemon::proto as daemon_proto;
 pub mod ipc;
 pub mod projects;
-pub mod pty;
 pub mod radial;
 pub mod run_button;
-pub mod selection;
-pub mod term_material;
 pub mod tools;
-pub mod vt;
 pub mod window_geometry;
-pub mod worker;
 pub mod workflow_graph;
-use atlas::GlyphAtlas;
-use term_material::{
-    make_cells_image, pack_rgb, GpuCell, TermMaterial, TermMaterialPlugin, TermParams,
-};
 use projects::{
     NewPaneRequest, OpenFileRequest, OpenProjectTarget, PendingActions, ProjectMembership,
     Projects, Sidebar,
 };
-use pty::PtySize;
-use worker::{SnapCell, WorkerHandle, WorkerMsg};
-
-pub const FONT_SIZE: f32 = 14.0;
-pub const LINE_HEIGHT: f32 = 18.0;
-pub const SCROLLBACK_LINES: usize = 100_000;
-
-/// Stable identifier for terminal panes. Stored on every terminal pane
-/// in `PaneKindMarker` and referenced by the registry.
-pub const PANE_KIND: &str = "terminal";
-
-/// Candidate monospace fonts tried in order, first readable one wins.
-/// SF Mono is preferred — Apple ships it with Terminal.app, so any Mac
-/// that has launched Terminal.app once has it — but we fall back to other
-/// common monospace faces so the terminal still starts on a machine that
-/// lacks it. Override the whole search with the `TERMINAL_BEVY_FONT` env
-/// var (absolute path to a `.otf`/`.ttf`).
-const PRIMARY_FONT_CANDIDATES: &[&str] = &[
-    "/Library/Fonts/SF-Mono-Regular.otf",
-    "/System/Library/Fonts/SFNSMono.ttf",
-    "/System/Library/Fonts/Menlo.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    "/Library/Fonts/Andale Mono.ttf",
-];
-
-/// Loads the primary monospace font and leaks it into a `'static` slice
-/// so the atlas (which holds a borrow of the font bytes for `swash`) sees
-/// a stable address for the program's lifetime. Tries `TERMINAL_BEVY_FONT`
-/// first, then [`PRIMARY_FONT_CANDIDATES`]; panics with the full list if
-/// none can be read (the terminal cannot render without a font).
-fn load_primary_font() -> &'static [u8] {
-    let mut tried: Vec<String> = Vec::new();
-    let override_path = std::env::var_os("TERMINAL_BEVY_FONT");
-    let candidates = override_path
-        .as_ref()
-        .map(|p| std::path::Path::new(p))
-        .into_iter()
-        .map(std::borrow::Cow::Borrowed)
-        .chain(
-            PRIMARY_FONT_CANDIDATES
-                .iter()
-                .map(|p| std::borrow::Cow::Owned(std::path::PathBuf::from(p))),
-        );
-    for path in candidates {
-        match std::fs::read(path.as_ref()) {
-            Ok(bytes) => return Box::leak(bytes.into_boxed_slice()),
-            Err(e) => tried.push(format!("  {}: {}", path.as_ref().display(), e)),
-        }
-    }
-    panic!(
-        "no usable monospace font found — set TERMINAL_BEVY_FONT to an \
-         absolute .otf/.ttf path. Tried:\n{}",
-        tried.join("\n")
-    );
-}
 
 /// Root for all on-disk persistence (projects + per-terminal scrollback).
 /// `~/.jim/` on every supported platform.
@@ -158,127 +62,12 @@ pub fn data_dir() -> Option<PathBuf> {
     jim_daemon::data_dir()
 }
 
-/// Per-terminal scrollback log. Raw pty bytes are appended here as they
-/// flow from the child; on restore the bytes are replayed into the new
-/// libghostty Terminal so the visible scrollback persists across runs.
-pub fn scrollback_path(session_id: u64) -> Option<PathBuf> {
-    let mut p = data_dir()?;
-    p.push("scrollback");
-    Some(p.join(format!("{}.bytes", session_id)))
-}
-
-/// Unix socket the per-session daemon listens on. Forwards to the
-/// daemon crate so client and daemon share a single source of truth.
-pub fn socket_path(session_id: u64) -> Option<PathBuf> {
-    jim_daemon::socket_path(session_id)
-}
-
-/// PID file the daemon writes on startup. Same delegation as
-/// [`socket_path`].
-pub fn pid_path(session_id: u64) -> Option<PathBuf> {
-    jim_daemon::pid_path(session_id)
-}
-
-/// Pick the shell to launch in a new daemon. Resolution: `$SHELL` →
-/// passwd entry → `/bin/sh`. Returns a `Vec<String>` so it slots into
-/// `Command::new(args[0]).args(&args[1..])` cleanly. Matches what
-/// `Pty::spawn` used to do before we moved PTY ownership into the daemon.
-///
-/// `-l` makes it a login shell so macOS's `/etc/zprofile` runs
-/// `/usr/libexec/path_helper` — without it `PATH` is missing
-/// `/opt/homebrew/bin` etc., breaking tools like autojump.
-pub fn default_shell_command() -> Vec<String> {
-    use std::path::PathBuf as PB;
-    let shell = match std::env::var_os("SHELL") {
-        Some(s) if !s.is_empty() => PB::from(s),
-        _ => match nix::unistd::User::from_uid(nix::unistd::getuid()) {
-            Ok(Some(user)) => user.shell,
-            _ => PB::from("/bin/sh"),
-        },
-    };
-    vec![shell.to_string_lossy().into_owned(), "-l".to_string()]
-}
-
-// ---------- Per-entity runtime ----------
-
-/// Per-entity handle to the worker thread. Plain `Send` data — the
-/// `!Send` libghostty `Terminal` lives entirely on the worker, so the
-/// main Bevy thread sees only the snapshot mutex + a message channel.
-pub struct TerminalData {
-    pub worker: WorkerHandle,
-}
-
-#[derive(Default, Resource)]
-pub struct TerminalStore {
-    pub map: HashMap<Entity, TerminalData>,
-}
-
-// ---------- Components (Send) ----------
-
-/// Stable id used to key per-terminal on-disk state (scrollback log,
-/// layout snapshot in `projects.json`). Allocated by `Projects` and
-/// preserved across restarts so a restored terminal finds its old
-/// scrollback file.
-#[derive(Component, Copy, Clone, Debug)]
-pub struct TerminalSession(pub u64);
-
-/// Cursor sprite child of a terminal pane's content_root. Held on the
-/// pane entity so `sync_grid` can position/show-hide the cursor without
-/// looking it up by traversal.
-#[derive(Component, Copy, Clone)]
-pub struct TerminalCursor(pub Entity);
-
-/// Per-terminal GPU grid state. One `TermMaterial` + cells texture per
-/// pane; the worker → sync_grid pipeline rewrites texels of the cells
-/// texture and Bevy re-uploads it. Replaces the previous "one Sprite
-/// entity per cell" model — for a busy TUI we used to walk thousands
-/// of `Mut<Sprite>` per frame, marking each one Changed; now it's a
-/// single mutated Image asset per frame regardless of how many cells
-/// changed.
-///
-/// `last_rendered_generation` is compared against the worker's snapshot
-/// generation to skip whole frames when the grid hasn't changed.
-#[derive(Component)]
-pub struct TermGrid {
-    pub material: Handle<term_material::TermMaterial>,
-    pub cells_image: Handle<Image>,
-    pub mesh: Handle<Mesh>,
-    /// Entity (child of `content_root`) carrying the `Mesh2d` +
-    /// `MeshMaterial2d<TermMaterial>`.
-    pub render_entity: Entity,
-    pub cols: u16,
-    pub rows: u16,
-    pub last_rendered_generation: u64,
-    /// Was this pane visible the last time sync_grid touched it? Used
-    /// to detect the hidden→visible transition so we can force a full
-    /// repaint of the cells texture (the worker has been processing pty
-    /// bytes the whole time but not pushing snapshots into the GPU).
-    pub was_visible: bool,
-}
-
-/// Bumped whenever the Terminal for this entity is mutated (vt bytes
-/// processed, resize). `sync_grid` rebuilds row spans when it differs
-/// from the value we last rendered.
-#[derive(Component, Default)]
-pub struct TerminalRev(pub u64);
-
-/// Per-terminal bell-tracking state. `last_seen` mirrors the worker's
-/// `bell_count` so we only react to *new* bells — incrementing the
-/// project counter once each, never every frame the counter is non-zero.
-#[derive(Component, Default)]
-pub struct BellPulse {
-    pub last_seen: u64,
-}
-
-#[derive(Resource)]
-pub struct MonoFont(pub Handle<Font>);
-
 /// Dedicated RenderLayer for menu overlays (radial menu, per-pane
 /// context menu) so they draw on top of every per-pane camera. Pane
 /// cameras have order `(rect.z * 100) + 1`, which can climb past 600
 /// as panes are focused — anything drawn on layer 0 ends up *under*
 /// those pane cameras inside their viewports, which made the radial
-/// vanish behind panes. The overlay camera (see [`setup_camera_and_font`])
+/// vanish behind panes. The overlay camera (see [`setup_camera`])
 /// runs at order [`MENU_OVERLAY_CAMERA_ORDER`] (well above any pane)
 /// and renders only this layer, so menu items are guaranteed on top.
 pub const MENU_OVERLAY_LAYER: usize = 32;
@@ -286,11 +75,6 @@ pub const MENU_OVERLAY_LAYER: usize = 32;
 /// any plausible pane-camera order: pane cameras max out around
 /// `(MAX_PANE_Z * 100) + 1` ≈ 50_001, so 100_000 leaves headroom.
 pub const MENU_OVERLAY_CAMERA_ORDER: isize = 100_000;
-
-#[derive(Resource, Copy, Clone)]
-pub struct MonoMetrics {
-    pub cell_width: f32,
-}
 
 /// Whether our OS window currently has keyboard focus. Mirrors the
 /// `WindowFocused` events winit dispatches; we maintain it ourselves
@@ -309,65 +93,38 @@ impl Default for AppFocused {
     }
 }
 
-/// Per-terminal text selection.
-///
-/// `anchor` and `head` are `(col, absolute_row)`:
-/// - `col` is a grid column, `i32` so out-of-bounds drag positions
-///   don't lose direction.
-/// - `absolute_row` is `i64`, indexing into libghostty's *total*
-///   scrollable area (scrollback + active) — i.e.,
-///   `snapshot.viewport_offset + viewport_row` at the moment of the
-///   click. Anchoring against the absolute row makes a selection
-///   follow its content while the user scrolls the viewport.
-///
-/// Limitation: when libghostty's bounded scrollback wraps (oldest line
-/// pushed out), all absolute rows shift down by one. We don't
-/// compensate; selections older than the wrap point will drift. In
-/// practice selections are short-lived enough that this is fine.
-#[derive(Component, Default, Debug)]
-pub struct TerminalSelection {
-    pub anchor: Option<(i32, i64)>,
-    pub head: Option<(i32, i64)>,
-    /// True while the user is mid-drag selecting. Cleared on mouse-up.
-    /// Per-frame drag-update checks this instead of consulting a global
-    /// mouse-mode enum.
-    pub dragging: bool,
-    /// Pool of overlay sprite entities visualising the selection
-    /// (children of the terminal's `content_root`). Rebuilt by the
-    /// selection-render system as the selection changes.
-    pub overlays: Vec<Entity>,
-}
-
-impl TerminalSelection {
-    pub fn clear(&mut self) {
-        self.anchor = None;
-        self.head = None;
-        self.dragging = false;
-    }
-    pub fn is_active(&self) -> bool {
-        match (self.anchor, self.head) {
-            (Some(a), Some(h)) => a != h,
-            _ => false,
-        }
-    }
-    /// Return (start, end) normalised so start ≤ end in line-flow order.
-    pub fn normalised(&self) -> Option<((i32, i64), (i32, i64))> {
-        let (a, h) = (self.anchor?, self.head?);
-        let order = (a.1, a.0) <= (h.1, h.0);
-        if order {
-            Some((a, h))
-        } else {
-            Some((h, a))
-        }
-    }
-}
-
 // ---------- Plugin ----------
 
-pub struct TerminalPlugin;
+/// The app-shell plugin. Adds `jim_terminal::TerminalPlugin` for the
+/// terminal widget, then registers every shell plugin (pane chrome,
+/// projects, canvas, cube, radial, drawer, …), the shell camera setup,
+/// global actions, and the shell-coupled glue systems.
+pub struct AppShellPlugin;
 
-impl Plugin for TerminalPlugin {
+impl Plugin for AppShellPlugin {
     fn build(&self, app: &mut App) {
+        // Terminal widget crate: GPU material, selection, font/atlas
+        // startup, terminal pane kind + per-frame terminal systems.
+        app.add_plugins(jim_terminal::TerminalPlugin);
+        // Install the shell-coupling seams the terminal spawn/restore
+        // path calls through (session-id allocator, initial cwd, dirty
+        // hook) so jim_terminal stays free of a jim_app dependency.
+        app.insert_resource(jim_terminal::TerminalIdAllocator(Box::new(|world| {
+            world.resource_mut::<Projects>().allocate_terminal_id()
+        })));
+        app.insert_resource(jim_terminal::TerminalInitialCwd(Box::new(|world, entity| {
+            world
+                .get::<ProjectMembership>(entity)
+                .map(|m| m.0)
+                .and_then(|pid| {
+                    world
+                        .get_resource::<Projects>()
+                        .and_then(|p| p.default_cwd_of(pid).map(str::to_string))
+                })
+        })));
+        app.insert_resource(jim_terminal::TerminalDirtyHook(Box::new(|world| {
+            world.resource_mut::<Projects>().terminals_dirty = true;
+        })));
         app.insert_resource(ClearColor(Color::srgb(0.072, 0.075, 0.085)))
             .insert_resource(AppFocused::default())
             .insert_resource(bevy::winit::WinitSettings {
@@ -400,7 +157,6 @@ impl Plugin for TerminalPlugin {
                     jim_style::dynamic::OVERLAY_LAYER,
                 ],
             })
-            .add_plugins(TermMaterialPlugin)
             .add_plugins(diagnostics::DiagnosticsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_plugins(actions::ActionsPlugin)
@@ -410,7 +166,6 @@ impl Plugin for TerminalPlugin {
             .add_plugins(radial::RadialPlugin)
             .add_plugins(command_palette::CommandPalettePlugin)
             .add_plugins(drawer::DrawerPlugin)
-            .add_plugins(selection::SelectionPlugin)
             .add_plugins(run_button::RunButtonPlugin)
             .add_plugins(workflow_graph::WorkflowGraphPlugin)
             .add_plugins(fps::FpsOverlayPlugin)
@@ -579,15 +334,15 @@ impl Plugin for TerminalPlugin {
             .add_systems(
                 Startup,
                 (
-                    setup_camera_and_font,
-                    register_terminal_kind,
-                    // Runs after `setup_camera_and_font` so its `PaneFont` /
-                    // `PaneFontMetrics` (the themed JetBrains mono used by
-                    // every cosmic-text pane) deterministically replace the
-                    // terminal's SF Mono defaults as a matched pair. Without
-                    // the ordering, only one of the two resources might win
-                    // and the caret grid would drift from the rendered text.
-                    jim_editor::setup_editor_font.after(setup_camera_and_font),
+                    setup_camera,
+                    // Runs after the terminal crate's `setup_terminal_font`
+                    // so its `PaneFont` / `PaneFontMetrics` (the themed
+                    // JetBrains mono used by every cosmic-text pane)
+                    // deterministically replace the terminal's SF Mono
+                    // defaults as a matched pair. Without the ordering, only
+                    // one of the two resources might win and the caret grid
+                    // would drift from the rendered text.
+                    jim_editor::setup_editor_font.after(jim_terminal::setup_terminal_font),
                     setup_ipc_listener,
                     request_microphone_access,
                 ),
@@ -618,18 +373,16 @@ impl Plugin for TerminalPlugin {
             .add_systems(
                 Update,
                 (
-                    // Focus-state + modifier reconciliation MUST run before
-                    // handle_keyboard so a stuck Cmd (e.g. swallowed Cmd-up
-                    // from a system shortcut) doesn't drop this frame's keys.
+                    // Focus-state + modifier reconciliation run before the
+                    // terminal crate's `handle_keyboard` (in
+                    // `jim_terminal::TerminalPlugin`) so a stuck Cmd (e.g. a
+                    // swallowed Cmd-up from a system shortcut) doesn't drop
+                    // this frame's keys. The reconciliation self-heals each
+                    // frame, so cross-plugin ordering being best-effort is
+                    // fine.
                     track_app_focus,
                     reconcile_macos_modifiers,
-                    handle_terminal_content_press,
-                    handle_terminal_selection_drag,
                     handle_scroll,
-                    handle_resize,
-                    handle_keyboard,
-                    handle_file_drop,
-                    sync_grid,
                     apply_bell_pulse,
                     apply_claude_notification_pulse,
                     clear_active_unread,
@@ -640,74 +393,33 @@ impl Plugin for TerminalPlugin {
     }
 }
 
-fn register_terminal_kind(mut registry: ResMut<PaneRegistry>) {
-    registry.register(jim_pane::PaneKindSpec {
-        kind: PANE_KIND,
-        display_name: "Terminal",
-        radial_icon: Some(">_"),
-        default_size: Vec2::new(640.0, 400.0),
-        spawn: terminal_spawn_from_config,
-        snapshot: terminal_snapshot,
-        on_close: Some(terminal_on_close),
-    });
-}
+/// Shell camera setup: the main 2D camera (layer 0) and the menu-overlay
+/// camera. Split out of the old `setup_camera_and_font`; the terminal's
+/// font/atlas half now lives in `jim_terminal::setup_terminal_font`.
+fn setup_camera(mut commands: Commands) {
+    // Main camera explicitly on layer 0 — pane-bevy reserves layer 0
+    // for pane chrome + non-pane scene content, and uses layers 1.. for
+    // each per-pane camera. Making the main camera's layer explicit
+    // matches the contract documented in `pane-bevy/src/camera.rs`.
+    commands.spawn((
+        Camera2d,
+        bevy::camera::visibility::RenderLayers::layer(0),
+    ));
 
-fn terminal_spawn_from_config(
-    world: &mut World,
-    entity: Entity,
-    content_root: Entity,
-    config: &Value,
-) {
-    let session_id = config
-        .get("session_id")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| {
-            let mut p = world.resource_mut::<Projects>();
-            p.allocate_terminal_id()
-        });
-    let replay_bytes = scrollback_path(session_id).and_then(|p| std::fs::read(&p).ok());
-    let initial_cwd = world
-        .get::<ProjectMembership>(entity)
-        .map(|m| m.0)
-        .and_then(|pid| {
-            world
-                .get_resource::<Projects>()
-                .and_then(|p| p.default_cwd_of(pid).map(str::to_string))
-        });
-    populate_terminal_pane(
-        world,
-        entity,
-        content_root,
-        session_id,
-        initial_cwd,
-        replay_bytes,
-    );
-}
-
-fn terminal_snapshot(world: &World, entity: Entity) -> Value {
-    let session_id = world
-        .get::<TerminalSession>(entity)
-        .map(|s| s.0)
-        .unwrap_or(0);
-    serde_json::json!({ "session_id": session_id })
-}
-
-fn terminal_on_close(world: &mut World, entity: Entity) {
-    if let Some(store) = world.get_resource::<TerminalStore>()
-        && let Some(data) = store.map.get(&entity)
-    {
-        data.worker.send(WorkerMsg::Shutdown);
-    }
-    if let Some(mut store) = world.get_resource_mut::<TerminalStore>() {
-        store.map.remove(&entity);
-    }
-    let session_id = world.get::<TerminalSession>(entity).map(|s| s.0);
-    if let Some(id) = session_id
-        && let Some(p) = scrollback_path(id)
-    {
-        let _ = std::fs::remove_file(&p);
-    }
-    world.resource_mut::<Projects>().terminals_dirty = true;
+    // Menu overlay camera — renders only `MENU_OVERLAY_LAYER` at a
+    // camera order far above any per-pane camera, so radial / context
+    // menus draw on top of every pane even when many panes are
+    // focused. `clear_color: None` keeps the underlying scene visible
+    // wherever the overlay has no geometry.
+    commands.spawn((
+        Camera2d,
+        bevy::camera::Camera {
+            order: MENU_OVERLAY_CAMERA_ORDER,
+            clear_color: bevy::camera::ClearColorConfig::None,
+            ..default()
+        },
+        bevy::camera::visibility::RenderLayers::layer(MENU_OVERLAY_LAYER),
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -1141,808 +853,6 @@ fn action_open_file(ctx: &mut actions::ActionCtx) {
         });
 }
 
-fn measure_cell_width(font_bytes: &[u8], font_size: f32) -> f32 {
-    use skrifa::instance::{LocationRef, Size};
-    use skrifa::{FontRef, MetadataProvider};
-    let font = FontRef::from_index(font_bytes, 0).expect("embedded font must parse");
-    let metrics = font.glyph_metrics(Size::new(font_size), LocationRef::default());
-    let gid = font.charmap().map('M').expect("font must contain 'M'");
-    metrics
-        .advance_width(gid)
-        .expect("'M' must have an advance width")
-}
-
-/// Exposed so callers can `.after(setup_camera_and_font)` their own
-/// startup systems that spawn terminals.
-///
-/// Note we deliberately do *not* call `CosmicFontSystem::load_system_fonts`
-/// — Text2d/cosmic-text isn't on the rendering path anymore (we draw
-/// glyphs from our own atlas), and loading every font on the system
-/// adds ~100ms of cold-start cost for nothing.
-pub fn setup_camera_and_font(world: &mut World) {
-    // Main camera explicitly on layer 0 — pane-bevy reserves layer 0
-    // for pane chrome + non-pane scene content, and uses layers 1.. for
-    // each per-pane camera. Making the main camera's layer explicit
-    // matches the contract documented in `pane-bevy/src/camera.rs`.
-    world.spawn((
-        Camera2d,
-        bevy::camera::visibility::RenderLayers::layer(0),
-    ));
-
-    // Menu overlay camera — renders only `MENU_OVERLAY_LAYER` at a
-    // camera order far above any per-pane camera, so radial / context
-    // menus draw on top of every pane even when many panes are
-    // focused. `clear_color: None` keeps the underlying scene visible
-    // wherever the overlay has no geometry.
-    world.spawn((
-        Camera2d,
-        bevy::camera::Camera {
-            order: MENU_OVERLAY_CAMERA_ORDER,
-            clear_color: bevy::camera::ClearColorConfig::None,
-            ..default()
-        },
-        bevy::camera::visibility::RenderLayers::layer(MENU_OVERLAY_LAYER),
-    ));
-
-    let font_bytes: &'static [u8] = load_primary_font();
-
-    let font_handle = world
-        .resource_mut::<Assets<Font>>()
-        .add(Font::try_from_bytes(font_bytes.to_vec()).expect("SFMono must parse"));
-    world.insert_resource(MonoFont(font_handle.clone()));
-    // pane-bevy uses this for chrome glyphs (close button, title text).
-    world.insert_resource(PaneFont(font_handle));
-
-    let cell_width = measure_cell_width(font_bytes, FONT_SIZE);
-    world.insert_resource(MonoMetrics { cell_width });
-    world.insert_resource(jim_pane::PaneFontMetrics {
-        cell_width,
-        font_size: FONT_SIZE,
-    });
-
-    // Build the glyph atlas now — pre-rasterizes printable ASCII so
-    // first-frame rendering doesn't pay for it. Needs mutable access
-    // to both `Assets<Image>` and `Assets<TextureAtlasLayout>` at the
-    // same time; `resource_scope` lifts one out so we can grab the other.
-    let atlas = world.resource_scope::<Assets<Image>, _>(|world, mut images| {
-        let mut layouts = world.resource_mut::<Assets<TextureAtlasLayout>>();
-        GlyphAtlas::new(
-            font_bytes,
-            FONT_SIZE,
-            cell_width,
-            LINE_HEIGHT,
-            &mut images,
-            &mut layouts,
-        )
-    });
-    world.insert_resource(atlas);
-
-    // Init the NonSend store once — spawners populate it per entity.
-    world.insert_resource(TerminalStore::default());
-}
-
-// ---------- Spawn ----------
-
-/// Create one terminal entity with its chrome + spawn a shell on its pty.
-/// Returns the entity so the caller can set focus, tweak z, etc.
-///
-/// `project_id` tags the terminal with `ProjectMembership` so the sidebar
-/// can group + show/hide it. It is REQUIRED: a terminal with no project
-/// leaks across every project (see `assert_pane_project_invariant`).
-///
-/// `session_id` is the persistence key — the worker logs raw pty bytes
-/// to `scrollback_path(session_id)` and on restart loads the same file
-/// back into a fresh Terminal via `replay_bytes`.
-pub fn spawn_terminal(
-    world: &mut World,
-    rect: PaneRect,
-    project_id: u64,
-    session_id: u64,
-    replay_bytes: Option<Vec<u8>>,
-) -> Entity {
-    let SpawnedPane {
-        entity: terminal_entity,
-        content_root,
-    } = spawn_pane(world, PANE_KIND, "Terminal", rect, Some(project_id));
-    let initial_cwd = world
-        .get_resource::<Projects>()
-        .and_then(|p| p.default_cwd_of(project_id).map(str::to_string));
-    populate_terminal_pane(
-        world,
-        terminal_entity,
-        content_root,
-        session_id,
-        initial_cwd,
-        replay_bytes,
-    );
-    terminal_entity
-}
-
-/// Insert terminal-specific components on an already-spawned pane, spawn
-/// its worker, and add the cursor child under `content_root`. Shared
-/// between `spawn_terminal` and the registry restore path.
-///
-/// `initial_cwd` overrides the daemon's default-to-$HOME behavior for
-/// this pane's shell. Used to honor a project's remembered
-/// `default_cwd` (populated by the inference layer). Only consulted
-/// when the daemon has to fork a fresh shell — attaching to an
-/// already-running daemon ignores it.
-fn populate_terminal_pane(
-    world: &mut World,
-    terminal_entity: Entity,
-    content_root: Entity,
-    session_id: u64,
-    initial_cwd: Option<String>,
-    replay_bytes: Option<Vec<u8>>,
-) {
-    let cell_width = world.resource::<MonoMetrics>().cell_width;
-    let rect = *world
-        .get::<PaneRect>(terminal_entity)
-        .expect("pane entity must already have PaneRect");
-    let (cols, rows) = grid_size_for_rect(rect.size, cell_width);
-
-    // Spawn the worker thread up front so the libghostty Terminal +
-    // Pty + render iterators all live on the worker side.
-    let wakeup = world
-        .get_resource::<bevy::winit::EventLoopProxyWrapper>()
-        .map(|w| bevy::winit::EventLoopProxy::clone(w));
-    let worker = WorkerHandle::spawn(
-        session_id,
-        default_shell_command(),
-        initial_cwd,
-        PtySize {
-            cols,
-            rows,
-            cell_width_px: cell_width as u16,
-            cell_height_px: LINE_HEIGHT as u16,
-        },
-        SCROLLBACK_LINES,
-        scrollback_path(session_id),
-        replay_bytes,
-        wakeup,
-    )
-    .expect("WorkerHandle::spawn");
-    let data = TerminalData { worker };
-
-    let cursor = world
-        .spawn((
-            ChildOf(content_root),
-            Sprite {
-                color: Color::srgba(0.55, 0.75, 0.95, 0.50),
-                custom_size: Some(Vec2::new(cell_width, LINE_HEIGHT)),
-                ..default()
-            },
-            Anchor::TOP_LEFT,
-            Transform::from_xyz(0.0, 0.0, 1.0),
-        ))
-        .id();
-
-    // Build the GPU grid for this terminal: one mesh + one cells texture +
-    // one material instance. `sync_grid` updates the cells texture
-    // texel-by-texel when the worker publishes a new snapshot.
-    let term_grid = build_term_grid(world, content_root, cell_width, cols, rows);
-
-    world.entity_mut(terminal_entity).insert((
-        TerminalRev::default(),
-        term_grid,
-        TerminalSelection::default(),
-        BellPulse::default(),
-        TerminalSession(session_id),
-        TerminalCursor(cursor),
-    ));
-
-    world
-        .get_resource_mut::<TerminalStore>()
-        .expect("TerminalStore resource (did setup_camera_and_font run?)")
-        .map
-        .insert(terminal_entity, data);
-}
-
-fn grid_size_for_rect(size: Vec2, cell_width: f32) -> (u16, u16) {
-    let content_w = (size.x - 2.0 * MARGIN).max(0.0);
-    let content_h = (size.y - TITLE_H - 2.0 * MARGIN).max(0.0);
-    let cols = ((content_w / cell_width).floor() as u16).max(1);
-    let rows = ((content_h / LINE_HEIGHT).floor() as u16).max(1);
-    (cols, rows)
-}
-
-/// Spawn the single quad+material that renders an entire terminal grid
-/// on the GPU. Returns the `TermGrid` component that goes on the pane
-/// entity; the render entity itself becomes a child of `content_root`.
-fn build_term_grid(
-    world: &mut World,
-    content_root: Entity,
-    cell_width: f32,
-    cols: u16,
-    rows: u16,
-) -> TermGrid {
-    // Snapshot atlas geometry up-front so we don't hold the resource
-    // borrow across the asset writes below.
-    let (atlas_cols, atlas_slot_w, atlas_slot_h, atlas_stride_w, atlas_stride_h, atlas_dim, atlas_image) = {
-        let atlas = world.resource::<GlyphAtlas>();
-        (
-            atlas.cols_per_row(),
-            atlas.slot_w(),
-            atlas.slot_h(),
-            atlas.stride_w(),
-            atlas.stride_h(),
-            atlas.dim(),
-            atlas.image.clone(),
-        )
-    };
-
-    // Initial background is the worker's default bg (matches what a
-    // freshly-spawned libghostty Terminal reports for unwritten cells).
-    let default_bg = pack_rgb(13, 15, 20);
-    let cells_image = make_cells_image(cols as u32, rows as u32, default_bg);
-    let cells_handle = world.resource_mut::<Assets<Image>>().add(cells_image);
-
-    let grid_w = cols as f32 * cell_width;
-    let grid_h = rows as f32 * LINE_HEIGHT;
-    let mesh_handle = world
-        .resource_mut::<Assets<Mesh>>()
-        .add(Mesh::from(Rectangle::new(grid_w, grid_h)));
-
-    let params = TermParams {
-        cols: cols as u32,
-        rows: rows as u32,
-        atlas_cols,
-        atlas_slot_w,
-        atlas_slot_h,
-        atlas_dim,
-        atlas_stride_w,
-        atlas_stride_h,
-    };
-    let material_handle = world.resource_mut::<Assets<TermMaterial>>().add(TermMaterial {
-        params,
-        atlas: atlas_image,
-        cells: cells_handle.clone(),
-    });
-
-    // `Rectangle` mesh is centered on its origin; shift it so top-left
-    // lands at the content_root origin (matches where the cursor sprite
-    // and the previous per-cell sprites lived).
-    //
-    // `Visibility::Inherited` is load-bearing: Bevy's 2D extract path
-    // queries `&ViewVisibility`, which only exists if `Visibility` (and
-    // its required `InheritedVisibility`/`ViewVisibility` companions)
-    // is on the entity. Without it the mesh silently never reaches the
-    // render world, the shader never runs, and the pane shows the chrome
-    // background through what looks like a blank quad.
-    let render_entity = world
-        .spawn((
-            ChildOf(content_root),
-            bevy::mesh::Mesh2d(mesh_handle.clone()),
-            bevy::sprite_render::MeshMaterial2d(material_handle.clone()),
-            Transform::from_xyz(grid_w * 0.5, -(grid_h * 0.5), 0.0),
-            Visibility::Inherited,
-        ))
-        .id();
-
-    TermGrid {
-        material: material_handle,
-        cells_image: cells_handle,
-        mesh: mesh_handle,
-        render_entity,
-        cols,
-        rows,
-        last_rendered_generation: 0,
-        was_visible: true,
-    }
-}
-
-// ---------- Resize ----------
-
-/// When a terminal's rect resolves to a different grid dimension than
-/// the worker's snapshot reports, send a `Resize` message. The worker
-/// applies it, the next snapshot reflects the new dims, and `sync_grid`
-/// resizes its sprite pools accordingly.
-fn handle_resize(
-    metrics: Res<MonoMetrics>,
-    store: Res<TerminalStore>,
-    rect_q: Query<(Entity, &PaneRect, &PaneKindMarker)>,
-) {
-    for (entity, rect, kind) in &rect_q {
-        if kind.0 != PANE_KIND {
-            continue;
-        }
-        let Some(data) = store.map.get(&entity) else {
-            continue;
-        };
-        let (cols, rows) = grid_size_for_rect(rect.size, metrics.cell_width);
-        let (snap_cols, snap_rows) = {
-            let g = data.worker.snapshot.lock().expect("snapshot lock");
-            (g.cols, g.rows)
-        };
-        if cols == snap_cols && rows == snap_rows {
-            continue;
-        }
-        data.worker.send(WorkerMsg::Resize {
-            cols,
-            rows,
-            cell_w_px: metrics.cell_width as u32,
-            cell_h_px: LINE_HEIGHT as u32,
-        });
-    }
-}
-
-// ---------- Keyboard ----------
-
-/// Translate Bevy key events to VT bytes for the focused terminal.
-///
-/// Direct mapping (not libghostty's key encoder) for v0 simplicity and
-/// to fix space/printable keys landing as `Key::Space` / `Key::Character`
-/// rather than going through an encoder path that requires a separate
-/// text stream.
-fn handle_keyboard(
-    mut events: MessageReader<KeyboardInput>,
-    mods: Res<ButtonInput<KeyCode>>,
-    focused: Res<FocusedPane>,
-    owner: Res<jim_pane::KeyboardOwner>,
-    store: Res<TerminalStore>,
-    kinds: Query<&PaneKindMarker>,
-    mut last_drop_reason: Local<Option<&'static str>>,
-) {
-    // Diagnostic: log on the *transition* into a drop reason whenever
-    // a real press event is being dropped. Logs once per reason-change
-    // (not per event) so a stuck-Cmd or dead-shell scenario surfaces
-    // exactly one stderr line, not a flood.
-    let buffered: Vec<KeyboardInput> = events.read().cloned().collect();
-    let any_press = buffered.iter().any(|e| e.state.is_pressed());
-    let mut report = |reason: &'static str| {
-        if any_press && last_drop_reason.as_deref() != Some(reason) {
-            eprintln!("[handle_keyboard] dropping key press: {reason}");
-            *last_drop_reason = Some(reason);
-        }
-    };
-    // Re-emit so the rest of the function can iterate buffered events
-    // without re-reading the channel.
-    let mut events_iter = buffered.iter();
-
-    // Skip unless the focused pane is a terminal.
-    let target_kind = focused.0.and_then(|e| kinds.get(e).ok());
-    if !matches!(target_kind, Some(k) if k.0 == PANE_KIND) {
-        report("focused pane is not a terminal");
-        return;
-    }
-    // Central keyboard ownership: a text modal (command palette, project
-    // rename) holds `KeyboardOwner::Modal`, so even though this terminal is
-    // still the focused pane, it must not consume keystrokes. (Subsumes the
-    // old explicit `Renaming` check.)
-    if matches!(focused.0, Some(t) if !owner.allows_pane(t)) {
-        report("keyboard owned by a text modal");
-        return;
-    }
-    let Some(target) = focused.0 else {
-        report("no focused pane");
-        return;
-    };
-    let Some(data) = store.map.get(&target) else {
-        report("focused pane has no terminal data");
-        return;
-    };
-    let child_alive = {
-        let g = data.worker.snapshot.lock().expect("snapshot lock");
-        g.child_alive
-    };
-    if !child_alive {
-        report("shell process has exited (child_alive=false)");
-        return;
-    }
-
-    let shift = mods.pressed(KeyCode::ShiftLeft) || mods.pressed(KeyCode::ShiftRight);
-    let ctrl = mods.pressed(KeyCode::ControlLeft) || mods.pressed(KeyCode::ControlRight);
-    let alt = mods.pressed(KeyCode::AltLeft) || mods.pressed(KeyCode::AltRight);
-    let cmd = mods.pressed(KeyCode::SuperLeft) || mods.pressed(KeyCode::SuperRight);
-
-    // Cmd-modified keys are owned by app-level handlers (copy/paste,
-    // future shortcuts). Skip routing them to the pty so Cmd+C doesn't
-    // also send "c" to the shell.
-    if cmd {
-        report("Cmd modifier held — see stuck-modifier note");
-        return;
-    }
-    // We made it past every gate. Clear any stale drop reason so the
-    // next drop transition logs again.
-    *last_drop_reason = None;
-
-    // For v0 we always emit xterm-style cursor-key escapes (CSI A/B/C/D);
-    // we don't have main-thread visibility into the worker's DECCKM mode.
-    // Most shells/readline work fine with these — apps that need SS3
-    // form (like vim in normal mode) will be addressed when we route
-    // mode bits through the snapshot.
-    let app_cursor = false;
-
-    let mut out: Vec<u8> = Vec::with_capacity(16);
-
-    for ev in events_iter.by_ref() {
-        if !ev.state.is_pressed() {
-            continue;
-        }
-
-        // Ctrl + printable letter → control byte (Ctrl+A = 0x01, etc.).
-        if ctrl && !alt {
-            if let KeyCode::KeyA
-            | KeyCode::KeyB
-            | KeyCode::KeyC
-            | KeyCode::KeyD
-            | KeyCode::KeyE
-            | KeyCode::KeyF
-            | KeyCode::KeyG
-            | KeyCode::KeyH
-            | KeyCode::KeyI
-            | KeyCode::KeyJ
-            | KeyCode::KeyK
-            | KeyCode::KeyL
-            | KeyCode::KeyM
-            | KeyCode::KeyN
-            | KeyCode::KeyO
-            | KeyCode::KeyP
-            | KeyCode::KeyQ
-            | KeyCode::KeyR
-            | KeyCode::KeyS
-            | KeyCode::KeyT
-            | KeyCode::KeyU
-            | KeyCode::KeyV
-            | KeyCode::KeyW
-            | KeyCode::KeyX
-            | KeyCode::KeyY
-            | KeyCode::KeyZ = ev.key_code
-            {
-                let b = keycode_to_ctrl_byte(ev.key_code);
-                out.push(b);
-                continue;
-            }
-        }
-
-        // Option+Left / Option+Right: send the readline word-jump
-        // bytes (ESC+b, ESC+f) instead of the regular arrow CSI. zsh,
-        // bash, fish, and friends all bind these to backward-word /
-        // forward-word, matching what macOS Terminal.app and iTerm2 do
-        // for Option+arrow. We do this *before* the named-key branch
-        // so the regular arrow encoding doesn't fire.
-        if alt
-            && matches!(ev.key_code, KeyCode::ArrowLeft | KeyCode::ArrowRight)
-        {
-            out.push(0x1b);
-            out.push(if matches!(ev.key_code, KeyCode::ArrowLeft) {
-                b'b'
-            } else {
-                b'f'
-            });
-            continue;
-        }
-
-        // Named keys we know the VT encoding for. Arrows / Home / End
-        // honor DECCKM.
-        if let Some(bytes) = named_key_bytes(&ev.key_code, app_cursor) {
-            // Option+Enter sends ESC+CR (the iTerm2-compatible "meta
-            // newline" convention). Shells / readline bind \e\r to
-            // self-insert-newline, so the user gets a literal LF in
-            // their command line instead of submitting it. Same trick
-            // Terminal.app's "Option-Enter inserts newline" uses.
-            //
-            // Option+Backspace sends ESC+0x7f, which readline/zle bind
-            // to `backward-kill-word`. Same meta-prefix convention as
-            // Option+Enter.
-            if alt
-                && matches!(
-                    ev.key_code,
-                    KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Backspace
-                )
-            {
-                out.push(0x1b);
-            }
-            out.extend_from_slice(bytes);
-            continue;
-        }
-
-        // Printable text via Bevy's logical_key.
-        match &ev.logical_key {
-            Key::Character(s) => {
-                let mut bytes: Vec<u8> = s.as_str().as_bytes().to_vec();
-                // Alt+letter sends ESC-prefixed byte (meta convention).
-                if alt && !ctrl {
-                    out.push(0x1b);
-                }
-                out.append(&mut bytes);
-            }
-            Key::Space => {
-                if alt && !ctrl {
-                    out.push(0x1b);
-                }
-                out.push(b' ');
-            }
-            _ => {
-                let _ = shift; // informational — most shifting already baked into Character.
-            }
-        }
-    }
-
-    if !out.is_empty() {
-        data.worker.send(WorkerMsg::Input(out));
-        // Real terminals snap the viewport back to the active region
-        // the moment you type — otherwise hitting Enter while scrolled
-        // up leaves you staring at history while your shell scrolls
-        // past below. Match that behavior.
-        data.worker.send(WorkerMsg::ScrollToBottom);
-    }
-}
-
-/// Route Finder/Files-app drag-drops onto a terminal pane: insert the
-/// dropped file's absolute path (POSIX single-quoted) into the pty,
-/// followed by a trailing space. Mirrors what Terminal.app and iTerm2
-/// do when you drag a file onto their window — Claude Code's prompt
-/// then sees the path as plain text and can read the image from disk.
-///
-/// Bevy fires one `DroppedFile` event per file, so multi-file drops
-/// land as space-separated tokens for free.
-fn handle_file_drop(
-    mut drops: MessageReader<bevy::window::FileDragAndDrop>,
-    windows: Query<&Window>,
-    viewport: Res<jim_pane::PaneViewport>,
-    store: Res<TerminalStore>,
-    panes: Query<(Entity, &PaneRect, &PaneKindMarker, Option<&Visibility>), With<PaneTag>>,
-    mut focused: ResMut<FocusedPane>,
-) {
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let cursor = window.cursor_position();
-
-    for ev in drops.read() {
-        let bevy::window::FileDragAndDrop::DroppedFile { path_buf, .. } = ev else {
-            continue;
-        };
-        let Some(pt) = cursor else {
-            // Drop arrived without a cursor sample (window not focused
-            // yet, or pointer left between drop start + finish). Without
-            // a cursor we can't pick a pane — skip rather than guess.
-            eprintln!(
-                "[file-drop] no cursor position — ignoring drop of {}",
-                path_buf.display()
-            );
-            continue;
-        };
-        let visible: Vec<(Entity, PaneRect)> = panes
-            .iter()
-            .filter(|(_, _, kind, vis)| {
-                kind.0 == PANE_KIND && !matches!(vis, Some(Visibility::Hidden))
-            })
-            .map(|(e, r, _, _)| (e, *r))
-            .collect();
-        let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &visible)
-        else {
-            eprintln!(
-                "[file-drop] no terminal under cursor — ignoring drop of {}",
-                path_buf.display()
-            );
-            continue;
-        };
-        let Some(data) = store.map.get(&target) else {
-            continue;
-        };
-
-        // Canonicalize to an absolute path so the receiving shell /
-        // Claude Code resolves the file regardless of its cwd. Fall
-        // back to the raw path if canonicalize fails (e.g., the source
-        // is a symlink the user wants preserved as-typed).
-        let abs = std::fs::canonicalize(path_buf).unwrap_or_else(|_| path_buf.clone());
-        let quoted = posix_single_quote(&abs.to_string_lossy());
-        let mut bytes = quoted.into_bytes();
-        bytes.push(b' ');
-        data.worker.send(WorkerMsg::Input(bytes));
-        data.worker.send(WorkerMsg::ScrollToBottom);
-        focused.0 = Some(target);
-    }
-}
-
-/// POSIX-safe shell quoting: wrap in single quotes; embed any literal
-/// `'` as `'\''` (close-quote, escaped quote, reopen-quote). Always
-/// safe regardless of the path's contents — spaces, $, *, !, newlines
-/// are all preserved literally by the shell.
-fn posix_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-fn keycode_to_ctrl_byte(code: KeyCode) -> u8 {
-    // Ctrl+A = 0x01 ... Ctrl+Z = 0x1a.
-    let base = match code {
-        KeyCode::KeyA => 1,
-        KeyCode::KeyB => 2,
-        KeyCode::KeyC => 3,
-        KeyCode::KeyD => 4,
-        KeyCode::KeyE => 5,
-        KeyCode::KeyF => 6,
-        KeyCode::KeyG => 7,
-        KeyCode::KeyH => 8,
-        KeyCode::KeyI => 9,
-        KeyCode::KeyJ => 10,
-        KeyCode::KeyK => 11,
-        KeyCode::KeyL => 12,
-        KeyCode::KeyM => 13,
-        KeyCode::KeyN => 14,
-        KeyCode::KeyO => 15,
-        KeyCode::KeyP => 16,
-        KeyCode::KeyQ => 17,
-        KeyCode::KeyR => 18,
-        KeyCode::KeyS => 19,
-        KeyCode::KeyT => 20,
-        KeyCode::KeyU => 21,
-        KeyCode::KeyV => 22,
-        KeyCode::KeyW => 23,
-        KeyCode::KeyX => 24,
-        KeyCode::KeyY => 25,
-        KeyCode::KeyZ => 26,
-        _ => 0,
-    };
-    base
-}
-
-fn named_key_bytes(code: &KeyCode, app_cursor: bool) -> Option<&'static [u8]> {
-    Some(match code {
-        KeyCode::Enter | KeyCode::NumpadEnter => b"\r",
-        KeyCode::Tab => b"\t",
-        KeyCode::Backspace => b"\x7f",
-        KeyCode::Escape => b"\x1b",
-        KeyCode::Delete => b"\x1b[3~",
-        KeyCode::Insert => b"\x1b[2~",
-        KeyCode::PageUp => b"\x1b[5~",
-        KeyCode::PageDown => b"\x1b[6~",
-        KeyCode::ArrowUp => {
-            if app_cursor {
-                b"\x1bOA"
-            } else {
-                b"\x1b[A"
-            }
-        }
-        KeyCode::ArrowDown => {
-            if app_cursor {
-                b"\x1bOB"
-            } else {
-                b"\x1b[B"
-            }
-        }
-        KeyCode::ArrowRight => {
-            if app_cursor {
-                b"\x1bOC"
-            } else {
-                b"\x1b[C"
-            }
-        }
-        KeyCode::ArrowLeft => {
-            if app_cursor {
-                b"\x1bOD"
-            } else {
-                b"\x1b[D"
-            }
-        }
-        KeyCode::Home => {
-            if app_cursor {
-                b"\x1bOH"
-            } else {
-                b"\x1b[H"
-            }
-        }
-        KeyCode::End => {
-            if app_cursor {
-                b"\x1bOF"
-            } else {
-                b"\x1b[F"
-            }
-        }
-        _ => return None,
-    })
-}
-
-// ---------- Mouse / chrome ----------
-
-/// Convert a window-space cursor position to a cell coord (col, row)
-/// inside the terminal at `rect`. The result is intentionally not
-/// clamped — the caller owns clipping to the actual grid bounds.
-pub fn pt_to_cell(pt: Vec2, rect: &PaneRect, cell_width: f32) -> (i32, i32) {
-    let local = jim_pane::pt_to_content_local(pt, rect);
-    let col = (local.x / cell_width).floor() as i32;
-    let row = (local.y / LINE_HEIGHT).floor() as i32;
-    (col, row)
-}
-
-/// Snapshot's `viewport_offset` for `entity`'s terminal, or 0 if the
-/// store doesn't know about it (e.g. mid-spawn).
-fn viewport_offset_of(store: &TerminalStore, entity: Entity) -> u64 {
-    let Some(data) = store.map.get(&entity) else {
-        return 0;
-    };
-    let g = data.worker.snapshot.lock().expect("snapshot lock");
-    g.viewport_offset
-}
-
-/// Promote a `(col, viewport_row)` cell to a `(col, absolute_row)`
-/// selection cell using a terminal's current `viewport_offset`. Done at
-/// click/drag time so the selection stays pinned to its content while
-/// the user scrolls (see [`TerminalSelection`]).
-fn promote_to_absolute(cell: (i32, i32), viewport_offset: u64) -> (i32, i64) {
-    (cell.0, viewport_offset as i64 + cell.1 as i64)
-}
-
-/// Start a selection drag inside a terminal pane in response to a
-/// pane-bevy content press event.
-fn handle_terminal_content_press(
-    mut presses: MessageReader<PaneContentPressed>,
-    metrics: Res<MonoMetrics>,
-    viewport: Res<jim_pane::PaneViewport>,
-    store: Res<TerminalStore>,
-    rects: Query<&PaneRect>,
-    kinds: Query<&PaneKindMarker>,
-    mut selections: Query<&mut TerminalSelection>,
-) {
-    for ev in presses.read() {
-        let Ok(kind) = kinds.get(ev.pane) else {
-            continue;
-        };
-        if kind.0 != PANE_KIND {
-            continue;
-        }
-        // Clear any other terminal's selection.
-        for mut sel in &mut selections {
-            sel.clear();
-        }
-        let Ok(rect) = rects.get(ev.pane) else { continue };
-        let viewport_cell =
-            pt_to_cell(viewport.window_to_canvas(ev.window_pt), rect, metrics.cell_width);
-        let cell = promote_to_absolute(viewport_cell, viewport_offset_of(&store, ev.pane));
-        if let Ok(mut sel) = selections.get_mut(ev.pane) {
-            sel.anchor = Some(cell);
-            sel.head = Some(cell);
-            sel.dragging = true;
-        }
-    }
-}
-
-/// Update the selection head while LMB is held; clear `dragging` on
-/// release. Mirrors editor-bevy's `handle_text_select_drag` shape.
-fn handle_terminal_selection_drag(
-    windows: Query<&Window>,
-    buttons: Res<ButtonInput<MouseButton>>,
-    metrics: Res<MonoMetrics>,
-    viewport: Res<jim_pane::PaneViewport>,
-    store: Res<TerminalStore>,
-    mut selections: Query<(Entity, &PaneRect, &PaneKindMarker, &mut TerminalSelection)>,
-) {
-    if buttons.just_released(MouseButton::Left) {
-        for (_, _, kind, mut sel) in &mut selections {
-            if kind.0 == PANE_KIND {
-                sel.dragging = false;
-            }
-        }
-        return;
-    }
-    if !buttons.pressed(MouseButton::Left) {
-        return;
-    }
-    let Ok(window) = windows.single() else { return };
-    let Some(pt) = window.cursor_position() else { return };
-    let pt_canvas = viewport.window_to_canvas(pt);
-
-    for (entity, rect, kind, mut sel) in &mut selections {
-        if kind.0 != PANE_KIND || !sel.dragging {
-            continue;
-        }
-        let viewport_cell = pt_to_cell(pt_canvas, rect, metrics.cell_width);
-        let cell = promote_to_absolute(viewport_cell, viewport_offset_of(&store, entity));
-        sel.head = Some(cell);
-    }
-}
 
 /// Mouse-wheel scrolls the terminal under the cursor (in the active
 /// project). Pixel-mode events (trackpads) accumulate a fractional line
@@ -2321,359 +1231,6 @@ fn sync_dock_badge(
 
 #[cfg(not(target_os = "macos"))]
 fn sync_dock_badge(_projects: Res<Projects>, _last: Local<u64>) {}
-
-fn sync_grid(
-    metrics: Res<MonoMetrics>,
-    theme: Res<jim_style::Theme>,
-    themes: Res<jim_style::ProjectThemes>,
-    mut atlas: ResMut<GlyphAtlas>,
-    mut images: ResMut<Assets<Image>>,
-    mut layouts: ResMut<Assets<TextureAtlasLayout>>,
-    mut materials: ResMut<Assets<TermMaterial>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    store: Res<TerminalStore>,
-    mut terminals: Query<
-        (
-            Entity,
-            &TerminalCursor,
-            &mut TermGrid,
-            &PaneKindMarker,
-            &Visibility,
-            Option<&jim_pane::PaneProject>,
-        ),
-        With<PaneTag>,
-    >,
-    mut transform_q: Query<&mut Transform>,
-    mut vis_q: Query<&mut Visibility, Without<TermGrid>>,
-    mut prof: Local<SyncGridProfile>,
-) {
-    use std::time::Instant;
-    let frame_start = Instant::now();
-
-    // Theme-driven defaults, substituted in below for any cell whose fg
-    // or bg matches libghostty's reported `default_fg/default_bg` (plain
-    // text the shell didn't color). Resolved PER PANE from its project's
-    // theme so each terminal reads in its own project's palette (a paper
-    // project gives ink-on-cream, a terminal project phosphor-on-black),
-    // including all faces in the cube overview. These globals are the
-    // fallback for panes with no project theme cached.
-    let global_default_fg = lin_to_rgb_bytes(theme.color(jim_style::tokens::FG));
-    let global_default_bg = lin_to_rgb_bytes(theme.color(jim_style::tokens::BG));
-    let theme_changed = theme.is_changed() || themes.is_changed();
-
-    let mut local_cells: Vec<SnapCell> = Vec::new();
-    let mut local_dirty_rows: Vec<bool> = Vec::new();
-
-    let mut work_done = false;
-    let mut lock_ns: u128 = 0;
-    let mut mutate_ns: u128 = 0;
-    let mut cells_touched = 0u64;
-
-    // Scratch reused across terminals: avoids per-frame allocation in
-    // the dirty-row hot path.
-    let mut pending_writes: Vec<(usize, GpuCell)> = Vec::new();
-
-    for (entity, cursor_marker, mut grid, kind, vis, proj) in &mut terminals {
-        // Per-pane theme defaults: this terminal's project theme if known,
-        // else the global (active) theme.
-        let (theme_default_fg, theme_default_bg) = proj
-            .and_then(|p| themes.get(p.0))
-            .map(|t| {
-                (
-                    lin_to_rgb_bytes(t.color(jim_style::tokens::FG)),
-                    lin_to_rgb_bytes(t.color(jim_style::tokens::BG)),
-                )
-            })
-            .unwrap_or((global_default_fg, global_default_bg));
-        if kind.0 != PANE_KIND {
-            continue;
-        }
-        let _prof = jim_pane::prof::pane_span(entity.to_bits(), "terminal");
-        let Some(data) = store.map.get(&entity) else {
-            continue;
-        };
-
-        // Propagate this pane's visibility to the worker so it skips the
-        // 60Hz Bevy wake while the user isn't looking. The worker keeps
-        // processing pty bytes either way — the libghostty terminal
-        // state stays correct — but inactive-project panes contribute
-        // zero to per-frame schedule cost.
-        let is_hidden = matches!(vis, Visibility::Hidden);
-        data.worker
-            .visible
-            .store(!is_hidden, std::sync::atomic::Ordering::Relaxed);
-        if is_hidden {
-            grid.was_visible = false;
-            continue;
-        }
-        // First frame after un-hide: libghostty's dirty_rows only reflect
-        // changes SINCE the last publish, but the worker has been
-        // publishing all along without us reading. Force a full repaint
-        // to bring the cells texture up to the current grid state.
-        let just_shown = !grid.was_visible;
-        grid.was_visible = true;
-
-        // Lock briefly, copy snapshot fields into locals, drop lock.
-        let lock_t = Instant::now();
-        let (cols, rows, default_fg, default_bg, cursor, generation) = {
-            let g = data.worker.snapshot.lock().expect("snapshot lock");
-            local_cells.clear();
-            local_cells.extend_from_slice(&g.cells);
-            local_dirty_rows.clear();
-            local_dirty_rows.extend_from_slice(&g.dirty_rows);
-            (
-                g.cols,
-                g.rows,
-                g.default_fg,
-                g.default_bg,
-                g.cursor,
-                g.generation,
-            )
-        };
-        lock_ns += lock_t.elapsed().as_nanos();
-
-        // Cursor — compare-before-write to avoid spurious Changed.
-        let cursor_entity = cursor_marker.0;
-        if let Ok(mut v) = vis_q.get_mut(cursor_entity) {
-            let want = if cursor.is_some() {
-                Visibility::Inherited
-            } else {
-                Visibility::Hidden
-            };
-            if *v != want {
-                *v = want;
-            }
-        }
-        if let Some((cx, cy)) = cursor {
-            if let Ok(mut t) = transform_q.get_mut(cursor_entity) {
-                let wx = cx as f32 * metrics.cell_width;
-                let wy = -(cy as f32) * LINE_HEIGHT;
-                let wz = 1.0;
-                if t.translation.x != wx
-                    || t.translation.y != wy
-                    || t.translation.z != wz
-                {
-                    t.translation.x = wx;
-                    t.translation.y = wy;
-                    t.translation.z = wz;
-                }
-            }
-        }
-
-        let pool_changed = grid.cols != cols || grid.rows != rows;
-        let nothing_changed = !pool_changed
-            && !just_shown
-            && !theme_changed
-            && grid.last_rendered_generation == generation;
-        if nothing_changed {
-            continue;
-        }
-        work_done = true;
-        let mutate_t = Instant::now();
-
-        // Resize the GPU grid: replace the cells image + mesh + uniform
-        // params. Cheap because there's only one of each per terminal.
-        if pool_changed {
-            let bg_packed = pack_rgb(
-                theme_default_bg.0,
-                theme_default_bg.1,
-                theme_default_bg.2,
-            );
-            // Replace cells image in place — keep the same Handle so the
-            // material doesn't need rebinding.
-            if let Some(img) = images.get_mut(&grid.cells_image) {
-                *img = make_cells_image(cols as u32, rows as u32, bg_packed);
-            }
-            // Replace mesh contents (same handle stays bound).
-            let grid_w = cols as f32 * metrics.cell_width;
-            let grid_h = rows as f32 * LINE_HEIGHT;
-            if let Some(mesh) = meshes.get_mut(&grid.mesh) {
-                *mesh = Mesh::from(Rectangle::new(grid_w, grid_h));
-            }
-            if let Some(mat) = materials.get_mut(&grid.material) {
-                mat.params.cols = cols as u32;
-                mat.params.rows = rows as u32;
-            }
-            if let Ok(mut t) = transform_q.get_mut(grid.render_entity) {
-                t.translation.x = grid_w * 0.5;
-                t.translation.y = -(grid_h * 0.5);
-            }
-            grid.cols = cols;
-            grid.rows = rows;
-        }
-
-        // Pass 1: resolve glyph indices and collect (idx, GpuCell) for
-        // every dirty cell. Atlas lookups borrow `images` mutably (atlas
-        // may insert a new glyph and re-upload), so we can't hold a
-        // `Image::get_mut(cells_image)` borrow at the same time. Two
-        // passes keeps the borrow checker happy and lets us compare
-        // existing-vs-new in pass 2.
-        pending_writes.clear();
-        let force_all = pool_changed || just_shown || theme_changed;
-        for r in 0..rows as usize {
-            let row_dirty = force_all
-                || local_dirty_rows.get(r).copied().unwrap_or(true);
-            if !row_dirty {
-                continue;
-            }
-            let row_base = r * cols as usize;
-            for c in 0..cols as usize {
-                let idx = row_base + c;
-                let cell = match local_cells.get(idx) {
-                    Some(c) => *c,
-                    None => continue,
-                };
-                let (final_fg, final_bg) = if cell.inverse {
-                    (cell.bg, cell.fg)
-                } else {
-                    (cell.fg, cell.bg)
-                };
-                // Substitute theme defaults for cells the shell didn't
-                // color explicitly. libghostty has already filled in
-                // its own palette default at the worker; we recognize
-                // it by exact-equal byte match and swap in the theme
-                // color instead. False positives (shell explicitly set
-                // a color that happens to equal libghostty's default)
-                // are visually identical to the user's intent, since
-                // the theme picks "the same color the shell would've
-                // shown" anyway.
-                let theme_fg =
-                    if final_fg.r == default_fg.r
-                        && final_fg.g == default_fg.g
-                        && final_fg.b == default_fg.b
-                    {
-                        theme_default_fg
-                    } else {
-                        (final_fg.r, final_fg.g, final_fg.b)
-                    };
-                let theme_bg =
-                    if final_bg.r == default_bg.r
-                        && final_bg.g == default_bg.g
-                        && final_bg.b == default_bg.b
-                    {
-                        theme_default_bg
-                    } else {
-                        (final_bg.r, final_bg.g, final_bg.b)
-                    };
-                let glyph_index =
-                    atlas.lookup_or_insert(cell.ch, &mut images, &mut layouts);
-                let gpu = GpuCell {
-                    glyph_index,
-                    fg_packed: pack_rgb(theme_fg.0, theme_fg.1, theme_fg.2),
-                    bg_packed: pack_rgb(theme_bg.0, theme_bg.1, theme_bg.2),
-                    flags: 0,
-                };
-                pending_writes.push((idx, gpu));
-                cells_touched += 1;
-            }
-        }
-
-        // Pass 2: filter no-op writes (cells whose state didn't change)
-        // by reading from the current cells image, then mutate it in one
-        // go. Reading via `Assets::get` doesn't mark the asset Changed —
-        // important so we don't re-upload the texture every frame when
-        // libghostty flagged a row dirty but no visible state moved.
-        if pending_writes.is_empty() {
-            grid.last_rendered_generation = generation;
-            mutate_ns += mutate_t.elapsed().as_nanos();
-            continue;
-        }
-        let mut needs_upload = false;
-        {
-            let current = images
-                .get(&grid.cells_image)
-                .expect("cells image must be alive");
-            let current_cells: &[GpuCell] = bytemuck::cast_slice(
-                current
-                    .data
-                    .as_ref()
-                    .expect("cells image must have CPU data")
-                    .as_slice(),
-            );
-            for (idx, new_cell) in &pending_writes {
-                if current_cells
-                    .get(*idx)
-                    .map_or(true, |existing| existing != new_cell)
-                {
-                    needs_upload = true;
-                    break;
-                }
-            }
-        }
-        if needs_upload {
-            if let Some(img) = images.get_mut(&grid.cells_image) {
-                let dst: &mut [GpuCell] = bytemuck::cast_slice_mut(
-                    img.data
-                        .as_mut()
-                        .expect("cells image must have CPU data"),
-                );
-                for (idx, new_cell) in &pending_writes {
-                    if let Some(slot) = dst.get_mut(*idx) {
-                        if slot != new_cell {
-                            *slot = *new_cell;
-                        }
-                    }
-                }
-            }
-            // Mutating the cells image alone re-extracts the GpuImage with
-            // a fresh wgpu texture, but the material's bind group still
-            // caches the OLD texture view — so without poking the material
-            // too, the shader keeps sampling the pre-modification upload.
-            // (Bevy's own tilemap_chunk material follows this same pattern;
-            // see `bevy_sprite_render::tilemap_chunk::update_chunk` —
-            // `materials.get_mut(material.id())` is the load-bearing line.)
-            let _ = materials.get_mut(&grid.material);
-        }
-
-        grid.last_rendered_generation = generation;
-        mutate_ns += mutate_t.elapsed().as_nanos();
-    }
-    if work_done && std::env::var("TERMINAL_PROFILE").is_ok() {
-        prof.frames += 1;
-        prof.frame_ns += frame_start.elapsed().as_nanos();
-        prof.lock_ns += lock_ns;
-        prof.mutate_ns += mutate_ns;
-        prof.cells += cells_touched;
-        if prof.frames >= 30 {
-            eprintln!(
-                "[render] {} frames | avg frame {:>5.2} ms | lock {:>4.2} ms | mutate {:>4.2} ms | {:>5.0} cells/frame",
-                prof.frames,
-                (prof.frame_ns as f64 / 1_000_000.0) / prof.frames as f64,
-                (prof.lock_ns as f64 / 1_000_000.0) / prof.frames as f64,
-                (prof.mutate_ns as f64 / 1_000_000.0) / prof.frames as f64,
-                prof.cells as f64 / prof.frames as f64,
-            );
-            *prof = SyncGridProfile::default();
-        }
-    }
-}
-
-#[derive(Default)]
-struct SyncGridProfile {
-    frames: u64,
-    frame_ns: u128,
-    lock_ns: u128,
-    mutate_ns: u128,
-    cells: u64,
-}
-
-// ---------- helpers ----------
-
-fn rgb_to_color(c: RgbColor) -> Color {
-    Color::srgb(c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0)
-}
-
-/// Linear-RGB theme color → (r, g, b) byte triple in sRGB space, the
-/// format libghostty + `pack_rgb` use. Used by `sync_grid` to convert
-/// theme tokens before stuffing them into per-cell colors.
-fn lin_to_rgb_bytes(c: bevy::color::LinearRgba) -> (u8, u8, u8) {
-    let srgb = Color::LinearRgba(c).to_srgba();
-    (
-        (srgb.red.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (srgb.green.clamp(0.0, 1.0) * 255.0).round() as u8,
-        (srgb.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
-    )
-}
 
 // ---------- style-bevy glue ----------
 

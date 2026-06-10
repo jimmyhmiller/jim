@@ -3546,15 +3546,10 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 name = "jim_app"
 version = "0.1.0"
 dependencies = [
- "arboard",
  "bevy",
- "bincode",
  "block2 0.5.1",
- "bytemuck",
  "claude-bus",
  "claude-bus-bevy",
- "core-foundation 0.10.1",
- "core-text",
  "editor_core",
  "image",
  "jim_daemon",
@@ -3562,6 +3557,7 @@ dependencies = [
  "jim_inference",
  "jim_pane",
  "jim_style",
+ "jim_terminal",
  "jim_widget",
  "libc",
  "libghostty-vt",
@@ -3574,8 +3570,6 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
- "skrifa 0.39.0",
- "swash",
  "tempfile",
 ]
 
@@ -3658,6 +3652,31 @@ dependencies = [
  "rhai",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "jim_terminal"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "bevy",
+ "bincode",
+ "bytemuck",
+ "claude-bus",
+ "core-foundation 0.10.1",
+ "core-text",
+ "jim_daemon",
+ "jim_pane",
+ "jim_style",
+ "libc",
+ "libghostty-vt",
+ "nix 0.31.2",
+ "objc2 0.5.2",
+ "objc2-foundation 0.2.2",
+ "serde",
+ "serde_json",
+ "skrifa 0.39.0",
+ "swash",
 ]
 
 [[package]]

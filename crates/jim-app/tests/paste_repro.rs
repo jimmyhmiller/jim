@@ -11,8 +11,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use jim_app::pty::PtySize;
-use jim_app::worker::{WorkerHandle, WorkerMsg};
+use jim_terminal::pty::PtySize;
+use jim_terminal::worker::{WorkerHandle, WorkerMsg};
 
 const SIZE: PtySize = PtySize {
     cols: 80,
@@ -52,7 +52,7 @@ fn keystroke_after_large_paste_reaches_pty() {
     let session = common::random_session_id();
     let handle = WorkerHandle::spawn(
         session,
-        jim_app::default_shell_command(),
+        jim_terminal::default_shell_command(),
         None,
         SIZE,
         1000,
@@ -100,7 +100,7 @@ fn keystroke_after_100_line_paste_reaches_pty() {
     let session = common::random_session_id();
     let handle = WorkerHandle::spawn(
         session,
-        jim_app::default_shell_command(),
+        jim_terminal::default_shell_command(),
         None,
         SIZE,
         1000,

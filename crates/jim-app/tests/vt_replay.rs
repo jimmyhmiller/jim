@@ -13,7 +13,7 @@
 //! reproducing the sequence that crashed. The bar is: the terminal
 //! should swallow arbitrary bytes without killing the process.
 
-use jim_app::vt::{self, CellPx};
+use jim_terminal::vt::{self, CellPx};
 
 const CELL_PX: CellPx = CellPx {
     width: 8,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/glaze", "crates/editor-core", "crates/jim-editor", "crates/jim-pane", "crates/jim-style", "crates/jim-app", "crates/jim-daemon", "crates/jim-widget", "crates/claude-bus", "crates/claude-bus-bevy", "crates/claude-statusline-bridge", "crates/claude-context-bars", "crates/claude-event-logger", "crates/claude-queue-drain", "crates/jim-inference", "crates/diff-core", "crates/jim-diff", "crates/jimctl"]
+members = ["crates/glaze", "crates/editor-core", "crates/jim-editor", "crates/jim-pane", "crates/jim-style", "crates/jim-app", "crates/jim-terminal", "crates/jim-daemon", "crates/jim-widget", "crates/claude-bus", "crates/claude-bus-bevy", "crates/claude-statusline-bridge", "crates/claude-context-bars", "crates/claude-event-logger", "crates/claude-queue-drain", "crates/jim-inference", "crates/diff-core", "crates/jim-diff", "crates/jimctl"]
 
 [workspace.package]
 license = "MIT"

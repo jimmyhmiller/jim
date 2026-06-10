@@ -17,8 +17,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use jim_app::daemon_client::DaemonClient;
-use jim_app::daemon_proto::DaemonMessage;
+use jim_terminal::daemon_client::DaemonClient;
+use jim_terminal::daemon_proto::DaemonMessage;
 
 /// Drain frames into a Vec for up to `timeout`.
 fn drain_for(
@@ -105,7 +105,7 @@ fn reattach_replays_history() {
     assert!(!c1.attached_existing);
 
     // Write something into the child via Input; cat echoes it back.
-    c1.send(&jim_app::daemon_proto::ClientMessage::Input(
+    c1.send(&jim_terminal::daemon_proto::ClientMessage::Input(
         b"hello-replay\n".to_vec(),
     ));
     c1.try_flush();
@@ -151,7 +151,7 @@ fn reattach_replays_history() {
     );
 
     // Kill so the test doesn't leave a daemon running.
-    c2.send(&jim_app::daemon_proto::ClientMessage::Kill);
+    c2.send(&jim_terminal::daemon_proto::ClientMessage::Kill);
     c2.try_flush();
     std::thread::sleep(Duration::from_millis(200));
 }

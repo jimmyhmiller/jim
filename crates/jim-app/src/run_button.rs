@@ -50,7 +50,7 @@ use jim_pane::{
 use serde_json::Value;
 
 use crate::projects::Projects;
-use crate::{MonoFont, MonoMetrics, FONT_SIZE};
+use jim_terminal::{MonoFont, MonoMetrics, FONT_SIZE};
 
 pub const PANE_KIND: &str = "run-button";
 
