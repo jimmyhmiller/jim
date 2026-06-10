@@ -13,5 +13,5 @@ may be used for any purpose. We credit SpiderDave here anyway, per the
 author's note on the source page ("If you want to credit me anyway,
 credit me as 'SpiderDave' or maybe link to this page").
 
-This is a copy of `crates/terminal-bevy/assets/garden/plants.png`, used by
+This is a copy of `crates/jim-app/assets/garden/plants.png`, used by
 the Rhai garden widget via the `widget_asset("garden/plants.png")` helper.

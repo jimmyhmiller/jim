@@ -7,7 +7,7 @@ Claude Code session as `<channel source="terminal-bevy-inbox">` tags.
 
 1. terminal-bevy's GUI maintains a per-project inbox at
    `~/.jim/inbox/<project_id>.jsonl`. Messages arrive via
-   `tbinbox` (CLI), inter-project sends, or any external POST.
+   `jimctl inbox` (CLI), inter-project sends, or any external POST.
 2. When the user clicks "Send to Claude" on a message in the Inbox
    pane, the message is appended to
    `~/.jim/claude-outbox/<project_id>.jsonl`.
@@ -71,9 +71,9 @@ claude --dangerously-load-development-channels server:terminal-bevy-inbox
 From a terminal:
 
 ```bash
-tbinbox --body "deploy finished"
-tbinbox --project alpha --sender ci --subject "build" --body "$(curl ...)"
-echo "stdin body works too" | tbinbox --project alpha
+jimctl inbox --body "deploy finished"
+jimctl inbox --project alpha --sender ci --subject "build" --body "$(curl ...)"
+echo "stdin body works too" | jimctl inbox --project alpha
 ```
 
 From any tool that can open a Unix socket: connect to

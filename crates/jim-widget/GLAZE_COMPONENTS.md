@@ -454,11 +454,11 @@ dedicated `RenderLayers`, with outside-click dismissal and a z-stack. This is th
 lift; each dependent is then cheap and slot-styled.
 
 **SUBSTRATE DONE (2026-06-09) — and the first consumer (`Select`) ships.** Key finding:
-the floating substrate already existed — terminal-bevy's `MENU_OVERLAY_LAYER` (32) + an
+the floating substrate already existed — jim-app's `MENU_OVERLAY_LAYER` (32) + an
 order-100,000 camera (used by the drawer / radial / context menu). Phase 3 is a *portal*:
 widget Elements render their floating part onto that layer via the EXISTING render path.
 - `WidgetOverlayLayer(usize)` resource (default 32) — the host reserves the layer +
-  provides the camera (terminal-bevy already does; the snapshot tool now does too).
+  provides the camera (jim-app already does; the snapshot tool now does too).
 - Open state is **host-owned** (`WidgetOpenSelect` resource, one at a time) — the widget
   only tracks `value`. `ClickKind::SelectTrigger` toggles it (no widget event).
 - `render_select_overlay` spawns a `WidgetOverlayRoot` at the trigger anchor converted
@@ -522,7 +522,7 @@ glaze tests.** Remaining doc components are thin variants: **Menu** (Select-path
 in a circle), `Image` (inline flow — lift the Canvas sprite texture path), `Spinner`
 (indeterminate; `on_frame` rotation), `Skeleton` (shimmer = Glaze shader slot),
 `SegmentedControl` (`Tabs` semantics as a control), `Breadcrumb`, `Pagination`,
-`Command palette` (ties into the existing suggestion-drawer / `tbsuggest` infra),
+`Command palette` (ties into the existing suggestion-drawer / `jimctl suggest` infra),
 `Resizable`/`Splitter`.
 
 ---

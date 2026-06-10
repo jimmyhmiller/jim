@@ -4,7 +4,7 @@ Status: **tilt + glass reverted.** Known-good baseline restored (see below).
 This documents what was attempted, why each approach failed, and the
 fundamental tensions, so the next attempt doesn't re-walk the same wall.
 
-The "cube" is `crates/terminal-bevy/src/cube.rs` — the Compiz-style 3D
+The "cube" is `crates/jim-app/src/cube.rs` — the Compiz-style 3D
 project overview. It is an **N-sided ring** (one vertical face per
 switchable project), NOT a literal cube. That distinction is the root of
 most of the trouble below.

@@ -5,7 +5,7 @@
 
 ## Why a language (not a data schema)
 
-The current styling model is **inline `Style` structs per `Element`** (`widget-bevy/src/protocol.rs`):
+The current styling model is **inline `Style` structs per `Element`** (`jim-widget/src/protocol.rs`):
 no reuse, no states, no variants, no inheritance, and "hover/focus" is hardcoded
 procedurally in `render.rs`. We already produce styles *programmatically* (the Rhai
 `render()` handler computes `Style` every frame) — so we're effectively living in
@@ -40,7 +40,7 @@ lex → parse → resolve(tokens/variants/env)
 ```
 
 The generated WGSL drops straight into the existing `DynamicMaterial` /
-`UserBuffer` naga-introspection path in `style-bevy/src/dynamic.rs` (the host already
+`UserBuffer` naga-introspection path in `jim-style/src/dynamic.rs` (the host already
 parses a `struct UserData{}`, learns field→offset, and binds by name via
 `uniform_set`). So for own-quad shader layers there is **almost no new GPU plumbing** —
 the net-new runtime work is per-element material instancing + draw-call keying.
@@ -153,10 +153,10 @@ engine-fed dynamic inputs for the dust shader; here they're bound per element.
 
 - New crate **`crates/glaze`** — pure compiler (lex/parse/typecheck/stage/lower → IR +
   WGSL). No Bevy, mirrors how `editor-core` is pure logic. Unit-testable in isolation.
-- **`style-bevy`** loads `*.glz` files, holds a `CompiledStyleSet`, hot-reloads on save
+- **`jim-style`** loads `*.glz` files, holds a `CompiledStyleSet`, hot-reloads on save
   (recompile → swap material shader handles + rebind uniforms). Generated WGSL feeds the
   existing `DynamicMaterial`.
-- **`widget-bevy`** `Element`s reference a style by name + pass variant/attrs:
+- **`jim-widget`** `Element`s reference a style by name + pass variant/attrs:
   `style: "button"`, `variant: { intent: "primary" }`. Inline `Style` stays as an
   escape hatch (highest precedence). The renderer's resolution step consumes the
   `CompiledStyle` (chooses the discrete-state plan, paints the layer-plan, instantiates
@@ -178,7 +178,7 @@ no cascade arithmetic.
 
 0. **Skeleton** — `crates/glaze`: lexer + parser → AST + golden tests. No semantics yet.
 1. **Static styles** — token resolution (3-tier) + type-check + static-only layer-plan IR
-   (`fill/border/shadow/radius/pad`, no shaders). Wire into the `widget-bevy` renderer:
+   (`fill/border/shadow/radius/pad`, no shaders). Wire into the `jim-widget` renderer:
    `Element.style: "name"` resolves to a `CompiledStyle`. *Delivers reuse + live retuning
    for ordinary styles — a real win on its own.*
 2. **Variants + discrete states** — variant params + `:hover/:focus/:selected` plans.

@@ -102,7 +102,7 @@ fn on_message(topic, payload, sender) {
 Delivery is **pushed** — the host wakes your worker and calls
 `on_message` directly. You do **not** need `set_animating` / `on_frame`;
 the bus is fully event-driven. `sender` is the publishing widget's id
-(`"tbmsg"` for the CLI); compare it to `my_id()` to skip your own
+(`"jimctl msg"` for the CLI); compare it to `my_id()` to skip your own
 messages, or use it to address a targeted reply (e.g. a topic naming the
 sender).
 
@@ -127,17 +127,17 @@ Same model over NDJSON: publish with `WidgetMsg::Emit { topic, payload,
 retain }` on stdout; receive `HostEvent::Message { topic, payload,
 sender }` on stdin.
 
-### From the shell — `tbmsg`
+### From the shell — `jimctl msg`
 
 ```sh
-tbmsg emit --project datalog-db --topic sql.run --json '{"sql":"select 1"}'
-tbmsg emit --project datalog-db --topic conn.state --json '{"ok":true}' --retain
-tbmsg tail --project datalog-db        # follow the bus live (one JSON line each)
+jimctl msg emit --project datalog-db --topic sql.run --json '{"sql":"select 1"}'
+jimctl msg emit --project datalog-db --topic conn.state --json '{"ok":true}' --retain
+jimctl msg tail --project datalog-db        # follow the bus live (one JSON line each)
 ```
 
 Handy for driving a widget from a `proc_spawn`ed child or verifying flow
 without the GUI. `--project` takes a project name or `active`. Messages
-from the CLI arrive with `sender = "tbmsg"`.
+from the CLI arrive with `sender = "jimctl msg"`.
 
 ### Suggested topic conventions
 
