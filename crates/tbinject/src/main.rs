@@ -214,7 +214,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let Some(sock) = terminal_daemon::inject_socket_path(session) else {
+    let Some(sock) = jim_daemon::inject_socket_path(session) else {
         eprintln!("tbinject: HOME unset, can't locate socket");
         return ExitCode::from(1);
     };

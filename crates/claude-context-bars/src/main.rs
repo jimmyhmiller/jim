@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
-use widget_bevy::protocol::{Align, Element, HostEvent, Weight, WidgetMsg};
+use jim_widget::protocol::{Align, Element, HostEvent, Weight, WidgetMsg};
 
 /// How often we redraw. Claude Code's statusLine fires every ~300ms,
 /// so 500ms gives us at-most-one-frame lag on changes without spinning.

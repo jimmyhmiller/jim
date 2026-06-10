@@ -2105,10 +2105,10 @@ dependencies = [
 name = "claude-context-bars"
 version = "0.1.0"
 dependencies = [
+ "jim_widget",
  "libc",
  "serde",
  "serde_json",
- "widget_bevy",
 ]
 
 [[package]]
@@ -2528,20 +2528,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "diff_bevy"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "diff_core",
- "editor_bevy",
- "pane_bevy",
- "ropey",
- "serde",
- "serde_json",
- "style_bevy",
-]
-
-[[package]]
 name = "diff_core"
 version = "0.1.0"
 dependencies = [
@@ -2624,26 +2610,6 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
-
-[[package]]
-name = "editor_bevy"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "bevy",
- "editor_core",
- "objc2 0.5.2",
- "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
- "pane_bevy",
- "ropey",
- "serde",
- "serde_json",
- "skrifa 0.39.0",
- "style_bevy",
- "tree-sitter",
- "tree-sitter-rust",
-]
 
 [[package]]
 name = "editor_core"
@@ -3500,16 +3466,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inference_bevy"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
- "ureq",
-]
-
-[[package]]
 name = "inflections"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3585,6 +3541,145 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jim_app"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "bevy",
+ "bincode",
+ "block2 0.5.1",
+ "bytemuck",
+ "claude-bus",
+ "claude-bus-bevy",
+ "core-foundation 0.10.1",
+ "core-text",
+ "editor_core",
+ "image",
+ "jim_daemon",
+ "jim_editor",
+ "jim_inference",
+ "jim_pane",
+ "jim_style",
+ "jim_widget",
+ "libc",
+ "libghostty-vt",
+ "nix 0.31.2",
+ "notify",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "rfd",
+ "rhai",
+ "serde",
+ "serde_json",
+ "skrifa 0.39.0",
+ "swash",
+ "tempfile",
+]
+
+[[package]]
+name = "jim_daemon"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "libc",
+ "nix 0.31.2",
+ "serde",
+]
+
+[[package]]
+name = "jim_diff"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "diff_core",
+ "jim_editor",
+ "jim_pane",
+ "jim_style",
+ "ropey",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jim_editor"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "bevy",
+ "editor_core",
+ "jim_pane",
+ "jim_style",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "ropey",
+ "serde",
+ "serde_json",
+ "skrifa 0.39.0",
+ "tree-sitter",
+ "tree-sitter-rust",
+]
+
+[[package]]
+name = "jim_inference"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+]
+
+[[package]]
+name = "jim_pane"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "bevy",
+ "editor_core",
+ "ropey",
+ "serde",
+ "serde_json",
+ "skrifa 0.39.0",
+]
+
+[[package]]
+name = "jim_style"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "bytemuck",
+ "jim_pane",
+ "naga",
+ "notify",
+ "rhai",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "jim_widget"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "clap",
+ "claude-bus-bevy",
+ "glaze",
+ "image",
+ "jim_editor",
+ "jim_inference",
+ "jim_pane",
+ "jim_style",
+ "notify",
+ "rhai",
+ "schemars",
+ "serde",
+ "serde_json",
+ "taffy",
+]
 
 [[package]]
 name = "jni"
@@ -4590,19 +4685,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
-]
-
-[[package]]
-name = "pane_bevy"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "bevy",
- "editor_core",
- "ropey",
- "serde",
- "serde_json",
- "skrifa 0.39.0",
 ]
 
 [[package]]
@@ -5635,20 +5717,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
-name = "style_bevy"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bytemuck",
- "naga",
- "notify",
- "pane_bevy",
- "rhai",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5732,9 +5800,9 @@ dependencies = [
 name = "tbinject"
 version = "0.1.0"
 dependencies = [
+ "jim_daemon",
  "serde",
  "serde_json",
- "terminal_daemon",
 ]
 
 [[package]]
@@ -5757,53 +5825,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "terminal_bevy"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "bevy",
- "bincode",
- "block2 0.5.1",
- "bytemuck",
- "claude-bus",
- "claude-bus-bevy",
- "core-foundation 0.10.1",
- "core-text",
- "editor_bevy",
- "editor_core",
- "image",
- "inference_bevy",
- "libc",
- "libghostty-vt",
- "nix 0.31.2",
- "notify",
- "objc2 0.5.2",
- "objc2-app-kit 0.2.2",
- "objc2-foundation 0.2.2",
- "pane_bevy",
- "rfd",
- "rhai",
- "serde",
- "serde_json",
- "skrifa 0.39.0",
- "style_bevy",
- "swash",
- "tempfile",
- "terminal_daemon",
- "widget_bevy",
-]
-
-[[package]]
-name = "terminal_daemon"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "libc",
- "nix 0.31.2",
- "serde",
 ]
 
 [[package]]
@@ -6727,27 +6748,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "web-sys",
-]
-
-[[package]]
-name = "widget_bevy"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "clap",
- "claude-bus-bevy",
- "editor_bevy",
- "glaze",
- "image",
- "inference_bevy",
- "notify",
- "pane_bevy",
- "rhai",
- "schemars",
- "serde",
- "serde_json",
- "style_bevy",
- "taffy",
 ]
 
 [[package]]

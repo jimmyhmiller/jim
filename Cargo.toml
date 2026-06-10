@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/glaze", "crates/editor-core", "crates/editor-bevy", "crates/pane-bevy", "crates/style-bevy", "crates/terminal-bevy", "crates/terminal-daemon", "crates/widget-bevy", "crates/claude-bus", "crates/claude-bus-bevy", "crates/claude-statusline-bridge", "crates/claude-context-bars", "crates/claude-event-logger", "crates/claude-queue-drain", "crates/tbinject", "crates/inference-bevy", "crates/diff-core", "crates/diff-bevy"]
+members = ["crates/glaze", "crates/editor-core", "crates/jim-editor", "crates/jim-pane", "crates/jim-style", "crates/jim-app", "crates/jim-daemon", "crates/jim-widget", "crates/claude-bus", "crates/claude-bus-bevy", "crates/claude-statusline-bridge", "crates/claude-context-bars", "crates/claude-event-logger", "crates/claude-queue-drain", "crates/tbinject", "crates/jim-inference", "crates/diff-core", "crates/jim-diff"]
 
 [workspace.package]
 license = "MIT"
