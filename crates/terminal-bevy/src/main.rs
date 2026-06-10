@@ -54,6 +54,11 @@ fn main() {
         }),
         ..default()
     }));
+    // Stash the saved geometry so `fit_window_to_monitor` can re-apply it
+    // once the OS scale factor is known (the window-creation path mis-
+    // scales it — see window_geometry). Captured here, before any system
+    // can overwrite window.json with the wrong creation-time size.
+    app.insert_resource(terminal_bevy::window_geometry::RestoredGeometry(saved));
     app.add_plugins(TerminalPlugin);
     // Subscribe to Claude Code hook events from the central bus. Any
     // system in this app (or its panes) can react by reading

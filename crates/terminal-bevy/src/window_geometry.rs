@@ -12,19 +12,26 @@
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use bevy::window::{PrimaryWindow, WindowMoved, WindowResized};
+use bevy::window::{Monitor, PrimaryMonitor, PrimaryWindow, WindowMoved, WindowResized};
 use serde::{Deserialize, Serialize};
 
 const FILE_NAME: &str = "window.json";
 const WRITE_DEBOUNCE: Duration = Duration::from_millis(400);
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowGeometry {
     pub x: i32,
     pub y: i32,
     pub w: u32,
     pub h: u32,
 }
+
+/// The geometry loaded from disk at startup, captured into a resource so
+/// [`fit_window_to_monitor`] can re-apply it once the real OS scale
+/// factor is known — *before* [`save_on_change`] can overwrite the file
+/// with the (wrongly-clamped) creation-time size. `main.rs` inserts this.
+#[derive(Resource, Default, Clone, Copy)]
+pub struct RestoredGeometry(pub Option<WindowGeometry>);
 
 fn path() -> Option<std::path::PathBuf> {
     crate::data_dir().map(|d| d.join(FILE_NAME))
@@ -54,6 +61,92 @@ fn write(g: &WindowGeometry) {
     if let Ok(body) = serde_json::to_string(g) {
         let _ = std::fs::write(&p, body);
     }
+}
+
+/// Constrain a saved window rect to a monitor (all in physical pixels,
+/// winit's top-left origin). Size is preserved whenever it fits — the
+/// window is *shifted* to stay fully on-screen rather than shrunk; it's
+/// only clamped smaller when genuinely larger than the usable area. This
+/// is what fixes "resized all the way to the right, size not kept after
+/// restart": the saved position then put the right edge off-screen, and
+/// macOS clamped the window *narrower* on restore. `top_inset` reserves
+/// space for the menu bar so the window lands below it.
+fn fit_to_monitor(
+    g: WindowGeometry,
+    mon_x: i32,
+    mon_y: i32,
+    mon_w: u32,
+    mon_h: u32,
+    top_inset: u32,
+) -> WindowGeometry {
+    let avail_h = mon_h.saturating_sub(top_inset);
+    let w = g.w.min(mon_w);
+    let h = g.h.min(avail_h);
+    let min_x = mon_x;
+    let max_x = (mon_x + mon_w as i32 - w as i32).max(min_x);
+    let min_y = mon_y + top_inset as i32;
+    let max_y = (mon_y + mon_h as i32 - h as i32).max(min_y);
+    WindowGeometry {
+        x: g.x.clamp(min_x, max_x),
+        y: g.y.clamp(min_y, max_y),
+        w,
+        h,
+    }
+}
+
+/// Once the primary monitor is known, pull the (restored) window fully
+/// on-screen at its saved size. Runs once: monitors aren't populated
+/// until a frame or two after startup, so it waits for one to appear.
+/// Only acts on windows positioned with `WindowPosition::At` (i.e.
+/// restored from disk) — a first-run auto-placed window is left alone.
+pub fn fit_window_to_monitor(
+    mut done: Local<bool>,
+    restored: Res<RestoredGeometry>,
+    monitors: Query<(&Monitor, Has<PrimaryMonitor>)>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if *done {
+        return;
+    }
+    let Some(saved) = restored.0 else {
+        *done = true; // first run / no saved geometry — let the OS place it
+        return;
+    };
+    // Prefer the primary monitor; fall back to the first one enumerated.
+    // `single()` would silently bail when winit reports 0 or 2+ monitors.
+    let monitor = monitors
+        .iter()
+        .find(|(_, primary)| *primary)
+        .or_else(|| monitors.iter().next())
+        .map(|(m, _)| m);
+    let Some(monitor) = monitor else {
+        return; // monitors not enumerated yet — try again next frame
+    };
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
+    *done = true;
+
+    // Re-apply the SAVED geometry now that the real scale factor is known.
+    // At window-creation the scale defaulted to 1.0, so winit requested
+    // the size in logical units at the wrong scale and macOS clamped the
+    // window to `monitor - position` — that's why a window resized toward
+    // the right always came back at one fixed (narrower) width. Setting
+    // physical size + physical position here, post-scale, restores it.
+    let top_inset = (monitor.scale_factor * 38.0) as u32;
+    let fitted = fit_to_monitor(
+        saved,
+        monitor.physical_position.x,
+        monitor.physical_position.y,
+        monitor.physical_width,
+        monitor.physical_height,
+        top_inset,
+    );
+    eprintln!("[window-geom] restored window to {:?} (monitor {}x{})", fitted, monitor.physical_width, monitor.physical_height);
+    window
+        .resolution
+        .set_physical_resolution(fitted.w, fitted.h);
+    window.position = WindowPosition::At(IVec2::new(fitted.x, fitted.y));
 }
 
 /// Local state for the debounce. `pending` carries the latest geometry
@@ -109,4 +202,47 @@ pub fn save_on_change(
     write(&g);
     state.pending = None;
     state.last_write_at = Some(now);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real numbers from the reported bug: 3456x2234 display, window saved
+    // wider-than-fits at the saved x so its right edge ran off-screen.
+    #[test]
+    fn right_resized_window_keeps_width_by_shifting_left() {
+        let g = WindowGeometry { x: 442, y: 78, w: 3228, h: 2328 };
+        let f = fit_to_monitor(g, 0, 0, 3456, 2234, 0);
+        // Width fits (3228 <= 3456) → preserved, not shrunk.
+        assert_eq!(f.w, 3228, "width preserved");
+        // Shifted left so the right edge sits exactly at the screen edge.
+        assert_eq!(f.x, 3456 - 3228);
+        assert_eq!(f.x + f.w as i32, 3456);
+        // Height exceeded the screen → clamped to fit.
+        assert_eq!(f.h, 2234);
+        assert_eq!(f.y, 0);
+    }
+
+    #[test]
+    fn already_fitting_window_is_unchanged() {
+        let g = WindowGeometry { x: 100, y: 100, w: 1200, h: 800 };
+        assert_eq!(fit_to_monitor(g, 0, 0, 3456, 2234, 0), g);
+    }
+
+    #[test]
+    fn top_inset_pushes_window_below_menu_bar() {
+        let g = WindowGeometry { x: 0, y: 0, w: 1000, h: 3000 };
+        let f = fit_to_monitor(g, 0, 0, 3456, 2234, 76);
+        assert_eq!(f.y, 76, "y clamped below the reserved menu-bar inset");
+        assert_eq!(f.h, 2234 - 76, "height clamped to the usable area");
+    }
+
+    #[test]
+    fn respects_nonzero_monitor_origin() {
+        // Secondary monitor to the right of the primary.
+        let g = WindowGeometry { x: 5000, y: 50, w: 800, h: 600 };
+        let f = fit_to_monitor(g, 3456, 0, 1920, 1080, 0);
+        assert!(f.x >= 3456 && f.x + f.w as i32 <= 3456 + 1920);
+    }
 }
