@@ -25,11 +25,12 @@ taffy = { version = "0.9", default-features = false, features = [
     "flexbox",
     "grid",
 ] }
-# Rhai scripting for hot-reloadable in-process widgets. `sync` makes the
-# Engine + AST Send so they can live in Bevy resources/components;
-# `serde` lets us serde_json::Value <-> rhai::Dynamic so widgets can
-# return frames as Rhai maps that deserialize into protocol::Element.
-rhai = { version = "1.21", features = ["sync", "serde"] }
+# funct — the embeddable VM replacing funct for in-process widgets. Its
+# reified VM (start/run/step over an owned VmState) is what lets a widget
+# handler be paused and time-sliced mid-execution; funct cannot. Path dep
+# (same out-of-repo practice as the symlinked datalog widgets) until funct
+# is published.
+funct = { path = "../../../PlayGround/claude-experiments/funct" }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 bevy = { version = "0.18", default-features = false, features = [
     "2d",

@@ -43,7 +43,7 @@ enum Cmd {
     ///
     /// One command, everything you need to build a widget: where every
     /// doc lives (the authoring guide, `widget docs`, the element-catalog
-    /// source, the rhai host internals), the live example scripts, the
+    /// source, the funct host internals), the live example scripts, the
     /// create/spawn commands, and the full authoring guide inline.
     Agent,
 
@@ -136,8 +136,8 @@ enum Cmd {
         #[arg(long, value_parser = parse_size, value_name = "WxH")]
         size: Option<(f32, f32)>,
         /// Widget runtime. Default spawns a subprocess widget (runs
-        /// `<cmd>`). Pass `rhai_widget` for an in-process Rhai script —
-        /// `<cmd>` is then a `.rhai` filename under
+        /// `<cmd>`). Pass `script_widget` for an in-process funct script —
+        /// `<cmd>` is then a `.ft` filename under
         /// ~/.jim/widgets/ (no subprocess is launched).
         #[arg(long, short = 'k')]
         kind: Option<String>,
@@ -286,9 +286,9 @@ fn cmd_spawn(
         let rest: Vec<String> = it.collect();
         (head, rest)
     };
-    // Rhai widgets run in-process from the watched scripts dir, so the
+    // funct widgets run in-process from the watched scripts dir, so the
     // caller's PWD is irrelevant; only subprocess widgets need a cwd.
-    let cwd = if kind.as_deref() == Some("rhai_widget") {
+    let cwd = if kind.as_deref() == Some("script_widget") {
         cwd
     } else {
         cwd.or_else(|| std::env::current_dir().ok())
@@ -412,7 +412,7 @@ fn cmd_agent() -> Result<(), String> {
         "# Building an editor-idea widget\n\
          \n\
          A widget is a pane that renders a UI tree (`Element`) and reacts\n\
-         to events. Two ways to host one: an in-process Rhai script (the\n\
+         to events. Two ways to host one: an in-process funct script (the\n\
          default for new widgets, hot-reloaded) or a subprocess speaking\n\
          NDJSON. Read the docs below FIRST, then write the widget and spawn\n\
          it.\n\
@@ -427,20 +427,20 @@ fn cmd_agent() -> Result<(), String> {
             $ widget docs textarea   # one element/event\n\
             $ widget schema element  # machine-readable JSON Schema\n\
             Source of truth: {protocol}\n\
-         3. RHAI HOST INTERNALS — handler dispatch table + host fns, in\n\
-            the module docs atop: {rhai_mod}\n\
+         3. FUNCT HOST INTERNALS — handler dispatch table + host fns, in\n\
+            the module docs atop: {funct_mod}\n\
          \n\
          ## Examples to copy from\n\
          Bundled subprocess samples:\n\
             $ widget examples         # list\n\
             $ widget examples bars    # print one\n\
-         Live in-process Rhai scripts (concrete references):\n\
-         {rhai_examples}\n\
+         Live in-process funct scripts (concrete references):\n\
+         {funct_examples}\n\
          \n\
          ## Create + run\n\
-         Rhai (in-process): write {widgets}/<name>.rhai (the dir is\n\
+         funct (in-process): write {widgets}/<name>.ft (the dir is\n\
          watched — saving hot-reloads the pane), then:\n\
-            $ widget spawn --kind rhai_widget --title \"<Title>\" <name>.rhai\n\
+            $ widget spawn --kind script_widget --title \"<Title>\" <name>.ft\n\
          Subprocess: scaffold and spawn:\n\
             $ widget init my-widget   # writes my-widget.sh\n\
             $ widget spawn --title \"<Title>\" -- ./my-widget.sh\n\
@@ -464,16 +464,16 @@ fn cmd_agent() -> Result<(), String> {
          {guide}",
         authoring = doc("AUTHORING.md"),
         protocol = doc("src/protocol.rs"),
-        rhai_mod = doc("src/rhai_widget.rs"),
+        funct_mod = doc("src/script_widget.rs"),
         widgets = widgets_str,
-        rhai_examples = list_rhai_examples(widgets_dir.as_deref()),
+        funct_examples = list_funct_examples(widgets_dir.as_deref()),
         guide = AUTHORING_GUIDE,
     );
     Ok(())
 }
 
-/// Bullet list of `.rhai` scripts in the widgets dir, or a hint if none.
-fn list_rhai_examples(dir: Option<&Path>) -> String {
+/// Bullet list of `.ft` scripts in the widgets dir, or a hint if none.
+fn list_funct_examples(dir: Option<&Path>) -> String {
     let Some(dir) = dir else {
         return "  (set $HOME to locate ~/.jim/widgets)".to_string();
     };
@@ -483,7 +483,7 @@ fn list_rhai_examples(dir: Option<&Path>) -> String {
     let mut paths: Vec<String> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rhai"))
+        .filter(|p| p.extension().is_some_and(|x| x == "funct"))
         .map(|p| format!("  - {}", p.display()))
         .collect();
     paths.sort();

@@ -127,9 +127,9 @@ impl Material for FloorMaterial {
 }
 
 
-// ---------- Runtime-tunable params (hot-reloaded from Rhai) ----------
+// ---------- Runtime-tunable params (hot-reloaded from funct) ----------
 
-/// Live-tunable overview parameters, driven by `~/.jim/cube.rhai`.
+/// Live-tunable overview parameters, driven by `~/.jim/cube.ft`.
 /// `board_recede` and `cam_tilt`/durations read every frame (apply
 /// instantly); float/fill/pullback bake in on the next overview open.
 #[derive(Resource, Clone, Debug)]
@@ -168,11 +168,11 @@ impl Default for CubeParams {
     }
 }
 
-const CUBE_RHAI_TEMPLATE: &str = "\
+const CUBE_FT_TEMPLATE: &str = "\
 // editor-idea project prism (cube) tuning — hot-reloaded as you save.
 // `board_recede` applies instantly; the rest apply next time you open
 // the overview (Cmd+Shift+\\).
-#{
+{
     board_recede: 1.5,      // how far the background surface falls away
     base_float: 0.5,        // nearest pane's float off the surface
     float_step: 0.38,       // extra float per stacked pane
@@ -187,40 +187,26 @@ const CUBE_RHAI_TEMPLATE: &str = "\
 }
 ";
 
-fn cube_rhai_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".jim/cube.rhai"))
+fn cube_ft_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".jim/cube.ft"))
 }
 
-fn rhai_f32(map: &rhai::Map, key: &str, default: f32) -> f32 {
-    map.get(key)
-        .and_then(|d| {
-            d.as_float()
-                .ok()
-                .map(|v| v as f32)
-                .or_else(|| d.as_int().ok().map(|v| v as f32))
-        })
-        .unwrap_or(default)
+type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+fn json_f32(map: &JsonMap, key: &str, default: f32) -> f32 {
+    map.get(key).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default)
 }
 
-/// Read a 3-element rhai array (e.g. `[0.1, 0.2, 0.3]`) into a Vec3.
-fn rhai_vec3(map: &rhai::Map, key: &str, default: Vec3) -> Vec3 {
-    let Some(arr) = map.get(key).and_then(|d| d.clone().try_cast::<rhai::Array>()) else {
+/// Read a 3-element funct array (e.g. `[0.1, 0.2, 0.3]`) into a Vec3.
+fn json_vec3(map: &JsonMap, key: &str, default: Vec3) -> Vec3 {
+    let Some(arr) = map.get(key).and_then(|v| v.as_array()) else {
         return default;
     };
-    let f = |i: usize, d: f32| {
-        arr.get(i)
-            .and_then(|x| {
-                x.as_float()
-                    .ok()
-                    .map(|v| v as f32)
-                    .or_else(|| x.as_int().ok().map(|v| v as f32))
-            })
-            .unwrap_or(d)
-    };
+    let f = |i: usize, d: f32| arr.get(i).and_then(|x| x.as_f64()).map(|v| v as f32).unwrap_or(d);
     Vec3::new(f(0, default.x), f(1, default.y), f(2, default.z))
 }
 
-/// Poll `cube.rhai` for changes; re-evaluate and update `CubeParams` on
+/// Poll `cube.ft` for changes; re-evaluate and update `CubeParams` on
 /// edit. Writes a default template on first run. Cheap (a stat per frame,
 /// eval only on mtime change).
 fn load_cube_params(
@@ -228,14 +214,14 @@ fn load_cube_params(
     mut last_mtime: Local<Option<std::time::SystemTime>>,
     mut initialized: Local<bool>,
 ) {
-    let Some(path) = cube_rhai_path() else { return };
+    let Some(path) = cube_ft_path() else { return };
     if !*initialized {
         *initialized = true;
         if !path.exists() {
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let _ = std::fs::write(&path, CUBE_RHAI_TEMPLATE);
+            let _ = std::fs::write(&path, CUBE_FT_TEMPLATE);
         }
     }
     let Ok(meta) = std::fs::metadata(&path) else { return };
@@ -245,31 +231,37 @@ fn load_cube_params(
     }
     *last_mtime = Some(mtime);
     let Ok(src) = std::fs::read_to_string(&path) else { return };
-    let engine = rhai::Engine::new();
-    match engine.eval::<rhai::Dynamic>(&src) {
-        Ok(val) => {
-            if let Ok(map) = val.try_cast::<rhai::Map>().ok_or(()) {
-                let d = CubeParams::default();
-                *params = CubeParams {
-                    board_recede: rhai_f32(&map, "board_recede", d.board_recede),
-                    base_float: rhai_f32(&map, "base_float", d.base_float),
-                    float_step: rhai_f32(&map, "float_step", d.float_step),
-                    overview_pullback: rhai_f32(&map, "overview_pullback", d.overview_pullback),
-                    cam_tilt: rhai_f32(&map, "cam_tilt", d.cam_tilt),
-                    face_fill: rhai_f32(&map, "face_fill", d.face_fill),
-                    enter_dur: rhai_f32(&map, "enter_dur", d.enter_dur),
-                    dive_dur: rhai_f32(&map, "dive_dur", d.dive_dur),
-                    skybox: map
-                        .get("skybox")
-                        .and_then(|v| v.clone().into_string().ok())
-                        .unwrap_or(d.skybox),
-                    reflection: rhai_f32(&map, "reflection", d.reflection),
-                    floor_color: rhai_vec3(&map, "floor_color", d.floor_color),
-                };
-                eprintln!("[cube] params reloaded: {:?}", *params);
-            }
+    let mut vm = funct::Funct::new();
+    match vm.eval(&src).map_err(|e| e.to_string()).and_then(|v| {
+        v.to_json()
+            .map_err(|e| e.to_string())
+            .and_then(|j| match j {
+                serde_json::Value::Object(m) => Ok(m),
+                _ => Err("cube.ft must evaluate to a { } record".to_string()),
+            })
+    }) {
+        Ok(map) => {
+            let d = CubeParams::default();
+            *params = CubeParams {
+                board_recede: json_f32(&map, "board_recede", d.board_recede),
+                base_float: json_f32(&map, "base_float", d.base_float),
+                float_step: json_f32(&map, "float_step", d.float_step),
+                overview_pullback: json_f32(&map, "overview_pullback", d.overview_pullback),
+                cam_tilt: json_f32(&map, "cam_tilt", d.cam_tilt),
+                face_fill: json_f32(&map, "face_fill", d.face_fill),
+                enter_dur: json_f32(&map, "enter_dur", d.enter_dur),
+                dive_dur: json_f32(&map, "dive_dur", d.dive_dur),
+                skybox: map
+                    .get("skybox")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or(d.skybox),
+                reflection: json_f32(&map, "reflection", d.reflection),
+                floor_color: json_vec3(&map, "floor_color", d.floor_color),
+            };
+            eprintln!("[cube] params reloaded: {:?}", *params);
         }
-        Err(e) => eprintln!("[cube] cube.rhai eval error: {e}"),
+        Err(e) => eprintln!("[cube] cube.ft eval error: {e}"),
     }
 }
 
@@ -683,7 +675,7 @@ fn start_dive(prism: &mut Prism, projects: &Projects, target: Option<u64>, dive_
 }
 
 /// Background color a project's panes sit against, honoring its
-/// per-project preset (or its own theme.rhai, or the built-in default).
+/// per-project preset (or its own theme.ft, or the built-in default).
 /// Used to tint each prism face's backboard so the overview shows each
 /// project in its real theme rather than the active project's. Loads the
 /// theme file fresh, but only when the cube is built (occasional), so the

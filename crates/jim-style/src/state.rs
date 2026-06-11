@@ -37,7 +37,7 @@ pub struct ProjectStyleStateEntry {
     #[serde(default)]
     pub last_edit_at: f64,
     /// Named style preset chosen for this project, e.g. `"forest"`.
-    /// `None` means "no preset — use the project's own theme.rhai (or the
+    /// `None` means "no preset — use the project's own theme.ft (or the
     /// built-in default)." This is what makes theming per-project: the
     /// active preset is loaded from here on every project switch.
     #[serde(default)]

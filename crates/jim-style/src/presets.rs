@@ -5,14 +5,14 @@
 //!
 //!     ~/.jim/styles/
 //!         default/
-//!             theme.rhai      # required
+//!             theme.ft      # required
 //!         linear/
-//!             theme.rhai
+//!             theme.ft
 //!
 //! Scripts switch presets by calling `set_active_style("linear")`. The
 //! choice is persisted to `~/.jim/active_style` and survives
-//! restarts. A preset's `theme.rhai` *overrides* the per-project
-//! theme.rhai whenever a preset is active — switch the preset to
+//! restarts. A preset's `theme.ft` *overrides* the per-project
+//! theme.ft whenever a preset is active — switch the preset to
 //! `None` (empty file) to fall back to per-project theming.
 //!
 //! Future-extension surface (manifest.toml + chrome.wgsl + dust.wgsl
@@ -23,7 +23,6 @@ use std::sync::{Arc, RwLock};
 
 use bevy::prelude::*;
 use jim_pane::ActiveChromeShader;
-use rhai::{Array, Dynamic, Engine};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -56,7 +55,7 @@ pub struct StylePresetRegistry {
 }
 
 /// Preset of the *currently active project*. `None` means "no preset —
-/// use that project's theme.rhai (or the default)." This is a derived
+/// use that project's theme.ft (or the default)." This is a derived
 /// mirror: it's reloaded from the active project's [`ProjectStyleState`]
 /// on every project switch (`sync_active_preset_from_project`) and
 /// written back there when the user picks a style (`drain_preset_messages`).
@@ -418,10 +417,10 @@ fn seed_default_presets() {
         warn!("style presets: couldn't create {}: {}", dir.display(), e);
         return;
     }
-    // Per-preset seeding: only writes if the preset's theme.rhai
+    // Per-preset seeding: only writes if the preset's theme.ft
     // doesn't exist yet. New built-in presets show up automatically
     // for users who already had earlier ones; user edits never get
-    // clobbered because we never overwrite an existing theme.rhai.
+    // clobbered because we never overwrite an existing theme.ft.
     //
     // `atelier` shares its bytes with `theme.rs::ATELIER_DEFAULT_THEME`
     // — the engine's default palette and the preset are the same file,
@@ -455,7 +454,7 @@ fn seed_default_presets() {
     );
 }
 
-/// Seed a preset with a `theme.rhai` (always) and optionally a
+/// Seed a preset with a `theme.ft` (always) and optionally a
 /// `chrome.wgsl`. Both writes are idempotent: only writes if the file
 /// doesn't already exist, so user edits never get clobbered.
 fn write_seed(preset_dir: &std::path::Path, theme_body: &str) {
@@ -471,7 +470,7 @@ fn write_seed_full(
         warn!("style presets: mkdir {}: {}", preset_dir.display(), e);
         return;
     }
-    let theme = preset_dir.join("theme.rhai");
+    let theme = preset_dir.join("theme.ft");
     if !theme.exists() {
         if let Err(e) = std::fs::write(&theme, theme_body) {
             warn!("style presets: write {}: {}", theme.display(), e);
@@ -511,7 +510,7 @@ pub(crate) fn rescan_presets(registry: &mut StylePresetRegistry) {
         if !path.is_dir() {
             continue;
         }
-        let theme = path.join("theme.rhai");
+        let theme = path.join("theme.ft");
         if !theme.exists() {
             continue;
         }
@@ -546,8 +545,8 @@ pub(crate) fn rescan_presets(registry: &mut StylePresetRegistry) {
     publish_names(&registry.presets);
 }
 
-/// Resolve a project's effective theme path: its preset's `theme.rhai`
-/// if it has a preset, else its own `theme.rhai`. `None` if neither is
+/// Resolve a project's effective theme path: its preset's `theme.ft`
+/// if it has a preset, else its own `theme.ft`. `None` if neither is
 /// determinable (no data dir).
 pub fn theme_path_for(
     project_id: u64,
@@ -567,7 +566,7 @@ pub fn theme_path_for(
         .or_else(|| data_dir.map(|d| theme_path_for_project(d, project_id)))
 }
 
-/// Resolve and load a project's effective theme (preset → its theme.rhai
+/// Resolve and load a project's effective theme (preset → its theme.ft
 /// → default). Loads from disk, so callers should cache the result (see
 /// [`crate::theme::ProjectThemes`]).
 pub fn resolve_project_theme(
@@ -715,42 +714,33 @@ fn ensure_channel() {
     });
 }
 
-/// Register `list_styles()` + `set_active_style(name)` on a Rhai
-/// engine. Called by each widget worker on its own engine. Idempotent.
-pub fn register_preset_host_fns(engine: &mut Engine) {
+/// funct equivalent of `register_preset_host_fns`, reusing the same
+/// `names_handle()` mirror + `PRESET_TX`/`RESCAN_TX` channels.
+pub fn register_preset_host_fns_funct(vm: &mut funct::Funct) {
+    use funct::Value;
     ensure_channel();
-    engine.register_fn("list_styles", || -> Array {
-        let lock = names_handle().read();
-        match lock {
-            Ok(names) => names
-                .iter()
-                .map(|n| Dynamic::from(n.clone()))
-                .collect(),
-            Err(_) => Array::new(),
-        }
+
+    vm.register0("list_styles", || -> Vec<String> {
+        names_handle().read().map(|n| n.clone()).unwrap_or_default()
     });
-    engine.register_fn("set_active_style", move |name: &str| {
-        let n = if name.is_empty() { None } else { Some(name.to_string()) };
+    vm.register1("set_active_style", |name: String| {
+        let n = if name.is_empty() { None } else { Some(name) };
         if let Some(tx) = PRESET_TX.get() {
             if let Ok(tx) = tx.lock() {
                 let _ = tx.send(PresetMsg(n));
             }
         }
     });
-    engine.register_fn("refresh_styles", || {
+    vm.register0("refresh_styles", || {
         if let Some(tx) = RESCAN_TX.get() {
             if let Ok(tx) = tx.lock() {
                 let _ = tx.send(());
             }
         }
     });
-    engine.register_fn("active_style", || -> Dynamic {
-        // We don't have a global mirror of the active preset (it
-        // could be stale across the wakeups). Reading from a snapshot
-        // would be one more moving part; for now, return UNIT and let
-        // scripts track it via state_set if they want UI highlight.
-        Dynamic::UNIT
-    });
+    // No global mirror of the active preset; scripts track it via state if
+    // they want a UI highlight (same as the funct surface).
+    vm.register0("active_style", || -> Value { Value::Unit });
 }
 
 fn drain_rescan_requests(mut registry: ResMut<StylePresetRegistry>) {

@@ -3,7 +3,7 @@
 //! Theme editor widgets read the current token values via
 //! `theme_get(name)` and push edits via `theme_set_color` /
 //! `theme_set_number`. Writes go through an mpsc channel; the main
-//! thread drains it, rewrites the active preset's `theme.rhai`, and
+//! thread drains it, rewrites the active preset's `theme.ft`, and
 //! the existing notify watcher hot-reloads the rest of the app.
 //!
 //! Reads use a shared `Arc<RwLock<Snapshot>>` that mirrors the
@@ -16,7 +16,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use bevy::prelude::*;
-use rhai::{Array, Dynamic, Engine};
 
 use crate::oklab;
 use crate::theme::{parse_color_string, ActiveThemePath, Theme, ThemeChanged, TokenValue};
@@ -37,7 +36,7 @@ pub enum ThemeWrite {
     SetNumber(String, f32),
     /// Remove a token override (falls back to default on next reload).
     Reset(String),
-    /// Wipe every override — rewrites the active theme.rhai to an
+    /// Wipe every override — rewrites the active theme.ft to an
     /// empty `#{}`. Escape hatch when the user has accidentally
     /// thrashed a token to an unreadable color.
     ResetAll,
@@ -129,9 +128,7 @@ fn drain_theme_writes(active_path: Res<ActiveThemePath>) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) =
-            std::fs::write(&path, "// Reset by theme editor.\n#{\n}\n")
-        {
+        if let Err(e) = std::fs::write(&path, "// Reset by theme editor.\n{\n}\n") {
             warn!("[theme-bridge] reset_all write {:?}: {}", path, e);
         }
         return;
@@ -142,7 +139,7 @@ fn drain_theme_writes(active_path: Res<ActiveThemePath>) {
 }
 
 /// Minimal line-based patcher: for each `key: value,` line in the
-/// theme.rhai, if the key is in `updates`, replace its value (or
+/// theme.ft, if the key is in `updates`, replace its value (or
 /// remove the line entirely if the override is `None`). Tokens not
 /// present in the file get appended just before the closing `}`.
 ///
@@ -158,10 +155,7 @@ fn patch_theme_file(
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(
-            path,
-            "// Auto-created by theme editor.\n#{\n}\n",
-        )?;
+        std::fs::write(path, "// Auto-created by theme editor.\n{\n}\n")?;
     }
     let src = std::fs::read_to_string(path)?;
     let mut out = String::with_capacity(src.len() + 64);
@@ -223,74 +217,81 @@ fn patch_theme_file(
     std::fs::write(path, out)
 }
 
-// ----------------- Rhai host fns -----------------
-
-pub fn register_theme_host_fns(engine: &mut Engine) {
+/// funct equivalent of `register_theme_host_fns`. Same backing (the
+/// `snapshot()` mirror + `TX` write channel); only the engine binding
+/// differs. Registered by the funct widget worker so `.ft` theme widgets
+/// (theme_editor, garden) get the identical surface.
+pub fn register_theme_host_fns_funct(vm: &mut funct::Funct) {
+    use funct::{Fault, Value};
     ensure_channel();
 
-    engine.register_fn("theme_tokens", || -> Array {
-        let Ok(snap) = snapshot().read() else { return Array::new() };
+    vm.register0("theme_tokens", || -> Vec<String> {
+        let Ok(snap) = snapshot().read() else {
+            return vec![];
+        };
         let mut names: Vec<String> = snap.keys().cloned().collect();
         names.sort();
-        names.into_iter().map(Dynamic::from).collect()
+        names
     });
 
-    engine.register_fn("theme_get", |name: &str| -> Dynamic {
-        let Ok(snap) = snapshot().read() else { return Dynamic::UNIT };
-        match snap.get(name) {
-            Some(TokenValue::Color(c)) => {
-                Dynamic::from(linear_rgba_to_hex(*c))
-            }
-            Some(TokenValue::F32(v)) => Dynamic::from(*v as f64),
-            Some(TokenValue::Bool(b)) => Dynamic::from(*b),
-            Some(TokenValue::Str(s)) => Dynamic::from(s.clone()),
-            None => Dynamic::UNIT,
-        }
+    vm.register_raw("theme_get", |_vm, args| {
+        let name = match args.first() {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => return Err(Fault::new("theme_get expects a token name string")),
+        };
+        let Ok(snap) = snapshot().read() else {
+            return Ok(Value::Unit);
+        };
+        Ok(match snap.get(&name) {
+            Some(TokenValue::Color(c)) => Value::str(linear_rgba_to_hex(*c)),
+            Some(TokenValue::F32(v)) => Value::Float(*v as f64),
+            Some(TokenValue::Bool(b)) => Value::Bool(*b),
+            Some(TokenValue::Str(s)) => Value::str(s.clone()),
+            None => Value::Unit,
+        })
     });
 
-    // theme_get_oklch returns [L, C, h] for color tokens, or () for
-    // non-color tokens. Lets editor widgets present perceptual sliders
-    // directly.
-    engine.register_fn("theme_get_oklch", |name: &str| -> Dynamic {
-        let Ok(snap) = snapshot().read() else { return Dynamic::UNIT };
-        let Some(TokenValue::Color(c)) = snap.get(name) else {
-            return Dynamic::UNIT;
+    vm.register_raw("theme_get_oklch", |_vm, args| {
+        let name = match args.first() {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => return Err(Fault::new("theme_get_oklch expects a token name string")),
+        };
+        let Ok(snap) = snapshot().read() else {
+            return Ok(Value::Unit);
+        };
+        let Some(TokenValue::Color(c)) = snap.get(&name) else {
+            return Ok(Value::Unit);
         };
         let (l, ch, h) = oklab::linear_srgb_to_oklch(*c);
-        let mut arr = Array::new();
-        arr.push(Dynamic::from(l as f64));
-        arr.push(Dynamic::from(ch as f64));
-        arr.push(Dynamic::from(h as f64));
-        Dynamic::from(arr)
+        Ok(Value::list(vec![
+            Value::Float(l as f64),
+            Value::Float(ch as f64),
+            Value::Float(h as f64),
+        ]))
     });
 
-    let tx_color = TX.get().unwrap().lock().unwrap().clone();
-    engine.register_fn("theme_set_color", move |name: &str, value: &str| {
-        let _ = tx_color.send(ThemeWrite::SetColor(name.into(), value.into()));
+    let tx = TX.get().unwrap().lock().unwrap().clone();
+    vm.register2("theme_set_color", move |name: String, value: String| {
+        let _ = tx.send(ThemeWrite::SetColor(name, value));
     });
-
-    let tx_color_lch = TX.get().unwrap().lock().unwrap().clone();
-    engine.register_fn(
+    let tx = TX.get().unwrap().lock().unwrap().clone();
+    vm.register4(
         "theme_set_oklch",
-        move |name: &str, l: f64, c: f64, h: f64| {
-            let s = format!("oklch({}, {}, {})", l, c, h);
-            let _ = tx_color_lch.send(ThemeWrite::SetColor(name.into(), s));
+        move |name: String, l: f64, c: f64, h: f64| {
+            let _ = tx.send(ThemeWrite::SetColor(name, format!("oklch({}, {}, {})", l, c, h)));
         },
     );
-
-    let tx_num = TX.get().unwrap().lock().unwrap().clone();
-    engine.register_fn("theme_set_number", move |name: &str, value: f64| {
-        let _ = tx_num.send(ThemeWrite::SetNumber(name.into(), value as f32));
+    let tx = TX.get().unwrap().lock().unwrap().clone();
+    vm.register2("theme_set_number", move |name: String, value: f64| {
+        let _ = tx.send(ThemeWrite::SetNumber(name, value as f32));
     });
-
-    let tx_reset = TX.get().unwrap().lock().unwrap().clone();
-    engine.register_fn("theme_reset", move |name: &str| {
-        let _ = tx_reset.send(ThemeWrite::Reset(name.into()));
+    let tx = TX.get().unwrap().lock().unwrap().clone();
+    vm.register1("theme_reset", move |name: String| {
+        let _ = tx.send(ThemeWrite::Reset(name));
     });
-
-    let tx_reset_all = TX.get().unwrap().lock().unwrap().clone();
-    engine.register_fn("theme_reset_all", move || {
-        let _ = tx_reset_all.send(ThemeWrite::ResetAll);
+    let tx = TX.get().unwrap().lock().unwrap().clone();
+    vm.register0("theme_reset_all", move || {
+        let _ = tx.send(ThemeWrite::ResetAll);
     });
 }
 

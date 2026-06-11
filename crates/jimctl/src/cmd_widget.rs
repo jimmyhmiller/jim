@@ -40,8 +40,8 @@ enum IpcRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         project: Option<String>,
         /// Optional widget kind override. Default is the subprocess
-        /// widget kind. Pass `"rhai_widget"` to spawn an in-process
-        /// Rhai-scripted widget; `command` is then the script filename
+        /// widget kind. Pass `"script_widget"` to spawn an in-process
+        /// funct-scripted widget; `command` is then the script filename
         /// under `~/.jim/widgets/`.
         #[serde(skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
@@ -216,7 +216,7 @@ fn print_usage() {
          directly. Without `--`, a single quoted positional is passed to\n\
          `sh -c`.\n\
          \n\
-         `--kind rhai_widget` swaps in the in-process Rhai-scripted\n\
+         `--kind script_widget` swaps in the in-process funct-scripted\n\
          widget runtime. `<cmd>` is then interpreted as a script filename\n\
          under `~/.jim/widgets/` and no subprocess is spawned.\n\
          \n\

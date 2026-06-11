@@ -16,17 +16,16 @@
 //!   time (via naga) and learns its `UserData` struct fields' offsets
 //!   plus its texture-binding names; the host writes values into the
 //!   buffer by **name**, not by type.
-//! - [`ScriptBridgePlugin`] registers Rhai host fns (`uniform_set`,
+//! - [`ScriptBridgePlugin`] registers funct host fns (`uniform_set`,
 //!   `mask_paint`, `emit`, `state_set`, etc.) and routes worker calls
 //!   to the main thread via mpsc + a read-side `ScriptSnapshot`.
-//! - [`SystemScriptPlugin`] runs a headless Rhai script each tick
 //!   (throttled to 30 Hz). Hot-reloads on disk save. Reads engine
 //!   events (`focus_changed`, `project_changed`, scheduled emits)
 //!   from the shared `EventBus`.
 //!
 //! Adding a visual behavior is *purely* on-disk:
 //! 1. Declare any fields you want in your shader's `UserData` struct.
-//! 2. Write a Rhai script that uses `uniform_set`/`mask_paint`/etc.
+//! 2. Write a funct script that uses `uniform_set`/`mask_paint`/etc.
 //!    by those names.
 //! 3. Save. AssetServer + the notify watcher reload both files; no
 //!    rebuild.
@@ -42,7 +41,6 @@ pub mod material;
 pub mod oklab;
 pub mod presets;
 pub mod script_bridge;
-pub mod script_host;
 pub mod state;
 pub mod theme;
 pub mod theme_bridge;
@@ -52,12 +50,11 @@ pub use dynamic::{DynamicMaterial, DynamicMaterialPlugin, ShaderSchemas};
 pub use fonts::{FontRegistry, FontRegistryPlugin};
 pub use material::{register_preset_asset_source, register_style_asset_source};
 pub use presets::{
-    register_preset_host_fns, resolve_project_theme, ActiveStylePreset, PresetsPlugin,
+    register_preset_host_fns_funct, resolve_project_theme, ActiveStylePreset, PresetsPlugin,
     StylePreset, StylePresetRegistry,
 };
-pub use script_bridge::{register_script_host_fns, EventBus, ScriptBridgePlugin};
-pub use theme_bridge::{register_theme_host_fns, ThemeBridgePlugin};
-pub use script_host::SystemScriptPlugin;
+pub use script_bridge::{register_script_host_fns_funct, EventBus, ScriptBridgePlugin};
+pub use theme_bridge::{register_theme_host_fns_funct, ThemeBridgePlugin};
 pub use state::{ProjectStyleState, StyleDataDir};
 pub use theme::{tokens, ProjectThemes, Theme, ThemeChanged, TokenId, TokenValue};
 
@@ -94,20 +91,6 @@ impl Plugin for StylePlugin {
             .add_plugins(PresetsPlugin)
             .add_plugins(ScriptBridgePlugin)
             .add_plugins(ThemeBridgePlugin)
-            .add_plugins(DynamicMaterialPlugin)
-            .add_plugins(SystemScriptPlugin {
-                path: dust_script_path(),
-                bootstrap_source: Some(include_str!("dust_default.rhai")),
-            });
+            .add_plugins(DynamicMaterialPlugin);
     }
-}
-
-fn dust_script_path() -> std::path::PathBuf {
-    let mut p = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    p.push(".jim");
-    p.push("widgets");
-    p.push("dust.rhai");
-    p
 }

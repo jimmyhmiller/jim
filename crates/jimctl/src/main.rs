@@ -58,7 +58,7 @@ fn usage() {
          commands:\n\
          \topen <file> [--project NAME]   open a file in an editor pane\n\
          \twidget ...                     spawn/control a widget pane\n\
-         \tinbox ...                      push to the inbox\n\
+         \tinbox ...                      push to / read a project's inbox\n\
          \tproject ...                    project operations\n\
          \tsuggest ...                    park a pane in the suggestion drawer\n\
          \tmsg <topic> <body>             publish on the widget message bus\n\

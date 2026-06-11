@@ -2,7 +2,7 @@
 //!
 //! This file is the single source of truth for the widget UI vocabulary:
 //! `Element` (the UI tree), `Style`, `HostEvent` (host → widget), and
-//! `WidgetMsg` (widget → host). Both hosting paths (in-process Rhai and
+//! `WidgetMsg` (widget → host). Both hosting paths (in-process funct and
 //! subprocess) speak this vocabulary. For the authoring guide — handlers,
 //! the event model, examples — see `crates/widget-bevy/AUTHORING.md`.
 //!
@@ -760,7 +760,7 @@ pub enum Element {
         /// Font family name resolved through the host's
         /// `jim_style::FontRegistry`. Unknown names fall back to mono.
         /// Typical values: `"serif"`, `"sans"`, `"mono"`, or pull a
-        /// token name from theme.rhai (`"font_family_heading"`).
+        /// token name from theme.ft (`"font_family_heading"`).
         #[serde(default)]
         family: Option<String>,
         /// Drag-selectable: the user can drag across this text to

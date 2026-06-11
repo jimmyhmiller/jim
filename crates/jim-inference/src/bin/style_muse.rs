@@ -1,5 +1,5 @@
 //! `style-muse` — CLI face of the Style Lab generator. One JSON line on
-//! stdout per invocation; the `style_lab.rhai` widget drives it over
+//! stdout per invocation; the `style_lab.ft` widget drives it over
 //! `proc_spawn` / `on_proc_output`.
 //!
 //!     style-muse next <count> <random|llm|auto> [note...]

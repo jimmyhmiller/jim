@@ -246,7 +246,7 @@ fn push_issue(file: &mut ProjectIssuesFile, title: String, body: String) -> u64 
 
 /// Watches `~/.jim/issues/` so external edits (a CLI/script adding an
 /// issue, or hand-editing a `<id>.json`) are picked up live, mirroring
-/// the rhai-widget hot-reload (`ScriptWatcher`). Changed project ids are
+/// the funct-widget hot-reload (`ScriptWatcher`). Changed project ids are
 /// pushed over the channel and drained by `poll_issues_watcher`.
 #[derive(Resource)]
 struct IssuesWatcher {

@@ -11,7 +11,7 @@
 //
 // To override per project, write `~/.jim/projects/<id>/
 // theme.rhai` with the tokens you want to change.
-#{
+{
     // --- core text + accent ---
     bg: "#10121a",
     fg: "#e8e4dd",

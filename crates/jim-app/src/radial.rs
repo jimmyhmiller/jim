@@ -15,6 +15,9 @@
 //! cancel. Esc also cancels.
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
@@ -56,10 +59,36 @@ pub struct RadialItem {
     pub action_id: &'static str,
 }
 
-/// Snapshot the action registry's radial-eligible actions (those with an
-/// icon) in a stable order (by id) so item indices stay consistent for
-/// the duration of one open menu.
+/// Snapshot the items for one menu opening.
+///
+/// Curation: if `~/.jim/radial.json` exists, it is an *ordered allowlist*
+/// of action ids — the radial shows exactly those, in that order, and
+/// *any* registered action may appear (not just icon-bearing ones; a
+/// listed action with no icon gets the `•` fallback). This is the easy
+/// knob for "the radial has too many things": edit the file, reopen the
+/// menu. With no file we fall back to "every action that carries an
+/// icon", sorted by id for a stable layout.
+///
+/// Read fresh on each open so edits take effect on the next right-click
+/// (menu opens are user-gated and rare, so the tiny file read is cheap).
 fn collect_radial_items(registry: &ActionRegistry) -> Vec<RadialItem> {
+    if let Some(ids) = load_radial_allowlist() {
+        return ids
+            .iter()
+            .filter_map(|id| {
+                let Some(a) = registry.get(id) else {
+                    warn!("radial.json: unknown action id {id:?}; skipping");
+                    return None;
+                };
+                Some(RadialItem {
+                    icon: a.radial_icon.unwrap_or("•"),
+                    label: a.title,
+                    action_id: a.id,
+                })
+            })
+            .collect();
+    }
+
     let mut items: Vec<RadialItem> = registry
         .radial_items()
         .map(|a| RadialItem {
@@ -70,6 +99,77 @@ fn collect_radial_items(registry: &ActionRegistry) -> Vec<RadialItem> {
         .collect();
     items.sort_by_key(|i| i.action_id);
     items
+}
+
+fn radial_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".jim").join("radial.json"))
+}
+
+/// `radial.json` accepts either a bare array of ids or an object with an
+/// `items` array (the object form lets the seeded default carry a
+/// `_comment`, which serde ignores).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RadialConfigFile {
+    List(Vec<String>),
+    Object { items: Vec<String> },
+}
+
+impl RadialConfigFile {
+    fn into_items(self) -> Vec<String> {
+        match self {
+            RadialConfigFile::List(v) => v,
+            RadialConfigFile::Object { items } => items,
+        }
+    }
+}
+
+/// Load the user's radial allowlist (ordered action ids). `None` means
+/// "no file / unreadable / invalid" → caller shows every icon action.
+fn load_radial_allowlist() -> Option<Vec<String>> {
+    let path = radial_config_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    match serde_json::from_slice::<RadialConfigFile>(&bytes) {
+        Ok(cfg) => Some(cfg.into_items()),
+        Err(e) => {
+            warn!("radial.json: invalid ({e}); showing every icon action");
+            None
+        }
+    }
+}
+
+/// Default `radial.json` written on first run so the menu starts curated
+/// (the full set is ~a dozen items — too many) and the file is
+/// discoverable. Deleting it restores "show every icon action".
+const DEFAULT_RADIAL_CONFIG: &str = r#"{
+  "_comment": "Ordered action ids shown on the right-click radial menu. Edit this list to control which actions appear (and their order). Delete this file to show every action that has an icon. Action ids show up in the command palette; any action id works here, even ones without an icon.",
+  "items": [
+    "pane.spawn.terminal",
+    "pane.spawn.editor",
+    "pane.spawn.run",
+    "pane.spawn.inbox",
+    "pane.spawn.issues",
+    "view.toggle_cube",
+    "widget.garden"
+  ]
+}
+"#;
+
+/// Seed the default curated `radial.json` if the user has none yet.
+fn seed_radial_config() {
+    let Some(path) = radial_config_path() else {
+        return;
+    };
+    if path.exists() {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, DEFAULT_RADIAL_CONFIG) {
+        warn!("[radial] couldn't write default {}: {e}", path.display());
+    }
 }
 
 #[derive(Resource, Default)]
@@ -97,12 +197,14 @@ pub struct RadialPlugin;
 
 impl Plugin for RadialPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(RadialMenu::default()).add_systems(
-            Update,
-            (radial_open_close, radial_hover, radial_render)
-                .chain()
-                .in_set(crate::actions::ActionProducerSet),
-        );
+        app.insert_resource(RadialMenu::default())
+            .add_systems(Startup, seed_radial_config)
+            .add_systems(
+                Update,
+                (radial_open_close, radial_hover, radial_render)
+                    .chain()
+                    .in_set(crate::actions::ActionProducerSet),
+            );
     }
 }
 

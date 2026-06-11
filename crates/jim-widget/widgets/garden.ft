@@ -1,0 +1,290 @@
+// garden.ft — Claude garden widget (funct port of garden.rhai).
+//
+// EVENT-DRIVEN. Animation is opt-in via set_animating(true); when all
+// plants are mature we set it back to false and the widget costs zero
+// CPU until the next event.
+//
+// State lives in a widget-local atom (funct has no mutable global
+// `state`). The Rhai version did one-time migrations against a
+// host-persisted state map; a fresh local atom starts at the final
+// migrated shape, so init_state() just returns empty plants / next_id 1.
+//
+// funct notes vs rhai:
+//   - lists are immutable: push/assoc return new values; we rebuild lists
+//   - records are immutable: update with spread { ..r, k: v }
+//   - no bitwise & / hex literals: `& 0xFFFF` -> `% 65536`
+//   - abs/max/min are prelude functions, not methods
+import "host"
+
+// theme_get is not (yet) registered for funct widgets; declared extern so
+// the file compiles. Faults loudly if called without a host binding.
+extern fn theme_get(name)
+
+// --- constants (inlined where Rhai inlined them inside fns) ---
+fn grass_tiles()  = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+fn flower_tiles() = [14, 18, 22, 25, 28, 32, 35, 38, 42, 45, 48, 51, 54]
+fn tree_tiles()   = [55, 57, 59, 61, 63, 65, 67]
+fn vine_tiles()   = [68, 69, 70, 71, 72, 73, 74, 75, 76, 77]
+fn seed_tiles()   = [0, 1, 2, 3]
+
+// --- state ---
+fn init_state() = { plants: [], next_id: 1 }
+let state = atom(init_state())
+
+// --- pure helpers ---
+
+fn pick_tile(bucket) = bucket[rand_int(0, len(bucket) - 1)]
+
+fn count_species(plants, species) {
+    let mut n = 0
+    for p in plants { if p.species == species { n = n + 1 } }
+    n
+}
+
+fn try_tree_x(plants, cw) {
+    let mut i = 0
+    while i < 20 {
+        let candidate = 120.0 + rand() * (cw - 240.0)
+        let mut ok = true
+        for p in plants {
+            if p.species == "tree" {
+                if abs(p.x - candidate) < 220.0 { ok = false }  // MIN_TREE_SPACING
+            }
+        }
+        if ok { return candidate }
+        i = i + 1
+    }
+    -1.0
+}
+
+fn first_vine_x(plants) {
+    for p in plants { if p.species == "vine" { return p.x } }
+    -1.0
+}
+
+fn any_growing(plants) {
+    for plant in plants { if plant.age < 8.0 { return true } }  // GROW_SECS
+    false
+}
+
+fn species_for_tool(tool_name) {
+    if tool_name == "Edit" or tool_name == "Write" or tool_name == "MultiEdit" or tool_name == "NotebookEdit" {
+        "flower"
+    } else if tool_name == "Bash" {
+        "vine"
+    } else if tool_name == "Read" or tool_name == "Grep" or tool_name == "Glob" {
+        "grass"
+    } else if tool_name == "Task" or tool_name == "Agent" {
+        "tree"
+    } else {
+        "seed"
+    }
+}
+
+fn cap_for(species) {
+    if species == "tree" { 4 }          // CAP_TREE
+    else if species == "flower" { 20 }  // CAP_FLOWER
+    else if species == "vine" { 10 }    // CAP_VINE
+    else if species == "grass" { 20 }   // CAP_GRASS
+    else { 8 }                          // CAP_SEED
+}
+
+fn target_scale_for(species) {
+    if species == "tree" {
+        1.40 + rand() * 1.80
+    } else if species == "flower" {
+        0.55 + rand() * 1.80
+    } else if species == "vine" {
+        0.35 + rand() * 1.20
+    } else if species == "grass" {
+        0.25 + rand() * 0.85
+    } else {
+        0.15 + rand() * 0.55
+    }
+}
+
+fn bucket_for(species) {
+    if species == "tree" { tree_tiles() }
+    else if species == "flower" { flower_tiles() }
+    else if species == "vine" { vine_tiles() }
+    else if species == "grass" { grass_tiles() }
+    else { seed_tiles() }
+}
+
+// --- handlers ---
+
+fn on_init() {
+    set_animating(any_growing((@state).plants))
+    request_render()
+}
+
+fn on_bus(kind, payload) {
+    let payload_is_map = typeof(payload) == "Record"
+
+    if kind == "pre_tool_use" {
+        let cwd = if payload_is_map and has(payload, "cwd") { payload.cwd } else { "" }
+        let tool_name = if payload_is_map and has(payload, "tool_name") { payload.tool_name } else { "" }
+        let species = species_for_tool(tool_name)
+        let s = @state
+        if count_species(s.plants, species) >= cap_for(species) { return }
+
+        let plot_key = hash_str(cwd)
+        let cx_frac = (to_float(abs(plot_key) % 65536) / 65535.0) * 0.6 + 0.2
+        let hue = to_float((abs(plot_key) / 65536) % 360)
+        let margin = 100.0
+
+        let x = if species == "tree" {
+            let tx = try_tree_x(s.plants, canvas_w)
+            if tx < 0.0 { return }
+            tx
+        } else if species == "vine" {
+            let vx = first_vine_x(s.plants)
+            if vx > 0.0 {
+                let cand = vx + (rand() - 0.5) * 2.0 * 120.0  // VINE_CLUSTER_RADIUS
+                min(max(cand, margin), canvas_w - margin)
+            } else {
+                let spread_px = canvas_w * 0.35
+                let center_x = cx_frac * canvas_w
+                let cand = center_x + (rand() - 0.5) * 2.0 * spread_px
+                min(max(cand, margin), canvas_w - margin)
+            }
+        } else {
+            let spread_px = canvas_w * 0.35
+            let center_x = cx_frac * canvas_w
+            let cand = center_x + (rand() - 0.5) * 2.0 * spread_px
+            min(max(cand, margin), canvas_w - margin)
+        }
+
+        let new_plant = {
+            id: s.next_id,
+            species: species,
+            age: 0.0,
+            target_scale: target_scale_for(species),
+            x: x,
+            hue: ((hue * 0.3) + (rand() - 0.5) * 12.0) % 360.0,
+            tile: pick_tile(bucket_for(species)),
+        }
+        reset!(state, { ..s, plants: push(s.plants, new_plant), next_id: s.next_id + 1 })
+        set_animating(true)
+        request_render()
+    } else if kind == "user_prompt_submit" {
+        let cwd = if payload_is_map and has(payload, "cwd") { payload.cwd } else { "" }
+        let plot_key = hash_str(cwd)
+        let cx_frac = (to_float(abs(plot_key) % 65536) / 65535.0) * 0.6 + 0.2
+        let center_x = cx_frac * canvas_w
+        let margin = 100.0  // SPRITE_W * 0.5
+        let mut s = @state
+        let mut i = 0
+        while i < 3 {
+            let offset = (rand() - 0.5) * 2.0 * canvas_w * 0.30
+            let x = min(max(center_x + offset, margin), canvas_w - margin)
+            let new_plant = {
+                id: s.next_id,
+                species: "seed",
+                age: 0.0,
+                target_scale: 0.30 + rand() * 0.20,
+                x: x,
+                hue: rand() * 24.0 - 12.0,
+                tile: pick_tile([0, 1, 2, 3]),  // SEED_TILES
+            }
+            s = { ..s, plants: push(s.plants, new_plant), next_id: s.next_id + 1 }
+            i = i + 1
+        }
+        reset!(state, s)
+        set_animating(true)
+        request_render()
+    } else if kind == "stop" {
+        let s = @state
+        let mut new_plants = []
+        for plant in s.plants {
+            let p = if plant.age < 8.0 { { ..plant, age: 8.0 } } else { plant }  // GROW_SECS
+            new_plants = push(new_plants, p)
+        }
+        reset!(state, { ..s, plants: new_plants })
+        set_animating(false)
+        request_render()
+    }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if cmd {
+        host_log("cmd-click: clearing " + str(len((@state).plants)) + " plants")
+        reset!(state, { ..(@state), plants: [], next_id: 1 })
+        set_animating(false)
+        request_render()
+    }
+}
+
+fn on_frame(dt) {
+    let s = @state
+    let mut still_growing = false
+    let mut new_plants = []
+    for plant in s.plants {
+        let p = if plant.age < 8.0 {  // GROW_SECS
+            let mut a = plant.age + dt
+            if a >= 8.0 { a = 8.0 } else { still_growing = true }
+            { ..plant, age: a }
+        } else {
+            plant
+        }
+        new_plants = push(new_plants, p)
+    }
+    // Trim to MAX_PLANTS (60), dropping from the front like shift().
+    while len(new_plants) > 60 {
+        new_plants = rest(new_plants)
+    }
+    reset!(state, { ..s, plants: new_plants })
+    if not still_growing { set_animating(false) }
+    request_render()
+}
+
+fn on_resize(w, h) { request_render() }
+
+fn render(canvas_w, canvas_h) {
+    // Inline constants: GROW_SECS = 8.0, GROUND_INSET = 18.0,
+    // GROUND_H = 5.0, SPRITE_W = 200.0, SPRITE_H = 400.0,
+    // TILE_W = 12, TILE_H = 24
+    let mut items = []
+    let bg = theme_get("canvas_bg")
+    items = push(items, {
+        kind: "rect",
+        id: "sky",
+        x: 0.0, y: 0.0,
+        w: canvas_w, h: canvas_h,
+        color: bg,
+        anchor: "top-left",
+        z: 0.0,
+    })
+    items = push(items, {
+        kind: "rect",
+        id: "ground",
+        x: 0.0, y: canvas_h - 18.0 - 5.0,
+        w: canvas_w, h: 5.0,
+        color: "#1a2e1a",
+        anchor: "top-left",
+        z: 0.05,
+    })
+    for plant in (@state).plants {
+        let mut t = plant.age / 8.0
+        if t > 1.0 { t = 1.0 }
+        let scale = plant.target_scale * (0.25 + 0.75 * t)
+        items = push(items, {
+            kind: "sprite",
+            id: "plant-" + str(plant.id),
+            x: plant.x,
+            y: canvas_h - 18.0,
+            w: 100.0 * scale,
+            h: 200.0 * scale,
+            image: "tile",
+            path: widget_asset("garden/plants.png"),
+            tile_w: 12,
+            tile_h: 24,
+            col: plant.tile,
+            row: 0,
+            hue_shift: plant.hue,
+            anchor: "bottom-center",
+            z: 2.0 - plant.target_scale * 0.4,
+        })
+    }
+    { kind: "canvas", children: items }
+}

@@ -11,7 +11,7 @@
 //!
 //! ## Two hosting paths
 //!
-//! - **In-process Rhai** — `rhai_widget.rs`. A `.rhai` script runs on a
+//! - **In-process funct** — `script_widget.rs`. A `.ft` script runs on a
 //!   worker thread and the host calls named handlers (`on_click`,
 //!   `on_toggle`, `on_input_change`, `on_bus`, …). Hot-reloaded from
 //!   `~/.jim/widgets/`. This is the default for new widgets.
@@ -55,13 +55,14 @@ use serde_json::Value;
 
 pub mod anim;
 pub mod button_material;
+pub mod funct_widget;
 pub mod glaze_material;
 pub mod glaze_style;
 pub mod layout;
 pub mod msgbus;
 pub mod protocol;
 pub mod render;
-pub mod rhai_widget;
+pub mod script_widget;
 pub mod subprocess;
 
 pub use msgbus::{PendingMsg, WidgetMsgBus};
@@ -102,7 +103,7 @@ pub fn request_main_loop_wakeup() {
 /// `handle_widget_wheel` when the user scrolls over the pane; applied
 /// to `PaneChrome.content_root.transform.y` by
 /// `apply_widget_scroll`. The two render paths (`rerender_widgets`
-/// here and `apply_latest_frames` in rhai_widget) write `max_y`
+/// here and `apply_latest_frames` in script_widget) write `max_y`
 /// after they know how tall the content drew.
 #[derive(Component, Default, Debug)]
 pub struct WidgetScroll {
@@ -672,7 +673,7 @@ fn begin_slider_drag(
     widgets: Query<(
         &WidgetTargets,
         Option<&WidgetIO>,
-        Option<&crate::rhai_widget::RhaiWidget>,
+        Option<&crate::script_widget::ScriptWidget>,
         Option<&WidgetScroll>,
     )>,
 ) {
@@ -681,7 +682,7 @@ fn begin_slider_drag(
         if kind.0 != PANE_KIND {
             continue;
         }
-        let Ok((targets, io, rhai, scroll)) = widgets.get(ev.pane) else {
+        let Ok((targets, io, sw, scroll)) = widgets.get(ev.pane) else {
             continue;
         };
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
@@ -693,8 +694,8 @@ fn begin_slider_drag(
         if let Some(io) = io {
             send_slider_change(io, &t.id, value);
         }
-        if let Some(rhai) = rhai {
-            rhai.send_slider_change(t.id.clone(), value);
+        if let Some(sw) = sw {
+            sw.send_slider_change(t.id.clone(), value);
         }
         commands.entity(ev.pane).insert(WidgetSliderDrag {
             target: t.clone(),
@@ -710,11 +711,11 @@ fn update_slider_drag(
     mut q: Query<(
         &mut WidgetSliderDrag,
         Option<&WidgetIO>,
-        Option<&crate::rhai_widget::RhaiWidget>,
+        Option<&crate::script_widget::ScriptWidget>,
     )>,
 ) {
     for ev in drags.read() {
-        let Ok((mut drag, io, rhai)) = q.get_mut(ev.pane) else {
+        let Ok((mut drag, io, sw)) = q.get_mut(ev.pane) else {
             continue;
         };
         let value = drag.target.value_at(ev.local_pt.x);
@@ -723,8 +724,8 @@ fn update_slider_drag(
             if let Some(io) = io {
                 send_slider_change(io, &drag.target.id, value);
             }
-            if let Some(rhai) = rhai {
-                rhai.send_slider_change(drag.target.id.clone(), value);
+            if let Some(sw) = sw {
+                sw.send_slider_change(drag.target.id.clone(), value);
             }
         }
     }
@@ -1014,7 +1015,7 @@ fn handle_overlay_input(
     windows: Query<&Window>,
     hits: Res<SelectMenuHits>,
     mut open: ResMut<WidgetOpenSelect>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::rhai_widget::RhaiWidget>)>,
+    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
 ) {
     if open.0.is_none() {
         return;
@@ -1038,7 +1039,7 @@ fn handle_overlay_input(
     }
     if let Some(hit) = hits.items.iter().find(|h| h.rect.contains(pt)) {
         if let Some(pane) = hits.pane {
-            if let Ok((io, rhai)) = widgets.get(pane) {
+            if let Ok((io, sw)) = widgets.get(pane) {
                 let evt = HostEvent::SelectChange {
                     id: hits.select_id.clone(),
                     value: hit.option_id.clone(),
@@ -1048,8 +1049,8 @@ fn handle_overlay_input(
                         let _ = io.tx.send(json);
                     }
                 }
-                if let Some(rhai) = rhai {
-                    rhai.send_select_change(hits.select_id.clone(), hit.option_id.clone());
+                if let Some(sw) = sw {
+                    sw.send_select_change(hits.select_id.clone(), hit.option_id.clone());
                 }
             }
         }
@@ -1090,14 +1091,14 @@ fn click_to_host_event(kind: &ClickKind, id: &str) -> Option<HostEvent> {
     })
 }
 
-fn send_host_event(io: Option<&WidgetIO>, rhai: Option<&crate::rhai_widget::RhaiWidget>, evt: &HostEvent) {
+fn send_host_event(io: Option<&WidgetIO>, sw: Option<&crate::script_widget::ScriptWidget>, evt: &HostEvent) {
     if let Some(io) = io {
         if let Ok(json) = serde_json::to_string(evt) {
             let _ = io.tx.send(json);
         }
     }
-    if let Some(rhai) = rhai {
-        rhai.send_host_event(evt);
+    if let Some(sw) = sw {
+        sw.send_host_event(evt);
     }
 }
 
@@ -1306,7 +1307,7 @@ fn handle_dialog_input(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window>,
     hits: Res<WidgetOverlayHits>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::rhai_widget::RhaiWidget>)>,
+    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
 ) {
     if hits.dialog_id.is_empty() {
         return;
@@ -1314,11 +1315,11 @@ fn handle_dialog_input(
     let Some(pane) = hits.pane else {
         return;
     };
-    let Ok((io, rhai)) = widgets.get(pane) else {
+    let Ok((io, sw)) = widgets.get(pane) else {
         return;
     };
     if keys.just_pressed(KeyCode::Escape) {
-        send_host_event(io, rhai, &HostEvent::DialogClose { id: hits.dialog_id.clone() });
+        send_host_event(io, sw, &HostEvent::DialogClose { id: hits.dialog_id.clone() });
         return;
     }
     if !buttons.just_pressed(bevy::input::mouse::MouseButton::Left) {
@@ -1332,10 +1333,10 @@ fn handle_dialog_input(
     };
     if let Some(hit) = hits.clicks.iter().find(|h| h.rect.contains(pt)) {
         if let Some(evt) = click_to_host_event(&hit.kind, &hit.id) {
-            send_host_event(io, rhai, &evt);
+            send_host_event(io, sw, &evt);
         }
     } else if !hits.panel_rect.contains(pt) {
-        send_host_event(io, rhai, &HostEvent::DialogClose { id: hits.dialog_id.clone() });
+        send_host_event(io, sw, &HostEvent::DialogClose { id: hits.dialog_id.clone() });
     }
 }
 
@@ -1489,7 +1490,7 @@ fn handle_popover_input(
     windows: Query<&Window>,
     hits: Res<PopoverHits>,
     mut open: ResMut<WidgetOpenPopover>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::rhai_widget::RhaiWidget>)>,
+    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
 ) {
     if open.0.is_none() {
         return;
@@ -1512,9 +1513,9 @@ fn handle_popover_input(
     }
     if let Some(hit) = hits.clicks.iter().find(|h| h.rect.contains(pt)) {
         if let Some(pane) = hits.pane {
-            if let Ok((io, rhai)) = widgets.get(pane) {
+            if let Ok((io, sw)) = widgets.get(pane) {
                 if let Some(evt) = click_to_host_event(&hit.kind, &hit.id) {
-                    send_host_event(io, rhai, &evt);
+                    send_host_event(io, sw, &evt);
                 }
             }
         }
@@ -1538,7 +1539,7 @@ fn render_toast_overlay(
     existing: Query<Entity, With<WidgetToastRoot>>,
     mut hits: ResMut<ToastHits>,
     time: Res<bevy::time::Time>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::rhai_widget::RhaiWidget>)>,
+    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
     // (first_seen, dismiss_sent) per live toast — drives TTL auto-dismiss
     mut ages: Local<std::collections::HashMap<(Entity, String), (f32, bool)>>,
 ) {
@@ -1570,8 +1571,8 @@ fn render_toast_overlay(
         }
         if !entry.1 {
             entry.1 = true;
-            if let Ok((io, rhai)) = widgets.get(*pane) {
-                send_host_event(io, rhai, &HostEvent::ToastDismiss { id: toast.id.clone() });
+            if let Ok((io, sw)) = widgets.get(*pane) {
+                send_host_event(io, sw, &HostEvent::ToastDismiss { id: toast.id.clone() });
             }
         }
         false
@@ -1762,7 +1763,7 @@ fn handle_toast_input(
     buttons: Res<ButtonInput<bevy::input::mouse::MouseButton>>,
     windows: Query<&Window>,
     hits: Res<ToastHits>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::rhai_widget::RhaiWidget>)>,
+    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
 ) {
     if hits.items.is_empty() || !buttons.just_pressed(bevy::input::mouse::MouseButton::Left) {
         return;
@@ -1774,8 +1775,8 @@ fn handle_toast_input(
         return;
     };
     if let Some((_, id, pane)) = hits.items.iter().find(|(rect, _, _)| rect.contains(pt)) {
-        if let Ok((io, rhai)) = widgets.get(*pane) {
-            send_host_event(io, rhai, &HostEvent::ToastDismiss { id: id.clone() });
+        if let Ok((io, sw)) = widgets.get(*pane) {
+            send_host_event(io, sw, &HostEvent::ToastDismiss { id: id.clone() });
         }
     }
 }
@@ -2135,12 +2136,12 @@ fn update_widget_hover(
             Entity,
             &jim_pane::PaneKindMarker,
             &mut WidgetHover,
-            // subprocess panes carry WidgetRender, rhai panes RhaiWidget —
+            // subprocess panes carry WidgetRender, funct panes ScriptWidget —
             // requiring either one non-optionally would silently skip the
-            // other kind (rhai widgets had NO hover at all for exactly
+            // other kind (funct widgets had NO hover at all for exactly
             // that reason)
             Option<&mut WidgetRender>,
-            Option<&mut rhai_widget::RhaiWidget>,
+            Option<&mut script_widget::ScriptWidget>,
             Option<&WidgetScroll>,
         ),
         With<jim_pane::PaneTag>,
@@ -2166,8 +2167,8 @@ fn update_widget_hover(
     });
 
     let mut want_pointer = false;
-    for (pane, kind, mut hover, render_state, rhai, scroll) in &mut widgets {
-        let is_widget_kind = kind.0 == PANE_KIND || kind.0 == rhai_widget::PANE_KIND;
+    for (pane, kind, mut hover, render_state, sw, scroll) in &mut widgets {
+        let is_widget_kind = kind.0 == PANE_KIND || kind.0 == script_widget::PANE_KIND;
         if !is_widget_kind {
             continue;
         }
@@ -2198,7 +2199,7 @@ fn update_widget_hover(
             if let Some(mut rs) = render_state {
                 rs.force_render = true;
             }
-            if let Some(mut rw) = rhai {
+            if let Some(mut rw) = sw {
                 rw.force_render = true;
             }
         }
@@ -2215,7 +2216,7 @@ fn update_widget_hover(
 }
 
 /// Read mouse wheel events, route to whichever widget pane (any kind:
-/// the protocol-driven `widget` or the `rhai_widget`) is topmost
+/// the protocol-driven `widget` or the `script_widget`) is topmost
 /// under the cursor, and update its `WidgetScroll.y` clamped to
 /// `[0, max_y]`. Lines are converted to pixels via `LINE_PX` since we
 /// don't carry per-widget font metrics here.
@@ -2267,7 +2268,7 @@ fn handle_widget_wheel(
     };
 
     if let Ok((_, mut scroll, kind)) = widgets.get_mut(target) {
-        if kind.0 != PANE_KIND && kind.0 != rhai_widget::PANE_KIND {
+        if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             return;
         }
         let new_y = (scroll.y - dy_px).clamp(0.0, scroll.max_y);
@@ -2298,7 +2299,7 @@ fn apply_widget_scroll(
 ) {
     use jim_pane::{MARGIN, TITLE_H};
     for (scroll, chrome, kind) in &widgets {
-        if kind.0 != PANE_KIND && kind.0 != rhai_widget::PANE_KIND {
+        if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             continue;
         }
         if let Ok(mut t) = t_q.get_mut(chrome.content_root) {
@@ -2885,7 +2886,7 @@ fn rerender_widgets(
                 // `try_despawn`: this per-frame rebuild can race a pane
                 // teardown (an exclusive system in another plugin) that
                 // recursively despawns this content. A plain `despawn` on
-                // a stale child panics the app. Same fix as the rhai
+                // a stale child panics the app. Same fix as the funct
                 // widget render path (`apply_latest_frames`/`diff_render`).
                 commands.entity(c).try_despawn();
             }
@@ -3241,18 +3242,18 @@ pub fn make_nearest_image(data: Vec<u8>, w: u32, h: u32) -> Image {
 /// buttons / links / inputs on pinned widgets keep working while
 /// empty space falls through to whatever is underneath.
 ///
-/// Covers both `widget` and `rhai_widget` kinds because they share the
+/// Covers both `widget` and `script_widget` kinds because they share the
 /// `WidgetTargets` component — no kind check required.
 fn update_widget_hot_zones(
     mut q: Query<(
         &PaneRect,
         &WidgetTargets,
         Option<&WidgetScroll>,
-        Option<&crate::rhai_widget::RhaiWidget>,
+        Option<&crate::script_widget::ScriptWidget>,
         &mut PaneHotZones,
     )>,
 ) {
-    for (rect, targets, scroll, rhai, mut zones) in &mut q {
+    for (rect, targets, scroll, sw, mut zones) in &mut q {
         zones.clear();
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
         let content_size = Vec2::new(
@@ -3280,14 +3281,14 @@ fn update_widget_hot_zones(
                 zones.push(clipped);
             }
         }
-        // Canvas-based rhai widgets (e.g. chess) self-route clicks and
+        // Canvas-based funct widgets (e.g. chess) self-route clicks and
         // publish no per-element targets, so the loops above leave them
         // with no hot-zones — meaning they'd be entirely click-through
         // when pinned. If such a widget handles clicks at all (defines
         // `on_click`), treat its whole content area as one hot-zone so
         // pinned clicks reach it. Decorative widgets without `on_click`
         // (dust) stay click-through.
-        if zones.0.is_empty() && rhai.map_or(false, |r| r.wants_clicks) && !visible.is_empty() {
+        if zones.0.is_empty() && sw.map_or(false, |r| r.wants_clicks) && !visible.is_empty() {
             zones.push(visible);
         }
     }
@@ -3607,7 +3608,7 @@ fn blur_inputs_on_focus_change(
     q: Query<(
         &WidgetInputFocus,
         Option<&WidgetIO>,
-        Option<&crate::rhai_widget::RhaiWidget>,
+        Option<&crate::script_widget::ScriptWidget>,
     )>,
 ) {
     if !focused.is_changed() {
@@ -3616,7 +3617,7 @@ fn blur_inputs_on_focus_change(
     let now = focused.0;
     if let Some(old) = *prev {
         if Some(old) != now {
-            if let Ok((focus, io, rhai)) = q.get(old) {
+            if let Ok((focus, io, sw)) = q.get(old) {
                 if let Some(io) = io {
                     let evt = HostEvent::InputFocus {
                         id: focus.id.clone(),
@@ -3626,8 +3627,8 @@ fn blur_inputs_on_focus_change(
                         let _ = io.tx.send(json);
                     }
                 }
-                if let Some(rhai) = rhai {
-                    rhai.send_input_focus(focus.id.clone(), false);
+                if let Some(sw) = sw {
+                    sw.send_input_focus(focus.id.clone(), false);
                 }
                 commands.entity(old).remove::<WidgetInputFocus>();
             }
@@ -3649,7 +3650,7 @@ fn handle_widget_input_typing(
         Entity,
         &mut WidgetInputFocus,
         Option<&WidgetIO>,
-        Option<&crate::rhai_widget::RhaiWidget>,
+        Option<&crate::script_widget::ScriptWidget>,
     )>,
 ) {
     use bevy::input::keyboard::Key;
@@ -3657,7 +3658,7 @@ fn handle_widget_input_typing(
         || modifiers.pressed(KeyCode::SuperRight)
         || modifiers.pressed(KeyCode::ControlLeft)
         || modifiers.pressed(KeyCode::ControlRight);
-    for (pane, mut focus, io, rhai) in &mut q {
+    for (pane, mut focus, io, sw) in &mut q {
         // A widget input can keep `WidgetInputFocus` while another pane is
         // focused; only consume keys when the keyboard owner allows this
         // pane (and never while a text modal owns input).
@@ -3787,8 +3788,8 @@ fn handle_widget_input_typing(
                     let _ = io.tx.send(json);
                 }
             }
-            if let Some(rhai) = rhai {
-                rhai.send_input_change(focus.id.clone(), focus.value.clone());
+            if let Some(sw) = sw {
+                sw.send_input_change(focus.id.clone(), focus.value.clone());
             }
         }
         if submitted {
@@ -3801,8 +3802,8 @@ fn handle_widget_input_typing(
                     let _ = io.tx.send(json);
                 }
             }
-            if let Some(rhai) = rhai {
-                rhai.send_input_submit(focus.id.clone(), focus.value.clone());
+            if let Some(sw) = sw {
+                sw.send_input_submit(focus.id.clone(), focus.value.clone());
             }
         }
         if blurred {
@@ -3815,8 +3816,8 @@ fn handle_widget_input_typing(
                     let _ = io.tx.send(json);
                 }
             }
-            if let Some(rhai) = rhai {
-                rhai.send_input_focus(focus.id.clone(), false);
+            if let Some(sw) = sw {
+                sw.send_input_focus(focus.id.clone(), false);
             }
             commands.entity(pane).remove::<WidgetInputFocus>();
         }

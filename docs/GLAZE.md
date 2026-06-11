@@ -7,7 +7,7 @@
 
 The current styling model is **inline `Style` structs per `Element`** (`jim-widget/src/protocol.rs`):
 no reuse, no states, no variants, no inheritance, and "hover/focus" is hardcoded
-procedurally in `render.rs`. We already produce styles *programmatically* (the Rhai
+procedurally in `render.rs`. We already produce styles *programmatically* (the funct
 `render()` handler computes `Style` every frame) — so we're effectively living in
 Netscape's **JSSS** model from 1996. The goal here is to lift the reusable,
 retunable, *animatable* parts into a real language whose constraints are inverted from
@@ -160,7 +160,7 @@ engine-fed dynamic inputs for the dust shader; here they're bound per element.
   `style: "button"`, `variant: { intent: "primary" }`. Inline `Style` stays as an
   escape hatch (highest precedence). The renderer's resolution step consumes the
   `CompiledStyle` (chooses the discrete-state plan, paints the layer-plan, instantiates
-  `DynamicMaterial`s for shader layers). Both hosting paths (in-process Rhai + subprocess
+  `DynamicMaterial`s for shader layers). Both hosting paths (in-process funct + subprocess
   NDJSON) reference styles by name — styles live engine-side and are shared.
 - **Live editing** = recompile on `.glz` save + per-frame dynamic uniform feed. A future
   structural editor / inspector edits the AST and rebinds named uniforms live
@@ -200,7 +200,7 @@ no cascade arithmetic.
   { primary danger ghost }`. Declared gives exhaustiveness + editor affordances.
 - **User functions / mixins** — allow `fn`/`mixin` in `.glz`, or keep styles flat?
 - **Layout** — stays in the `Element` protocol (Taffy), or does Glaze own layout too?
-  (L2 keeps the tree in Rhai/subprocess, so: stays in Element for now.)
+  (L2 keeps the tree in funct/subprocess, so: stays in Element for now.)
 - **Material instancing / batching** — share `DynamicMaterial`s keyed by
   `(compiled-shader, uniform-signature)` to bound draw calls; the main net-new risk.
 - **Render-to-texture tier (backdrop/layer-effects)** — explicitly out of L2; revisit as

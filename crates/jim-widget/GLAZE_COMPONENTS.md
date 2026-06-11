@@ -49,7 +49,7 @@ Building the component system on it would cap every component at the shim's ceil
 ## The right seam: a `StylePlan` (box + ordered layer stack)
 
 Invert the dependency. Today `Style` is the seam and Glaze compiles *down* into it.
-Instead, make the **layer-plan the renderer's seam**, and make `Style` (and Rhai, and
+Instead, make the **layer-plan the renderer's seam**, and make `Style` (and funct, and
 subprocess JSON) *front-ends that lower up into it* — the same target Glaze already
 emits. This is exactly GLAZE.md's stated lowering target ("static residue → layer-plan +
 uniform write-list; dynamic residue → WGSL fragments"); we just stop hiding it behind
@@ -85,7 +85,7 @@ walks `layers` in order.
 
 ### `Style` becomes sugar that lowers into a plan
 
-`protocol::Style` stays — it is the **simple hand-authoring path** for Rhai/subprocess
+`protocol::Style` stays — it is the **simple hand-authoring path** for funct/subprocess
 widgets and we are not taking that away. It gains a single method, `Style::into_plan()`:
 
 | `Style` field | lowers to |
@@ -289,7 +289,7 @@ Two structural gaps dominate the list:
 ## Phase 1 — Make `StylePlan` the seam (foundational, gates everything)
 
 Goal: `render.rs` paints **only** by walking a `StylePlan`'s layer stack; `Style`,
-Glaze, Rhai, and subprocess all lower into `StylePlan`; states are GPU uniforms; slots
+Glaze, funct, and subprocess all lower into `StylePlan`; states are GPU uniforms; slots
 are named boxes. Sequenced so each step is independently shippable and non-breaking.
 
 ### 1a. Introduce `StylePlan` + `paint_plan` (no behavior change)
@@ -435,9 +435,9 @@ pin down the slot-name→field adapter pattern the rest of the components follow
 No overlay needed; runs alongside Phase 1 as its proving ground. Reuse
 `on_drag`/`on_release`; one new `*-change` event each. All slot-styled from day one.
 
-- **`Slider`** `{id, value, min, max, step}` → `slider-change`. Slots `track`/`range`/`thumb`; states `hover`/`press`/`disabled`. First continuous control — needs a drag-track hit region in `render.rs`. **DONE (2026-06-08)** — the first net-new component on the slot system. `Element::Slider` + `SliderStyle{track,range,thumb}` + `HostEvent::SliderChange{id,value}`. Drag plumbing: `WidgetTargets.sliders: Vec<SliderTarget>` (each carries the value-mapping `value_x0`/`value_span` + `min/max/step`); `SliderTarget::value_at(x)` does the clamp+step-snap (unit-tested); `begin/update/end_slider_drag` systems map press/drag/release on `PaneContentPressed/Dragged/Released` and emit `SliderChange` through **both** the subprocess (`WidgetIO`) and rhai (`RhaiWidget::send_slider_change` → `HostToWorker::SliderChange` → `on_slider_change(id,value)`) channels. `render_slider_at` does value-driven sub-layout: full `track`, leading `range` to the thumb centre, `thumb` handle — each `paint_style_background`'d from its slot plan with a sensible fallback. Verified: `glaze_ui` slider (gradient range + glowing-thumb overlay shader) snapshot; value round-trips via `slider-change`. NOTE: when adding an `Element` variant, REBUILD all host bins (`widget-snapshot`, the main app) — a stale host rejects the new serde variant and silently drops the whole frame.
+- **`Slider`** `{id, value, min, max, step}` → `slider-change`. Slots `track`/`range`/`thumb`; states `hover`/`press`/`disabled`. First continuous control — needs a drag-track hit region in `render.rs`. **DONE (2026-06-08)** — the first net-new component on the slot system. `Element::Slider` + `SliderStyle{track,range,thumb}` + `HostEvent::SliderChange{id,value}`. Drag plumbing: `WidgetTargets.sliders: Vec<SliderTarget>` (each carries the value-mapping `value_x0`/`value_span` + `min/max/step`); `SliderTarget::value_at(x)` does the clamp+step-snap (unit-tested); `begin/update/end_slider_drag` systems map press/drag/release on `PaneContentPressed/Dragged/Released` and emit `SliderChange` through **both** the subprocess (`WidgetIO`) and funct (`functWidget::send_slider_change` → `HostToWorker::SliderChange` → `on_slider_change(id,value)`) channels. `render_slider_at` does value-driven sub-layout: full `track`, leading `range` to the thumb centre, `thumb` handle — each `paint_style_background`'d from its slot plan with a sensible fallback. Verified: `glaze_ui` slider (gradient range + glowing-thumb overlay shader) snapshot; value round-trips via `slider-change`. NOTE: when adding an `Element` variant, REBUILD all host bins (`widget-snapshot`, the main app) — a stale host rejects the new serde variant and silently drops the whole frame.
 - **`Checkbox`** — **DONE (2026-06-08)**. `Element::Checkbox{id,label,checked,style}` + `CheckboxStyle{box,check}` (Rust field `square`; Glaze slot `box`). Reuses the **`toggle` event** (no new plumbing) — clicking emits `ClickKind::Toggle`. `:checked` resolved at the widget; the `check` mark renders only when checked. Layout mirrors Toggle (box + label row). Verified in `glaze_ui` (gradient tick, teal `:checked` border).
-- **`Radio` / `RadioGroup`** — **DONE (2026-06-08)**. `Element::RadioGroup{id,options:Vec<TabItem>,selected,style}` + `RadioGroupStyle{ring,dot}` + new **`HostEvent::RadioSelect{id,option}`** (mirrors `TabSelect` across all paths: `ClickKind::RadioSelect`, subprocess press handler, rhai `HostToWorker::RadioSelect`→`on_radio_select`). Layout = column of label cells with left-padding reserving the ring (no nesting, like Tabs). Verified in `glaze_ui` (gradient `dot` on the selected option, accent ring affordance).
+- **`Radio` / `RadioGroup`** — **DONE (2026-06-08)**. `Element::RadioGroup{id,options:Vec<TabItem>,selected,style}` + `RadioGroupStyle{ring,dot}` + new **`HostEvent::RadioSelect{id,option}`** (mirrors `TabSelect` across all paths: `ClickKind::RadioSelect`, subprocess press handler, funct `HostToWorker::RadioSelect`→`on_radio_select`). Layout = column of label cells with left-padding reserving the ring (no nesting, like Tabs). Verified in `glaze_ui` (gradient `dot` on the selected option, accent ring affordance).
 - **`Stepper` / `NumberInput`** — **DONE (2026-06-08)**. `Element::Stepper{id,value,min,max,step,style}` + `StepperStyle{field,button}` + new **`HostEvent::NumberChange{id,value}`** (wired like RadioSelect). The `−`/`+` buttons carry the **precomputed clamped target value** in `ClickKind::NumberChange{value}` — the renderer owns the arithmetic, so a click is a plain value-set (same trick as Toggle's `new_checked`). Arithmetic sub-layout (no Taffy children, like Slider): `[− button][value field][+ button]`, fixed `STEPPER_W`. Verified in `glaze_ui` (teal-bordered buttons, live value).
 - **`Rating`** — deferred: poor slot fit (star glyphs aren't box-paintable; would degrade slots to glyph colors). Do later as a glyph-based special case if wanted.
 
@@ -495,7 +495,7 @@ widget Elements render their floating part onto that layer via the EXISTING rend
   + `click_to_host_event`; `handle_popover_input` closes on a content click, an outside click, or Escape.
   `to_popover_style`; `widget-snapshot --open-popover <id>`. Verified: floating card with working ghost
   buttons, anchored, escaping pane bounds.
-- **`Dialog` / `Sheet` / `Alert`** `{open, title, body, actions}` — modal scrim + focus trap. Slots `scrim`/`panel`/`title`/`body`/`footer`. **DONE (2026-06-09)** — and with it the **arbitrary-element overlay capability** (the substrate's last gap). `Element::Dialog{id,open,title,body:Box<Element>,style:DialogStyle{scrim,panel,title}}` + `HostEvent::DialogClose`. `render_dialog_overlay` renders the **arbitrary `body` through `render::render`** onto a panel root (centered after measuring), with a full-window scrim root behind it. The body's `ClickTarget`s are translated to window-space in `WidgetOverlayHits` and routed by `handle_dialog_input` (body button → its normal event via the shared `click_to_host_event`; outside-panel/Escape → `DialogClose`). `handle_widget_press` blocks all pane presses while a dialog is open (modal). `to_dialog_style`; rhai `send_host_event` + `on_dialog_close`. Verified: centered modal, scrim dims the UI, two working buttons. This generalization (render any Element on the overlay + route its clicks) is what makes rich Popovers / Menus cheap.
+- **`Dialog` / `Sheet` / `Alert`** `{open, title, body, actions}` — modal scrim + focus trap. Slots `scrim`/`panel`/`title`/`body`/`footer`. **DONE (2026-06-09)** — and with it the **arbitrary-element overlay capability** (the substrate's last gap). `Element::Dialog{id,open,title,body:Box<Element>,style:DialogStyle{scrim,panel,title}}` + `HostEvent::DialogClose`. `render_dialog_overlay` renders the **arbitrary `body` through `render::render`** onto a panel root (centered after measuring), with a full-window scrim root behind it. The body's `ClickTarget`s are translated to window-space in `WidgetOverlayHits` and routed by `handle_dialog_input` (body button → its normal event via the shared `click_to_host_event`; outside-panel/Escape → `DialogClose`). `handle_widget_press` blocks all pane presses while a dialog is open (modal). `to_dialog_style`; funct `send_host_event` + `on_dialog_close`. Verified: centered modal, scrim dims the UI, two working buttons. This generalization (render any Element on the overlay + route its clicks) is what makes rich Popovers / Menus cheap.
 - **`Toast`** — transient, auto-dismiss via `on_frame` timer; emitted programmatically. Slots `toast`/`toast:enter`/`toast:exit`. **DONE (2026-06-09)** — `Element::Toast{id,text,style:ToastStyle{surface}}`. New **corner-positioning** mode (bottom-right, stacked) — no anchor, no center. 0-size in-pane; `render_toast_overlay` stacks all toasts at the window corner on the overlay (passive, no input). Widget owns the lifecycle (include to show, drop after a `tick`-driven delay to dismiss — no host timer state). `to_toast_style`; shows by just being in the frame (no force-flag). Verified. (enter/exit animations not yet.)
 
 ---
@@ -549,7 +549,7 @@ For every component:
    rects in the render arm (`layout.rs` / `render.rs`).
 4. Render arm in `render.rs` = compute slot rects → `paint_plan` each slot. Styling comes
    **only** from the resolved per-slot plans — never hardcoded.
-5. Optional new `*-change` event in the handler table (`AUTHORING.md`) for both the Rhai
+5. Optional new `*-change` event in the handler table (`AUTHORING.md`) for both the funct
    and subprocess hosts.
 
 (So a component is ~5 coordinated edits, not 3 — the `<Name>Style` struct and the adapter
@@ -566,7 +566,7 @@ entry are the price of the typed-fields decision.)
   the inner component inherit the outer's tokens/`env`? GLAZE.md has `env` inheritance for
   styles; the *component nesting* story (which env a child slot resolves against) is
   unspecified and needs a decision before Phase 3's composites.
-- **Subprocess `StylePlan` is mostly theoretical.** Subprocess/Rhai authors will use the
+- **Subprocess `StylePlan` is mostly theoretical.** Subprocess/funct authors will use the
   `Style` sugar, not hand-write WGSL layer stacks. The "three front-ends" framing is
   honest only because sugar lowers to a plan — the raw-plan-over-the-wire path may never
   see real use. Fine, but don't build elaborate subprocess plan-authoring ergonomics.

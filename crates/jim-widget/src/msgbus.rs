@@ -10,11 +10,11 @@
 //!
 //! ## Model
 //!
-//! - A widget **publishes** with `emit(topic, payload)` (Rhai host fn) or
+//! - A widget **publishes** with `emit(topic, payload)` (funct host fn) or
 //!   `WidgetMsg::Emit` (subprocess) or the `tbmsg` CLI (via IPC). The host
 //!   serializes the payload; scripts pass native values, never JSON.
 //! - Every widget in the **same editor project** receives the message as
-//!   a pushed `on_message(topic, payload, sender)` (Rhai) /
+//!   a pushed `on_message(topic, payload, sender)` (funct) /
 //!   `HostEvent::Message` (subprocess). Delivery wakes the receiver —
 //!   there is no polling and no `set_animating` requirement.
 //! - `sender` is the publishing widget's id, so a widget can ignore
@@ -27,7 +27,7 @@
 //! ## Flow
 //!
 //! `pump_widget_messages` runs every frame:
-//!   1. Drain each Rhai widget's outbox + the `external` queue (CLI/IPC).
+//!   1. Drain each funct widget's outbox + the `external` queue (CLI/IPC).
 //!   2. Update the retained store for any `retain` messages.
 //!   3. Deliver this frame's messages to every same-project widget, and
 //!      deliver the retained backlog to any widget seen for the first time.
@@ -45,7 +45,7 @@ use serde_json::Value;
 use jim_pane::{PaneKindMarker, PaneProject};
 
 use crate::protocol::HostEvent;
-use crate::rhai_widget::{self, RhaiWidget};
+use crate::script_widget::{self, ScriptWidget};
 use crate::{WidgetIO, WidgetRender};
 
 /// One message awaiting delivery on the widget↔widget bus. Produced by
@@ -122,7 +122,7 @@ fn append_bus_log(m: &PendingMsg) {
 /// Drives the bus once per frame. See module docs for the three phases.
 fn pump_widget_messages(
     mut bus: ResMut<WidgetMsgBus>,
-    rhai_widgets: Query<(&PaneKindMarker, &RhaiWidget, Option<&PaneProject>)>,
+    script_widgets: Query<(&PaneKindMarker, &ScriptWidget, Option<&PaneProject>)>,
     sub_widgets: Query<(
         Entity,
         &PaneKindMarker,
@@ -136,8 +136,8 @@ fn pump_widget_messages(
     let mut pending: Vec<PendingMsg> = std::mem::take(&mut bus.external);
     let mut live_ids: HashSet<String> = HashSet::new();
 
-    for (kind, w, proj) in &rhai_widgets {
-        if kind.0 != rhai_widget::PANE_KIND {
+    for (kind, w, proj) in &script_widgets {
+        if kind.0 != script_widget::PANE_KIND {
             continue;
         }
         live_ids.insert(w.widget_id.clone());
@@ -181,8 +181,8 @@ fn pump_widget_messages(
     // seen after the immutable delivery loops (can't mutate `bus` mid-read).
     let mut newly_seen: Vec<String> = Vec::new();
 
-    for (kind, w, proj) in &rhai_widgets {
-        if kind.0 != rhai_widget::PANE_KIND {
+    for (kind, w, proj) in &script_widgets {
+        if kind.0 != script_widget::PANE_KIND {
             continue;
         }
         let pk = proj.map(|p| p.0);
@@ -227,7 +227,7 @@ fn pump_widget_messages(
     bus.seen.extend(newly_seen);
 }
 
-/// Stable bus id for a subprocess widget pane. Mirrors the Rhai side's
+/// Stable bus id for a subprocess widget pane. Mirrors the funct side's
 /// `rw{bits}` scheme so the two id namespaces never collide.
 pub(crate) fn subprocess_widget_id(entity: Entity) -> String {
     format!("sw{:x}", entity.to_bits())

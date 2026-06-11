@@ -1,0 +1,340 @@
+// theme_editor.ft — live OkLCh theme editor with a real color picker.
+// (funct port of theme_editor.rhai.)
+//
+// EVENT-DRIVEN. Click a token's swatch to open the picker for that
+// token; the picker shows an LxH (lightness × hue) grid at the
+// token's current chroma plus chroma steppers. Click the swatch
+// again (or another row's swatch) to switch. Clicking a swatch in
+// the grid commits that (L, C, h) directly. Writes go through
+// theme_set_oklch — the bridge rewrites the active preset's
+// theme.rhai and the notify watcher retones the rest of the app in
+// the same frame.
+import "host"
+
+// theme_* host natives — the Rust bridge for funct is being written
+// separately; declared extern here so the widget compiles and the call
+// sites are ready once the host registers them.
+extern fn theme_get(token)
+extern fn theme_get_oklch(token)
+extern fn theme_set_oklch(token, l, c, h)
+extern fn theme_set_number(token, v)
+extern fn theme_reset(token)
+extern fn theme_reset_all()
+extern fn theme_contrast(fg, bg)
+
+fn init_state() = { focus: "" }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+// Split "<token>_<value>" where the token itself may contain
+// underscores (e.g. "syntax_keyword", "pane_bg"). The value is
+// always the segment after the FINAL underscore.
+fn split_token_value(s) {
+    let parts = split(s, "_")
+    let n = len(parts)
+    if n < 2 { return ["", s] }
+    let value = parts[n - 1]
+    let mut token = ""
+    let mut i = 0
+    while i < n - 1 {
+        if i > 0 { token = token + "_" }
+        token = token + parts[i]
+        i = i + 1
+    }
+    [token, value]
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "" { return }
+    if starts_with(id, "open_") {
+        let tok = slice(id, 5, len(id) - 5)
+        let s = @state
+        // Toggle: clicking the same swatch closes the picker.
+        if s.focus == tok { reset!(state, { ..s, focus: "" }) }
+        else { reset!(state, { ..s, focus: tok }) }
+        request_render()
+        return
+    }
+    if id == "close_picker" {
+        reset!(state, { ..(@state), focus: "" })
+        request_render()
+        return
+    }
+    // hue_<token>_<h> — change hue, keep L + C.
+    if starts_with(id, "hue_") {
+        let pair = split_token_value(slice(id, 4, len(id) - 4))
+        let token = pair[0]
+        let h = unwrap_or(parse_float(pair[1]), 0.0)
+        let cur = theme_get_oklch(token)
+        let l = if typeof(cur) == "List" { cur[0] } else { 60.0 }
+        let c = if typeof(cur) == "List" { cur[1] } else { 0.1 }
+        theme_set_oklch(token, l, c, h)
+        request_render()
+        return
+    }
+    // lit_<token>_<L> — change lightness, keep h + C.
+    if starts_with(id, "lit_") {
+        let pair = split_token_value(slice(id, 4, len(id) - 4))
+        let token = pair[0]
+        let l = unwrap_or(parse_float(pair[1]), 0.0)
+        let cur = theme_get_oklch(token)
+        let c = if typeof(cur) == "List" { cur[1] } else { 0.1 }
+        let h = if typeof(cur) == "List" { cur[2] } else { 250.0 }
+        theme_set_oklch(token, l, c, h)
+        request_render()
+        return
+    }
+    if starts_with(id, "chr_") {
+        // chr_<token>_<sign> — sign is p (more chroma) / m (less)
+        let pair = split_token_value(slice(id, 4, len(id) - 4))
+        let token = pair[0]
+        let sign = pair[1]
+        let cur = theme_get_oklch(token)
+        if typeof(cur) != "List" { return }
+        let l = cur[0]
+        let mut c = cur[1]
+        let h = cur[2]
+        let delta = if sign == "p" { 0.02 } else { -0.02 }
+        c = c + delta
+        if c < 0.0 { c = 0.0 }
+        if c > 0.4 { c = 0.4 }
+        theme_set_oklch(token, l, c, h)
+        request_render()
+        return
+    }
+    if starts_with(id, "num_") {
+        let pair = split_token_value(slice(id, 4, len(id) - 4))
+        let token = pair[0]
+        let sign = pair[1]
+        let cur = theme_get(token)
+        if typeof(cur) != "Float" and typeof(cur) != "Int" { return }
+        let mut v = if typeof(cur) == "Int" { to_float(cur) } else { cur }
+        let step = if sign == "p" { 1.0 }
+            else if sign == "P" { 5.0 }
+            else if sign == "m" { -1.0 }
+            else if sign == "M" { -5.0 }
+            else { 0.0 }
+        v = v + step
+        if v < 0.0 { v = 0.0 }
+        theme_set_number(token, v)
+        request_render()
+        return
+    }
+    if id == "reset_all" {
+        theme_reset_all()
+        request_render()
+        return
+    }
+    if starts_with(id, "reset_") {
+        let token = slice(id, 6, len(id) - 6)
+        theme_reset(token)
+        request_render()
+        return
+    }
+}
+
+fn on_bus(kind, payload) {
+    if kind == "theme_changed" { request_render() }
+}
+
+fn fmt_oklch(arr) {
+    "L " + str(to_int(arr[0])) + " C " + str(to_int(arr[1] * 100.0)) + " h " + str(to_int(arr[2]))
+}
+
+fn fmt_num(v) {
+    if typeof(v) == "Int" { str(v) }
+    else { str(to_float(to_int(v * 10.0)) / 10.0) }
+}
+
+fn nearest_idx(arr, value) {
+    // Pick the index whose value is closest to `value`. Used to
+    // highlight the current selection on the hue/lightness strips.
+    let mut best = 0
+    let mut best_d = 1000000000.0
+    let mut i = 0
+    while i < len(arr) {
+        let mut d = to_float(arr[i]) - value
+        if d < 0.0 { d = -d }
+        if d < best_d { best_d = d; best = i }
+        i = i + 1
+    }
+    best
+}
+
+fn color_row(token, is_focused) {
+    let cur = theme_get(token)
+    let lch = theme_get_oklch(token)
+    let swatch_color = if typeof(cur) == "Str" { cur } else { "#000000" }
+    let l_cur = if typeof(lch) == "List" { lch[0] } else { 60.0 }
+    let c_cur = if typeof(lch) == "List" { lch[1] } else { 0.1 }
+    let h_cur = if typeof(lch) == "List" { lch[2] } else { 250.0 }
+
+    // Row header: click the swatch to open the picker.
+    let lch_text = "L " + str(to_int(l_cur)) + "  C " + str(to_int(c_cur * 100.0)) + "  h " + str(to_int(h_cur))
+    let header = { kind: "hstack", gap: 10.0, align: "center", children: [
+        { kind: "swatch-button", id: "open_" + token, color: swatch_color, size: 22.0 },
+        { kind: "text", value: token, size: 12.0, color: "#dde1ea" },
+        { kind: "text", value: lch_text, size: 10.0, color: "#888c98" },
+    ]}
+    if not is_focused { return [header] }
+
+    let mut rows = [header]
+    rows = push(rows, { kind: "divider" })
+
+    // Hue strip — fixed reference L+C so the cells always read as a
+    // rainbow even when the token's own L is near-black or near-white.
+    let hs = [0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330]
+    let h_idx = nearest_idx(hs, h_cur)
+    let mut hue_cells = []
+    let mut i = 0
+    while i < len(hs) {
+        let h_val = hs[i]
+        let col = oklch(65.0, 0.18, to_float(h_val))
+        let size = if i == h_idx { 26.0 } else { 18.0 }
+        hue_cells = push(hue_cells, {
+            kind: "swatch-button",
+            id: "hue_" + token + "_" + str(h_val),
+            color: col,
+            size: size,
+        })
+        i = i + 1
+    }
+    rows = push(rows, { kind: "text", value: "hue", size: 10.0, color: "#888c98" })
+    rows = push(rows, { kind: "hstack", gap: 3.0, align: "center", children: hue_cells })
+
+    // Lightness strip at the token's CURRENT hue + chroma.
+    let ls = [95, 85, 75, 60, 45, 30, 18, 8]
+    let l_idx = nearest_idx(ls, l_cur)
+    let mut lit_cells = []
+    let mut j = 0
+    while j < len(ls) {
+        let l_val = ls[j]
+        let col = oklch(to_float(l_val), c_cur, h_cur)
+        let size = if j == l_idx { 26.0 } else { 18.0 }
+        lit_cells = push(lit_cells, {
+            kind: "swatch-button",
+            id: "lit_" + token + "_" + str(l_val),
+            color: col,
+            size: size,
+        })
+        j = j + 1
+    }
+    rows = push(rows, { kind: "text", value: "lightness", size: 10.0, color: "#888c98" })
+    rows = push(rows, { kind: "hstack", gap: 3.0, align: "center", children: lit_cells })
+
+    // Chroma controls + reset/close on one row.
+    rows = push(rows, { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "text", value: "chroma " + str(to_int(c_cur * 100.0)), size: 10.0, color: "#888c98" },
+        { kind: "button", id: "chr_" + token + "_m", label: "−" },
+        { kind: "button", id: "chr_" + token + "_p", label: "+" },
+        { kind: "button", id: "reset_" + token, label: "reset" },
+        { kind: "button", id: "close_picker", label: "done" },
+    ]})
+    rows = push(rows, { kind: "divider" })
+    rows
+}
+
+fn num_row(token) {
+    let cur = theme_get(token)
+    let v = if typeof(cur) == "Int" { to_float(cur) }
+        else if typeof(cur) == "Float" { cur }
+        else { 0.0 }
+    { kind: "hstack", gap: 4.0, align: "center", children: [
+        { kind: "text", value: token + "  " + fmt_num(v), size: 11.0, color: "#bdc1c9" },
+        { kind: "button", id: "num_" + token + "_M", label: "-5" },
+        { kind: "button", id: "num_" + token + "_m", label: "-1" },
+        { kind: "button", id: "num_" + token + "_p", label: "+1" },
+        { kind: "button", id: "num_" + token + "_P", label: "+5" },
+        { kind: "button", id: "reset_" + token, label: "reset" },
+    ]}
+}
+
+fn contrast_row(pair) {
+    let fg_v = theme_get(pair.fg)
+    let bg_v = theme_get(pair.bg)
+    let score = if typeof(fg_v) == "Str" and typeof(bg_v) == "Str" {
+        theme_contrast(fg_v, bg_v)
+    } else { 0.0 }
+    let pass = if score >= 25.0 { "✓" } else { "!" }
+    let txt_color = if score >= 25.0 { "#7bd58a" } else { "#ff7a7a" }
+    let bg_color = if typeof(bg_v) == "Str" { bg_v } else { "#000000" }
+    let fg_color = if typeof(fg_v) == "Str" { fg_v } else { "#ffffff" }
+    { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "swatch", color: bg_color, size: 14.0 },
+        { kind: "swatch", color: fg_color, size: 14.0 },
+        { kind: "text", value: pair.label + "   ΔL " + str(to_int(score)) + "  " + pass, size: 11.0, color: txt_color },
+    ]}
+}
+
+fn render(canvas_w, canvas_h) {
+    let color_tokens = [
+        "bg", "fg", "fg_muted", "accent", "caret",
+        "pane_bg", "pane_border", "pane_border_focused", "pane_focus_glow",
+        "chrome_title", "chrome_title_focused",
+        "syntax_keyword", "syntax_string", "syntax_comment", "syntax_function",
+        "syntax_type", "syntax_constant",
+        "button_bg", "button_label", "button_primary_bg",
+        "input_bg", "input_text",
+        "radial_wedge", "radial_wedge_hover",
+        "canvas_bg", "sidebar_bg",
+    ]
+    let num_tokens = [
+        "pane_corner_radius",
+        "pane_border_width",
+        "pane_border_width_focused",
+        "pane_focus_width",
+        "pane_focus_strength",
+        "pane_shadow_blur",
+        "pane_shadow_offset_y",
+        "widget_button_corner_radius",
+        "widget_button_border_width",
+        "widget_button_shadow_blur",
+        "widget_button_shadow_offset_y",
+    ]
+    let contrast_pairs = [
+        { label: "body",    fg: "fg",                    bg: "bg" },
+        { label: "comment", fg: "syntax_comment",        bg: "bg" },
+        { label: "string",  fg: "syntax_string",         bg: "bg" },
+        { label: "keyword", fg: "syntax_keyword",        bg: "bg" },
+        { label: "input",   fg: "input_text",            bg: "input_bg" },
+        { label: "button",  fg: "button_label",          bg: "button_bg" },
+        { label: "title",   fg: "chrome_title_focused",  bg: "pane_bg" },
+    ]
+
+    let mut rows = []
+    rows = push(rows, { kind: "text", value: "Theme editor", size: 14.0, color: "#dde1ea" })
+    rows = push(rows, { kind: "text", value: "Click a swatch → pick a hue, then a lightness. Current selection is the bigger cell.", size: 10.0, color: "#888c98" })
+    rows = push(rows, { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "button", id: "reset_all", label: "RESET ALL OVERRIDES" },
+        { kind: "text", value: "(emergency escape — clears every override on the active theme)", size: 10.0, color: "#888c98" },
+    ]})
+    rows = push(rows, { kind: "divider" })
+
+    rows = push(rows, { kind: "text", value: "Contrast (OkLab dL; 25 = pass)", size: 11.0, color: "#bdc1c9" })
+    for pair in contrast_pairs {
+        rows = push(rows, contrast_row(pair))
+    }
+    rows = push(rows, { kind: "divider" })
+
+    rows = push(rows, { kind: "text", value: "Colors", size: 11.0, color: "#bdc1c9" })
+    for token in color_tokens {
+        let is_focused = (@state).focus == token
+        for r in color_row(token, is_focused) {
+            rows = push(rows, r)
+        }
+    }
+
+    rows = push(rows, { kind: "divider" })
+    rows = push(rows, { kind: "text", value: "Numbers", size: 11.0, color: "#bdc1c9" })
+    for token in num_tokens {
+        rows = push(rows, num_row(token))
+    }
+
+    {
+        kind: "scroll",
+        pad: 10.0,
+        gap: 3.0,
+        children: rows,
+    }
+}

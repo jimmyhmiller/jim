@@ -5,9 +5,9 @@ reacts to events. There are **two ways to host one**, and they share the
 same `Element` vocabulary and the same set of interactions. They differ
 only in where the code runs and how events are delivered:
 
-| | In-process Rhai | Subprocess |
+| | In-process funct | Subprocess |
 |---|---|---|
-| Code | a `.rhai` script in `~/.jim/widgets/` | any program speaking NDJSON on stdio |
+| Code | a `.ft` script in `~/.jim/widgets/` | any program speaking NDJSON on stdio |
 | Runs on | a worker thread inside the app | its own OS process |
 | Event delivery | calls into named script **handlers** (`on_click`, …) | one `HostEvent` JSON line per event on stdin |
 | Frame delivery | script `render()` returns an `Element` | program writes a `frame` JSON line on stdout |
@@ -39,9 +39,9 @@ them straight:
   THIRD, separate channel — not UI, not the Claude bus. See
   "[The widget↔widget bus](#the-widgetwidget-bus)" below.
 
-### Rhai handlers ↔ subprocess `HostEvent`
+### funct handlers ↔ subprocess `HostEvent`
 
-| Interaction | Rhai handler | Subprocess `HostEvent` (`event` field) |
+| Interaction | funct handler | Subprocess `HostEvent` (`event` field) |
 |---|---|---|
 | Button / `ListItem` press | `on_click(x, y, shift, cmd, id)` | `click` `{id}` |
 | Press on empty space | `on_click(x, y, shift, cmd, "")` | (n/a — no target) |
@@ -50,9 +50,9 @@ them straight:
 | `Input` focus / blur | `on_input_focus(id, focused)` | `input-focus` `{id, focused}` |
 | `Input` edited | `on_input_change(id, value)` | `input-change` `{id, value}` |
 | `Input` Enter | `on_input_submit(id, value)` | `input-submit` `{id, value}` |
-| drag / release | `on_drag(x, y)` / `on_release(x, y)` | (rhai only) |
-| hover (x=inf on leave) | `on_hover(x, y)` | (rhai only) |
-| nav key, no input focused | `on_key(key)` | (rhai only) |
+| drag / release | `on_drag(x, y)` / `on_release(x, y)` | (funct only) |
+| hover (x=inf on leave) | `on_hover(x, y)` | (funct only) |
+| nav key, no input focused | `on_key(key)` | (funct only) |
 | pane resized | `on_resize(w, h)` | `resize` `{width, height}` |
 | per frame, while animating | `on_frame(dt)` | `tick` `{dt}` |
 | **Claude Code bus** | **`on_bus(kind, payload)`** | `claude-event` `{kind, payload}` |
@@ -77,12 +77,12 @@ a general publish/subscribe channel, **separate from the Claude bus**
 
 ### Publish
 
-```rhai
+```funct
 emit("sql.run", #{ sql: state.query });   // native value — host serializes
 emit("schema.changed");                    // payload-less signal
 ```
 
-`emit(topic, payload)` is fire-and-forget. `payload` is any native Rhai
+`emit(topic, payload)` is fire-and-forget. `payload` is any native funct
 value (map `#{…}`, array, string, number, bool) — the **host** encodes
 it, so you never touch JSON in a script. The message is broadcast to
 every widget **in the same editor project** (panes in other projects
@@ -90,7 +90,7 @@ never see it).
 
 ### Receive
 
-```rhai
+```funct
 fn on_message(topic, payload, sender) {
     if sender == my_id() { return; }       // ignore echoes of our own emits
     if topic == "sql.run" {
@@ -112,7 +112,7 @@ A pane that opens *after* a message was sent would miss it. For state
 that late joiners need — the current DB connection, the current query —
 use `emit_retained`:
 
-```rhai
+```funct
 emit_retained("conn.state", #{ host: "localhost", ok: true });
 ```
 
@@ -169,7 +169,7 @@ Both emit the *same* `on_input_change` / `on_input_submit` /
 `input-focus`), with `value` carrying the full string (newlines and
 all). So a query box is just:
 
-```rhai
+```funct
 #{ type: "textarea", id: "query", value: state.q, rows: 6,
    placeholder: "SELECT …" }
 
@@ -184,7 +184,7 @@ size to their content (capped, then the cell text wraps) unless you give
 an explicit `width`; set per-column `align` for right-aligned numbers.
 `zebra` stripes alternate rows.
 
-```rhai
+```funct
 #{ type: "table", zebra: true,
    columns: [
      #{ header: "id",    width: 48.0, align: "end" },
@@ -208,7 +208,7 @@ below): the user drags across a cell's text to highlight a substring and
 Cmd/Ctrl+C it — the "grab one value out of the results" workflow, without
 a whole-table export. Pass `selectable: false` to disable.
 
-```rhai
+```funct
 #{ type: "table", zebra: true,
    columns: [ #{ header: "id", align: "end" }, #{ header: "email" } ],
    rows: [ ["42", "ada@example.com"] ] }   // drag across the email → Cmd+C
@@ -227,7 +227,7 @@ table or a value label is copyable out of the box.
 Opt a specific element OUT with `selectable: false` — e.g. a label that's
 part of a custom drag gesture you handle yourself:
 
-```rhai
+```funct
 #{ type: "text", value: "drag me", selectable: false }
 ```
 
@@ -262,15 +262,15 @@ edit buffer and the blinking caret (`WidgetInputFocus`). That means:
 
 ---
 
-## Writing a Rhai widget
+## Writing a funct widget
 
-Drop a `.rhai` file in `~/.jim/widgets/`. The file watcher
+Drop a `.ft` file in `~/.jim/widgets/`. The file watcher
 re-parses on save. The top-level body runs **once per load** (initialize
 `state`, define handler `fn`s). All handlers are optional — define only
 what you need.
 
-```rhai
-// counter.rhai
+```funct
+// counter.ft
 if !("n" in state)    { state.n = 0; }
 if !("dark" in state) { state.dark = false; }
 if !("q" in state)    { state.q = ""; }
@@ -312,7 +312,7 @@ fn render(w, h) {
 
 ### Scheduling renders
 
-Rhai widgets are **event-driven** — there is no per-frame poll by
+funct widgets are **event-driven** — there is no per-frame poll by
 default. After a handler mutates state, call `request_render()` to redraw
 once. For continuous animation, call `set_animating(true)` to start
 receiving `on_frame(dt)`; `set_animating(false)` to stop (idle widgets
@@ -329,7 +329,7 @@ subprocess reader pushes to two handlers:
 | `on_proc_output(handle, line)` | once per stdout line |
 | `on_proc_exit(handle, code)`   | once when the child exits (`code` = exit status, or -1 if unknown) |
 
-```rhai
+```funct
 fn run_query(sql) {
     state.rows = [];
     state.proc = proc_spawn("datalog", ["--host", state.host, "query", sql]);
@@ -351,7 +351,7 @@ explicit polling / back-compat.
 
 User-defined `fn`s are pure: they do **not** see top-level `const`s, and
 only host-invoked handlers receive `state`. Helpers take what they need
-as parameters. (See `project_editor_idea_rhai_scoping` in memory.)
+as parameters. (See the funct fn-scoping notes in memory.)
 
 ### Host functions available to scripts
 
@@ -363,7 +363,7 @@ primitives `proc_spawn` / `proc_write` / `proc_read` / `proc_alive` /
 `proc_kill` (plus the push handlers `on_proc_output` / `on_proc_exit` —
 see "Driving a subprocess"), and the JSON bridge `parse_json(s)` →
 map/array/scalar (`()` on bad input) / `to_json(v)` → compact string,
-for talking JSON protocols with subprocesses (see `style_lab.rhai`).
+for talking JSON protocols with subprocesses (see `style_lab.ft`).
 
 ---
 
@@ -381,7 +381,7 @@ just delivered as JSON lines instead of handler calls.
 
 - `src/protocol.rs` — `Element` catalog, `Style`, `HostEvent`,
   `WidgetMsg`. The single source of truth for the UI vocabulary.
-- `src/rhai_widget.rs` — the in-process Rhai host: worker thread,
+- `src/script_widget.rs` — the in-process funct host: worker thread,
   `HostToWorker` channel, handler dispatch, hot reload. The module-level
   doc has the handler table inline.
 - `src/lib.rs` — the subprocess host (`WidgetIO`, NDJSON pump) plus the

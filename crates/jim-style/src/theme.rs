@@ -1,15 +1,15 @@
-//! Design tokens loaded from `<project>/theme.rhai`.
+//! Design tokens loaded from `<project>/theme.ft`.
 //!
 //! A token is a named value: a color, an f32, or a bool. Widget code
 //! looks tokens up by [`TokenId`] (a `&'static str` newtype) so a typo
-//! is a compile error.  The Rhai file may also define ad-hoc tokens
+//! is a compile error.  The funct file may also define ad-hoc tokens
 //! beyond the engine-known set — those are kept in the [`Theme`] map and
 //! can be referenced by name (e.g. a custom shader reads
 //! `theme.get_by_name("aurora_speed")`).
 //!
 //! ## Hot reload
 //!
-//! A background thread watches the project's theme.rhai via `notify`.
+//! A background thread watches the project's theme.ft via `notify`.
 //! On any change we re-evaluate; on success the [`Theme`] resource is
 //! replaced and [`ThemeChanged`] fires. On failure the last good theme
 //! stays in place and the error string is stashed in [`StyleErrors`].
@@ -44,7 +44,7 @@ pub enum TokenValue {
 }
 
 /// Active theme. Always populated — the default theme provides every
-/// engine-known token, and project theme.rhai overrides selected ones.
+/// engine-known token, and project theme.ft overrides selected ones.
 #[derive(Resource, Clone, Debug)]
 pub struct Theme {
     tokens: HashMap<String, TokenValue>,
@@ -103,7 +103,7 @@ impl Theme {
         self.tokens.insert(name.into(), value);
     }
 
-    /// All currently-known token names (engine defaults + theme.rhai
+    /// All currently-known token names (engine defaults + theme.ft
     /// additions). Returned unsorted; callers sort if they need to.
     pub fn token_names(&self) -> Vec<String> {
         self.tokens.keys().cloned().collect()
@@ -111,7 +111,7 @@ impl Theme {
 }
 
 /// Fired whenever the theme resource is replaced from a successful
-/// theme.rhai load (or, in future, an inspector edit). Bevy 0.18
+/// theme.ft load (or, in future, an inspector edit). Bevy 0.18
 /// renamed `Event` → `Message`; we follow.
 #[derive(Message, Clone, Copy, Debug)]
 pub struct ThemeChanged;
@@ -174,7 +174,7 @@ pub mod tokens {
     /// "fraction of canvas wiped per stamp" × 1024).
     pub const WIPE_BRUSH_RADIUS_PX: TokenId = TokenId("wipe_brush_radius_px");
     /// Multiplier on dust output for this project. Default 1.0; set
-    /// to 0 in a project's `theme.rhai` to completely opt out of
+    /// to 0 in a project's `theme.ft` to completely opt out of
     /// dust (e.g. "website" projects where the effect is distracting).
     /// 0.5 = half-strength dust; >1 amplifies but the visible result
     /// saturates fast.
@@ -290,7 +290,7 @@ pub mod tokens {
     //
     // Five-step ramps for layout primitives. Widget code that takes a
     // style override is free to plug a literal pixel value, but
-    // theme.rhai authors should reach for these tokens so the whole UI
+    // theme.ft authors should reach for these tokens so the whole UI
     // moves coherently when the scale is tuned.
 
     // --- spacing scale (px) ---
@@ -354,103 +354,103 @@ pub mod tokens {
 
 /// Atelier dark palette, embedded so the engine has a sensible
 /// default look without depending on any on-disk preset. The same
-/// bytes are also seeded to `~/.jim/styles/atelier/theme.rhai`
+/// bytes are also seeded to `~/.jim/styles/atelier/theme.ft`
 /// at first launch so the preset picker has an entry for it.
 pub const ATELIER_DEFAULT_THEME: &str =
-    include_str!("../assets/themes/atelier.rhai");
+    include_str!("../assets/themes/atelier.ft");
 
 fn default_tokens() -> HashMap<String, TokenValue> {
     parse_theme_str(ATELIER_DEFAULT_THEME)
 }
 
-// ---------- Rhai loader ----------
+// ---------- funct loader ----------
 
 #[derive(Debug)]
 pub enum ThemeLoadError {
-    Rhai(String),
+    Eval(String),
     BadValue { key: String, reason: String },
 }
 
 impl std::fmt::Display for ThemeLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Rhai(e) => write!(f, "rhai: {}", e),
+            Self::Eval(e) => write!(f, "eval: {}", e),
             Self::BadValue { key, reason } => write!(f, "token {:?}: {}", key, reason),
         }
     }
 }
 
-/// Evaluate `theme.rhai` and overlay its tokens onto a default theme.
+/// Evaluate a `theme.ft` funct document and overlay its tokens onto a
+/// default theme. The file is a bare `{ name: value, … }` record; funct
+/// evaluates it to that record, which we read as JSON.
 pub fn load_theme(path: &Path) -> Result<Theme, ThemeLoadError> {
-    let engine = rhai::Engine::new();
-    let result: rhai::Dynamic = engine
-        .eval_file::<rhai::Dynamic>(path.to_path_buf())
-        .map_err(|e| ThemeLoadError::Rhai(e.to_string()))?;
-    let map = result.try_cast::<rhai::Map>().ok_or_else(|| {
-        ThemeLoadError::Rhai("theme.rhai must return a #{} map".to_string())
-    })?;
-
+    let src = std::fs::read_to_string(path).map_err(|e| ThemeLoadError::Eval(e.to_string()))?;
+    let map = eval_theme_src(&src).map_err(ThemeLoadError::Eval)?;
     let mut theme = Theme::default();
-    for (k, v) in map.into_iter() {
-        let key = k.to_string();
+    for (key, v) in map {
         let value = parse_token(&key, &v)?;
         theme.set(key, value);
     }
     Ok(theme)
 }
 
-/// Parse a rhai theme document from a string, returning the
+/// Parse an embedded funct theme document, returning the
 /// `(name, TokenValue)` pairs. Used by [`default_tokens`] to load the
 /// embedded Atelier preset at startup. Errors panic — the embedded
 /// file is shipped with the binary, so a parse failure is a build-time
 /// bug, not a runtime issue.
 fn parse_theme_str(src: &str) -> HashMap<String, TokenValue> {
-    let engine = rhai::Engine::new();
-    let result: rhai::Dynamic = engine
-        .eval::<rhai::Dynamic>(src)
-        .expect("embedded theme rhai must parse");
-    let map = result
-        .try_cast::<rhai::Map>()
-        .expect("embedded theme must return a #{} map");
+    let map = eval_theme_src(src).expect("embedded theme must eval to a record");
     let mut out = HashMap::with_capacity(map.len());
-    for (k, v) in map.into_iter() {
-        let key = k.to_string();
+    for (key, v) in map {
         let value = parse_token(&key, &v).expect("embedded theme token must parse");
         out.insert(key, value);
     }
     out
 }
 
-fn parse_token(key: &str, v: &rhai::Dynamic) -> Result<TokenValue, ThemeLoadError> {
-    // Strings: try color forms first ("#rrggbb[aa]", "oklch(...)",
-    // "oklab(...)", "rgb(...)"). If none match, keep as a free-form Str
-    // — used for font-family names like "serif" / "mono".
-    if let Some(s) = v.clone().try_cast::<String>() {
-        return Ok(match parse_color_string(&s) {
+/// Evaluate funct theme source and return its top-level record as a JSON
+/// object map.
+fn eval_theme_src(src: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let mut vm = funct::Funct::new();
+    let value = vm.eval(src).map_err(|e| e.to_string())?;
+    match value.to_json().map_err(|e| e.to_string())? {
+        serde_json::Value::Object(m) => Ok(m),
+        _ => Err("theme.ft must evaluate to a { } record".to_string()),
+    }
+}
+
+fn parse_token(key: &str, v: &serde_json::Value) -> Result<TokenValue, ThemeLoadError> {
+    use serde_json::Value as J;
+    match v {
+        // Strings: try color forms first ("#rrggbb[aa]", "oklch(...)",
+        // "oklab(...)", "rgb(...)"). If none match, keep as a free-form Str
+        // — used for font-family names like "serif" / "mono".
+        J::String(s) => Ok(match parse_color_string(s) {
             Ok(c) => TokenValue::Color(c),
-            Err(_) => TokenValue::Str(s),
-        });
+            Err(_) => TokenValue::Str(s.clone()),
+        }),
+        J::Bool(b) => Ok(TokenValue::Bool(*b)),
+        J::Number(n) => n
+            .as_f64()
+            .map(|f| TokenValue::F32(f as f32))
+            .ok_or_else(|| ThemeLoadError::BadValue {
+                key: key.into(),
+                reason: "non-finite number".into(),
+            }),
+        other => Err(ThemeLoadError::BadValue {
+            key: key.into(),
+            reason: format!(
+                "unsupported value type ({})",
+                match other {
+                    J::Null => "null",
+                    J::Array(_) => "array",
+                    J::Object(_) => "object",
+                    _ => "value",
+                }
+            ),
+        }),
     }
-    if let Some(s) = v.clone().try_cast::<rhai::ImmutableString>() {
-        let owned = s.to_string();
-        return Ok(match parse_color_string(&owned) {
-            Ok(c) => TokenValue::Color(c),
-            Err(_) => TokenValue::Str(owned),
-        });
-    }
-    if let Some(b) = v.clone().try_cast::<bool>() {
-        return Ok(TokenValue::Bool(b));
-    }
-    if let Some(i) = v.clone().try_cast::<i64>() {
-        return Ok(TokenValue::F32(i as f32));
-    }
-    if let Some(f) = v.clone().try_cast::<f64>() {
-        return Ok(TokenValue::F32(f as f32));
-    }
-    Err(ThemeLoadError::BadValue {
-        key: key.into(),
-        reason: format!("unsupported value type ({})", v.type_name()),
-    })
 }
 
 /// Parse any of the accepted color string forms. Hex (`#rrggbb` or
@@ -572,14 +572,14 @@ pub fn parse_hex_color(s: &str) -> Result<LinearRgba, String> {
 
 // ---------- Hot reload plugin ----------
 
-/// Resolves to the current `<base>/<active>/theme.rhai` path. Updated
+/// Resolves to the current `<base>/<active>/theme.ft` path. Updated
 /// whenever the active project changes.
 #[derive(Resource, Default, Debug, Clone)]
 pub struct ActiveThemePath(pub Option<PathBuf>);
 
 /// Holds the running notify watcher plus the channel it pushes paths
 /// into. Wrapped in `Mutex` so the resource is `Sync` (mpsc::Receiver
-/// is `Send` but not `Sync`). Pattern lifted from `rhai_widget.rs` and
+/// is `Send` but not `Sync`). Pattern lifted from `script_widget.rs` and
 /// `garden_pane.rs` which do the same dance.
 #[derive(Resource)]
 struct ThemeWatcher {
@@ -775,5 +775,5 @@ fn audit_contrast(theme: &Theme, path: &Path) {
 /// dir. The host typically calls this from a system that watches its
 /// own active-project resource.
 pub fn theme_path_for_project(data_dir: &StyleDataDir, project_id: u64) -> PathBuf {
-    data_dir.0.join(project_id.to_string()).join("theme.rhai")
+    data_dir.0.join(project_id.to_string()).join("theme.ft")
 }

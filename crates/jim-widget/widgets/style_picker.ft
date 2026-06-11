@@ -1,0 +1,67 @@
+// style_picker.ft — switch between visual presets.
+// (funct port of style_picker.rhai)
+//
+// EVENT-DRIVEN. Renders one button per discovered preset (plus a
+// "(project)" button to clear back to the per-project theme).
+// Clicking a button calls set_active_style(name) — the host swaps
+// the active theme path, theme reloads, and every pane's
+// chrome material updates the same frame.
+//
+// Host fns:
+//   list_styles()              -> array of preset names
+//   set_active_style(name)     -> switch to that preset
+//                                  (empty string = clear, project)
+import "host"
+
+// Not-yet-registered host natives (see missing_natives in report).
+extern fn list_styles()
+extern fn set_active_style(name)
+
+fn init_state() = { selected: "" }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "" { return }
+    let s = @state
+    if id == "_project" {
+        reset!(state, { ..s, selected: "" })
+        set_active_style("")
+    } else if starts_with(id, "style_") {
+        let name = slice(id, 6, len(id))
+        reset!(state, { ..s, selected: name })
+        set_active_style(name)
+    }
+    request_render()
+}
+
+fn render(canvas_w, canvas_h) {
+    let s = @state
+    let presets = list_styles()
+    let mut rows = []
+    rows = push(rows, { kind: "text", value: "Style preset", size: 14.0, color: "#cfd2d8" })
+
+    let mark = if s.selected == "" { ">  " } else { "   " }
+    rows = push(rows, {
+        kind: "button",
+        id: "_project",
+        label: mark + "(per-project theme)",
+    })
+
+    for name in presets {
+        let mark = if s.selected == name { ">  " } else { "   " }
+        rows = push(rows, {
+            kind: "button",
+            id: "style_" + name,
+            label: mark + name,
+        })
+    }
+
+    {
+        kind: "vstack",
+        pad: 10.0,
+        gap: 4.0,
+        children: rows,
+    }
+}

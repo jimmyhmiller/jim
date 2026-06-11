@@ -8,7 +8,7 @@
 //!   jimctl close --project P [--kind K]
 //!
 //!   --project P   project name (or `active`). Required.
-//!   --kind K      only close panes of this kind (e.g. `rhai_widget`,
+//!   --kind K      only close panes of this kind (e.g. `script_widget`,
 //!                 `widget`, `editor`). Omit to close EVERY pane in P.
 
 use std::io::Write;

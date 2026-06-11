@@ -176,7 +176,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(inbox::InboxPanePlugin)
             .add_plugins(inference_dispatch::InferenceDispatchPlugin)
             .add_plugins(jim_widget::WidgetPlugin)
-            .add_plugins(jim_widget::rhai_widget::RhaiWidgetPlugin)
+            .add_plugins(jim_widget::script_widget::ScriptWidgetPlugin)
             .add_plugins(jim_editor::EditorEmbedPlugin)
             .add_plugins(jim_style::StylePlugin)
             .add_plugins(jim_style::state::ProjectStatePlugin);
@@ -562,13 +562,13 @@ fn drain_ipc_open_requests(
                     continue;
                 };
 
-                // Route by `kind`. Rhai widgets get a different config
+                // Route by `kind`. funct widgets get a different config
                 // shape (`script` field, not `command`) and a different
                 // pane kind in the registry.
                 let pane_kind = kind.as_deref().unwrap_or(jim_widget::PANE_KIND);
                 let mut cfg = serde_json::Map::new();
-                if pane_kind == jim_widget::rhai_widget::PANE_KIND {
-                    // For rhai_widget, `command` is the script filename.
+                if pane_kind == jim_widget::script_widget::PANE_KIND {
+                    // For script_widget, `command` is the script filename.
                     cfg.insert("script".into(), Value::String(command));
                     if let Some(t) = title {
                         cfg.insert("title".into(), Value::String(t));
@@ -593,7 +593,7 @@ fn drain_ipc_open_requests(
                 }
                 let kind_static: &'static str = match pane_kind {
                     "widget" => jim_widget::PANE_KIND,
-                    "rhai_widget" => jim_widget::rhai_widget::PANE_KIND,
+                    "script_widget" => jim_widget::script_widget::PANE_KIND,
                     other => Box::leak(other.to_string().into_boxed_str()),
                 };
                 pending.new_panes.push(NewPaneRequest {
@@ -1322,7 +1322,7 @@ fn maintain_project_themes(
             );
         }
     } else if theme_edited {
-        // Live edit of the active project's theme.rhai — reload just it.
+        // Live edit of the active project's theme.ft — reload just it.
         if let Some(pid) = projects.active {
             themes.set(
                 pid,
@@ -1332,21 +1332,21 @@ fn maintain_project_themes(
     }
 }
 
-/// Cmd+Shift+D opens the style dev panel (a Rhai widget). Lets you
+/// Cmd+Shift+D opens the style dev panel (a funct widget). Lets you
 /// scrub dust / edit / age / time_scale without waiting for real time
 /// to pass. Spawning goes through the same `PendingActions.new_panes`
 /// channel the radial menu uses, so all the usual pane-bevy chrome
 /// applies.
 /// `view.dev_panel` action (Cmd+Shift+D). Opens the style dev panel
-/// (a Rhai widget). Dedups: each spawn leaves a fresh Rhai worker thread
+/// (a funct widget). Dedups: each spawn leaves a fresh funct worker thread
 /// ticking the script at 30 Hz (~50% CPU per duplicate), so if a dev
 /// panel already exists anywhere on the canvas, silently do nothing.
 fn action_open_dev_panel(ctx: &mut actions::ActionCtx) {
     let exists = {
         let mut q = ctx
             .world
-            .query::<&jim_widget::rhai_widget::RhaiWidget>();
-        q.iter(ctx.world).any(|w| w.script == "dev_panel.rhai")
+            .query::<&jim_widget::script_widget::ScriptWidget>();
+        q.iter(ctx.world).any(|w| w.script == "dev_panel.ft")
     };
     if exists {
         return;
@@ -1358,12 +1358,12 @@ fn action_open_dev_panel(ctx: &mut actions::ActionCtx) {
         .resource_mut::<projects::PendingActions>()
         .new_panes
         .push(projects::NewPaneRequest {
-            kind: jim_widget::rhai_widget::PANE_KIND,
+            kind: jim_widget::script_widget::PANE_KIND,
             project_id: active,
             origin: None,
             size: Some(Vec2::new(420.0, 280.0)),
             config: serde_json::json!({
-                "script": "dev_panel.rhai",
+                "script": "dev_panel.ft",
                 "title": "Style dev panel",
             }),
         });
@@ -1540,7 +1540,7 @@ fn maintain_winit_mode_for_animation(
     drawer: Res<drawer::Drawer>,
     prism: Res<cube::Prism>,
     palette: Res<command_palette::CommandPalette>,
-    rhai_widgets: Query<&jim_widget::rhai_widget::RhaiWidget>,
+    script_widgets: Query<&jim_widget::script_widget::ScriptWidget>,
     widget_anim: Res<jim_widget::anim::WidgetAnim>,
     mut settings: ResMut<bevy::winit::WinitSettings>,
 ) {
@@ -1551,13 +1551,13 @@ fn maintain_winit_mode_for_animation(
             .find(|p| p.name == name)
             .map_or(false, |p| p.chrome_animates)
     });
-    // A Rhai widget that opted into animation via `set_animating(true)`
+    // A funct widget that opted into animation via `set_animating(true)`
     // (e.g. the datalog IDE results pane draining a `datalog` subprocess in
     // `on_frame`, or chess polling Stockfish) also needs every frame. Without
     // this term, the reactive loop only wakes ~every 5s while the window is
     // idle, so the widget's `on_frame` tick — and thus its proc-drain —
     // arrives ~5s late even though the underlying work finished in ms.
-    let widget_animating = rhai_widgets.iter().any(|w| w.is_animating());
+    let widget_animating = script_widgets.iter().any(|w| w.is_animating());
     // The drawer's slide and the 3D project prism (live textures + camera
     // animation) are the other sources of "needs every frame". The cooldown
     // keeps redrawing briefly after the prism closes so the flat panes
@@ -1600,20 +1600,20 @@ fn maintain_winit_mode_for_animation(
     }
 }
 
-/// Cmd+Shift+T opens the live theme editor (a Rhai widget). OkLCh
+/// Cmd+Shift+T opens the live theme editor (a funct widget). OkLCh
 /// steppers per color token; click to focus a token, then ± each
-/// of L / C / h. Writes propagate to the active preset's `theme.rhai`
+/// of L / C / h. Writes propagate to the active preset's `theme.ft`
 /// via the bridge; notify watcher reloads it and the rest of the
 /// app retones the same frame.
 /// `view.theme_editor` action (Cmd+Shift+T). Opens the live theme editor
-/// (a Rhai widget): OkLCh steppers per color token that write back to the
-/// active preset's `theme.rhai`. Dedups like the dev panel.
+/// (a funct widget): OkLCh steppers per color token that write back to the
+/// active preset's `theme.ft`. Dedups like the dev panel.
 fn action_open_theme_editor(ctx: &mut actions::ActionCtx) {
     let exists = {
         let mut q = ctx
             .world
-            .query::<&jim_widget::rhai_widget::RhaiWidget>();
-        q.iter(ctx.world).any(|w| w.script == "theme_editor.rhai")
+            .query::<&jim_widget::script_widget::ScriptWidget>();
+        q.iter(ctx.world).any(|w| w.script == "theme_editor.ft")
     };
     if exists {
         return;
@@ -1625,23 +1625,23 @@ fn action_open_theme_editor(ctx: &mut actions::ActionCtx) {
         .resource_mut::<projects::PendingActions>()
         .new_panes
         .push(projects::NewPaneRequest {
-            kind: jim_widget::rhai_widget::PANE_KIND,
+            kind: jim_widget::script_widget::PANE_KIND,
             project_id: active,
             origin: None,
             size: Some(Vec2::new(420.0, 600.0)),
             config: serde_json::json!({
-                "script": "theme_editor.rhai",
+                "script": "theme_editor.ft",
                 "title": "Theme editor",
             }),
         });
 }
 
-/// Cmd+Shift+S opens the style preset picker (a Rhai widget). Lists
+/// Cmd+Shift+S opens the style preset picker (a funct widget). Lists
 /// every preset under `~/.jim/styles/` plus a `(per-project
 /// theme)` entry; clicking switches the active style and persists the
 /// choice. Same dedup logic as the dev panel.
 /// `view.style_picker` action (Cmd+Shift+S). Opens the style preset
-/// picker (a Rhai widget). No dedup: each instance is a parked, event-
+/// picker (a funct widget). No dedup: each instance is a parked, event-
 /// driven worker (~zero idle CPU), so stacking a few is cheap.
 fn action_open_style_picker(ctx: &mut actions::ActionCtx) {
     let Some(active) = ctx.world.resource::<projects::Projects>().active else {
@@ -1651,26 +1651,26 @@ fn action_open_style_picker(ctx: &mut actions::ActionCtx) {
         .resource_mut::<projects::PendingActions>()
         .new_panes
         .push(projects::NewPaneRequest {
-            kind: jim_widget::rhai_widget::PANE_KIND,
+            kind: jim_widget::script_widget::PANE_KIND,
             project_id: active,
             origin: None,
             size: Some(Vec2::new(280.0, 240.0)),
             config: serde_json::json!({
-                "script": "style_picker.rhai",
+                "script": "style_picker.ft",
                 "title": "Styles",
             }),
         });
 }
 
-/// `view.chess` action. Opens the chess widget — a Rhai widget that
+/// `view.chess` action. Opens the chess widget — a funct widget that
 /// plays against Stockfish over UCI. Dedups on the script name: each
 /// instance spawns its own engine subprocess, so one board is plenty.
 fn action_open_chess(ctx: &mut actions::ActionCtx) {
     let exists = {
         let mut q = ctx
             .world
-            .query::<&jim_widget::rhai_widget::RhaiWidget>();
-        q.iter(ctx.world).any(|w| w.script == "chess.rhai")
+            .query::<&jim_widget::script_widget::ScriptWidget>();
+        q.iter(ctx.world).any(|w| w.script == "chess.ft")
     };
     if exists {
         return;
@@ -1682,12 +1682,12 @@ fn action_open_chess(ctx: &mut actions::ActionCtx) {
         .resource_mut::<projects::PendingActions>()
         .new_panes
         .push(projects::NewPaneRequest {
-            kind: jim_widget::rhai_widget::PANE_KIND,
+            kind: jim_widget::script_widget::PANE_KIND,
             project_id: active,
             origin: None,
             size: Some(Vec2::new(520.0, 640.0)),
             config: serde_json::json!({
-                "script": "chess.rhai",
+                "script": "chess.ft",
                 "title": "Chess",
             }),
         });

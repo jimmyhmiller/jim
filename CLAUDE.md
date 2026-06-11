@@ -30,7 +30,7 @@ dirs use hyphens (`crates/jim-app`).
   `EditorEmbedPlugin` (for hosts that already own camera/font).
 - `crates/jim-widget` — retained-UI widget panes. Two hosting paths
   sharing one `Element` vocabulary (`src/protocol.rs`): **in-process
-  Rhai** scripts (`src/rhai_widget.rs`, worker thread + named handlers
+  funct** scripts (`src/script_widget.rs`, worker thread + named handlers
   like `on_click`/`on_toggle`/`on_input_change`/`on_bus`, hot reload from
   `~/.jim/widgets/`) and **subprocess** widgets (`src/lib.rs`,
   NDJSON `HostEvent`/`WidgetMsg` over stdio). UI events and the Claude

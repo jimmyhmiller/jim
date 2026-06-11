@@ -6,7 +6,7 @@
 //!
 //! ## Convention
 //!
-//! - L is on **[0, 100]** in our public API (theme.rhai authors say
+//! - L is on **[0, 100]** in our public API (theme.ft authors say
 //!   `oklch(70, 0.15, 280)`, not `oklch(0.70, ...)`). Internally we
 //!   divide by 100 for the math.
 //! - a and b are roughly **[-0.4, +0.4]** in OkLab.

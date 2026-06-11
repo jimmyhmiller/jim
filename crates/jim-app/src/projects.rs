@@ -1647,6 +1647,7 @@ pub(crate) fn kind_to_static(kind: &str) -> &'static str {
         "terminal" => "terminal",
         "editor" => "editor",
         "run-button" => "run-button",
+        "script_widget" => "script_widget",
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }

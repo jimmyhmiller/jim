@@ -167,7 +167,7 @@ pub fn tick_widget_anims(
     time: Res<Time>,
     mut store: ResMut<WidgetAnim>,
     mut subprocess: Query<&mut crate::WidgetRender>,
-    mut rhai: Query<&mut crate::rhai_widget::RhaiWidget>,
+    mut sw: Query<&mut crate::script_widget::ScriptWidget>,
     panes: Query<Entity, With<jim_pane::PaneTag>>,
 ) {
     store.retain_panes(|pane| panes.contains(pane));
@@ -175,7 +175,7 @@ pub fn tick_widget_anims(
         if let Ok(mut r) = subprocess.get_mut(pane) {
             r.force_render = true;
         }
-        if let Ok(mut w) = rhai.get_mut(pane) {
+        if let Ok(mut w) = sw.get_mut(pane) {
             w.force_render = true;
         }
     }

@@ -1,6 +1,6 @@
-//! Bridge between Rhai workers and the main thread.
+//! Bridge between funct workers and the main thread.
 //!
-//! Rhai workers run on background threads with no ECS access. They
+//! funct workers run on background threads with no ECS access. They
 //! issue host calls (`uniform_set("name", v)`, `mask_paint(...)`,
 //! `emit(...)`) which are encoded as [`DynamicMsg`] variants and
 //! pushed through an mpsc channel. A main-thread system
@@ -15,11 +15,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock, RwLock, Arc};
 
 use bevy::prelude::*;
-use rhai::{Dynamic, Engine, Map};
 use serde_json::Value;
 
 /// All host calls a worker can issue. Each variant maps 1:1 to a
-/// Rhai-callable host function. Adding a new variant + a matching
+/// funct-callable host function. Adding a new variant + a matching
 /// `register_fn` block in [`register_script_host_fns`] is how a new
 /// primitive gets added — but the goal is to keep this enum *small
 /// and frozen*: every "new behavior" should be doable via the
@@ -68,7 +67,7 @@ pub struct ScriptReceiver(Mutex<Receiver<DynamicMsg>>);
 /// script's `events` scope variable.
 ///
 /// Anyone — Rust systems or scripts via `emit(...)` — can push here.
-/// Rust producers use [`EventBus::push`]; the rhai bridge routes
+/// Rust producers use [`EventBus::push`]; the funct bridge routes
 /// `emit`/`schedule` host calls through the dynamic-msg channel which
 /// drain into this bus.
 #[derive(Resource, Default)]
@@ -161,199 +160,155 @@ impl Plugin for ScriptBridgePlugin {
             .init_resource::<ScheduledEvents>();
     }
 }
+pub fn register_script_host_fns_funct(vm: &mut funct::Funct) {
+    use funct::{Fault, Value as V};
 
-/// Convert a `serde_json::Value` payload back to a Rhai map (or
-/// scalar) for delivery to scripts. Used when building the `events`
-/// array that gets pushed into a script's scope.
-pub fn value_to_rhai_public(v: Value) -> Option<Dynamic> {
-    value_to_rhai(v)
-}
+    fn num_to_f32(v: &V) -> f32 {
+        match v {
+            V::Float(f) => *f as f32,
+            V::Int(i) => *i as f32,
+            _ => 0.0,
+        }
+    }
 
-/// Register every host fn a script can call on the Rhai engine. Idempotent
-/// across multiple engines (each worker calls this on its own engine).
-/// All fns are no-ops if `ScriptBridgePlugin` hasn't been added.
-pub fn register_script_host_fns(engine: &mut Engine) {
-    let Some(tx) = script_sender() else { return };
-
-    // ---- uniform_set ----
-    let tx_f = tx.clone();
-    engine.register_fn("uniform_set", move |name: &str, value: f64| {
-        let _ = tx_f.send(DynamicMsg::SetUniformF32(name.to_string(), value as f32));
+    // ---- uniform_set(name, scalar | [2] | [4]) ----
+    vm.register_raw("uniform_set", |_vm, args| {
+        let Some(tx) = script_sender() else {
+            return Ok(V::Unit);
+        };
+        let name = match args.first() {
+            Some(V::Str(s)) => s.to_string(),
+            _ => return Err(Fault::new("uniform_set: name must be a string")),
+        };
+        match args.get(1) {
+            Some(V::Float(_)) | Some(V::Int(_)) => {
+                let _ = tx.send(DynamicMsg::SetUniformF32(name, num_to_f32(&args[1])));
+            }
+            Some(V::List(items)) => {
+                let nums: Vec<f32> = items.iter().map(num_to_f32).collect();
+                match nums.len() {
+                    2 => {
+                        let _ = tx.send(DynamicMsg::SetUniformVec2(name, [nums[0], nums[1]]));
+                    }
+                    4 => {
+                        let _ = tx.send(DynamicMsg::SetUniformVec4(
+                            name,
+                            [nums[0], nums[1], nums[2], nums[3]],
+                        ));
+                    }
+                    _ => return Err(Fault::new("uniform_set([..]) expects array of len 2 or 4")),
+                }
+            }
+            _ => return Err(Fault::new("uniform_set expects (name, number | [..])")),
+        }
+        Ok(V::Unit)
     });
-    let tx_i = tx.clone();
-    engine.register_fn("uniform_set", move |name: &str, value: i64| {
-        let _ = tx_i.send(DynamicMsg::SetUniformF32(name.to_string(), value as f32));
+
+    // ---- uniform_get ----
+    vm.register_raw("uniform_get", |_vm, args| {
+        let name = match args.first() {
+            Some(V::Str(s)) => s.to_string(),
+            _ => return Err(Fault::new("uniform_get expects a name string")),
+        };
+        let Some(snap) = snapshot() else {
+            return Ok(V::Unit);
+        };
+        Ok(snap.read(|d| {
+            d.uniforms
+                .get(&name)
+                .map(V::from_json)
+                .unwrap_or(V::Unit)
+        }))
     });
-    let tx_arr = tx.clone();
-    engine.register_fn("uniform_set", move |name: &str, value: rhai::Array| {
-        match value.len() {
-            2 => {
-                let a = dynamic_to_f32(&value[0]);
-                let b = dynamic_to_f32(&value[1]);
-                let _ = tx_arr.send(DynamicMsg::SetUniformVec2(name.to_string(), [a, b]));
+
+    // ---- mask_paint / mask_fill / mask_clear ----
+    vm.register5(
+        "mask_paint",
+        move |name: String, x: f64, y: f64, radius: f64, value: f64| {
+            if let Some(tx) = script_sender() {
+                let _ = tx.send(DynamicMsg::MaskPaint {
+                    name,
+                    x: x as f32,
+                    y: y as f32,
+                    radius: radius as f32,
+                    value: value as f32,
+                });
             }
-            4 => {
-                let a = dynamic_to_f32(&value[0]);
-                let b = dynamic_to_f32(&value[1]);
-                let c = dynamic_to_f32(&value[2]);
-                let d = dynamic_to_f32(&value[3]);
-                let _ = tx_arr.send(DynamicMsg::SetUniformVec4(
-                    name.to_string(),
-                    [a, b, c, d],
-                ));
-            }
-            _ => {
-                eprintln!("[bridge] uniform_set(name, [...]) expects array of len 2 or 4");
-            }
+        },
+    );
+    vm.register2("mask_fill", move |name: String, value: f64| {
+        if let Some(tx) = script_sender() {
+            let _ = tx.send(DynamicMsg::MaskFill(name, value as f32));
+        }
+    });
+    vm.register1("mask_clear", move |name: String| {
+        if let Some(tx) = script_sender() {
+            let _ = tx.send(DynamicMsg::MaskFill(name, 0.0));
         }
     });
 
-    // ---- uniform_get (read from snapshot) ----
-    engine.register_fn("uniform_get", |name: &str| -> Dynamic {
-        let Some(snap) = snapshot() else { return Dynamic::UNIT };
+    // ---- pane_rects ----
+    vm.register0("pane_rects", || -> V {
+        let Some(snap) = snapshot() else {
+            return V::list(vec![]);
+        };
         snap.read(|d| {
-            d.uniforms
-                .get(name)
-                .cloned()
-                .and_then(|v| value_to_rhai(v))
-                .unwrap_or(Dynamic::UNIT)
-        })
-    });
-
-    // ---- mask_paint / fill / clear ----
-    let tx_paint = tx.clone();
-    engine.register_fn(
-        "mask_paint",
-        move |name: &str, x: f64, y: f64, radius: f64, value: f64| {
-            let _ = tx_paint.send(DynamicMsg::MaskPaint {
-                name: name.to_string(),
-                x: x as f32,
-                y: y as f32,
-                radius: radius as f32,
-                value: value as f32,
-            });
-        },
-    );
-    let tx_fill = tx.clone();
-    engine.register_fn("mask_fill", move |name: &str, value: f64| {
-        let _ = tx_fill.send(DynamicMsg::MaskFill(name.to_string(), value as f32));
-    });
-    let tx_clear = tx.clone();
-    engine.register_fn("mask_clear", move |name: &str| {
-        let _ = tx_clear.send(DynamicMsg::MaskFill(name.to_string(), 0.0));
-    });
-
-    // ---- emit / schedule ----
-    let tx_emit = tx.clone();
-    engine.register_fn("emit", move |kind: &str, payload: Map| {
-        let v = rhai_map_to_value(payload);
-        let _ = tx_emit.send(DynamicMsg::Emit(kind.to_string(), v));
-    });
-    // Convenience: emit with no payload.
-    let tx_emit_empty = tx.clone();
-    engine.register_fn("emit", move |kind: &str| {
-        let _ = tx_emit_empty.send(DynamicMsg::Emit(kind.to_string(), Value::Null));
-    });
-    let tx_sched = tx.clone();
-    engine.register_fn("schedule", move |delay: f64, kind: &str, payload: Map| {
-        let v = rhai_map_to_value(payload);
-        let _ = tx_sched.send(DynamicMsg::Schedule {
-            delay_secs: delay as f32,
-            kind: kind.to_string(),
-            payload: v,
-        });
-    });
-
-    // ---- pane_rects (read from snapshot) ----
-    engine.register_fn("pane_rects", || -> rhai::Array {
-        let Some(snap) = snapshot() else { return rhai::Array::new() };
-        snap.read(|d| {
-            d.pane_rects
+            let arr: Vec<V> = d
+                .pane_rects
                 .iter()
                 .map(|r| {
-                    let mut m = Map::new();
-                    m.insert("x".into(), Dynamic::from(r.x as f64));
-                    m.insert("y".into(), Dynamic::from(r.y as f64));
-                    m.insert("w".into(), Dynamic::from(r.w as f64));
-                    m.insert("h".into(), Dynamic::from(r.h as f64));
-                    m.insert("kind".into(), Dynamic::from(r.kind.clone()));
-                    Dynamic::from(m)
+                    V::from_json(&serde_json::json!({
+                        "x": r.x, "y": r.y, "w": r.w, "h": r.h, "kind": r.kind,
+                    }))
                 })
-                .collect()
+                .collect();
+            V::list(arr)
         })
     });
 
     // ---- state_get / state_set ----
-    engine.register_fn("state_get", |key: &str, default: Dynamic| -> Dynamic {
-        let Some(snap) = snapshot() else { return default };
-        snap.read(|d| {
-            d.state
-                .get(key)
-                .cloned()
-                .and_then(|v| value_to_rhai(v))
-                .unwrap_or(default)
-        })
+    vm.register_raw("state_get", |_vm, args| {
+        let key = match args.first() {
+            Some(V::Str(s)) => s.to_string(),
+            _ => return Err(Fault::new("state_get expects (key, default)")),
+        };
+        let default = args.get(1).cloned().unwrap_or(V::Unit);
+        let Some(snap) = snapshot() else {
+            return Ok(default);
+        };
+        Ok(snap.read(|d| d.state.get(&key).map(V::from_json).unwrap_or(default)))
     });
-    let tx_state = tx.clone();
-    engine.register_fn("state_set", move |key: &str, value: Dynamic| {
-        let Ok(v) = rhai_dyn_to_value(&value) else { return };
-        let _ = tx_state.send(DynamicMsg::StateSet(key.to_string(), v));
+    vm.register_raw("state_set", |_vm, args| {
+        let key = match args.first() {
+            Some(V::Str(s)) => s.to_string(),
+            _ => return Err(Fault::new("state_set expects (key, value)")),
+        };
+        let value = args.get(1).cloned().unwrap_or(V::Unit);
+        let json = value.to_json()?; // loud on non-JSON values
+        if let Some(tx) = script_sender() {
+            let _ = tx.send(DynamicMsg::StateSet(key, json));
+        }
+        Ok(V::Unit)
     });
 
-    // ---- OkLCh / OkLab color helpers ----
-    //
-    // Return the chosen color as a `#rrggbbaa` hex string. Widgets use
-    // these in build-up code (e.g. `text { color: oklch(70, 0.15, 280) }`
-    // in dev panels) so authors can think in perceptual coordinates
-    // without leaving Rhai.
-    engine.register_fn("oklch", |l: f64, c: f64, h: f64| -> String {
-        let rgba = crate::oklab::oklch_to_linear_srgb(l as f32, c as f32, h as f32);
-        linear_rgba_to_hex(rgba)
+    // ---- OkLCh / OkLab color helpers (hex, matching the funct surface) ----
+    vm.register3("oklch", |l: f64, c: f64, h: f64| -> String {
+        linear_rgba_to_hex(crate::oklab::oklch_to_linear_srgb(l as f32, c as f32, h as f32))
     });
-    engine.register_fn(
-        "oklch",
-        |l: f64, c: f64, h: f64, alpha: f64| -> String {
-            let mut rgba =
-                crate::oklab::oklch_to_linear_srgb(l as f32, c as f32, h as f32);
-            rgba.alpha = alpha as f32;
-            linear_rgba_to_hex(rgba)
-        },
-    );
-    engine.register_fn("oklab", |l: f64, a: f64, b: f64| -> String {
-        let rgba = crate::oklab::oklab_to_linear_srgb(l as f32, a as f32, b as f32);
-        linear_rgba_to_hex(rgba)
+    vm.register3("oklab", |l: f64, a: f64, b: f64| -> String {
+        linear_rgba_to_hex(crate::oklab::oklab_to_linear_srgb(l as f32, a as f32, b as f32))
     });
-    engine.register_fn(
-        "oklab",
-        |l: f64, a: f64, b: f64, alpha: f64| -> String {
-            let mut rgba =
-                crate::oklab::oklab_to_linear_srgb(l as f32, a as f32, b as f32);
-            rgba.alpha = alpha as f32;
-            linear_rgba_to_hex(rgba)
-        },
-    );
 
     // ---- theme_contrast(a, b) → OkLab L difference [0, 100] ----
-    //
-    // `a` and `b` are any color string the theme parser accepts
-    // (hex / oklch() / oklab() / rgb()). Returns the absolute OkLab
-    // lightness difference — a quick perceptual contrast score.
-    engine.register_fn("theme_contrast", |a: &str, b: &str| -> f64 {
-        use crate::theme::parse_color_string;
-        let ca = match parse_color_string(a) {
-            Ok(c) => c,
-            Err(_) => return 0.0,
-        };
-        let cb = match parse_color_string(b) {
-            Ok(c) => c,
-            Err(_) => return 0.0,
+    vm.register2("theme_contrast", |a: String, b: String| -> f64 {
+        let (Ok(ca), Ok(cb)) = (
+            crate::theme::parse_color_string(&a),
+            crate::theme::parse_color_string(&b),
+        ) else {
+            return 0.0;
         };
         crate::oklab::lightness_delta(ca, cb) as f64
     });
-
-    // Drain `tx` so the borrow checker doesn't grumble (keeps last
-    // clone alive too).
-    let _keep = tx;
 }
 
 /// Format a `LinearRgba` as `#rrggbbaa` (alpha appended only when not 1).
@@ -368,98 +323,6 @@ fn linear_rgba_to_hex(c: bevy::color::LinearRgba) -> String {
         format!("#{:02x}{:02x}{:02x}", r, g, b)
     } else {
         format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a)
-    }
-}
-
-fn dynamic_to_f32(d: &Dynamic) -> f32 {
-    if let Some(f) = d.clone().try_cast::<f64>() {
-        return f as f32;
-    }
-    if let Some(i) = d.clone().try_cast::<i64>() {
-        return i as f32;
-    }
-    0.0
-}
-
-fn rhai_map_to_value(m: Map) -> Value {
-    let mut out = serde_json::Map::new();
-    for (k, v) in m.into_iter() {
-        if let Ok(jv) = rhai_dyn_to_value(&v) {
-            out.insert(k.to_string(), jv);
-        }
-    }
-    Value::Object(out)
-}
-
-fn rhai_dyn_to_value(d: &Dynamic) -> Result<Value, ()> {
-    rhai::serde::to_dynamic::<Value>(serde_json::Value::Null).ok();
-    if let Some(f) = d.clone().try_cast::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(f) {
-            return Ok(Value::Number(n));
-        }
-    }
-    if let Some(i) = d.clone().try_cast::<i64>() {
-        return Ok(Value::Number(i.into()));
-    }
-    if let Some(s) = d.clone().try_cast::<String>() {
-        return Ok(Value::String(s));
-    }
-    if let Some(s) = d.clone().try_cast::<rhai::ImmutableString>() {
-        return Ok(Value::String(s.to_string()));
-    }
-    if let Some(b) = d.clone().try_cast::<bool>() {
-        return Ok(Value::Bool(b));
-    }
-    if let Some(arr) = d.clone().try_cast::<rhai::Array>() {
-        let mut out = Vec::with_capacity(arr.len());
-        for item in arr {
-            if let Ok(v) = rhai_dyn_to_value(&item) {
-                out.push(v);
-            }
-        }
-        return Ok(Value::Array(out));
-    }
-    if let Some(map) = d.clone().try_cast::<Map>() {
-        return Ok(rhai_map_to_value(map));
-    }
-    if d.is_unit() {
-        return Ok(Value::Null);
-    }
-    Err(())
-}
-
-fn value_to_rhai(v: Value) -> Option<Dynamic> {
-    match v {
-        Value::Null => Some(Dynamic::UNIT),
-        Value::Bool(b) => Some(Dynamic::from(b)),
-        Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
-                Some(Dynamic::from(f))
-            } else if let Some(i) = n.as_i64() {
-                Some(Dynamic::from(i))
-            } else {
-                None
-            }
-        }
-        Value::String(s) => Some(Dynamic::from(s)),
-        Value::Array(a) => {
-            let mut out = rhai::Array::new();
-            for item in a {
-                if let Some(d) = value_to_rhai(item) {
-                    out.push(d);
-                }
-            }
-            Some(Dynamic::from(out))
-        }
-        Value::Object(o) => {
-            let mut m = Map::new();
-            for (k, v) in o {
-                if let Some(d) = value_to_rhai(v) {
-                    m.insert(k.into(), d);
-                }
-            }
-            Some(Dynamic::from(m))
-        }
     }
 }
 

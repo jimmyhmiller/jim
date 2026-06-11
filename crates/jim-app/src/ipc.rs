@@ -60,8 +60,8 @@ pub enum IpcRequest {
         #[serde(default)]
         size: Option<[f32; 2]>,
         /// Optional widget kind override. Default is the subprocess
-        /// widget kind (`"widget"`). Pass `"rhai_widget"` to spawn a
-        /// Rhai-scripted in-process widget — `command` is then
+        /// widget kind (`"widget"`). Pass `"script_widget"` to spawn a
+        /// funct-scripted in-process widget — `command` is then
         /// interpreted as the script filename under
         /// `~/.jim/widgets/` (no shell invocation).
         #[serde(default)]
@@ -157,14 +157,14 @@ pub enum IpcRequest {
     /// forget; the file appears a frame or two later.
     Screenshot { path: PathBuf },
     /// `tbclose --project P [--kind K]` — close (despawn) panes in a
-    /// project, optionally filtered to a pane `kind` (e.g. `rhai_widget`).
+    /// project, optionally filtered to a pane `kind` (e.g. `script_widget`).
     /// Routes through the normal pane-close path (`on_close` + despawn),
     /// so it's the scriptable equivalent of clicking each close button.
     /// Fire-and-forget; no response body.
     CloseProjectPanes {
         #[serde(default)]
         project: Option<String>,
-        /// Pane kind to close (e.g. `"rhai_widget"`, `"widget"`). None =
+        /// Pane kind to close (e.g. `"script_widget"`, `"widget"`). None =
         /// every pane in the project.
         #[serde(default)]
         kind: Option<String>,

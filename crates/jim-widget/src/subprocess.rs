@@ -1,4 +1,4 @@
-//! Generic subprocess host API for rhai widgets.
+//! Generic subprocess host API for funct widgets.
 //!
 //! Lets a script spawn a child process and talk to it over its
 //! stdin/stdout, without any process-specific Rust. The chess widget
@@ -6,7 +6,7 @@
 //! chess-aware — any widget that wants to pipe lines to a CLI tool can
 //! use the same verbs.
 //!
-//! Host functions registered in `rhai_widget::register_host_functions`:
+//! Host functions registered in `script_widget::register_host_functions`:
 //!
 //! ```text
 //!   proc_spawn(cmd)            -> handle   spawn `cmd` (no args)
@@ -27,7 +27,7 @@
 //! Each child gets a reader thread that pushes stdout lines into a
 //! shared queue (popped by the non-blocking `proc_read`) AND, if a
 //! [`ProcNotifier`] is installed, fires a [`ProcEvent`] per line and once
-//! on exit. The event path is the recommended one: the rhai layer turns
+//! on exit. The event path is the recommended one: the funct layer turns
 //! those events into `on_proc_output(handle, line)` /
 //! `on_proc_exit(handle, code)` handler calls, so a widget is fully
 //! event-driven — no `set_animating`, no polling `proc_read` from
@@ -36,7 +36,7 @@
 //! # Lifecycle
 //!
 //! One [`ProcRegistry`] per worker thread, captured by the registered
-//! closures. When the worker shuts down (pane close), the Rhai engine
+//! closures. When the worker shuts down (pane close), the funct engine
 //! holding those closures drops, the registry drops, and every child
 //! it still owns is killed. So panes can't leak processes.
 //!

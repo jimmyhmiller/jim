@@ -449,8 +449,8 @@ impl AppActionsExt for App {
 // ============================================================
 //
 // Lets the common "open a specific pane kind with a config" action —
-// e.g. "open the chess rhai widget" — be declared on disk and picked up
-// live, without editing this file + rebuilding. Mirrors the rhai-widget
+// e.g. "open the chess funct widget" — be declared on disk and picked up
+// live, without editing this file + rebuilding. Mirrors the funct-widget
 // hot reload (`~/.jim/widgets/`).
 //
 // The manifest is a JSON array of entries:
@@ -463,13 +463,13 @@ impl AppActionsExt for App {
 //     "category": "Widgets",
 //     "icon": "♟",
 //     "keys": "cmd+k h",
-//     "kind": "rhai_widget",
-//     "config": { "script": "chess.rhai", "title": "Chess" }
+//     "kind": "script_widget",
+//     "config": { "script": "chess.ft", "title": "Chess" }
 //   }
 // ]
 // ```
 //
-// `kind` defaults to `rhai_widget`; `config` is handed verbatim to that
+// `kind` defaults to `script_widget`; `config` is handed verbatim to that
 // pane kind's spawn callback. `keys` is a default binding (still
 // overridable per-id from `keybinds.json`); `icon` makes it radial-eligible.
 
@@ -493,7 +493,7 @@ struct ManifestAction {
 }
 
 fn default_manifest_kind() -> String {
-    "rhai_widget".to_string()
+    "script_widget".to_string()
 }
 
 /// State + file watcher for the runtime action manifest. The config
@@ -520,7 +520,7 @@ fn actions_manifest_path() -> Option<PathBuf> {
 
 /// Default manifest written on first run so the feature is discoverable
 /// and immediately useful (the chess widget script is auto-bootstrapped
-/// by the rhai-widget plugin, so this action works out of the box).
+/// by the funct-widget plugin, so this action works out of the box).
 const DEFAULT_ACTIONS_MANIFEST: &str = r#"[
   {
     "id": "widget.chess",
@@ -528,8 +528,16 @@ const DEFAULT_ACTIONS_MANIFEST: &str = r#"[
     "category": "Widgets",
     "icon": "♟",
     "keys": "cmd+k h",
-    "kind": "rhai_widget",
-    "config": { "script": "chess.rhai", "title": "Chess" }
+    "kind": "script_widget",
+    "config": { "script": "chess.ft", "title": "Chess" }
+  },
+  {
+    "id": "widget.garden",
+    "title": "Garden",
+    "category": "Widgets",
+    "icon": "✿",
+    "kind": "script_widget",
+    "config": { "script": "garden.ft", "title": "Garden" }
   }
 ]
 "#;
@@ -571,7 +579,7 @@ fn apply_actions_manifest(world: &mut World) {
         }
         // Leak owned strings to `'static`, matching the `Box::leak`
         // already used for dynamic pane-kind ids. Reloads re-leak (a
-        // small, bounded, user-driven cost — same tradeoff as rhai
+        // small, bounded, user-driven cost — same tradeoff as funct
         // script recompiles).
         let id: &'static str = Box::leak(m.id.clone().into_boxed_str());
         let title: &'static str = Box::leak(m.title.into_boxed_str());
@@ -944,9 +952,9 @@ mod tests {
             keywords: &[],
             radial_icon: Some("♟"),
             default_keys: &[],
-            run: ActionRun::SpawnConfigured { kind: "rhai_widget" },
+            run: ActionRun::SpawnConfigured { kind: "script_widget" },
         });
-        let cfg = serde_json::json!({ "script": "chess.rhai", "title": "Chess" });
+        let cfg = serde_json::json!({ "script": "chess.ft", "title": "Chess" });
         world
             .resource_mut::<RuntimeActions>()
             .configs
@@ -959,7 +967,7 @@ mod tests {
 
         let panes = &world.resource::<PendingActions>().new_panes;
         assert_eq!(panes.len(), 1, "exactly one pane queued");
-        assert_eq!(panes[0].kind, "rhai_widget");
+        assert_eq!(panes[0].kind, "script_widget");
         assert_eq!(panes[0].project_id, 42);
         assert_eq!(panes[0].config, cfg);
     }
