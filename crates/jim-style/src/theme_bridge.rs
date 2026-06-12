@@ -91,6 +91,21 @@ fn publish(theme: &Theme) {
     }
 }
 
+/// Force the shared theme snapshot (what `theme_get` reads) to mirror
+/// `theme` right now, on the calling thread.
+///
+/// `publish_snapshot_on_change` already does this off `ThemeChanged`,
+/// but that's decoupled from the per-widget `Rerender` nudge: the nudge
+/// rides `Theme::is_changed()` and a worker thread may process it before
+/// the event-driven publish has run, re-rendering a canvas widget (e.g.
+/// the garden's `canvas_bg` sky) from the *stale* snapshot — and nothing
+/// re-triggers it afterward. Callers that are about to dispatch a
+/// theme-driven re-render should publish synchronously first so the
+/// worker can only ever read the fresh palette.
+pub fn refresh_snapshot(theme: &Theme) {
+    publish(theme);
+}
+
 fn drain_theme_writes(active_path: Res<ActiveThemePath>) {
     let Some(rx) = RX.get() else { return };
     let Ok(rx) = rx.lock() else { return };

@@ -1094,6 +1094,17 @@ fn forward_inputs_to_workers(
     // they keep the stale color until some unrelated event re-renders
     // them. Push a one-shot re-render whenever the theme changes.
     let theme_changed = theme.is_changed();
+    if theme_changed {
+        // The worker reads `theme_get` off a shared snapshot on its own
+        // thread. The event-driven publisher (`publish_snapshot_on_change`)
+        // is unordered w.r.t. this nudge, so a worker can process the
+        // Rerender below before the snapshot reflects the new project's
+        // theme — re-rendering the garden's sky from the *stale*
+        // canvas_bg, with nothing to re-trigger it. Publish synchronously
+        // here, on the main thread, before any Rerender is queued, so the
+        // worker can only ever read the fresh palette.
+        jim_style::theme_bridge::refresh_snapshot(&theme);
+    }
     let new_events: Vec<(String, Value)> = events
         .read()
         .map(|ev| {
