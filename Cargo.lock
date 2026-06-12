@@ -2911,6 +2911,8 @@ dependencies = [
 [[package]]
 name = "funct"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07930b526f5f2e406edb9e92a19b5401bf36432440189c3ca2c204093585559f"
 dependencies = [
  "imbl",
  "serde",

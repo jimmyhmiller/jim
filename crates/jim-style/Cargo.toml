@@ -16,7 +16,7 @@ serde_json = "1"
 bytemuck = { version = "1", features = ["derive"] }
 # funct VM — theme files (`theme.ft`), style presets, and the widget
 # host fns all evaluate through funct. Replaced funct across jim-style.
-funct = { path = "../../../PlayGround/claude-experiments/funct" }
+funct = "0.1"
 # File-watch theme.ft + shaders/*.wgsl edits in per-project asset dirs.
 # AssetServer handles WGSL hot-reload itself; we use notify only for the
 # funct file (which isn't an asset).

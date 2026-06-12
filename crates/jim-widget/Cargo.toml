@@ -30,7 +30,7 @@ taffy = { version = "0.9", default-features = false, features = [
 # handler be paused and time-sliced mid-execution; funct cannot. Path dep
 # (same out-of-repo practice as the symlinked datalog widgets) until funct
 # is published.
-funct = { path = "../../../PlayGround/claude-experiments/funct" }
+funct = "0.1"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 bevy = { version = "0.18", default-features = false, features = [
     "2d",
