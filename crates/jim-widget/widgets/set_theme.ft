@@ -1,0 +1,20 @@
+// set_theme.ft — tiny control PRIMITIVE: switch the active project's
+// theme preset. params { preset: "amber" | "forest" | "default" | … }.
+// Proves the charts are theme-reactive: flipping the preset recolors
+// every chart (the host re-renders widgets on theme change).
+import "host"
+extern fn set_active_style(name)
+extern fn list_styles()
+
+fn p(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+fn apply() { set_active_style(p("preset", "default")); request_render() }
+
+fn on_start() { apply() }   // side effect → on_start (runs every start)
+fn on_click(x, y, shift, cmd, id) { apply() }
+
+fn render(w, h) = {
+    kind: "vstack", gap: 6.0, pad: 12.0, children: [
+        { kind: "text", value: "theme → " + p("preset", "default"), size: 13.0, weight: "bold" },
+        { kind: "button", id: "apply", label: "re-apply" },
+    ]
+}

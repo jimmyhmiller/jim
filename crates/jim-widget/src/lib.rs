@@ -64,8 +64,9 @@ pub mod protocol;
 pub mod render;
 pub mod script_widget;
 pub mod subprocess;
+pub mod text_fallback;
 
-pub use msgbus::{PendingMsg, WidgetMsgBus};
+pub use msgbus::{BusMessageObserved, PendingMsg, WidgetMsgBus};
 
 pub use button_material::{
     ButtonParams as WidgetButtonParams, WidgetButtonMaterial, WidgetButtonMaterialPlugin,
@@ -2116,7 +2117,15 @@ impl Plugin for WidgetPlugin {
                 stamp_overlay_layers
                     .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility),
             )
-            .add_systems(PostUpdate, (clip_widget_sprites, override_overlay_cursor));
+            .add_systems(Update, rerender_script_widgets_on_scroll)
+            .add_systems(PostUpdate, (clip_widget_sprites, override_overlay_cursor))
+            // Per-glyph font fallback: split any Text2d whose font lacks a
+            // glyph into fallback spans, before text is laid out.
+            .add_systems(
+                PostUpdate,
+                text_fallback::apply_text_fallback
+                    .before(bevy::text::Text2dUpdateSystems),
+            );
     }
 }
 
@@ -2397,12 +2406,23 @@ fn forward_ticks(
 /// boundaries even though the visible portion is clipped. Keeping
 /// custom_size honest avoids that mismatch.
 fn clip_widget_sprites(
-    panes: Query<(&PaneKindMarker, &PaneRect, &WidgetContentRoot)>,
+    // Both widget kinds: subprocess panes carry `WidgetContentRoot`, funct
+    // script panes carry `PaneChrome` (its `content_root`). Clip both so
+    // canvas charts (heatmap cells, etc.) are cut at the pane edge instead
+    // of bleeding into neighbours.
+    panes: Query<(
+        &PaneKindMarker,
+        &PaneRect,
+        Option<&WidgetContentRoot>,
+        Option<&jim_pane::PaneChrome>,
+        Option<&WidgetScroll>,
+    )>,
     changed_panes: Query<(), (With<PaneKindMarker>, Changed<PaneRect>)>,
     mut needs_clip: ResMut<WidgetClipDirty>,
     children_q: Query<&Children>,
     transforms: Query<&Transform>,
     mut sprites: Query<&mut Sprite>,
+    anchors: Query<&bevy::sprite::Anchor>,
 ) {
     // Same idle-fast-path as jim_pane::enforce_pane_content_bounds:
     // walking every widget subtree every frame to clamp sizes that
@@ -2416,10 +2436,17 @@ fn clip_widget_sprites(
     if changed_panes.is_empty() && !new_content {
         return;
     }
-    for (kind, rect, root) in &panes {
-        if kind.0 != PANE_KIND {
+    for (kind, rect, wcr, chrome, scroll) in &panes {
+        if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             continue;
         }
+        let Some(root) = wcr
+            .map(|w| w.0)
+            .or_else(|| chrome.map(|c| c.content_root))
+        else {
+            continue;
+        };
+        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
         let content_w = (rect.size.x - 2.0 * MARGIN).max(0.0);
         let content_h = (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0);
 
@@ -2427,7 +2454,7 @@ fn clip_widget_sprites(
         // translations from `content_root` outward: x is right, y is up
         // (negative y = down inside the pane).
         let mut stack: Vec<(Entity, Vec2)> = Vec::with_capacity(16);
-        if let Ok(children) = children_q.get(root.0) {
+        if let Ok(children) = children_q.get(root) {
             for c in children.iter() {
                 let t = transforms
                     .get(c)
@@ -2438,15 +2465,38 @@ fn clip_widget_sprites(
         }
 
         while let Some((entity, offset)) = stack.pop() {
-            // top_offset is "distance below content_root top, in px".
-            let top_offset = (-offset.y).max(0.0);
+            // Distance below the VISIBLE top (accounts for scroll). The
+            // content_root is translated up by `scroll_y` (apply_widget_scroll),
+            // but `offset` is local to content_root, so subtract scroll here.
+            let eff_top = -offset.y - scroll_y;
             let left_offset = offset.x.max(0.0);
             let avail_w = (content_w - left_offset).max(0.0);
-            let avail_h = (content_h - top_offset).max(0.0);
+            let avail_h = (content_h - eff_top).max(0.0);
 
             if let Ok(mut sprite) = sprites.get_mut(entity) {
                 if let Some(want) = sprite.custom_size {
-                    let new = Vec2::new(want.x.min(avail_w), want.y.min(avail_h));
+                    // `eff_top` is the sprite's ANCHOR point (canvas y-down).
+                    // Which direction the quad extends from it — and thus how
+                    // much room it has before escaping the content area —
+                    // depends on the vertical anchor. A bottom-anchored bar
+                    // grows UP toward the content top; clamping it as if it
+                    // grew down (the old behavior) crushed its height to the
+                    // sliver below the baseline. `Anchor` is y-up: +0.5 top,
+                    // 0 center, -0.5 bottom.
+                    let anchor_y = anchors.get(entity).map(|a| a.as_vec().y).unwrap_or(0.0);
+                    let new_h = if anchor_y < 0.0 {
+                        // bottom-anchored: grows up from eff_top toward 0.
+                        if eff_top <= 0.0 { 0.0 } else { want.y.min(eff_top) }
+                    } else if anchor_y > 0.0 {
+                        // top-anchored: grows down from eff_top.
+                        if eff_top + want.y <= 0.0 { 0.0 } else { want.y.min(avail_h) }
+                    } else {
+                        // center-anchored: grows both ways, so the limit is
+                        // twice the distance to the nearer content edge.
+                        let room = 2.0 * eff_top.min(content_h - eff_top);
+                        if room <= 0.0 { 0.0 } else { want.y.min(room) }
+                    };
+                    let new = Vec2::new(want.x.min(avail_w), new_h);
                     if (new.x - want.x).abs() > f32::EPSILON
                         || (new.y - want.y).abs() > f32::EPSILON
                     {
@@ -2465,6 +2515,18 @@ fn clip_widget_sprites(
                 }
             }
         }
+    }
+}
+
+/// When a script widget is scrolled, force it to re-render. Canvas sprite
+/// sizes get clamped by `clip_widget_sprites` and can't grow back on their
+/// own; re-rendering rebuilds them at full size so the scroll-aware clip
+/// can re-clamp for the new offset.
+fn rerender_script_widgets_on_scroll(
+    mut q: Query<&mut script_widget::ScriptWidget, Changed<WidgetScroll>>,
+) {
+    for mut w in &mut q {
+        w.force_render = true;
     }
 }
 
@@ -3281,14 +3343,16 @@ fn update_widget_hot_zones(
                 zones.push(clipped);
             }
         }
-        // Canvas-based funct widgets (e.g. chess) self-route clicks and
-        // publish no per-element targets, so the loops above leave them
-        // with no hot-zones — meaning they'd be entirely click-through
-        // when pinned. If such a widget handles clicks at all (defines
-        // `on_click`), treat its whole content area as one hot-zone so
-        // pinned clicks reach it. Decorative widgets without `on_click`
-        // (dust) stay click-through.
-        if zones.0.is_empty() && sw.map_or(false, |r| r.wants_clicks) && !visible.is_empty() {
+        // Canvas-based funct widgets (e.g. chess, the df_* charts)
+        // self-route pointer input and publish no per-element targets, so
+        // the loops above leave them with no hot-zones — meaning they'd be
+        // entirely pass-through when pinned. If such a widget handles
+        // clicks (`on_click`) OR hover (`on_hover`, e.g. a chart tooltip),
+        // treat its whole content area as one hot-zone so pinned-pane
+        // hit-testing (press AND hover) reaches it. Purely decorative
+        // widgets (no `on_click`/`on_hover`, e.g. dust) stay pass-through.
+        let wants_pointer = sw.map_or(false, |r| r.wants_clicks || r.wants_hover);
+        if zones.0.is_empty() && wants_pointer && !visible.is_empty() {
             zones.push(visible);
         }
     }

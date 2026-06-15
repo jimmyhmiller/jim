@@ -173,3 +173,60 @@ pub fn complete_json<T: DeserializeOwned>(
         err: e.to_string(),
     })
 }
+
+/// One message in a multi-turn conversation (for agent loops).
+#[derive(Clone)]
+pub struct Msg {
+    pub role: String,
+    pub content: String,
+}
+
+impl Msg {
+    pub fn system(s: impl Into<String>) -> Self {
+        Self { role: "system".into(), content: s.into() }
+    }
+    pub fn user(s: impl Into<String>) -> Self {
+        Self { role: "user".into(), content: s.into() }
+    }
+    pub fn assistant(s: impl Into<String>) -> Self {
+        Self { role: "assistant".into(), content: s.into() }
+    }
+}
+
+/// Multi-turn chat completion. Unlike [`complete_json`] (system+user only)
+/// this carries a full message history — the primitive an agent loop calls
+/// each step. Still `response_format = json_object`, so the assistant's
+/// reply is expected to be a single JSON object; we return it raw for the
+/// caller to parse (an agent turn is small and bespoke). Blocking HTTP —
+/// call from a worker thread, never a Bevy system.
+pub fn chat_json(cfg: &LlmConfig, messages: &[Msg], temperature: f32) -> Result<String, LlmError> {
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let msgs: Vec<ChatMessage> = messages
+        .iter()
+        .map(|m| ChatMessage { role: &m.role, content: &m.content })
+        .collect();
+    let body = ChatRequest {
+        model: &cfg.model,
+        messages: msgs,
+        response_format: ResponseFormat { kind: "json_object" },
+        temperature,
+    };
+    let res = ureq::post(&url)
+        // Agent turns can involve more reasoning than a classifier; give the
+        // model more room than the 60s classifier cap, but still bounded so
+        // a hung connection surfaces as an error.
+        .timeout(std::time::Duration::from_secs(120))
+        .set("Authorization", &format!("Bearer {}", cfg.api_key))
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::to_value(&body).expect("serialize request"));
+    let res = res.map_err(|e| LlmError::Http(e.to_string()))?;
+    let parsed: ChatResponse = res
+        .into_json()
+        .map_err(|e| LlmError::BadResponse(e.to_string()))?;
+    parsed
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| LlmError::BadResponse("no choices in response".into()))
+        .map(|c| c.message.content)
+}

@@ -1,0 +1,103 @@
+// http.ft — a generic HTTP fetch PRIMITIVE.
+//
+// One node, any endpoint. Configured entirely by `params` (set at spawn):
+//   { url, out, interval (auto-refresh secs, optional), curl_cfg (-K auth, optional) }
+//
+// Publishes (retained) on `out`: { kind:"raw", body:<parsed-json>, url, fetched_at }
+//
+// Persistence model: the fetched body is kept in `state.body` and saved
+// as widget state. Proc handling is EVENT-DRIVEN (on_proc_output /
+// on_proc_exit, which persist), so a completed fetch is durably recorded.
+// Therefore on RESTART the node is not "fresh" → `on_start` (the fetch)
+// does NOT re-run. The data is restored from state, not re-requested.
+import "host"
+import { col_text, col_muted } from "df"
+
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+fn url()       = param("url", "https://computer.jimmyhmiller.com/analytics/by-day?days=14")
+fn out_topic() = param("out", "http/out")
+fn interval_s() = param("interval", 0.0)
+
+fn curl_args() {
+    let cfg = param("curl_cfg", "")
+    if cfg == "" { ["-sS", url()] } else { ["-sS", "-K", cfg, url()] }
+}
+
+fn init_state() = { proc: -1, busy: false, lines: [], next_at: 0.0,
+                    status: "idle", last_at: "never", bytes: 0, body: {} }
+let state = atom(init_state())
+
+fn start_fetch() {
+    let s = @state
+    if s.busy { return }
+    let h = proc_spawn("curl", curl_args())
+    if h == -1 {
+        emit_retained(out_topic(), { kind: "error", message: "curl spawn failed", stage: "http" })
+        reset!(state, { ..s, status: "spawn failed" })
+        request_render()
+        return
+    }
+    reset!(state, { ..s, proc: h, busy: true, lines: [], status: "fetching…" })
+    request_render()
+}
+
+// Ephemeral timer (auto-refresh) is re-established every start — it's
+// runtime, not data. With no interval, nothing animates.
+fn on_init() { if interval_s() > 0.0 { set_animating(true) } }
+
+// The initial GET is a side effect → on_start, which runs ONLY on a fresh
+// spawn (not on restart). On restart the body is already in state.
+fn on_start() { start_fetch() }
+
+// Event-driven proc output (these handlers persist, so the result sticks).
+fn on_proc_output(handle, line) {
+    let s = @state
+    if handle == s.proc { reset!(state, { ..s, lines: push(s.lines, line) }) }
+}
+
+fn on_proc_exit(handle, code) {
+    let s = @state
+    if handle != s.proc { return }
+    let body_text = trim(join(s.lines, "\n"))
+    if starts_with(body_text, "{") or starts_with(body_text, "[") {
+        let parsed = parse_json(body_text)
+        emit_retained(out_topic(), { kind: "raw", body: parsed, url: url(), fetched_at: time() })
+        host_log("[http] " + url() + " → " + out_topic() + " (" + str(len(body_text)) + "b)")
+        reset!(state, { ..s, busy: false, proc: -1, lines: [], status: "ok",
+                        last_at: "t=" + str(round(time())), bytes: len(body_text), body: parsed })
+    } else {
+        let msg = if body_text == "" { "empty response" } else { slice(body_text, 0, 120) }
+        emit_retained(out_topic(), { kind: "error", message: msg, stage: "http" })
+        reset!(state, { ..s, busy: false, proc: -1, lines: [], status: "error" })
+    }
+    request_render()
+}
+
+// Only used when an auto-refresh interval is configured.
+fn on_frame(dt) {
+    let iv = interval_s()
+    if iv <= 0.0 { set_animating(false); return }
+    let s = @state
+    if not s.busy and time() >= s.next_at {
+        reset!(state, { ..s, next_at: time() + iv })
+        start_fetch()
+    }
+}
+
+fn on_click(x, y, shift, cmd, id) { if id == "refresh" { start_fetch() } }
+
+fn render(w, h) {
+    let s = @state
+    {
+        kind: "vstack", gap: 8.0, pad: 12.0, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: "◆ http", size: 14.0, weight: "bold", color: col_text() },
+                { kind: "button", id: "refresh", label: if s.busy { "fetching…" } else { "GET" } },
+            ]},
+            { kind: "text", value: url(), size: 10.0, family: "mono", color: col_muted(), selectable: true },
+            { kind: "text", value: "→ " + out_topic(), size: 10.0, family: "mono", color: col_muted() },
+            { kind: "text", value: "status: " + s.status + "  ·  " + str(s.bytes) + "b  ·  " + s.last_at,
+              size: 11.0, color: col_muted() },
+        ]
+    }
+}

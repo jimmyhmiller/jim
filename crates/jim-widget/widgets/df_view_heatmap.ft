@@ -1,0 +1,113 @@
+// df_view_heatmap.ft — a VIEW node: value grid / calendar heatmap.
+//
+// Rows laid out in a 7-wide grid, each cell colored by its value via the
+// shared ramp. Hover a cell for a white outline + value tooltip.
+//
+//   in : df/analytics/norm/out   (dataset | error)
+import "host"
+import { first_role, cell, col_max, ramp, tooltip, concat, dsify, pget , col_text, col_muted, col_axis, col_accent, col_err, col_warn } from "df"
+
+fn in_topic() = pget(params, "in", "http/out")
+let cols = 7
+
+fn init_state() = { ds: { kind: "empty" }, w: 400.0, h: 300.0, hov: -1 }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_message(topic, payload, sender) {
+    if topic != in_topic() { return }
+    reset!(state, { ..(@state), ds: dsify(payload, params), hov: -1 })
+    request_render()
+}
+
+fn on_resize(w, h) { reset!(state, { ..(@state), w: w, h: h }); request_render() }
+
+fn geo(s) {
+    let pad_l = 12.0
+    let pad_t = 34.0
+    let gap = 4.0
+    let cell_sz = (s.w - pad_l * 2.0 - (cols - 1) * gap) / cols
+    { pad_l: pad_l, pad_t: pad_t, gap: gap, cell: cell_sz, n: len(s.ds.rows) }
+}
+
+fn cell_xy(g, i) {
+    let c = i % cols
+    let r = to_int(floor(i / cols))
+    { x: g.pad_l + c * (g.cell + g.gap), y: g.pad_t + r * (g.cell + g.gap) }
+}
+
+fn on_hover(x, y) {
+    let s = @state
+    // Cursor-left sentinel (x = inf). Clear hover and bail BEFORE any
+    // arithmetic — to_int(floor(inf)) faults the handler, which would
+    // otherwise strand the highlight.
+    if x > 100000.0 { if s.hov >= 0 { reset!(state, { ..s, hov: -1 }); request_render() } return }
+    if s.ds.kind != "dataset" { return }
+    let g = geo(s)
+    let c = to_int(floor((x - g.pad_l) / (g.cell + g.gap)))
+    let r = to_int(floor((y - g.pad_t) / (g.cell + g.gap)))
+    let idx = r * cols + c
+    let hov = if x < 100000.0 and x >= g.pad_l and y >= g.pad_t
+                 and c >= 0 and c < cols and idx >= 0 and idx < g.n { idx } else { -1 }
+    if hov != s.hov { reset!(state, { ..s, hov: hov }); request_render() }
+}
+
+fn banner(text, color) =
+    { kind: "canvas", children: [
+        { kind: "text", id: "bt", x: 12.0, y: 10.0, value: "■ heatmap", size: 13.0, color: col_text() },
+        { kind: "text", id: "bm", x: 12.0, y: 40.0, value: text, size: 12.0, color: color },
+    ]}
+
+fn render(w, h) {
+    let s = @state
+    let ds = s.ds
+    if ds.kind == "error" { return banner("error: " + ds.message, col_err()) }
+    if ds.kind != "dataset" { return banner("waiting for data…", col_muted()) }
+    let xcol = first_role(ds, "dimension")
+    let ycol = first_role(ds, "measure")
+    if ycol == "" { return banner("no measure column", col_warn()) }
+    let g = geo(s)
+    if g.n == 0 { return banner("no rows", col_muted()) }
+    let mx = col_max(ds, ycol)
+
+    let mut items = []
+    items = push(items, { kind: "text", id: "title", x: 12.0, y: 10.0,
+        value: "■ " + ycol + " heatmap", size: 13.0, color: col_text() })
+
+    let mut i = 0
+    while i < g.n {
+        let v = cell(unwrap_or(get(ds.rows, i), {}), ycol, 0)
+        let t = if mx > 0 { v / mx } else { 0 }
+        let p = cell_xy(g, i)
+        if i == s.hov {
+            items = push(items, { kind: "rect", id: "hl", x: p.x - 2.0, y: p.y - 2.0,
+                w: g.cell + 4.0, h: g.cell + 4.0, color: col_text(), anchor: "top-left" })
+        }
+        items = push(items, { kind: "rect", id: "c" + str(i),
+            x: p.x, y: p.y, w: g.cell, h: g.cell, color: ramp(t), anchor: "top-left" })
+        i = i + 1
+    }
+
+    // legend
+    let rows_used = to_int(floor((g.n - 1) / cols)) + 1
+    let ly = g.pad_t + rows_used * (g.cell + g.gap) + 8.0
+    items = push(items, { kind: "text", id: "lo", x: g.pad_l, y: ly, value: "low", size: 9.0, color: col_muted() })
+    let mut j = 0
+    while j < 6 {
+        items = push(items, { kind: "rect", id: "lg" + str(j), x: g.pad_l + 30.0 + j * 16.0, y: ly,
+            w: 14.0, h: 10.0, color: ramp(j / 5.0), anchor: "top-left" })
+        j = j + 1
+    }
+    items = push(items, { kind: "text", id: "hi", x: g.pad_l + 30.0 + 6 * 16.0 + 4.0, y: ly,
+        value: "high (peak " + str(to_int(round(mx))) + ")", size: 9.0, color: col_muted() })
+
+    if s.hov >= 0 and s.hov < g.n {
+        let r = unwrap_or(get(ds.rows, s.hov), {})
+        let p = cell_xy(g, s.hov)
+        items = concat(items, tooltip(p.x + g.cell / 2.0, p.y, s.w, s.h,
+            str(cell(r, xcol, "")) + ": " + str(cell(r, ycol, 0))))
+    }
+
+    { kind: "canvas", children: items }
+}

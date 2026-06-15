@@ -1,0 +1,114 @@
+// df_view_bar.ft — a VIEW node: HORIZONTAL bar chart (Canvas).
+//
+// Bars grow sideways from a single aligned baseline (the left gutter),
+// so every bar starts at the same x regardless of label length. Labels
+// are truncated to the gutter. Hover a row to highlight it + see the
+// exact value in a tooltip. Pairs with df_view_vbars (vertical columns)
+// — same data, the other orientation.
+//
+//   in : df/analytics/norm/out   (dataset | error)
+import "host"
+import { first_role, cell, col_max, ramp, trunc, tooltip, concat, dsify, pget , col_text, col_muted, col_axis, col_accent, col_err, col_warn } from "df"
+
+fn in_topic() = pget(params, "in", "http/out")
+
+fn init_state() = { ds: { kind: "empty" }, w: 480.0, h: 360.0, hov: -1 }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_message(topic, payload, sender) {
+    if topic != in_topic() { return }
+    reset!(state, { ..(@state), ds: dsify(payload, params), hov: -1 })
+    request_render()
+}
+
+fn on_resize(w, h) { reset!(state, { ..(@state), w: w, h: h }); request_render() }
+
+// Layout geometry, shared by render + hover so hit-testing matches pixels.
+fn geo(s) {
+    let pad_t = 34.0
+    let pad_b = 12.0
+    let plot_l = 118.0
+    let pad_r = 52.0
+    let n = len(s.ds.rows)
+    let step = if n > 0 { (s.h - pad_t - pad_b) / n } else { 0.0 }
+    {
+        pad_t: pad_t, plot_l: plot_l,
+        plot_w: s.w - plot_l - pad_r,
+        step: step,
+        bar_h: if step - 5.0 > 3.0 { step - 5.0 } else { step * 0.7 },
+        n: n,
+    }
+}
+
+fn on_hover(x, y) {
+    let s = @state
+    // Cursor-left sentinel (x = inf). Clear hover and bail BEFORE any
+    // arithmetic — to_int(floor(inf)) faults the handler, which would
+    // otherwise strand the highlight.
+    if x > 100000.0 { if s.hov >= 0 { reset!(state, { ..s, hov: -1 }); request_render() } return }
+    if s.ds.kind != "dataset" { return }
+    let g = geo(s)
+    let idx = to_int(floor((y - g.pad_t) / g.step))
+    let hov = if x < 100000.0 and y >= g.pad_t and idx >= 0 and idx < g.n { idx } else { -1 }
+    if hov != s.hov { reset!(state, { ..s, hov: hov }); request_render() }
+}
+
+fn banner(text, color) =
+    { kind: "canvas", children: [
+        { kind: "text", id: "bt", x: 12.0, y: 10.0, value: "▬ bars", size: 13.0, color: col_text() },
+        { kind: "text", id: "bm", x: 12.0, y: 40.0, value: text, size: 12.0, color: color },
+    ]}
+
+fn render(w, h) {
+    let s = @state
+    let ds = s.ds
+    if ds.kind == "error" { return banner("error: " + ds.message, col_err()) }
+    if ds.kind != "dataset" { return banner("waiting for data…", col_muted()) }
+    let xcol = first_role(ds, "dimension")
+    let ycol = first_role(ds, "measure")
+    if ycol == "" { return banner("no measure column", col_warn()) }
+    let g = geo(s)
+    if g.n == 0 { return banner("no rows", col_muted()) }
+    let mx = col_max(ds, ycol)
+
+    let mut items = []
+    items = push(items, { kind: "text", id: "title", x: 12.0, y: 10.0,
+        value: "▬ " + ycol + " by " + xcol, size: 13.0, color: col_text() })
+    // aligned baseline
+    items = push(items, { kind: "rect", id: "axis", x: g.plot_l, y: g.pad_t,
+        w: 1.0, h: g.step * g.n, color: col_axis() })
+
+    let mut i = 0
+    while i < g.n {
+        let r = unwrap_or(get(ds.rows, i), {})
+        let v = cell(r, ycol, 0)
+        let t = if mx > 0 { v / mx } else { 0 }
+        let bw = t * g.plot_w
+        let ry = g.pad_t + i * g.step
+        let by = ry + (g.step - g.bar_h) / 2.0
+        let hot = i == s.hov
+        if hot {
+            items = push(items, { kind: "rect", id: "hl" + str(i), x: 4.0, y: ry,
+                w: s.w - 8.0, h: g.step, color: (col_text() + "22"), anchor: "top-left" })
+        }
+        items = push(items, { kind: "text", id: "l" + str(i), x: 10.0, y: ry + g.step / 2.0 - 6.0,
+            value: trunc(str(cell(r, xcol, "")), 15), size: 11.0,
+            color: if hot { col_text() } else { col_muted() }, family: "mono" })
+        items = push(items, { kind: "rect", id: "b" + str(i), x: g.plot_l + 1.0, y: by,
+            w: bw, h: g.bar_h, color: if hot { col_text() } else { ramp(t) }, anchor: "top-left" })
+        items = push(items, { kind: "text", id: "v" + str(i), x: g.plot_l + bw + 7.0, y: ry + g.step / 2.0 - 6.0,
+            value: str(v), size: 11.0, color: col_text(), family: "mono" })
+        i = i + 1
+    }
+    // tooltip for the hovered row
+    if s.hov >= 0 and s.hov < g.n {
+        let r = unwrap_or(get(ds.rows, s.hov), {})
+        let ry = g.pad_t + s.hov * g.step + g.step / 2.0
+        items = concat(items, tooltip(g.plot_l + 40.0, ry, s.w, s.h,
+            str(cell(r, xcol, "")) + ": " + str(cell(r, ycol, 0))))
+    }
+
+    { kind: "canvas", children: items }
+}

@@ -12,7 +12,8 @@
 //! drop in real files. Unknown names also fall back to mono — the
 //! engine never crashes for a missing font, it just renders in mono.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bevy::prelude::*;
 
@@ -20,9 +21,18 @@ use bevy::prelude::*;
 #[derive(Resource, Default, Clone)]
 pub struct FontRegistry {
     by_name: HashMap<String, Handle<Font>>,
-    /// Fallback used when a name doesn't resolve. Always points at the
+    /// Fallback used when a *name* doesn't resolve. Always points at the
     /// bundled mono font.
     fallback: Handle<Font>,
+    /// Per-handle set of covered Unicode codepoints, parsed from each
+    /// font's cmap at load. Drives per-glyph font fallback so a glyph
+    /// missing from the chosen family is still drawn (from `symbols`)
+    /// instead of silently vanishing. `Arc` so cloning the registry
+    /// (it's a `Resource` that callers clone into `LayoutCtx`) is cheap.
+    coverage: HashMap<Handle<Font>, Arc<HashSet<u32>>>,
+    /// Broad-coverage fallback font (DejaVu Sans) consulted per-glyph
+    /// when the requested family lacks a codepoint.
+    symbols: Handle<Font>,
 }
 
 impl FontRegistry {
@@ -58,6 +68,45 @@ impl FontRegistry {
         v.sort();
         v
     }
+
+    /// Does font `handle` cover codepoint `ch`? Unknown handles (not
+    /// bundled) are assumed to cover everything, so we never *hide* text
+    /// just because we couldn't introspect its font.
+    fn covers(&self, handle: &Handle<Font>, ch: char) -> bool {
+        match self.coverage.get(handle) {
+            Some(set) => set.contains(&(ch as u32)),
+            None => true,
+        }
+    }
+
+    /// Pick the font to draw `ch` in: the requested `base` if it covers
+    /// the glyph, else the broad `symbols` fallback if *it* does, else
+    /// `base` (let it render tofu rather than swap unexpectedly).
+    pub fn font_for_char(&self, base: &Handle<Font>, ch: char) -> Handle<Font> {
+        if self.covers(base, ch) {
+            base.clone()
+        } else if self.symbols != Handle::default() && self.covers(&self.symbols, ch) {
+            self.symbols.clone()
+        } else {
+            base.clone()
+        }
+    }
+
+    /// Split `text` into maximal runs that share one font, applying
+    /// per-glyph fallback. Returns `[(run_text, font)]`. The overwhelmingly
+    /// common case — every glyph covered by `base` — yields a single run,
+    /// so callers can cheaply special-case `len == 1` (no rich text).
+    pub fn split_runs(&self, base: &Handle<Font>, text: &str) -> Vec<(String, Handle<Font>)> {
+        let mut runs: Vec<(String, Handle<Font>)> = Vec::new();
+        for ch in text.chars() {
+            let font = self.font_for_char(base, ch);
+            match runs.last_mut() {
+                Some((s, f)) if *f == font => s.push(ch),
+                _ => runs.push((ch.to_string(), font)),
+            }
+        }
+        runs
+    }
 }
 
 /// Per-family bundled bytes. New families add a row here.
@@ -71,7 +120,31 @@ const BUNDLED_FONTS: &[(&str, &[u8])] = &[
     ("mono", include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
     ("sans", include_bytes!("../assets/fonts/Inter-VF.ttf")),
     ("serif", include_bytes!("../assets/fonts/CrimsonPro-VF.ttf")),
+    // Broad-coverage glyph fallback (geometric shapes, arrows, math,
+    // symbols) consulted per-glyph when the chosen family lacks a
+    // codepoint. Also selectable as a family by name.
+    ("symbols", include_bytes!("../assets/fonts/DejaVuSans.ttf")),
 ];
+
+/// The family name whose handle becomes the per-glyph fallback font.
+const FALLBACK_FAMILY: &str = "symbols";
+
+/// Parse a font's cmap into the set of Unicode codepoints it can render.
+fn coverage_of(bytes: &[u8]) -> HashSet<u32> {
+    let mut set = HashSet::new();
+    if let Ok(face) = ttf_parser::Face::parse(bytes, 0) {
+        if let Some(cmap) = face.tables().cmap {
+            for sub in cmap.subtables {
+                if sub.is_unicode() {
+                    sub.codepoints(|cp| {
+                        set.insert(cp);
+                    });
+                }
+            }
+        }
+    }
+    set
+}
 
 pub struct FontRegistryPlugin;
 
@@ -105,6 +178,14 @@ pub fn ensure_initialized(registry: &mut FontRegistry, fonts: &mut Assets<Font>)
         let handle = fonts.add(font);
         if first.is_none() {
             first = Some(handle.clone());
+        }
+        // Record glyph coverage for per-glyph fallback, and remember the
+        // dedicated fallback family's handle.
+        registry
+            .coverage
+            .insert(handle.clone(), Arc::new(coverage_of(bytes)));
+        if *name == FALLBACK_FAMILY {
+            registry.symbols = handle.clone();
         }
         registry.by_name.insert((*name).to_string(), handle);
     }

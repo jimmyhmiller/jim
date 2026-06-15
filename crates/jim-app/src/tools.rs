@@ -8,6 +8,33 @@
 
 use serde::Deserialize;
 
+/// One durable note added via `jimctl memory add`, folded into the system
+/// prompt. Stored as JSONL in `~/.jim/actions-memory.jsonl`; the format is
+/// duplicated in `jimctl/src/cmd_memory.rs` (per the workspace convention) —
+/// keep the two in sync.
+#[derive(Deserialize)]
+struct MemoryEntry {
+    text: String,
+}
+
+/// Load the user's open-ended notes for the action planner. Best-effort:
+/// a missing or malformed file just yields no notes. Shared with the
+/// agent loop ([`crate::agent`]), which folds the same notes into its
+/// system prompt.
+pub(crate) fn load_memory() -> Vec<String> {
+    let Some(path) = crate::data_dir().map(|d| d.join("actions-memory.jsonl")) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<MemoryEntry>(l).ok())
+        .map(|e| e.text)
+        .collect()
+}
+
 /// The model's planned response.
 #[derive(Deserialize, Debug, Default)]
 pub struct ToolPlan {
@@ -72,8 +99,8 @@ pub const TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "spawn_widget",
         risk: Risk::Safe,
-        description: "Open a new pane running a shell command (a small terminal-like widget).",
-        args_hint: r#"{"command":"<shell cmd>","title":"<short>","project":"<name>|active"}"#,
+        description: "Open a new pane. Two modes via `kind`: (1) kind omitted/\"widget\" runs `command` as a shell command in a small terminal-like widget; (2) kind=\"script_widget\" spawns a funct (.ft) script from ~/.jim/widgets/ (set `command` to the filename, pass per-instance config in `params`). Charts/graphs use mode 2 (e.g. http.ft + df_view_*.ft). Use `position`/`size` to place panes so they don't overlap.",
+        args_hint: r#"{"command":"<shell cmd | script.ft>","kind":"widget|script_widget","params":{},"title":"<short>","project":"<name>|active","position":[x,y],"size":[w,h]}"#,
     },
     ToolSpec {
         name: "open_file",
@@ -140,6 +167,16 @@ pub fn system_prompt() -> String {
             "- {} ({}): {}\n  args: {}\n",
             t.name, tag, t.description, t.args_hint
         ));
+    }
+    let notes = load_memory();
+    if !notes.is_empty() {
+        s.push_str(
+            "\nUser notes (durable facts and instructions about this system \
+             and the user's preferences — honor them when planning):\n",
+        );
+        for n in &notes {
+            s.push_str(&format!("- {n}\n"));
+        }
     }
     s
 }

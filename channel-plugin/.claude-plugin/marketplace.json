@@ -1,0 +1,12 @@
+{
+  "name": "jim-local",
+  "owner": { "name": "Jimmy Miller" },
+  "description": "Local-only marketplace for the Jim editor channel. Never published.",
+  "plugins": [
+    {
+      "name": "jim",
+      "source": "./jim",
+      "description": "Bridges this Claude session to the Jim editor's agent bus (see CHANNELS.md)."
+    }
+  ]
+}

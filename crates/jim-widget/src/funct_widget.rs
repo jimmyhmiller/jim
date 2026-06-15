@@ -73,6 +73,9 @@ extern let canvas_w
 extern let canvas_h
 // host-owned persistent state atom (survives hot reload + restart)
 extern let state
+// per-instance params (config) set at spawn — same .ft, different URL /
+// columns / topics. A plain record (not an atom); read-only.
+extern let params
 
 // --- render / animation control ---
 extern fn request_render()
@@ -112,6 +115,14 @@ extern fn time()
 /// generic `PaneSnapshot.config.state` JSON, so the funct worker can tell
 /// its own snapshot apart from a rhai state map.
 const SNAPSHOT_KEY: &str = "__funct_vmstate__";
+
+/// Key for a STATE-ONLY snapshot: the serialized value of the widget's
+/// `state` atom (data), NOT the whole VM (code + execution). Snapshotting
+/// data instead of execution is what lets a widget keep its state across
+/// restarts while still re-evaluating the CURRENT source + modules — so
+/// hot-reloaded code (e.g. `df.ft`) actually takes effect. (A full
+/// execution snapshot would restore stale baked-in code.)
+const STATE_KEY: &str = "__funct_state__";
 
 /// What the in-flight job is, so its completion routes correctly.
 #[derive(Clone, Copy)]
@@ -188,6 +199,12 @@ impl FunctWorker {
         ];
         let wants = INTERACTIVE.iter().any(|n| self.defines(n));
         self.slots.wants_clicks.store(wants, Ordering::Release);
+        // Hover is reported separately: a chart with `on_hover` but no
+        // `on_click` must still publish a content hot-zone so pinned-pane
+        // hover hit-testing reaches it (same gate clicks use).
+        self.slots
+            .wants_hover
+            .store(self.defines("on_hover"), Ordering::Release);
     }
 
     /// Evaluate the script source: defines functions, runs top-level
@@ -216,25 +233,46 @@ impl FunctWorker {
         self.slots.render_dirty.store(true, Ordering::Release);
     }
 
-    /// Restore a persisted VM snapshot instead of evaluating source. The
-    /// host surface must already be registered (it is — `new` does it).
-    /// Does NOT call `on_init`: durable state is already in the restored
-    /// globals/atoms, and re-running `on_init` would reset it. Returns
-    /// false (caller falls back to `load`) on any restore failure.
-    fn restore(&mut self, snapshot_json: &str) -> bool {
-        self.inject_globals();
-        match self.vm.restore_state(snapshot_json) {
-            Ok(_) => {
-                self.loaded = true;
-                self.clear_error();
-                self.update_wants_clicks();
-                self.slots.render_dirty.store(true, Ordering::Release);
-                true
+    /// Rehydrate saved DATA into the `state` atom AFTER source has been
+    /// evaluated (so code/modules are current). Reuses the atom the script
+    /// bound (or the host-injected one); otherwise installs a host-owned
+    /// `state`. This is the restore half of state-only snapshots.
+    fn seed_state(&mut self, data: &serde_json::Value) {
+        let v = Value::from_json(data);
+        match self.vm.global("state") {
+            Some(Value::Atom(a)) => {
+                *a.value.write() = v;
             }
-            Err(e) => {
-                eprintln!("[funct] snapshot restore failed ({e}); starting fresh");
-                false
+            _ => {
+                let atom = self.vm.make_atom(v);
+                self.vm.set_global("state", atom);
             }
+        }
+        self.slots.render_dirty.store(true, Ordering::Release);
+    }
+
+    /// Call a zero-arg lifecycle handler (e.g. `on_start`) if the script
+    /// defines it. `on_start` is the place for SIDE EFFECTS — fetches,
+    /// `proc_spawn`, `set_animating`, bus subscriptions — because it runs
+    /// every time the widget starts (fresh spawn, restart, hot-reload)
+    /// AFTER `state` is set/rehydrated, whereas `on_init` runs during
+    /// source eval (before rehydration). Effects live outside the snapshot,
+    /// so they must be re-established on each start.
+    fn call_lifecycle(&mut self, name: &str) {
+        if self.loaded && self.defines(name) {
+            if let Err(e) = self.vm.call(name, vec![]) {
+                self.set_error(format!("{name}: {e}"));
+            }
+        }
+    }
+
+    /// Current `state` value as JSON — used to preserve data across a
+    /// hot-reload (which re-evals top-level and would otherwise reset it).
+    fn capture_state(&self) -> Option<serde_json::Value> {
+        match self.vm.global("state") {
+            Some(Value::Atom(a)) => a.value.read().clone().to_json().ok(),
+            Some(other) => other.to_json().ok(),
+            None => None,
         }
     }
 
@@ -362,25 +400,26 @@ impl FunctWorker {
         }
     }
 
-    /// Snapshot the whole VM (code, globals, atoms) into the snapshot slot
-    /// so the pane's state survives close/restart. Best-effort: a snapshot
-    /// referencing a Native host value can't serialize and is skipped with
-    /// a log rather than faulting the widget.
+    /// Snapshot the widget's DATA (the `state` atom's value), not the VM.
+    /// Survives close/restart while letting the next spawn re-evaluate the
+    /// current source + modules. Best-effort: a `state` value holding a
+    /// non-serializable (native handle, closure) is skipped rather than
+    /// faulting the widget.
     fn persist_state(&mut self) {
-        let st = VmState {
-            frames: vec![],
-            stack: vec![],
-            status: Status::Done(Value::Unit),
+        let value = match self.vm.global("state") {
+            Some(Value::Atom(a)) => a.value.read().clone(),
+            Some(other) => other,
+            None => return, // no state to persist
         };
-        match self.vm.save_state(&st) {
-            Ok(json) => {
+        match value.to_json() {
+            Ok(data) => {
                 if let Ok(mut slot) = self.slots.snapshot.lock() {
-                    *slot = serde_json::json!({ SNAPSHOT_KEY: json });
+                    *slot = serde_json::json!({ STATE_KEY: data });
                 }
             }
             Err(e) => {
-                // Common + expected for widgets holding native handles
-                // (e.g. a spawned proc). Not fatal; just no persistence.
+                // state holds something unserializable (e.g. a proc handle
+                // wrapper). Not fatal; just no persistence this tick.
                 eprintln!("[funct] state not persisted: {e}");
             }
         }
@@ -395,7 +434,29 @@ impl FunctWorker {
         match msg {
             HostToWorker::Shutdown => return false,
             HostToWorker::Reload { source } => {
+                // Preserve live data across a code edit: capture state,
+                // re-eval the new source (which would reset it), restore it.
+                // `on_start` is NOT re-run — a code edit shouldn't redo side
+                // effects (e.g. re-fetch).
+                let saved = self.capture_state();
                 self.load(&source);
+                if let Some(s) = saved {
+                    self.seed_state(&s);
+                }
+            }
+            HostToWorker::ReloadModule { name } => {
+                // Hot-swap an imported library module (e.g. `df`) whose file
+                // changed, so widgets that imported it pick up new code (chart
+                // colors, helpers) without a respawn — then re-render. Only
+                // meaningful for funct file modules; `reload_module` rejects
+                // host modules, which we ignore.
+                if self.loaded {
+                    match self.vm.reload_module(&name) {
+                        Ok(_) => self.slots.render_dirty.store(true, Ordering::Release),
+                        // Not a file module (host) / not loadable — ignore.
+                        Err(_) => {}
+                    }
+                }
             }
             HostToWorker::Rerender => {
                 if self.loaded {
@@ -574,6 +635,7 @@ pub(crate) fn funct_worker_main(
     slots: WorkerSlots,
     initial_source: Option<String>,
     initial_state: serde_json::Value,
+    params: serde_json::Value,
     widget_id: String,
 ) {
     let mut vm = Funct::new();
@@ -581,6 +643,11 @@ pub(crate) fn funct_worker_main(
         vm.set_module_root(dir); // so `import "host"` resolves
     }
     register_host_surface(&mut vm, &slots, &widget_id, self_tx);
+    // Per-instance params → funct global `params` (host.ft: `extern let
+    // params`). Set before the script evaluates so `on_init` can read it.
+    // This is the primitive-config channel: same `.ft`, different URL /
+    // columns / topics per instance.
+    vm.set_global("params", Value::from_json(&params));
 
     let mut worker = FunctWorker {
         vm,
@@ -593,17 +660,25 @@ pub(crate) fn funct_worker_main(
         persist_dirty: false,
     };
 
-    // Prefer restoring a persisted VM snapshot; fall back to a fresh eval.
-    let restored = initial_state
-        .get(SNAPSHOT_KEY)
-        .and_then(|v| v.as_str())
-        .map(|json| worker.restore(json))
-        .unwrap_or(false);
-    if !restored {
-        if let Some(src) = initial_source.as_deref() {
-            worker.load(src);
-        }
+    // ALWAYS evaluate the current source first — this re-reads the widget
+    // script AND re-imports its modules, so hot-reloaded code (e.g. df.ft)
+    // takes effect across restarts. THEN rehydrate the saved data into the
+    // `state` atom. We snapshot state, not execution.
+    if let Some(src) = initial_source.as_deref() {
+        worker.load(src);
     }
+    match initial_state.get(STATE_KEY) {
+        // RESTART: rehydrate the saved state and STOP. `on_start` (side
+        // effects — fetches, etc.) is deliberately NOT run: we restore the
+        // data we already had instead of redoing the work.
+        Some(data) => worker.seed_state(data),
+        // FRESH spawn (never persisted): run `on_start` once to do the
+        // initial side effects (e.g. the first fetch).
+        None => worker.call_lifecycle("on_start"),
+    }
+    // Legacy whole-VM snapshots (SNAPSHOT_KEY) are intentionally ignored:
+    // restoring them would bring back stale baked-in code. Such widgets
+    // re-init their state once, then persist in the new state-only format.
 
     // Time-sliced event loop. Idle = block on recv (zero CPU). With a job
     // in flight, run fuel slices back-to-back (still draining the channel

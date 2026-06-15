@@ -1,0 +1,20 @@
+// df_glyphtest.ft — verifies per-glyph font fallback (DATAFLOW unicode fix).
+// Every glyph below is ABSENT from JetBrains Mono / Inter / Crimson Pro
+// and must now render via the DejaVu "symbols" fallback. Before the fix
+// these showed as nothing.
+import "host"
+
+fn on_init() { request_render() }
+
+fn render(w, h) {
+    {
+        kind: "vstack", gap: 6.0, pad: 14.0, children: [
+            { kind: "text", value: "glyph fallback test", size: 15.0, weight: "bold", color: "#e6e9f0" },
+            { kind: "divider" },
+            { kind: "text", value: "was-broken: ⇄ ▦ ▮ ⊞ ⊟ ⊠ ☰ ▣ ◼", size: 18.0, color: "#cfd3dd" },
+            { kind: "text", value: "covered:    ◆ ● ■ ▶ → ⇒ ✓ × ▾", size: 18.0, color: "#9098a4" },
+            { kind: "text", value: "mixed:  views ⇄ paths ▦ grid ∑ sum", size: 14.0, color: "#aeb6c2" },
+            { kind: "text", value: "(all symbols should be visible)", size: 11.0, color: "#6f7686" },
+        ]
+    }
+}

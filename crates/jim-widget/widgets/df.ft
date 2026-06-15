@@ -1,0 +1,414 @@
+// df.ft — dataflow shared library: the dataset envelope CONTRACT + adapters.
+//
+// This is the keystone of the whole pipeable-widget system (see
+// DATAFLOW.md). Every node speaks ONE of three envelope shapes on the
+// widget bus, and they are all built here so the contract lives in one
+// place:
+//
+//   dataset: { kind:"dataset", schema:{ columns:[ {name,ctype,role} ] },
+//              rows:[ {<col>: <val>, ...} ], meta:{ source, row_count, ... } }
+//   scalar:  { kind:"scalar", value, label, meta }   // for big-number views
+//   error:   { kind:"error", message, stage, meta }  // flows, never silent
+//
+// Rows are RECORDS keyed by column name (tidy/long form). Views convert
+// to whatever their renderer needs (e.g. Element::Table wants cell rows).
+//
+// `type` is a funct keyword, so the column's data-type field is `ctype`.
+// Pure module: no host natives, no side effects — importable + testable.
+
+// ---- envelope constructors ----
+
+export fn col(name, ctype, role) = { name: name, ctype: ctype, role: role }
+
+export fn dataset(columns, rows, meta) = {
+    kind: "dataset",
+    schema: { columns: columns },
+    rows: rows,
+    meta: merge(meta, { row_count: len(rows) }),
+}
+
+export fn scalar(value, label, meta) =
+    { kind: "scalar", value: value, label: label, meta: meta }
+
+export fn err(message, stage, meta) =
+    { kind: "error", message: message, stage: stage, meta: meta }
+
+// ---- generic dataset helpers (used by every view) ----
+
+// Value at column `name` in a record row; `dflt` if absent.
+export fn cell(row, name, dflt) = unwrap_or(get(row, name), dflt)
+
+// Column names in schema order.
+export fn col_names(ds) {
+    let mut out = []
+    for c in ds.schema.columns { out = push(out, c.name) }
+    out
+}
+
+// Row -> list of stringified cells in schema column order (Element::Table).
+export fn row_cells(ds, row) {
+    let mut out = []
+    for c in ds.schema.columns { out = push(out, str(cell(row, c.name, ""))) }
+    out
+}
+
+// First column with the given role ("dimension"/"measure"), or "".
+export fn first_role(ds, role) {
+    for c in ds.schema.columns { if c.role == role { return c.name } }
+    ""
+}
+
+// Largest numeric value in column `name` (min 1, so bars never /0).
+// Returns a Float — critical: funct `/` is INTEGER division for Int/Int,
+// so `v / col_max` must have a Float divisor or every value below the max
+// truncates to 0 (the "flat lines + one bump" bug).
+export fn col_max(ds, name) {
+    let mut mx = 1.0
+    for r in ds.rows {
+        let v = cell(r, name, 0)
+        if v > mx { mx = v }
+    }
+    mx * 1.0
+}
+
+// ---- source adapters: endpoint-specific JSON -> standard dataset ----
+//
+// Each analytics endpoint has its own JSON shape; an adapter normalizes
+// it. Adding a new source = adding one adapter here + a clause in adapt().
+
+export fn adapt(source, body, params) {
+    if source == "analytics/by-day"    { return adapt_by_day(body, params) }
+    if source == "analytics/top-paths" { return adapt_top_paths(body, params) }
+    if source == "analytics/blog"      { return adapt_blog(body, params) }
+    if source == "analytics/timeline"  { return adapt_timeline(body, params) }
+    if source == "analytics/recent"    { return adapt_recent(body, params) }
+    err("no adapter for source '" + source + "'", "adapt", { source: source })
+}
+
+// { by_day: [ {date, day_start_ms, views} ] }
+export fn adapt_by_day(body, params) {
+    let entries = unwrap_or(get(body, "by_day"), [])
+    let mut rows = []
+    for e in entries {
+        rows = push(rows, {
+            date:  unwrap_or(get(e, "date"), ""),
+            views: unwrap_or(get(e, "views"), 0),
+        })
+    }
+    dataset(
+        [ col("date", "string", "dimension"), col("views", "number", "measure") ],
+        rows,
+        { source: "analytics/by-day", params: params }
+    )
+}
+
+// { top: [ {value, views} ] }
+export fn adapt_top_paths(body, params) {
+    let entries = unwrap_or(get(body, "top"), [])
+    let mut rows = []
+    for e in entries {
+        rows = push(rows, {
+            path:  unwrap_or(get(e, "value"), ""),
+            views: unwrap_or(get(e, "views"), 0),
+        })
+    }
+    dataset(
+        [ col("path", "string", "dimension"), col("views", "number", "measure") ],
+        rows,
+        { source: "analytics/top-paths", params: params }
+    )
+}
+
+// { post_count, total_views, posts: [ {slug, path, views} ] }
+// Ranked by views (desc) so bar/column views read as a leaderboard.
+export fn adapt_blog(body, params) {
+    let posts = unwrap_or(get(body, "posts"), [])
+    let ranked = sort_by(posts, p => -unwrap_or(get(p, "views"), 0))
+    let mut rows = []
+    for p in ranked {
+        rows = push(rows, {
+            slug: unwrap_or(get(p, "slug"), unwrap_or(get(p, "path"), "")),
+            views: unwrap_or(get(p, "views"), 0),
+        })
+    }
+    dataset(
+        [ col("slug", "string", "dimension"), col("views", "number", "measure") ],
+        rows,
+        { source: "analytics/blog", params: params,
+          total_views: unwrap_or(get(body, "total_views"), 0),
+          post_count: unwrap_or(get(body, "post_count"), len(rows)) }
+    )
+}
+
+// { buckets:[{date,bucket_start_ms}], series:[{label, total_views,
+//   points:[{date,bucket_start_ms,views}]}] }  → long (tidy) multi-series:
+// one row per (series, date). Bucket date order is carried in meta.buckets
+// so a multi-line view can align series on a shared x-axis.
+export fn adapt_timeline(body, params) {
+    let buckets = unwrap_or(get(body, "buckets"), [])
+    let mut bdates = []
+    for b in buckets { bdates = push(bdates, unwrap_or(get(b, "date"), "")) }
+    let series = unwrap_or(get(body, "series"), [])
+    let mut rows = []
+    for s in series {
+        let label = unwrap_or(get(s, "label"), "")
+        for p in unwrap_or(get(s, "points"), []) {
+            rows = push(rows, {
+                date: unwrap_or(get(p, "date"), ""),
+                series: label,
+                views: unwrap_or(get(p, "views"), 0),
+            })
+        }
+    }
+    dataset(
+        [ col("date", "string", "dimension"),
+          col("series", "string", "dimension"),
+          col("views", "number", "measure") ],
+        rows,
+        { source: "analytics/timeline", params: params, buckets: bdates }
+    )
+}
+
+// { count, recent: [ {ts, path, referer, region, status} ] }
+export fn adapt_recent(body, params) {
+    let entries = unwrap_or(get(body, "recent"), [])
+    let mut rows = []
+    for e in entries {
+        rows = push(rows, {
+            ts:     unwrap_or(get(e, "ts"), 0),
+            path:   unwrap_or(get(e, "path"), ""),
+            region: unwrap_or(get(e, "region"), ""),
+            status: unwrap_or(get(e, "status"), 0),
+        })
+    }
+    dataset(
+        [ col("ts", "number", "dimension"), col("path", "string", "dimension"),
+          col("region", "string", "dimension"), col("status", "number", "measure") ],
+        rows,
+        { source: "analytics/recent", params: params }
+    )
+}
+
+// ---- theme-aware colors ----
+//
+// Charts pull every color from the active theme via `theme_get` (a host
+// native, callable from any module). Falls back to a sensible default if
+// a token is absent, so a sparse theme still renders.
+extern fn theme_get(token)
+
+fn tc(token, fb) {
+    let c = theme_get(token)
+    if typeof(c) == "Str" { c } else { fb }
+}
+export fn col_text()   = tc("fg", "#e6e9f0")
+export fn col_muted()  = tc("fg_muted", "#9098a4")
+export fn col_axis()   = tc("chrome_divider", "#3a414e")
+export fn col_accent() = tc("accent", "#8fe3b0")
+export fn col_panel()  = tc("surface_2", "#12151b")
+export fn col_err()    = tc("err", "#e08a8a")
+export fn col_warn()   = tc("warn", "#e0b066")
+
+// Categorical palette for multi-series charts — distinct theme colors
+// (reuses the syntax-highlight scale, which every theme defines).
+let _series_tokens = ["syntax_keyword", "syntax_function", "syntax_type",
+    "syntax_string", "syntax_constant", "syntax_attribute",
+    "syntax_property", "syntax_operator"]
+export fn series_color(i) =
+    tc(unwrap_or(get(_series_tokens, i % len(_series_tokens)), "accent"), "#8fe3b0")
+
+// ---- visualization helpers (shared by the chart views) ----
+
+export fn lerp(a, b, t) = a + (b - a) * t
+
+let _hexd = "0123456789abcdef"
+fn _hd(d) = slice(_hexd, d, d + 1)
+// Int 0..255 → two hex digits (for #rrggbbAA alpha).
+export fn hex2(n) {
+    let m = if n < 0 { 0 } else if n > 255 { 255 } else { to_int(n) }
+    _hd(m / 16) + _hd(m - (m / 16) * 16)
+}
+
+// Value-intensity ramp: the theme accent at an alpha scaled by t (dim for
+// low, solid for high). Theme-aware with no hex interpolation.
+export fn ramp(t) {
+    let tt = if t < 0.0 { 0.0 } else if t > 1.0 { 1.0 } else { t }
+    col_accent() + hex2(to_int(lerp(55.0, 255.0, tt)))
+}
+
+// Truncate a string to n chars with an ellipsis (cheap, char-based —
+// canvas labels have no font metrics to measure against).
+export fn trunc(s, n) = if len(s) > n { slice(s, 0, n) + "…" } else { s }
+
+// A floating tooltip as two canvas items (bg + text), flipped to stay
+// on-screen. Returns a list to splice into a canvas children array.
+export fn tooltip(x, y, cw, ch, text) {
+    let tw = 16.0 + len(text) * 7.0
+    let tx = if x + 14.0 + tw > cw { x - 14.0 - tw } else { x + 14.0 }
+    let ty = if y - 28.0 < 0.0 { y + 10.0 } else { y - 28.0 }
+    [
+        { kind: "rect", id: "tipbg", x: tx, y: ty, w: tw, h: 23.0,
+          color: col_panel() + "f2", anchor: "top-left", z: 90.0 },
+        { kind: "text", id: "tiptx", x: tx + 8.0, y: ty + 5.0, value: text,
+          size: 12.0, color: col_text(), anchor: "top-left", z: 91.0 },
+    ]
+}
+
+// Append every item of list `b` onto list `a` (canvas children helper).
+export fn concat(a, b) {
+    let mut out = a
+    for x in b { out = push(out, x) }
+    out
+}
+
+// ---- generic primitive plumbing ----
+//
+// These make the widgets reusable PRIMITIVES: one `http.ft` pointed at
+// any URL, one `bar.ft` told which columns to plot. `params` is the
+// per-instance config injected at spawn (host.ft `extern let params`);
+// it's passed in here as an argument because modules can't see an
+// importer's globals.
+
+// Read key `k` from a params record, falling back to `d`.
+export fn pget(p, k, d) = if typeof(p) == "Record" { unwrap_or(get(p, k), d) } else { d }
+
+// Walk a dotted path into nested records: dig(e, "properties.mag", 0).
+// Empty path returns the object itself (top-level arrays). Missing →
+// default. This is what lets ANY API shape work, not just flat ones.
+fn dig(obj, path, dflt) {
+    if path == "" { return obj }
+    let mut cur = obj
+    for k in split(path, ".") {
+        if typeof(cur) != "Record" { return dflt }
+        match get(cur, k) {
+            Some(v) => { cur = v }
+            None => { return dflt }
+        }
+    }
+    cur
+}
+
+// Last segment of a dotted path — the clean column name to store under.
+fn leaf(path) {
+    let parts = split(path, ".")
+    unwrap_or(get(parts, len(parts) - 1), path)
+}
+
+// Turn ANY JSON body into a standard dataset given the (dotted) path to
+// the row array and the x/y field paths. The generic replacement for
+// per-endpoint adapters, now nesting-aware:
+//   extract(body, "by_day", "date", "views")               (analytics)
+//   extract(body, "", "login", "contributions")            (GitHub, top-level array)
+//   extract(body, "features", "properties.place", "properties.mag")  (USGS GeoJSON)
+export fn extract(body, rows_path, xkey, ykey) {
+    let arr = dig(body, rows_path, [])
+    let xc = leaf(xkey)
+    let yc = leaf(ykey)
+    let mut rows = []
+    for e in arr {
+        let row = assoc(assoc({}, xc, dig(e, xkey, "")), yc, dig(e, ykey, 0))
+        rows = push(rows, row)
+    }
+    dataset(
+        [ col(xc, "string", "dimension"), col(yc, "number", "measure") ],
+        rows,
+        { source: rows_path }
+    )
+}
+
+// Flatten a NESTED multi-series body into a long (tidy) dataset with a
+// `series` column — the generic time-series extractor. All paths dotted:
+//   extract_series(body, "series", "label", "points", "bucket_start_ms", "views")
+export fn extract_series(body, series_path, label_key, points_key, xkey, ykey) {
+    let series = dig(body, series_path, [])
+    let xc = leaf(xkey)
+    let yc = leaf(ykey)
+    let mut rows = []
+    for s in series {
+        let label = dig(s, label_key, "")
+        for p in dig(s, points_key, []) {
+            let row = assoc(assoc(assoc({}, xc, dig(p, xkey, "")), "series", label),
+                            yc, dig(p, ykey, 0))
+            rows = push(rows, row)
+        }
+    }
+    dataset(
+        [ col(xc, "string", "dimension"),
+          col("series", "string", "dimension"),
+          col(yc, "number", "measure") ],
+        rows,
+        { source: series_path }
+    )
+}
+
+// Coerce whatever arrived on a chart's input topic into a dataset:
+// pass a dataset envelope straight through; otherwise pull `.body`
+// (an http `raw` message) and extract per params. When `series_path` is
+// set, do the nested multi-series flatten; otherwise the flat rows_path
+// extract.
+export fn dsify(payload, p) {
+    if typeof(payload) == "Record" and has(payload, "kind") and payload.kind == "dataset" {
+        return payload
+    }
+    let body = if typeof(payload) == "Record" and has(payload, "body") { payload.body } else { payload }
+    if pget(p, "series_path", "") != "" {
+        return extract_series(body, pget(p, "series_path", "series"),
+                              pget(p, "label", "label"), pget(p, "points", "points"),
+                              pget(p, "x", "x"), pget(p, "y", "y"))
+    }
+    extract(body, pget(p, "rows_path", ""), pget(p, "x", "x"), pget(p, "y", "y"))
+}
+
+fn pad2(n) = if n < 10 { "0" + str(n) } else { str(n) }
+
+// Epoch-ms → "YYYY-MM-DD" (Howard Hinnant's civil-from-days, integer
+// math). For axis labels on a real time scale.
+export fn ms_to_date(ms) {
+    let z = ms / 86400000 + 719468
+    let era = z / 146097
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y0 = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    let y = if m <= 2 { y0 + 1 } else { y0 }
+    str(y) + "-" + pad2(m) + "-" + pad2(d)
+}
+
+// Min of a numeric column across all rows (Float — see col_max note).
+export fn col_min(ds, name) {
+    let mut mn = 0.0
+    let mut first = true
+    for r in ds.rows {
+        let v = cell(r, name, 0)
+        if first or v < mn { mn = v; first = false }
+    }
+    mn * 1.0
+}
+
+// Distinct values of column `name` in first-seen order.
+export fn distinct(ds, name) {
+    let mut out = []
+    for r in ds.rows {
+        let v = cell(r, name, "")
+        if not contains(out, v) { out = push(out, v) }
+    }
+    out
+}
+
+// Sum / peak of a measure column across all rows.
+export fn col_sum(ds, name) {
+    let mut total = 0.0
+    for r in ds.rows { total = total + cell(r, name, 0) }
+    total
+}
+
+// Numeric value of column `name` in row index `i` (0 if absent).
+export fn row_val(ds, name, i) {
+    match get(ds.rows, i) {
+        Some(r) => cell(r, name, 0),
+        None => 0,
+    }
+}
+

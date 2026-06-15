@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "jim": {
+      "command": "${HOME}/.cargo/bin/jimctl",
+      "args": ["channel"]
+    }
+  }
+}

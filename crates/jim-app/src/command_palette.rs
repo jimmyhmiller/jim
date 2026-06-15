@@ -2,13 +2,12 @@
 //! searches the [`ActionRegistry`](crate::actions::ActionRegistry) and
 //! runs the chosen action. Opened with **Cmd+Shift+P**; Esc / Enter close it.
 //!
-//! It also hosts the **DeepSeek "Ask"** flow: when the query doesn't (or
-//! does) match actions, an "Ask DeepSeek" row sends the query — plus the
-//! current project/cwd/pane context — to the model, which replies with a
-//! plan of tool calls drawn from the app's IPC surface
-//! ([`crate::tools`]). Safe calls run immediately (via
-//! [`crate::ipc::dispatch_local`], the same socket the CLIs use); risky
-//! ones are listed and wait for Enter.
+//! It also hosts the **"Ask DeepSeek"** entry, which launches the in-app
+//! [`agent`](crate::agent): the query becomes the goal for an autonomous
+//! ReAct loop that runs shell commands (driving the app through `jimctl`)
+//! and observes their output, step by step. The loop runs on a worker
+//! thread; its transcript (thoughts / commands / observations) streams into
+//! the palette live, and Esc cancels it.
 //!
 //! ## Why native (not a widget pane)
 //!
@@ -36,8 +35,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::keyboard::{Key, KeyboardInput};
@@ -49,9 +49,8 @@ use jim_widget::render::{self, LayoutCtx, WidgetPalette};
 use jim_widget::WidgetTargets;
 
 use crate::actions::{ActionInvocations, ActionRegistry, Keymap};
-use crate::ipc;
+use crate::agent::{self, AgentMsg};
 use crate::projects::Projects;
-use crate::tools;
 use crate::MENU_OVERLAY_LAYER;
 
 /// Z within the overlay layer — above the drawer (550) and radial (600).
@@ -62,39 +61,22 @@ const MAX_ROWS: usize = 10;
 /// Synthetic result-row id for the "Ask DeepSeek" entry.
 const ASK_ID: &str = "__ask_deepseek__";
 
-/// Result of a DeepSeek worker call.
-type AskResult = Result<tools::ToolPlan, String>;
-
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
     /// Fuzzy action search (default).
     #[default]
     Actions,
-    /// Waiting on a DeepSeek response.
+    /// The agent is running; the transcript streams in live.
     Busy,
-    /// Showing the model's plan (safe calls already ran; risky ones
-    /// pending Enter).
+    /// The agent finished; final answer + transcript shown until dismissed.
     Plan,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RowStatus {
-    /// Risky call awaiting confirmation.
-    Pending,
-    /// Dispatched successfully.
-    Ran,
-    /// Rejected or failed to dispatch.
-    Failed,
-}
-
-/// One row of a DeepSeek plan.
-struct PlanRow {
-    label: String,
-    reason: String,
-    /// Validated request for pending (risky) rows; `None` if rejected.
-    req: Option<ipc::IpcRequest>,
-    status: RowStatus,
-    detail: String,
+/// One line of the agent transcript shown in the palette.
+struct TLine {
+    icon: &'static str,
+    text: String,
+    color: &'static str,
 }
 
 /// One row in the filtered action list.
@@ -115,11 +97,13 @@ pub struct PaletteOpenRequest {
     pub ask: bool,
 }
 
-/// Channel back from the DeepSeek worker thread. `Mutex` makes the
-/// `Receiver` `Sync` so this stays an ordinary `Resource`.
+/// Channel back from the agent worker thread, plus a cancel flag the UI
+/// flips when the palette closes mid-run. `Mutex` makes the `Receiver`
+/// `Sync` so this stays an ordinary `Resource`.
 #[derive(Resource, Default)]
-pub struct DeepSeekChannel {
-    rx: Mutex<Option<Receiver<AskResult>>>,
+pub struct AgentChannel {
+    rx: Mutex<Option<Receiver<AgentMsg>>>,
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// Per-action pick counts, persisted to disk. Used to bias ranking so a
@@ -186,7 +170,8 @@ pub struct CommandPalette {
     pub selected: usize,
     /// Header line for Busy / Plan modes.
     message: String,
-    plan_rows: Vec<PlanRow>,
+    /// Live agent transcript (Busy + Plan modes).
+    transcript: Vec<TLine>,
     root: Option<Entity>,
     last_sig: u64,
 }
@@ -203,9 +188,9 @@ impl CommandPalette {
         self.selected.hash(&mut h);
         self.message.hash(&mut h);
         self.results.len().hash(&mut h);
-        for r in &self.plan_rows {
-            r.label.hash(&mut h);
-            (r.status as u8).hash(&mut h);
+        self.transcript.len().hash(&mut h);
+        if let Some(last) = self.transcript.last() {
+            last.text.hash(&mut h);
         }
         h.finish()
     }
@@ -217,10 +202,10 @@ impl Plugin for CommandPalettePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CommandPalette>()
             .init_resource::<PaletteOpenRequest>()
-            .init_resource::<DeepSeekChannel>()
+            .init_resource::<AgentChannel>()
             .insert_resource(PaletteUsage::load())
-            .add_systems(Update, (palette_input, poll_deepseek).chain())
-            .add_systems(Update, render_palette.after(palette_input));
+            .add_systems(Update, (palette_input, poll_agent).chain())
+            .add_systems(Update, render_palette.after(poll_agent));
     }
 }
 
@@ -319,7 +304,7 @@ fn palette_input(
     projects: Res<Projects>,
     mut palette: ResMut<CommandPalette>,
     mut invocations: ResMut<ActionInvocations>,
-    mut deepseek: ResMut<DeepSeekChannel>,
+    mut agent_ch: ResMut<AgentChannel>,
     mut usage: ResMut<PaletteUsage>,
     mut open_req: ResMut<PaletteOpenRequest>,
     keymap: Res<Keymap>,
@@ -335,7 +320,7 @@ fn palette_input(
             refresh_results(&mut palette, &registry, &usage, &keymap);
         }
         if std::mem::take(&mut open_req.ask) && !palette.query.trim().is_empty() {
-            start_ask(&mut palette, &projects, &pane_registry, &mut deepseek);
+            start_agent(&mut palette, &projects, &pane_registry, &mut agent_ch);
         }
     }
 
@@ -363,12 +348,12 @@ fn palette_input(
         }
 
         match &ev.logical_key {
-            Key::Escape => close(&mut palette),
+            Key::Escape => close_and_cancel(&mut palette, &mut agent_ch),
             Key::Enter => match palette.mode {
                 PaletteMode::Actions => {
                     if let Some(row) = palette.results.get(palette.selected).cloned() {
                         if row.id == ASK_ID {
-                            start_ask(&mut palette, &projects, &pane_registry, &mut deepseek);
+                            start_agent(&mut palette, &projects, &pane_registry, &mut agent_ch);
                         } else {
                             usage.bump(row.id);
                             invocations.request(row.id, None);
@@ -376,17 +361,9 @@ fn palette_input(
                         }
                     }
                 }
-                PaletteMode::Plan => {
-                    let pending = palette
-                        .plan_rows
-                        .iter()
-                        .any(|r| r.status == RowStatus::Pending);
-                    if pending {
-                        run_pending(&mut palette);
-                    } else {
-                        close(&mut palette);
-                    }
-                }
+                // Agent finished — Enter just dismisses.
+                PaletteMode::Plan => close(&mut palette),
+                // Running — Enter is inert; Esc cancels.
                 PaletteMode::Busy => {}
             },
             Key::ArrowDown if palette.mode == PaletteMode::Actions => {
@@ -419,7 +396,7 @@ fn open(palette: &mut CommandPalette, registry: &ActionRegistry, usage: &Palette
     palette.mode = PaletteMode::Actions;
     palette.query.clear();
     palette.message.clear();
-    palette.plan_rows.clear();
+    palette.transcript.clear();
     palette.selected = 0;
     refresh_results(palette, registry, usage, keymap);
     // No focus juggling: while `palette.open`, `compute_keyboard_owner`
@@ -430,50 +407,60 @@ fn open(palette: &mut CommandPalette, registry: &ActionRegistry, usage: &Palette
 fn close(palette: &mut CommandPalette) {
     palette.open = false;
     palette.mode = PaletteMode::Actions;
-    palette.plan_rows.clear();
+    palette.transcript.clear();
 }
 
-// ---------- DeepSeek ----------
+/// Close the palette and signal any in-flight agent run to stop. The worker
+/// checks the flag between steps; we also drop the receiver so its final
+/// events are ignored.
+fn close_and_cancel(palette: &mut CommandPalette, agent_ch: &mut AgentChannel) {
+    if let Some(flag) = agent_ch.cancel.lock().unwrap().take() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    *agent_ch.rx.lock().unwrap() = None;
+    close(palette);
+}
 
-/// Kick off a DeepSeek call: assemble context, resolve the API config,
-/// spawn the blocking call on a worker thread, and switch to Busy.
-fn start_ask(
+// ---------- Agent ----------
+
+/// Kick off an agent run: resolve config, assemble context, spawn the
+/// blocking loop on a worker thread, and switch to Busy. Transcript events
+/// stream back over [`AgentChannel`] and are drained by [`poll_agent`].
+fn start_agent(
     palette: &mut CommandPalette,
     projects: &Projects,
     pane_registry: &PaneRegistry,
-    deepseek: &mut DeepSeekChannel,
+    agent_ch: &mut AgentChannel,
 ) {
     let cfg = match jim_inference::llm::LlmConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
             palette.mode = PaletteMode::Plan;
-            palette.message = format!("DeepSeek unavailable: {e}");
-            palette.plan_rows.clear();
+            palette.message = format!("Agent unavailable: {e}");
+            palette.transcript.clear();
             return;
         }
     };
     let context = assemble_context(projects, pane_registry);
-    let prompt = palette.query.trim().to_string();
-    let system = tools::system_prompt();
-    let user = format!("Context:\n{context}\nRequest: {prompt}");
+    let goal = palette.query.trim().to_string();
+    let system = agent::build_system_prompt(&context);
 
-    let (tx, rx) = std::sync::mpsc::channel::<AskResult>();
+    let (tx, rx) = std::sync::mpsc::channel::<AgentMsg>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_worker = cancel.clone();
     let spawned = std::thread::Builder::new()
-        .name("deepseek-palette".into())
-        .spawn(move || {
-            let r = jim_inference::llm::classify::<tools::ToolPlan>(&cfg, &system, &user)
-                .map_err(|e| e.to_string());
-            let _ = tx.send(r);
-        });
+        .name("jim-agent".into())
+        .spawn(move || agent::run(cfg, system, goal, tx, cancel_worker));
     if spawned.is_err() {
         palette.mode = PaletteMode::Plan;
-        palette.message = "Could not spawn DeepSeek worker".into();
+        palette.message = "Could not spawn agent worker".into();
         return;
     }
-    *deepseek.rx.lock().unwrap() = Some(rx);
+    *agent_ch.rx.lock().unwrap() = Some(rx);
+    *agent_ch.cancel.lock().unwrap() = Some(cancel);
     palette.mode = PaletteMode::Busy;
-    palette.message = "Asking DeepSeek…".into();
-    palette.plan_rows.clear();
+    palette.message = "Agent working…".into();
+    palette.transcript.clear();
 }
 
 /// Concise context handed to the model.
@@ -497,113 +484,74 @@ fn assemble_context(projects: &Projects, pane_registry: &PaneRegistry) -> String
     s
 }
 
-/// Poll the worker channel; when a plan arrives, run safe calls and queue
-/// risky ones.
-fn poll_deepseek(mut palette: ResMut<CommandPalette>, deepseek: Res<DeepSeekChannel>) {
+/// Drain transcript events from the agent worker each frame, appending them
+/// as transcript lines. On Done/Error the palette flips to Plan (the run is
+/// over, transcript stays visible until dismissed).
+fn poll_agent(mut palette: ResMut<CommandPalette>, agent_ch: Res<AgentChannel>) {
     if palette.mode != PaletteMode::Busy {
         return;
     }
-    let got: Option<AskResult> = {
-        let mut guard = deepseek.rx.lock().unwrap();
-        match guard.as_ref() {
-            Some(rx) => match rx.try_recv() {
-                Ok(r) => {
-                    *guard = None;
-                    Some(r)
-                }
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => {
-                    *guard = None;
-                    Some(Err("DeepSeek worker exited".into()))
-                }
-            },
-            None => None,
-        }
-    };
-    let Some(result) = got else { return };
-    match result {
-        Ok(plan) => apply_plan(&mut palette, plan),
-        Err(e) => {
-            palette.mode = PaletteMode::Plan;
-            palette.message = format!("DeepSeek error: {e}");
-            palette.plan_rows.clear();
-        }
-    }
-}
-
-/// Validate each call; run safe ones immediately; queue risky ones.
-fn apply_plan(palette: &mut CommandPalette, plan: tools::ToolPlan) {
-    eprintln!(
-        "[palette] deepseek plan: message={:?} calls={}",
-        plan.message,
-        plan.calls.len()
-    );
-    for c in &plan.calls {
-        eprintln!("[palette]   call tool={} args={}", c.tool, c.args);
-    }
-    palette.message = if plan.message.is_empty() {
-        "DeepSeek plan".into()
-    } else {
-        plan.message
-    };
-    palette.plan_rows.clear();
-    for call in plan.calls {
-        let spec = tools::spec_of(&call.tool);
-        let mut row = PlanRow {
-            label: call.tool.clone(),
-            reason: call.reason.clone(),
-            req: None,
-            status: RowStatus::Failed,
-            detail: String::new(),
-        };
-        match (spec, tools::to_ipc_request(&call)) {
-            (Some(spec), Ok(req)) => {
-                if spec.risk == tools::Risk::Risky {
-                    row.req = Some(req);
-                    row.status = RowStatus::Pending;
-                } else {
-                    match ipc::dispatch_local(&req) {
-                        Ok(()) => {
-                            eprintln!("[palette]   dispatched safe tool {}", call.tool);
-                            row.status = RowStatus::Ran;
-                        }
-                        Err(e) => {
-                            eprintln!("[palette]   dispatch failed for {}: {e}", call.tool);
-                            row.status = RowStatus::Failed;
-                            row.detail = e.to_string();
-                        }
+    // Collect everything available this frame without holding the lock while
+    // mutating the palette.
+    let mut events: Vec<AgentMsg> = Vec::new();
+    let mut disconnected = false;
+    {
+        let mut guard = agent_ch.rx.lock().unwrap();
+        if let Some(rx) = guard.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => events.push(msg),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
                 }
             }
-            (None, _) => {
-                eprintln!("[palette]   rejected unknown tool {}", call.tool);
-                row.detail = "not an available tool".into();
-            }
-            (_, Err(e)) => {
-                eprintln!("[palette]   invalid args for {}: {e}", call.tool);
-                row.detail = e;
-            }
         }
-        palette.plan_rows.push(row);
+        if disconnected {
+            *guard = None;
+        }
     }
-    palette.mode = PaletteMode::Plan;
-}
 
-/// Dispatch all still-pending (risky, confirmed) rows.
-fn run_pending(palette: &mut CommandPalette) {
-    for row in &mut palette.plan_rows {
-        if row.status != RowStatus::Pending {
-            continue;
-        }
-        if let Some(req) = &row.req {
-            match ipc::dispatch_local(req) {
-                Ok(()) => row.status = RowStatus::Ran,
-                Err(e) => {
-                    row.status = RowStatus::Failed;
-                    row.detail = e.to_string();
-                }
+    let mut finished = false;
+    for ev in events {
+        match ev {
+            AgentMsg::Thought(t) => palette.transcript.push(TLine {
+                icon: "·",
+                text: t,
+                color: "fg_muted",
+            }),
+            AgentMsg::Action(c) => palette.transcript.push(TLine {
+                icon: "$",
+                text: c,
+                color: "accent",
+            }),
+            AgentMsg::Observation(o) => palette.transcript.push(TLine {
+                icon: "→",
+                text: o,
+                color: "fg_muted",
+            }),
+            AgentMsg::Done(m) => {
+                palette.message = m;
+                finished = true;
+            }
+            AgentMsg::Error(e) => {
+                palette.message = format!("Agent error: {e}");
+                finished = true;
             }
         }
+    }
+
+    if finished {
+        palette.mode = PaletteMode::Plan;
+        *agent_ch.rx.lock().unwrap() = None;
+        *agent_ch.cancel.lock().unwrap() = None;
+    } else if disconnected {
+        // Worker died without a Done/Error (shouldn't happen) — don't hang.
+        palette.message = "Agent worker exited".into();
+        palette.mode = PaletteMode::Plan;
+        *agent_ch.cancel.lock().unwrap() = None;
     }
 }
 
@@ -692,11 +640,8 @@ fn render_palette(world: &mut World) {
 fn build_palette_element(palette: &CommandPalette) -> Element {
     let children = match palette.mode {
         PaletteMode::Actions => actions_children(palette),
-        PaletteMode::Busy => vec![
-            query_text(&palette.query),
-            text_colored(&palette.message, "accent", 15.0),
-        ],
-        PaletteMode::Plan => plan_children(palette),
+        PaletteMode::Busy => transcript_children(palette, true),
+        PaletteMode::Plan => transcript_children(palette, false),
     };
 
     Element::Frame {
@@ -739,39 +684,26 @@ fn actions_children(palette: &CommandPalette) -> Vec<Element> {
     children
 }
 
-fn plan_children(palette: &CommandPalette) -> Vec<Element> {
-    let mut children = vec![text_colored(&palette.message, "accent", 16.0)];
-    if palette.plan_rows.is_empty() {
-        children.push(text_muted("(no actions)", 14.0));
+/// Render the agent transcript. `running` true → Busy (footer: Esc cancels);
+/// false → Plan (run finished; the header holds the final answer).
+fn transcript_children(palette: &CommandPalette, running: bool) -> Vec<Element> {
+    let mut children = Vec::new();
+    children.push(text_colored(&palette.message, "accent", 16.0));
+
+    // Keep the visible transcript bounded; show the most recent lines.
+    let max_lines = 12usize;
+    let skip = palette.transcript.len().saturating_sub(max_lines);
+    if skip > 0 {
+        children.push(text_muted(&format!("… {skip} earlier steps"), 12.0));
     }
-    for row in &palette.plan_rows {
-        let (glyph, color) = match row.status {
-            RowStatus::Ran => ("✓", "fg"),
-            RowStatus::Pending => ("⏎", "accent"),
-            RowStatus::Failed => ("✗", "fg_muted"),
-        };
-        let mut label = format!("{glyph}  {}", row.label);
-        if !row.reason.is_empty() {
-            label.push_str(&format!(" — {}", row.reason));
-        }
-        let hint = if row.detail.is_empty() {
-            match row.status {
-                RowStatus::Ran => "ran".to_string(),
-                RowStatus::Pending => "needs confirm".to_string(),
-                RowStatus::Failed => "skipped".to_string(),
-            }
-        } else {
-            row.detail.clone()
-        };
-        children.push(list_row("plan", &label, &hint, false, color));
+    for line in palette.transcript.iter().skip(skip) {
+        let label = format!("{}  {}", line.icon, line.text);
+        children.push(text_colored(&label, line.color, 13.0));
     }
-    let pending = palette
-        .plan_rows
-        .iter()
-        .any(|r| r.status == RowStatus::Pending);
+
     children.push(text_muted(
-        if pending {
-            "Enter to run the highlighted calls · Esc to dismiss"
+        if running {
+            "running · Esc to stop"
         } else {
             "Esc to dismiss"
         },

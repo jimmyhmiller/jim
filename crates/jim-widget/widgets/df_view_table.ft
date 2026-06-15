@@ -1,0 +1,54 @@
+// df_view_table.ft — a VIEW node: render any `dataset` as a table.
+//
+// Column-agnostic: it reads the schema, so it renders whatever dataset
+// flows in (by-day, top-paths, recent, …) with no per-source code. This
+// is the encoding contract from DATAFLOW.md in its simplest form — the
+// view adapts to the data, not the other way round.
+//
+//   in : df/analytics/norm/out   (dataset | error)
+import "host"
+import { col_names, row_cells, dsify, pget , col_text, col_muted, col_axis, col_accent, col_err, col_warn } from "df"
+
+fn in_topic() = pget(params, "in", "http/out")
+
+fn init_state() = { ds: { kind: "empty" } }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_message(topic, payload, sender) {
+    if topic != in_topic() { return }
+    reset!(state, { ds: dsify(payload, params) })
+    request_render()
+}
+
+fn banner(text, color) =
+    { kind: "vstack", pad: 14.0, gap: 6.0, children: [
+        { kind: "text", value: "■ table", size: 14.0, weight: "bold", color: col_text() },
+        { kind: "text", value: text, size: 12.0, color: color },
+    ]}
+
+fn render(w, h) {
+    let ds = (@state).ds
+    if ds.kind == "error" { return banner("error: " + ds.message, col_err()) }
+    if ds.kind != "dataset" { return banner("waiting for data…", col_muted()) }
+
+    let mut cols = []
+    for name in col_names(ds) { cols = push(cols, { header: name }) }
+    let mut trows = []
+    for r in ds.rows { trows = push(trows, row_cells(ds, r)) }
+
+    {
+        kind: "vstack", gap: 8.0, pad: 12.0, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: "■ table", size: 14.0, weight: "bold", color: col_text() },
+                { kind: "badge", value: ds.meta.source },
+            ]},
+            { kind: "divider" },
+            { kind: "scroll", gap: 0.0, pad: 0.0, children: [
+                { kind: "table", zebra: true, columns: cols, rows: trows },
+            ]},
+            { kind: "text", value: str(len(ds.rows)) + " rows", size: 10.0, color: col_muted() },
+        ]
+    }
+}

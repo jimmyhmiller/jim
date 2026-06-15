@@ -5,11 +5,15 @@
 //! button. Handy for cleaning up panes spawned via `widget`/`open`.
 //!
 //! Usage:
-//!   jimctl close --project P [--kind K]
+//!   jimctl close --project P [--kind K] [--title T ...]
 //!
 //!   --project P   project name (or `active`). Required.
 //!   --kind K      only close panes of this kind (e.g. `script_widget`,
-//!                 `widget`, `editor`). Omit to close EVERY pane in P.
+//!                 `widget`, `editor`).
+//!   --title T     only close panes with this exact title; repeatable to
+//!                 close several. Lets you remove ONE pane (e.g. a
+//!                 duplicate) instead of all of a kind. Omit all filters
+//!                 to close EVERY pane in P.
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -25,6 +29,7 @@ pub fn run() -> ExitCode {
     let args: Vec<String> = crate::sub_args().collect();
     let mut project: Option<String> = None;
     let mut kind: Option<String> = None;
+    let mut titles: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -36,13 +41,19 @@ pub fn run() -> ExitCode {
                 kind = args.get(i + 1).cloned();
                 i += 1;
             }
+            "--title" | "-t" => {
+                if let Some(t) = args.get(i + 1).cloned() {
+                    titles.push(t);
+                }
+                i += 1;
+            }
             "-h" | "--help" => {
-                eprintln!("usage: jimctl close --project P [--kind K]");
+                eprintln!("usage: jimctl close --project P [--kind K] [--title T ...]");
                 return ExitCode::SUCCESS;
             }
             other => {
                 eprintln!("jimctl close: unexpected arg `{}`", other);
-                eprintln!("usage: jimctl close --project P [--kind K]");
+                eprintln!("usage: jimctl close --project P [--kind K] [--title T ...]");
                 return ExitCode::from(2);
             }
         }
@@ -57,6 +68,7 @@ pub fn run() -> ExitCode {
         "action": "close_project_panes",
         "project": project,
         "kind": kind,
+        "titles": if titles.is_empty() { serde_json::Value::Null } else { serde_json::json!(titles) },
     });
 
     let Some(sock) = socket_path() else {

@@ -19,7 +19,9 @@
 //!
 //! | Handler                          | Fired by                       |
 //! |----------------------------------|--------------------------------|
-//! | `on_init()`                      | once, after top-level          |
+//! | `on_init()`                      | during source eval (state init)|
+//! | `on_start()`                     | every start, AFTER state set;  |
+//! |                                  |   put SIDE EFFECTS here         |
 //! | `render(w, h) -> Element`        | whenever a redraw is needed    |
 //! | `on_click(x, y, shift, cmd, id)` | press on a Button / empty area |
 //! | `on_toggle(id, checked)`         | `Element::Toggle` flipped      |
@@ -243,6 +245,12 @@ pub(crate) enum HostToWorker {
     /// this message engine-neutral so both the funct and funct workers ride
     /// the same channel.
     Reload { source: String },
+    /// Hot-swap an imported *module* (e.g. `df`) that changed on disk into
+    /// this widget's VM, then re-render. This is how a shared library edit
+    /// (the chart helpers in `df.ft`) reaches widgets that imported it —
+    /// `Reload` only re-evals a widget's OWN script and would reuse the
+    /// cached module. No-op if this widget doesn't import the module.
+    ReloadModule { name: String },
     /// Exit the worker loop. Sent by `on_close` and by `Drop`.
     Shutdown,
 }
@@ -288,6 +296,11 @@ pub(crate) struct WorkerSlots {
     /// scan the engine-specific program, so the worker reports it here
     /// and the component mirrors it for pinned-widget click hot-zoning.
     pub(crate) wants_clicks: Arc<AtomicBool>,
+    /// Does the loaded script define `on_hover`? Reported like
+    /// `wants_clicks` so a pinned canvas widget that only hovers (a
+    /// chart with tooltips, no `on_click`) still publishes a content
+    /// hot-zone — otherwise pinned-pane hover hit-testing skips it.
+    pub(crate) wants_hover: Arc<AtomicBool>,
 }
 
 impl WorkerSlots {
@@ -301,6 +314,7 @@ impl WorkerSlots {
             render_dirty: Arc::new(AtomicBool::new(true)),
             outbox: Arc::new(Mutex::new(Vec::new())),
             wants_clicks: Arc::new(AtomicBool::new(false)),
+            wants_hover: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -315,7 +329,7 @@ pub struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    fn send(&self, msg: HostToWorker) {
+    pub(crate) fn send(&self, msg: HostToWorker) {
         let _ = self.tx.send(msg);
     }
 
@@ -349,6 +363,7 @@ impl Drop for WorkerHandle {
 fn spawn_worker(
     initial_source: Option<String>,
     initial_state: Value,
+    params: Value,
     script_name: String,
     widget_id: String,
 ) -> WorkerHandle {
@@ -368,6 +383,7 @@ fn spawn_worker(
                 slots_for_thread,
                 initial_source,
                 initial_state,
+                params,
                 widget_id,
             )
         })
@@ -392,6 +408,9 @@ pub struct ScriptWidget {
     /// delivery. Derived from the pane entity at spawn.
     pub widget_id: String,
     pub handle: WorkerHandle,
+    /// Per-instance params injected as the funct global `params`. Kept so
+    /// the snapshot can round-trip them across restart.
+    pub params: Value,
     /// Last frame generation we applied to the scene. Compared against
     /// `handle.slots.frame_gen` to skip diffing when nothing changed.
     pub applied_frame_gen: u64,
@@ -418,6 +437,11 @@ pub struct ScriptWidget {
     /// no per-element `WidgetTargets`, so they'd otherwise be
     /// click-through when pinned). Recomputed on reload.
     pub wants_clicks: bool,
+    /// True when the script defines `on_hover`. Same role as
+    /// `wants_clicks` but for hover: lets a pinned chart (hover tooltips,
+    /// no `on_click`) publish a content hot-zone so pinned-pane hover
+    /// hit-testing reaches it. Recomputed on reload.
+    pub wants_hover: bool,
     /// Set by `anim::tick_widget_anims` while a state transition is in
     /// flight, so the next `apply_latest_frames` pass re-renders with the
     /// advanced eased values even though the frame itself didn't change.
@@ -706,6 +730,14 @@ struct ScriptWidgetConfig {
     title: Option<String>,
     #[serde(default)]
     state: Value,
+    /// Per-instance parameters injected as the funct global `params`
+    /// (read via `extern let params` in host.ft). This is what makes a
+    /// widget a reusable *primitive*: one `http.ft` pointed at any URL,
+    /// one `bar.ft` told which columns to plot — set at spawn, not baked
+    /// into a per-endpoint file. Distinct from `state` (runtime VM
+    /// snapshot); `params` is the instance's configuration.
+    #[serde(default)]
+    params: Value,
 }
 
 fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity, config: &Value) {
@@ -714,6 +746,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             script: "garden.ft".to_string(),
             title: None,
             state: Value::Null,
+            params: Value::Null,
         });
     if let Some(title) = cfg.title.clone() {
         if let Some(mut t) = world.get_mut::<PaneTitle>(entity) {
@@ -747,6 +780,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
     let handle = spawn_worker(
         initial_source,
         cfg.state.clone(),
+        cfg.params.clone(),
         cfg.script.clone(),
         widget_id.clone(),
     );
@@ -757,6 +791,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             script_path,
             widget_id,
             handle,
+            params: cfg.params,
             applied_frame_gen: 0,
             last_state: cfg.state,
             last_size: Vec2::ZERO,
@@ -768,6 +803,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             // Starts false; mirrored from the worker's `wants_clicks` slot
             // each frame once the engine has loaded the script.
             wants_clicks: false,
+            wants_hover: false,
             force_render: false,
         },
         WidgetTargets::default(),
@@ -795,6 +831,7 @@ fn script_widget_snapshot(world: &World, entity: Entity) -> Value {
         "script": w.script,
         "title": title,
         "state": state,
+        "params": w.params,
     })
 }
 
@@ -839,9 +876,25 @@ fn poll_watcher(watcher: Option<Res<ScriptWatcher>>, mut widgets: Query<&mut Scr
         return;
     }
     let unique: HashSet<PathBuf> = paths.into_iter().collect();
+    // A changed file that ISN'T some widget's own script is a shared
+    // *library module* (e.g. `df.ft`, imported by every chart). Editing it
+    // must hot-swap into every widget that imported it — otherwise charts
+    // keep the stale module they compiled at spawn. Collect those module
+    // names (file stems) to broadcast as `ReloadModule`.
+    let widget_scripts: HashSet<PathBuf> = widgets.iter().map(|w| w.script_path.clone()).collect();
+    let changed_modules: Vec<String> = unique
+        .iter()
+        .filter(|p| !widget_scripts.contains(*p))
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect();
     for mut w in &mut widgets {
         if unique.contains(&w.script_path) {
+            // The widget's own script changed → full re-eval.
             w.reload_gen = w.reload_gen.wrapping_add(1);
+        }
+        // Hot-swap any changed imported module into this widget's VM.
+        for name in &changed_modules {
+            w.handle.send(HostToWorker::ReloadModule { name: name.clone() });
         }
     }
 }
@@ -854,6 +907,10 @@ fn apply_reloads(mut widgets: Query<&mut ScriptWidget>) {
         let wc = w.handle.slots.wants_clicks.load(Ordering::Acquire);
         if w.wants_clicks != wc {
             w.wants_clicks = wc;
+        }
+        let wh = w.handle.slots.wants_hover.load(Ordering::Acquire);
+        if w.wants_hover != wh {
+            w.wants_hover = wh;
         }
         if w.applied_reload_gen == w.reload_gen {
             continue;
@@ -1086,6 +1143,7 @@ fn forward_inputs_to_workers(
     time: Res<Time>,
     pane_zoom: Res<jim_pane::PaneZoom>,
     theme: Res<jim_style::Theme>,
+    mut theme_events: MessageReader<jim_style::ThemeChanged>,
     mut events: MessageReader<ClaudeBusEvent>,
     mut widgets: Query<(&PaneKindMarker, &PaneRect, &mut ScriptWidget)>,
 ) {
@@ -1093,7 +1151,12 @@ fn forward_inputs_to_workers(
     // widgets bake theme colors into their frame, so without a nudge
     // they keep the stale color until some unrelated event re-renders
     // them. Push a one-shot re-render whenever the theme changes.
-    let theme_changed = theme.is_changed();
+    // Trigger on the `ThemeChanged` MESSAGE (the canonical signal the
+    // chrome + snapshot publisher use). `Res<Theme>::is_changed()` does
+    // NOT fire for this query on the style-picker / `set_active_style`
+    // path, so canvas charts kept stale baked colors while chrome
+    // recolored.
+    let theme_changed = theme_events.read().last().is_some() || theme.is_changed();
     if theme_changed {
         // The worker reads `theme_get` off a shared snapshot on its own
         // thread. The event-driven publisher (`publish_snapshot_on_change`)
@@ -1246,6 +1309,31 @@ fn apply_latest_frames(
             // visualizers. Diffs against sprite_entities for cheap
             // per-frame mutation.
             Element::Canvas { children } => {
+                // Canvas widgets draw absolutely, so the host can't infer
+                // their height for scrolling. Derive it from the items'
+                // lowest extent and set the scroll bound, so a tall canvas
+                // (e.g. a heatmap with many rows) becomes wheel-scrollable.
+                let mut extent = 0.0_f32;
+                for it in &children {
+                    let bottom = match it {
+                        CanvasItem::Rect { y, h, anchor, .. } => canvas_item_bottom(*y, *h, *anchor),
+                        CanvasItem::Sprite { y, h, anchor, .. } => canvas_item_bottom(*y, *h, *anchor),
+                        CanvasItem::Text { y, size, anchor, .. } => {
+                            canvas_item_bottom(*y, size.unwrap_or(14.0), *anchor)
+                        }
+                    };
+                    if bottom > extent {
+                        extent = bottom;
+                    }
+                }
+                let content_h = (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0);
+                let new_max = (extent + MARGIN - content_h).max(0.0);
+                if (scroll.max_y - new_max).abs() > 0.5 {
+                    scroll.max_y = new_max;
+                }
+                if scroll.y > scroll.max_y {
+                    scroll.y = scroll.max_y;
+                }
                 diff_render(
                     &mut commands,
                     &mut images,
@@ -1338,6 +1426,26 @@ fn apply_latest_frames(
             }
         }
         clip_dirty.0 = true;
+    }
+}
+
+/// Lowest canvas-y a canvas item reaches, accounting for its anchor.
+/// The item's `(y)` is the anchor point, so where the item extends to
+/// depends on which corner/edge that anchor pins:
+///   - top-anchored    → item spans `[y, y + h]`, bottom = `y + h`
+///   - center-anchored  → item spans `[y - h/2, y + h/2]`, bottom = `y + h/2`
+///   - bottom-anchored  → item spans `[y - h, y]`, bottom = `y`
+///
+/// Used for the scroll-extent calc: a vertical bar chart anchors its
+/// bars `bottom-left` on the baseline and grows *upward*, so a naive
+/// `y + h` would report a phantom region as tall as the tallest bar
+/// below the baseline — inflating the scroll bound and clipping the
+/// bars' tops off (they rendered as uniform short stubs).
+fn canvas_item_bottom(y: f32, h: f32, anchor: CanvasAnchor) -> f32 {
+    match anchor {
+        CanvasAnchor::TopLeft | CanvasAnchor::TopCenter => y + h,
+        CanvasAnchor::Center => y + h * 0.5,
+        CanvasAnchor::BottomLeft | CanvasAnchor::BottomCenter => y,
     }
 }
 
@@ -1471,44 +1579,108 @@ fn diff_render(
                     .as_deref()
                     .and_then(parse_canvas_color)
                     .unwrap_or(Color::WHITE);
-                let font = match family.as_deref() {
+                let base_font = match family.as_deref() {
                     Some(f) => fonts.resolve(f),
                     None => default_font.clone(),
                 };
                 let anchor_cmp = canvas_anchor_to_bevy(*anchor);
                 let transform = Transform::from_xyz(*x, -*y, *z);
-                let text = Text2d::new(value.clone());
-                let text_font = TextFont {
-                    font,
-                    font_size,
-                    ..default()
-                };
-                let text_color = TextColor(col);
                 // No-wrap: short labels (button text, status lines) must
                 // never break mid-word. Without this, "New game" wraps
                 // to "New\ngame" inside a narrow canvas because Bevy's
                 // default TextLayout still inserts soft breaks.
                 let layout = bevy::text::TextLayout::new_with_no_wrap();
-                match existing {
+
+                // Per-glyph font fallback. Bevy draws a Text2d in ONE font
+                // and silently drops codepoints it lacks, so geometric
+                // shapes / arrows / math vanished from canvas labels. The
+                // global PostUpdate splitter skips canvas text (it fights
+                // this in-place diff — see `CanvasManagedText`), so we do
+                // the split HERE and OWN the child spans: the root holds
+                // run 0, each later run becomes a `TextSpan` child tracked
+                // in `sprite_entities` under a composite key so the
+                // stale-cleanup below despawns spans when the run count
+                // shrinks (or the symbol goes away). Fully-covered strings
+                // are a single run → no children, zero overhead.
+                let runs = fonts.split_runs(&base_font, value);
+                let (root_str, root_font) = match runs.first() {
+                    Some((s, f)) => (s.clone(), f.clone()),
+                    None => (String::new(), base_font),
+                };
+                let text_entity = match existing {
                     Some(e) => {
                         commands.entity(e).try_insert((
-                            text, text_font, text_color, anchor_cmp, transform, layout,
+                            Text2d::new(root_str),
+                            TextFont {
+                                font: root_font,
+                                font_size,
+                                ..default()
+                            },
+                            TextColor(col),
+                            anchor_cmp,
+                            transform,
+                            layout,
+                            crate::text_fallback::CanvasManagedText,
                         ));
+                        e
                     }
                     None => {
                         let e = commands
                             .spawn((
                                 ChildOf(content_root),
-                                text,
-                                text_font,
-                                text_color,
+                                Text2d::new(root_str),
+                                TextFont {
+                                    font: root_font,
+                                    font_size,
+                                    ..default()
+                                },
+                                TextColor(col),
                                 anchor_cmp,
                                 transform,
                                 layout,
                                 Visibility::Inherited,
+                                crate::text_fallback::CanvasManagedText,
                             ))
                             .id();
-                        sprite_entities.insert(id, e);
+                        sprite_entities.insert(id.clone(), e);
+                        e
+                    }
+                };
+                // Reconcile fallback spans (runs[1..]) as children of the
+                // text root. Composite key keeps them in `sprite_entities`
+                // and `seen` so they reuse across frames and get reaped
+                // when no longer produced. `\u{1}` can't appear in an
+                // author-chosen canvas id, so keys never collide.
+                for (n, (s, f)) in runs.iter().enumerate().skip(1) {
+                    let span_key = format!("{id}\u{1}fb{n}");
+                    seen.insert(span_key.clone());
+                    match sprite_entities.get(&span_key).copied() {
+                        Some(se) => {
+                            commands.entity(se).try_insert((
+                                bevy::text::TextSpan::new(s.clone()),
+                                TextFont {
+                                    font: f.clone(),
+                                    font_size,
+                                    ..default()
+                                },
+                                TextColor(col),
+                            ));
+                        }
+                        None => {
+                            let se = commands
+                                .spawn((
+                                    ChildOf(text_entity),
+                                    bevy::text::TextSpan::new(s.clone()),
+                                    TextFont {
+                                        font: f.clone(),
+                                        font_size,
+                                        ..default()
+                                    },
+                                    TextColor(col),
+                                ))
+                                .id();
+                            sprite_entities.insert(span_key, se);
+                        }
                     }
                 }
             }

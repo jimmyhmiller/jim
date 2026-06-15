@@ -1,0 +1,134 @@
+// claude-sessions.ft — live roster of Claude Code sessions on the agent
+// bus (see CHANNELS.md). Each `jimctl channel` bridge announces itself as
+// a retained `agent.hello.<id>` on the GLOBAL bus channel and tombstones
+// on exit; this pane shows who's live and echoes recent agent traffic.
+//
+// Pure view + one action: the "ping" button emits `agent.inbox.<id>`, so
+// the editor can poke a session and watch it react — proving the
+// editor→session direction from the GUI. (session→editor is every
+// agent.* message arriving here via on_message.)
+import "host"
+import { col_text, col_muted, col_accent } from "df"
+
+fn init_state() = { sessions: [], log: [] }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+// Suffix of `s` after a known `prefix` (e.g. the id in "agent.hello.<id>").
+fn after(s, prefix) = slice(s, len(prefix), len(s))
+
+// Replace-or-append a session record by id.
+fn upsert(list, id, info) {
+    let mut out = []
+    let mut found = false
+    for s in list {
+        if s.id == id { out = push(out, info); found = true }
+        else { out = push(out, s) }
+    }
+    if not found { out = push(out, info) }
+    out
+}
+
+fn remove_id(list, id) {
+    let mut out = []
+    for s in list { if s.id != id { out = push(out, s) } }
+    out
+}
+
+// Keep only the last `n` items of a list (rolling log).
+fn cap_tail(list, n) {
+    if len(list) <= n { return list }
+    let start = len(list) - n
+    let mut out = []
+    let mut i = 0
+    for x in list { if i >= start { out = push(out, x) } i = i + 1 }
+    out
+}
+
+fn msg_text(payload) =
+    if typeof(payload) == "Record" and has(payload, "text") { str(payload.text) }
+    else { str(payload) }
+
+fn on_message(topic, payload, sender) {
+    let st = @state
+    if starts_with(topic, "agent.hello.") {
+        let id = after(topic, "agent.hello.")
+        // A retained null payload is the bridge's exit tombstone.
+        if typeof(payload) == "Record" {
+            let info = assoc(payload, "id", id)
+            reset!(state, { sessions: upsert(st.sessions, id, info), log: st.log })
+        } else {
+            reset!(state, { sessions: remove_id(st.sessions, id), log: st.log })
+        }
+        request_render()
+        return
+    }
+    if starts_with(topic, "agent.all") or starts_with(topic, "agent.inbox.") {
+        let entry = { sender: sender, text: msg_text(payload) }
+        reset!(state, { sessions: st.sessions, log: cap_tail(push(st.log, entry), 12) })
+        request_render()
+        return
+    }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if starts_with(id, "ping_") {
+        let sid = after(id, "ping_")
+        emit("agent.inbox." + sid, { from: "editor", text: "ping from the editor roster" })
+    }
+}
+
+fn label_of(s) {
+    let l = unwrap_or(get(s, "label"), "")
+    if l == "" { s.id } else { l + "  (" + s.id + ")" }
+}
+
+fn session_row(s) =
+    { kind: "vstack", gap: 2.0, children: [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "text", value: "● ", size: 12.0, color: col_accent() },
+            { kind: "text", value: label_of(s), size: 13.0, weight: "bold", color: col_text() },
+            { kind: "button", id: "ping_" + s.id, label: "ping" },
+        ]},
+        { kind: "text", value: unwrap_or(get(s, "cwd"), ""), size: 10.0, color: col_muted() },
+    ]}
+
+fn log_row(e) =
+    { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: e.sender, size: 10.0, weight: "bold", color: col_accent() },
+        { kind: "text", value: e.text, size: 11.0, color: col_text() },
+    ]}
+
+fn render(w, h) {
+    let st = @state
+
+    let mut srows = []
+    for s in st.sessions { srows = push(srows, session_row(s)) }
+    if len(srows) == 0 {
+        srows = push(srows, { kind: "text", value: "no live sessions",
+                              size: 12.0, color: col_muted() })
+    }
+
+    let mut lrows = []
+    for e in st.log { lrows = push(lrows, log_row(e)) }
+    if len(lrows) == 0 {
+        lrows = push(lrows, { kind: "text", value: "(no traffic yet)",
+                              size: 11.0, color: col_muted() })
+    }
+
+    {
+        kind: "vstack", gap: 8.0, pad: 12.0, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: "◆ claude sessions", size: 14.0,
+                  weight: "bold", color: col_text() },
+                { kind: "text", value: str(len(st.sessions)) + " live", size: 11.0,
+                  color: col_muted() },
+            ]},
+            { kind: "vstack", gap: 6.0, children: srows },
+            { kind: "divider" },
+            { kind: "text", value: "recent agent traffic", size: 11.0, color: col_muted() },
+            { kind: "scroll", gap: 3.0, pad: 0.0, children: lrows },
+        ]
+    }
+}

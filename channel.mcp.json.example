@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "jim": {
+      "command": "jimctl",
+      "args": ["channel"]
+    }
+  }
+}

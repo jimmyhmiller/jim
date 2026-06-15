@@ -1,0 +1,88 @@
+// ipc_monitor.ft — live view of the app's IPC listener.
+//
+// Visualizes the IPC thread pool + request activity published by the Rust
+// shell (`crate::ipc_stats`) on the `ipc/stats` bus topic (retained, so this
+// pane shows the latest immediately on spawn). Pure view: no input, no
+// polling — it just re-renders when a new stats message arrives.
+import "host"
+import { col_text, col_muted, col_accent, col_err, col_warn, pget } from "df"
+
+fn init_state() = { s: {}, have: false }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_message(topic, payload, sender) {
+    if topic != "ipc/stats" { return }
+    reset!(state, { s: payload, have: true })
+    request_render()
+}
+
+fn outcome_color(o) =
+    if o == "ok" { col_text() }
+    else { if o == "timeout" { col_warn() } else { col_err() } }
+
+// One labelled number gauge.
+fn gauge(label, value, color) =
+    { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "text", value: str(value), size: 16.0, weight: "bold", color: color },
+        { kind: "text", value: label, size: 11.0, color: col_muted() },
+    ]}
+
+fn render(w, h) {
+    let st = @state
+    if not st.have {
+        return { kind: "vstack", pad: 14.0, gap: 6.0, children: [
+            { kind: "text", value: "◆ ipc monitor", size: 14.0, weight: "bold", color: col_text() },
+            { kind: "text", value: "waiting for stats…", size: 12.0, color: col_muted() },
+        ]}
+    }
+    let s = st.s
+    let workers = pget(s, "workers", 0)
+    let busy = pget(s, "busy", 0)
+    let queued = pget(s, "queued", 0)
+    let accepted = pget(s, "accepted", 0)
+    let completed = pget(s, "completed", 0)
+    let perr = pget(s, "parse_errors", 0)
+    let tmo = pget(s, "timeouts", 0)
+    let rerr = pget(s, "read_errors", 0)
+    let recent = pget(s, "recent", [])
+
+    let mut rows = []
+    for e in recent {
+        let oc = pget(e, "outcome", "?")
+        let act = pget(e, "action", "?")
+        let dur = pget(e, "dur_ms", 0)
+        rows = push(rows, { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "text", value: oc, size: 11.0, weight: "bold", color: outcome_color(oc) },
+            { kind: "text", value: act, size: 12.0, color: col_text() },
+            { kind: "text", value: str(dur) + "ms", size: 10.0, color: col_muted() },
+        ]})
+    }
+    if len(rows) == 0 {
+        rows = push(rows, { kind: "text", value: "(no requests yet)", size: 11.0, color: col_muted() })
+    }
+
+    {
+        kind: "vstack", gap: 8.0, pad: 12.0, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: "◆ ipc monitor", size: 14.0, weight: "bold", color: col_text() },
+                { kind: "text", value: "pool of " + str(workers), size: 11.0, color: col_muted() },
+            ]},
+            { kind: "hstack", gap: 18.0, align: "center", children: [
+                gauge("busy", str(busy) + "/" + str(workers), col_accent()),
+                gauge("queued", queued, if queued > 0 { col_warn() } else { col_muted() }),
+            ]},
+            { kind: "hstack", gap: 16.0, align: "center", children: [
+                gauge("accepted", accepted, col_text()),
+                gauge("ok", completed, col_text()),
+                gauge("parse✗", perr, if perr > 0 { col_err() } else { col_muted() }),
+                gauge("timeout", tmo, if tmo > 0 { col_warn() } else { col_muted() }),
+                gauge("read✗", rerr, if rerr > 0 { col_err() } else { col_muted() }),
+            ]},
+            { kind: "divider" },
+            { kind: "text", value: "recent requests", size: 11.0, color: col_muted() },
+            { kind: "scroll", gap: 3.0, pad: 0.0, children: rows },
+        ]
+    }
+}

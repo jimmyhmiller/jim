@@ -24,6 +24,7 @@ use jim_terminal::{
 };
 
 pub mod actions;
+pub mod agent;
 pub mod canvas;
 pub mod command_palette;
 pub mod claude_events_pane;
@@ -37,6 +38,7 @@ pub mod graph_view;
 pub mod inference_dispatch;
 pub mod inbox;
 pub mod inferences_pane;
+pub mod ipc_stats;
 pub mod issues_pane;
 /// Re-export of the daemon protocol from the headless crate so existing
 /// callers can continue to write `jim_app::daemon_proto::*`.
@@ -45,6 +47,7 @@ pub mod ipc;
 pub mod projects;
 pub mod radial;
 pub mod run_button;
+pub mod screenshot_consent;
 pub mod tools;
 pub mod window_geometry;
 pub mod workflow_graph;
@@ -165,6 +168,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(cube::CubePlugin)
             .add_plugins(radial::RadialPlugin)
             .add_plugins(command_palette::CommandPalettePlugin)
+            .add_plugins(screenshot_consent::ScreenshotConsentPlugin)
             .add_plugins(drawer::DrawerPlugin)
             .add_plugins(run_button::RunButtonPlugin)
             .add_plugins(workflow_graph::WorkflowGraphPlugin)
@@ -364,10 +368,12 @@ impl Plugin for AppShellPlugin {
             // consumer reads it.
             .add_systems(PreUpdate, compute_keyboard_owner)
             .add_systems(Update, debug_fps_log)
+            .add_systems(Update, ipc_stats::publish_ipc_stats)
             .add_systems(
                 Update,
                 (
                     drain_ipc_open_requests,
+                    dispatch_bus_actions,
                 ),
             )
             .add_systems(
@@ -504,8 +510,9 @@ fn setup_ipc_listener(world: &mut World) {
             let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
         });
     }
-    if let Some(rx) = ipc::spawn_listener(wakeup) {
+    if let Some((rx, metrics)) = ipc::spawn_listener(wakeup) {
         world.insert_non_send_resource(IpcInbox(rx));
+        world.insert_resource(ipc_stats::IpcMetricsRes(metrics));
     }
 }
 
@@ -523,6 +530,7 @@ fn drain_ipc_open_requests(
     mut msg_bus: ResMut<jim_widget::WidgetMsgBus>,
     mut palette_open: ResMut<command_palette::PaletteOpenRequest>,
     mut issues: ResMut<issues_pane::IssuesStore>,
+    mut screenshot_consent: ResMut<screenshot_consent::ScreenshotConsent>,
     mut commands: Commands,
 ) {
     let Some(inbox) = inbox else { return };
@@ -552,6 +560,7 @@ fn drain_ipc_open_requests(
                 position,
                 size,
                 kind,
+                params,
             } => {
                 let target = match project {
                     Some(name) => OpenProjectTarget::ByName(name),
@@ -572,6 +581,9 @@ fn drain_ipc_open_requests(
                     cfg.insert("script".into(), Value::String(command));
                     if let Some(t) = title {
                         cfg.insert("title".into(), Value::String(t));
+                    }
+                    if let Some(p) = params {
+                        cfg.insert("params".into(), p);
                     }
                 } else {
                     cfg.insert("command".into(), Value::String(command));
@@ -606,6 +618,15 @@ fn drain_ipc_open_requests(
             }
             ipc::IpcRequest::ToggleCube => {
                 prism.pending_toggle = true;
+            }
+            ipc::IpcRequest::ActivateProject { project } => {
+                match projects::resolve_project(
+                    &OpenProjectTarget::ByName(project),
+                    &projects,
+                ) {
+                    Some(id) => projects.set_active(id),
+                    None => eprintln!("[ipc] activate_project: no matching project"),
+                }
             }
             ipc::IpcRequest::OpenPalette { query, ask } => {
                 palette_open.requested = true;
@@ -774,16 +795,14 @@ fn drain_ipc_open_requests(
 
                 drawer.push(kind, row_title, reason, config, project_id);
             }
-            ipc::IpcRequest::Screenshot { path } => {
-                // Render-side capture: spawn a one-shot Screenshot entity
-                // and save it to disk when the GPU readback lands. Works
-                // headlessly and never grabs the user's screen.
-                use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-                commands
-                    .spawn(Screenshot::primary_window())
-                    .observe(save_to_disk(path));
+            ipc::IpcRequest::Screenshot { path, reason } => {
+                // Don't capture immediately: enqueue for the consent toast,
+                // which captures on user tap or after a short countdown. This
+                // keeps an automated requester from grabbing a frame while
+                // the user is mid-task.
+                screenshot_consent.request(path, reason);
             }
-            ipc::IpcRequest::CloseProjectPanes { project, kind } => {
+            ipc::IpcRequest::CloseProjectPanes { project, kind, titles } => {
                 let target = match project.as_deref() {
                     Some("active") | None => OpenProjectTarget::Active,
                     Some(name) => OpenProjectTarget::ByName(name.to_string()),
@@ -792,25 +811,68 @@ fn drain_ipc_open_requests(
                     eprintln!("[ipc] close_project_panes: no matching project");
                     continue;
                 };
-                pending.close_panes.push((project_id, kind));
+                pending.close_panes.push((project_id, kind, titles));
             }
-            ipc::IpcRequest::WidgetMessage { project, topic, payload, retain } => {
-                let target = match project.as_deref() {
-                    Some("active") | None => OpenProjectTarget::Active,
-                    Some(name) => OpenProjectTarget::ByName(name.to_string()),
-                };
-                let Some(project_id) = projects::resolve_project(&target, &projects) else {
-                    eprintln!("[ipc] widget_message: no matching project");
-                    continue;
+            ipc::IpcRequest::WidgetMessage { project, topic, payload, retain, sender } => {
+                // `"global"`/`"*"` → the global channel (`None`), delivered
+                // to every widget; otherwise resolve a project id.
+                let project = match project.as_deref() {
+                    Some("global") | Some("*") => None,
+                    other => {
+                        let target = match other {
+                            Some("active") | None => OpenProjectTarget::Active,
+                            Some(name) => OpenProjectTarget::ByName(name.to_string()),
+                        };
+                        let Some(project_id) = projects::resolve_project(&target, &projects)
+                        else {
+                            eprintln!("[ipc] widget_message: no matching project");
+                            continue;
+                        };
+                        Some(project_id)
+                    }
                 };
                 msg_bus.push_external(jim_widget::PendingMsg {
-                    project: Some(project_id),
+                    project,
                     topic,
                     payload,
-                    sender: "tbmsg".to_string(),
+                    sender: sender.unwrap_or_else(|| "tbmsg".to_string()),
                     retain,
                 });
             }
+        }
+    }
+}
+
+/// Consume `jim.action` bus messages and re-dispatch their payload as a
+/// local `IpcRequest`, so ANY bus participant — a Claude session via the
+/// channel bridge, or a funct widget calling `emit("jim.action", …)` — can
+/// drive the editor through the same action surface the `tb*`/`jimctl`
+/// CLIs use. See CHANNELS.md. The payload IS an `IpcRequest` (internally
+/// `action`-tagged), e.g. `{ "action": "open_file", "path": "…" }`.
+///
+/// It re-injects via `dispatch_local` (the socket) rather than touching
+/// world state here, so the action lands on the next frame through the
+/// identical `drain_ipc_open_requests` path — no parallel dispatch to
+/// drift. An inner action is never another `jim.action`, so there's no
+/// loop.
+fn dispatch_bus_actions(mut events: MessageReader<jim_widget::BusMessageObserved>) {
+    for ev in events.read() {
+        if ev.topic != "jim.action" {
+            continue;
+        }
+        let tag = ev
+            .payload
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        match serde_json::from_value::<ipc::IpcRequest>(ev.payload.clone()) {
+            Ok(req) => {
+                eprintln!("[jim.action] {tag} (from {})", ev.sender);
+                if let Err(e) = ipc::dispatch_local(&req) {
+                    eprintln!("[jim.action] dispatch '{tag}' failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("[jim.action] bad payload from {} ('{tag}'): {e}", ev.sender),
         }
     }
 }

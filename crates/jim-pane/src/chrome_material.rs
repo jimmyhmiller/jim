@@ -242,13 +242,15 @@ impl ChromeStyle {
         }
     }
 
-    /// Params for the title-cover quad. The cover is sized to the
+    /// Params for the content-cover quad. The cover is sized to the
     /// full pane (same mesh + params as the body) so its rounded
     /// corners, gradient, border, and focus glow all match the body
-    /// pixel-for-pixel; the shader cuts out the content area via
-    /// `cover_mode` + `title_h`, leaving the cover painting *only*
-    /// the title region — which is exactly what we need to mask
-    /// scrolled content out from under the title bar.
+    /// pixel-for-pixel; the shader (`cover_mode` + `title_h` +
+    /// `content_margin`) cuts out the content rect, leaving the cover
+    /// painting the title region AND the surrounding margin ring — so
+    /// content that scrolls or overflows past the content area on any
+    /// edge (under the title, or into the bottom/side margins) is
+    /// masked, not just the bit under the title bar.
     pub fn params_for_title_cover(
         &self,
         pane_size: Vec2,

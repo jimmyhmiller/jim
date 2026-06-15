@@ -66,7 +66,7 @@ pub const TEXTAREA_PAD_Y: f32 = 6.0;
 
 // Table cell padding (inside each grid cell).
 pub const TABLE_CELL_PAD_X: f32 = 8.0;
-pub const TABLE_CELL_PAD_Y: f32 = 5.0;
+pub const TABLE_CELL_PAD_Y: f32 = 9.0;
 // Gap between table columns.
 pub const TABLE_COL_GAP: f32 = 12.0;
 
@@ -3410,20 +3410,16 @@ fn render_table_at(
         let content_w = (cl.size.width - 2.0 * TABLE_CELL_PAD_X).max(0.0);
         let left = cell_origin.x + TABLE_CELL_PAD_X;
         let top = cell_origin.y + TABLE_CELL_PAD_Y;
-        // Alignment by explicit positioning. Left-aligned cells wrap
-        // within the column (TextBounds width); End/Center are measured
-        // single-line and offset — this avoids a Justify+TextBounds
-        // interaction that mis-places the text.
-        let (text_x, bounds_w) = match columns[ci].align {
-            Align::End => {
-                let tw = ctx.metrics.measure(&text, DEFAULT_FONT_SIZE);
-                (left + (content_w - tw).max(0.0), None)
-            }
-            Align::Center => {
-                let tw = ctx.metrics.measure(&text, DEFAULT_FONT_SIZE);
-                (left + ((content_w - tw) * 0.5).max(0.0), None)
-            }
-            _ => (left, Some(content_w)),
+        // Single line, no wrap: truncate with an ellipsis to the column
+        // width. A long unbroken token (a slug, a path) would otherwise
+        // char-wrap into an ugly multi-line cell. Align by explicit
+        // positioning off the (possibly truncated) measured width.
+        let text = truncate_to_width(&ctx.metrics, &text, DEFAULT_FONT_SIZE, content_w);
+        let tw = ctx.metrics.measure(&text, DEFAULT_FONT_SIZE);
+        let text_x = match columns[ci].align {
+            Align::End => left + (content_w - tw).max(0.0),
+            Align::Center => left + ((content_w - tw) * 0.5).max(0.0),
+            _ => left,
         };
         // Drag-select: register the cell as a selectable span. `text_x` is
         // the glyph origin (already alignment-shifted), and the run reaches
@@ -3460,15 +3456,43 @@ fn render_table_at(
                 ctx.palette.text,
             )),
             Anchor::TOP_LEFT,
+            // No wrap: we already truncated to the column width, so a long
+            // unbroken token stays on one line instead of char-wrapping.
+            bevy::text::TextLayout::new_with_no_wrap(),
             TextBounds {
-                width: bounds_w,
+                width: None,
                 height: None,
             },
-            // Keep our per-column wrap width: opt out of the pane-wide
-            // TextBounds enforcement that would otherwise rewrap cells to
-            // the full pane width.
+            // Opt out of the pane-wide TextBounds enforcement that would
+            // otherwise rewrap cells to the full pane width.
             jim_pane::PaneContentNoClip,
             Transform::from_xyz(text_x, -top, z + 0.01),
         ));
     }
+}
+
+/// Truncate `text` to fit `max_w` at `font_size`, appending an ellipsis
+/// when it overflows. Returns the input unchanged when it already fits.
+fn truncate_to_width(
+    metrics: &crate::PaneFontMetrics,
+    text: &str,
+    font_size: f32,
+    max_w: f32,
+) -> String {
+    if max_w <= 0.0 || metrics.measure(text, font_size) <= max_w {
+        return text.to_string();
+    }
+    let ell_w = metrics.measure("…", font_size);
+    let mut out = String::new();
+    let mut w = 0.0;
+    for ch in text.chars() {
+        let cw = metrics.measure(&ch.to_string(), font_size);
+        if w + cw + ell_w > max_w {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
 }

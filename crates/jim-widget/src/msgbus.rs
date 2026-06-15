@@ -51,7 +51,9 @@ use crate::{WidgetIO, WidgetRender};
 /// One message awaiting delivery on the widget↔widget bus. Produced by
 /// draining widget outboxes and the external (CLI/IPC) queue.
 pub struct PendingMsg {
-    /// Project channel. `None` = the project-less channel.
+    /// Project channel. `Some(p)` is delivered only to widgets in project
+    /// `p`; `None` is the GLOBAL channel, delivered to every widget (this
+    /// is what the cross-project `agent.*` bus rides on — see CHANNELS.md).
     pub project: Option<u64>,
     pub topic: String,
     pub payload: Value,
@@ -59,6 +61,20 @@ pub struct PendingMsg {
     pub sender: String,
     /// Keep as the topic's retained last value for late joiners.
     pub retain: bool,
+}
+
+/// A bus message as delivered this frame, surfaced as a Bevy message so
+/// app-side systems can observe bus traffic without being widgets. The
+/// `jim.action` consumer (see CHANNELS.md) reads these to let any
+/// participant — a Claude session via the bridge, or a funct widget —
+/// drive the editor. Emitted once per delivered message; NOT for the
+/// retained backlog redelivered to a late joiner.
+#[derive(Message, Debug, Clone)]
+pub struct BusMessageObserved {
+    pub project: Option<u64>,
+    pub topic: String,
+    pub payload: Value,
+    pub sender: String,
 }
 
 /// Central state for the widget↔widget bus. Ephemeral: retained values
@@ -122,6 +138,7 @@ fn append_bus_log(m: &PendingMsg) {
 /// Drives the bus once per frame. See module docs for the three phases.
 fn pump_widget_messages(
     mut bus: ResMut<WidgetMsgBus>,
+    mut observed: MessageWriter<BusMessageObserved>,
     script_widgets: Query<(&PaneKindMarker, &ScriptWidget, Option<&PaneProject>)>,
     sub_widgets: Query<(
         Entity,
@@ -171,12 +188,25 @@ fn pump_widget_messages(
             );
         }
         append_bus_log(m);
+        // Surface every delivered message to app-side observers (the
+        // `jim.action` consumer, monitors, …).
+        observed.write(BusMessageObserved {
+            project: m.project,
+            topic: m.topic.clone(),
+            payload: m.payload.clone(),
+            sender: m.sender.clone(),
+        });
     }
     // Drop a widget id from `seen` once it's gone so a future widget that
     // happens to reuse the id (entity bits recycle) still gets a backlog.
     bus.seen.retain(|id| live_ids.contains(id));
 
     // ---- Phase 3: deliver ----
+    // Project scoping: a message on a project channel (`Some(p)`) goes only
+    // to widgets in project `p`; a message on the GLOBAL channel (`None`)
+    // goes to EVERY widget regardless of project. That global broadcast is
+    // what the `agent.*` bus (Claude sessions ↔ editor, see CHANNELS.md)
+    // rides on, so any widget in any project can observe/participate.
     // Collect ids that need the retained backlog this pass, then mark them
     // seen after the immutable delivery loops (can't mutate `bus` mid-read).
     let mut newly_seen: Vec<String> = Vec::new();
@@ -188,14 +218,14 @@ fn pump_widget_messages(
         let pk = proj.map(|p| p.0);
         if !bus.seen.contains(&w.widget_id) {
             for ((rpk, topic), (payload, sender)) in &bus.retained {
-                if *rpk == pk {
+                if rpk.is_none() || *rpk == pk {
                     w.deliver_bus_message(topic.clone(), payload.clone(), sender.clone());
                 }
             }
             newly_seen.push(w.widget_id.clone());
         }
         for m in &pending {
-            if m.project == pk {
+            if m.project.is_none() || m.project == pk {
                 w.deliver_bus_message(m.topic.clone(), m.payload.clone(), m.sender.clone());
             }
         }
@@ -211,14 +241,14 @@ fn pump_widget_messages(
         let id = subprocess_widget_id(entity);
         if !bus.seen.contains(&id) {
             for ((rpk, topic), (payload, sender)) in &bus.retained {
-                if *rpk == pk {
+                if rpk.is_none() || *rpk == pk {
                     send_sub_message(io, topic.clone(), payload.clone(), sender.clone());
                 }
             }
             newly_seen.push(id);
         }
         for m in &pending {
-            if m.project == pk {
+            if m.project.is_none() || m.project == pk {
                 send_sub_message(io, m.topic.clone(), m.payload.clone(), m.sender.clone());
             }
         }
@@ -250,6 +280,7 @@ impl Plugin for WidgetMsgBusPlugin {
     fn build(&self, app: &mut App) {
         truncate_bus_log();
         app.init_resource::<WidgetMsgBus>()
+            .add_message::<BusMessageObserved>()
             .add_systems(Update, pump_widget_messages);
     }
 }

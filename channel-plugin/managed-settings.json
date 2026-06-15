@@ -1,0 +1,6 @@
+{
+  "channelsEnabled": true,
+  "allowedChannelPlugins": [
+    { "marketplace": "jim-local", "plugin": "jim" }
+  ]
+}

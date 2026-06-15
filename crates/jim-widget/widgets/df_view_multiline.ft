@@ -1,0 +1,148 @@
+// df_view_multiline.ft — a VIEW node: multi-series TIME-SERIES line chart.
+//
+// One line per distinct `series`, positioned on a real time axis by the
+// numeric x column (epoch-ms `bucket_start_ms`), so hourly density and
+// uneven gaps render faithfully — not collapsed to an index. Works off
+// the long dataset `dsify` produces when params set `series_path`.
+// Right-side legend; hover snaps to the nearest point (series/date/value).
+//
+//   params : { in, x, y, series_path, label, points }
+import "host"
+import { cell, col_max, col_min, ms_to_date, trunc, tooltip, concat, dsify, pget, distinct,
+         col_text, col_muted, col_axis, col_err, col_warn, series_color } from "df"
+
+fn in_topic() = pget(params, "in", "http/out")
+let pi = 3.141592653589793
+
+fn init_state() = { ds: { kind: "empty" }, w: 760.0, h: 380.0, hovx: -1.0, hovy: 0.0 }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_message(topic, payload, sender) {
+    if topic != in_topic() { return }
+    reset!(state, { ..(@state), ds: dsify(payload, params), hovx: -1.0 })
+    request_render()
+}
+
+fn on_resize(w, h) { reset!(state, { ..(@state), w: w, h: h }); request_render() }
+
+fn on_hover(x, y) {
+    let s = @state
+    if x > 100000.0 { if s.hovx >= 0.0 { reset!(state, { ..s, hovx: -1.0 }); request_render() } return }
+    reset!(state, { ..s, hovx: x, hovy: y })
+    request_render()
+}
+
+fn geo(s) {
+    let pad_l = 38.0
+    let pad_r = 138.0
+    let pad_t = 32.0
+    let pad_b = 24.0
+    {
+        pad_l: pad_l, pad_t: pad_t,
+        plot_w: s.w - pad_l - pad_r,
+        plot_h: s.h - pad_t - pad_b,
+        baseline: pad_t + (s.h - pad_t - pad_b),
+    }
+}
+
+fn banner(text, color) =
+    { kind: "canvas", children: [
+        { kind: "text", id: "bt", x: 12.0, y: 10.0, value: "╱╱ series", size: 13.0, color: col_text() },
+        { kind: "text", id: "bm", x: 12.0, y: 40.0, value: text, size: 12.0, color: color },
+    ]}
+
+fn render(w, h) {
+    let s = @state
+    let ds = s.ds
+    if ds.kind == "error" { return banner("error: " + ds.message, col_err()) }
+    if ds.kind != "dataset" { return banner("waiting for data…", col_muted()) }
+    let xcol = pget(params, "x", "bucket_start_ms")
+    let ycol = pget(params, "y", "views")
+    let slist = distinct(ds, "series")
+    if len(ds.rows) < 2 or len(slist) == 0 { return banner("need a multi-series dataset", col_warn()) }
+
+    let xmin = col_min(ds, xcol)
+    let xmax = col_max(ds, xcol)
+    let span = if xmax > xmin { xmax - xmin } else { 1.0 }
+    let ymax = col_max(ds, ycol)
+    let g = geo(s)
+
+    // group points by series
+    let mut groups = {}
+    for r in ds.rows {
+        let key = cell(r, "series", "")
+        let cur = unwrap_or(get(groups, key), [])
+        groups = assoc(groups, key, push(cur, { x: cell(r, xcol, 0), y: cell(r, ycol, 0) }))
+    }
+
+    let mut items = []
+    items = push(items, { kind: "text", id: "title", x: 10.0, y: 9.0,
+        value: "╱╱ " + ycol + " over time · " + str(len(slist)) + " series", size: 13.0, color: col_text() })
+    items = push(items, { kind: "rect", id: "axis", x: g.pad_l, y: g.baseline, w: g.plot_w, h: 1.0, color: col_axis() })
+    // y peak label
+    items = push(items, { kind: "text", id: "ymax", x: g.pad_l - 6.0, y: g.pad_t - 2.0,
+        value: str(to_int(round(ymax))), size: 9.0, color: col_muted(), anchor: "top-center", family: "mono" })
+
+    // x date ticks (5 across)
+    let mut ti = 0
+    while ti <= 4 {
+        let xv = xmin + span * ti / 4.0
+        let px = g.pad_l + (xv - xmin) / span * g.plot_w
+        items = push(items, { kind: "text", id: "xt" + str(ti), x: px, y: g.baseline + 4.0,
+            value: ms_to_date(to_int(xv)), size: 9.0, color: col_muted(),
+            anchor: if ti == 0 { "top-left" } else if ti == 4 { "top-center" } else { "top-center" }, family: "mono" })
+        ti = ti + 1
+    }
+
+    // one polyline per series (sorted by time)
+    let mut si = 0
+    for label in slist {
+        let color = series_color(si)
+        let pts = sort_by(unwrap_or(get(groups, label), []), p => p.x)
+        let mut k = 0
+        while k < len(pts) - 1 {
+            let a = unwrap_or(get(pts, k), { x: 0, y: 0 })
+            let b = unwrap_or(get(pts, k + 1), { x: 0, y: 0 })
+            let ax = g.pad_l + (a.x - xmin) / span * g.plot_w
+            let ay = g.baseline - (a.y / ymax) * g.plot_h
+            let bx = g.pad_l + (b.x - xmin) / span * g.plot_w
+            let by = g.baseline - (b.y / ymax) * g.plot_h
+            let dx = bx - ax
+            let dy = by - ay
+            items = push(items, { kind: "rect", id: "s" + str(si) + "_" + str(k),
+                x: (ax + bx) / 2.0, y: (ay + by) / 2.0, w: sqrt(dx * dx + dy * dy), h: 1.5,
+                color: color, anchor: "center", rotation: atan2(dy, dx) * 180.0 / pi })
+            k = k + 1
+        }
+        // legend
+        items = push(items, { kind: "rect", id: "lg" + str(si), x: s.w - 132.0, y: g.pad_t + si * 15.0, w: 10.0, h: 10.0, color: color, anchor: "top-left" })
+        items = push(items, { kind: "text", id: "ll" + str(si), x: s.w - 118.0, y: g.pad_t + si * 15.0 - 1.0,
+            value: trunc(label, 15), size: 10.0, color: col_muted(), family: "mono" })
+        si = si + 1
+    }
+
+    // hover: nearest point overall
+    if s.hovx >= 0.0 {
+        let mut best_d = 1000000.0
+        let mut best = { ok: false }
+        for label in slist {
+            for p in unwrap_or(get(groups, label), []) {
+                let px = g.pad_l + (p.x - xmin) / span * g.plot_w
+                let py = g.baseline - (p.y / ymax) * g.plot_h
+                let dx = px - s.hovx
+                let dy = py - s.hovy
+                let d = dx * dx + dy * dy
+                if d < best_d { best_d = d; best = { ok: true, px: px, py: py, x: p.x, y: p.y, label: label } }
+            }
+        }
+        if best.ok and best_d < 900.0 {
+            items = push(items, { kind: "rect", id: "hp", x: best.px, y: best.py, w: 7.0, h: 7.0, color: col_text(), anchor: "center" })
+            items = concat(items, tooltip(best.px, best.py, s.w, s.h,
+                trunc(best.label, 18) + " " + ms_to_date(to_int(best.x)) + ": " + str(best.y)))
+        }
+    }
+
+    { kind: "canvas", children: items }
+}

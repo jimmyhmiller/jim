@@ -81,15 +81,26 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);  // outside the rounded rect — transparent
     }
 
-    // Title-cover cutout: the cover quad is sized to the full pane
-    // and identical to the body in every other respect, but pixels
-    // below the title-region height are punched out so scrolled
-    // content shows through there. Result: cover paints only the
-    // title region — with a 1-pixel AA band at the boundary so it
-    // doesn't seam against the body underneath.
+    // Cover cutout: the cover quad is sized to the full pane and
+    // identical to the body in every other respect, but the CONTENT
+    // RECT is punched out so pane content shows through there. The
+    // cover therefore paints the title strip AND the whole margin ring
+    // (top, bottom, left, right) — masking any content that scrolls or
+    // overflows past the content area on ANY edge (e.g. a tall table's
+    // rows bleeding into the bottom margin), not just under the title.
+    // A 1-pixel AA band at the content-rect boundary avoids a seam
+    // against the body underneath. Mirrors the body's two-tone ring.
     if (params.cover_mode > 0.5) {
-        let y_from_top = in.uv.y * params.size.y;
-        let cover_mask = 1.0 - smoothstep(params.title_h - 0.5, params.title_h + 0.5, y_from_top);
+        let px = in.uv * params.size;
+        let m = params.content_margin;
+        let c_min = vec2<f32>(m, params.title_h + m);
+        let c_max = params.size - vec2<f32>(m, m);
+        // Signed distance outside the content rect: >0 outside, <0 inside.
+        let cd = max(
+            max(c_min.x - px.x, px.x - c_max.x),
+            max(c_min.y - px.y, px.y - c_max.y),
+        );
+        let cover_mask = smoothstep(-0.5, 0.5, cd);
         if (cover_mask <= 0.0) {
             return vec4<f32>(0.0);
         }

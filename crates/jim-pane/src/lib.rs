@@ -166,11 +166,14 @@ pub struct PaneProject(pub u64);
 /// forced to 0 so it always sits below any unpinned pane. Empty-space
 /// left-clicks fall through to whatever pane (or canvas) is under it.
 ///
-/// Interactive elements (buttons, links, list rows, etc.) remain
-/// clickable: each kind publishes hit rects to [`PaneHotZones`] every
-/// frame, and pinned-pane hit-testing only fires `PaneContentPressed`
-/// when the click lands inside one of those zones. Right-click still
-/// goes to the host's context menu (which handles unpinning).
+/// Interactive elements (buttons, links, list rows, charts, etc.) remain
+/// interactive: each kind publishes hit rects to [`PaneHotZones`] every
+/// frame, and pinned-pane hit-testing — for BOTH `PaneContentPressed`
+/// and `PaneContentHovered` — only fires when the cursor lands inside one
+/// of those zones (empty space falls through). A chart publishes its
+/// whole plot area as a hot-zone, so a pinned chart still shows its hover
+/// tooltip. Right-click still goes to the host's context menu (which
+/// handles unpinning).
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct PanePinned;
 
@@ -734,11 +737,13 @@ impl Plugin for PanePlugin {
 }
 
 /// Emit [`PaneContentHovered`] for the topmost pane whose content area
-/// is under the cursor, when no mouse button is held. Debounced so a
-/// stationary cursor doesn't refire every frame. Cursor-leaves-pane
-/// also emits one event with `local_pt` clamped to the last pane —
-/// canvases that show a hover indicator can clear it on receipt of an
-/// out-of-bounds local_pt.
+/// is under the cursor, when no mouse button is held. Unpinned panes use
+/// their full content area; pinned panes (background decoration) only
+/// hover inside a registered [`PaneHotZones`] rect, mirroring the press
+/// path so hover and click route identically. Debounced so a stationary
+/// cursor doesn't refire every frame. Cursor-leaves-pane also emits one
+/// event with `local_pt` clamped to the last pane — canvases that show a
+/// hover indicator can clear it on receipt of an out-of-bounds local_pt.
 #[derive(Resource, Default)]
 struct LastHover {
     pane: Option<Entity>,
@@ -756,6 +761,7 @@ fn emit_pane_hover(
         (Entity, &PaneRect, Option<&Visibility>, Has<PanePinned>),
         With<PaneTag>,
     >,
+    hot_zones: Query<&PaneHotZones>,
 ) {
     let _prof = prof::sys_span("pane_hover");
     // Any button held → drag/release flow owns motion. Don't double-emit.
@@ -767,26 +773,81 @@ fn emit_pane_hover(
         return;
     }
     let Ok(window) = windows.single() else { return };
-    let Some(pt) = window.cursor_position() else { return };
+    let Some(pt) = window.cursor_position() else {
+        // Cursor left the window entirely — `cursor_position()` is None,
+        // so no later code runs. Clear any pane that was being hovered so
+        // its hover indicator (chart tooltip, etc.) doesn't get stranded.
+        if let Some(prev) = last.pane.take() {
+            writer.write(PaneContentHovered {
+                pane: prev,
+                window_pt: last.window_pt,
+                local_pt: Vec2::new(f32::INFINITY, f32::INFINITY),
+            });
+        }
+        return;
+    };
     if last.window_pt == pt {
         return; // cursor parked — no new event.
     }
     last.window_pt = pt;
     let pt_canvas = viewport.window_to_canvas(pt);
-    let rects: Vec<(Entity, PaneRect)> = panes
+    // Mirror the press hit-test (`handle_pane_mouse`) so hover and click
+    // route identically.
+    //
+    // Stage 1: unpinned panes get the full content area. They always sit
+    // above pinned panes (pinned are forced to z=0), so any unpinned hit
+    // wins outright.
+    let unpinned_rects: Vec<(Entity, PaneRect)> = panes
         .iter()
         .filter(|(_, _, vis, pinned)| !matches!(vis, Some(Visibility::Hidden)) && !pinned)
         .map(|(e, r, _, _)| (e, *r))
         .collect();
-    let target = topmost_pane_at(pt_canvas, &rects).and_then(|e| {
-        let rect = rects.iter().find(|(x, _)| *x == e).map(|(_, r)| r)?;
+    let mut target = topmost_pane_at(pt_canvas, &unpinned_rects).and_then(|e| {
+        let rect = unpinned_rects.iter().find(|(x, _)| *x == e).map(|(_, r)| r)?;
         if matches!(region_at(pt_canvas, rect), Some(PaneRegion::Content)) {
             Some((e, pt_to_content_local(pt_canvas, rect)))
         } else {
             None
         }
     });
+    // Stage 2: no unpinned pane under the cursor — walk pinned panes and
+    // hover only when the cursor lands inside a registered hot-zone (a
+    // chart publishes its whole plot area; empty space on a pinned pane
+    // stays hover-through, matching the "background decoration" promise
+    // and the press path exactly).
+    if target.is_none() {
+        let mut best: Option<(Entity, f32, Vec2)> = None;
+        for (e, r, vis, pinned) in panes.iter() {
+            if matches!(vis, Some(Visibility::Hidden)) || !pinned {
+                continue;
+            }
+            if !matches!(region_at(pt_canvas, r), Some(PaneRegion::Content)) {
+                continue;
+            }
+            let local = pt_to_content_local(pt_canvas, r);
+            let Ok(zones) = hot_zones.get(e) else { continue };
+            if !zones.contains(local) {
+                continue;
+            }
+            if best.map_or(true, |(_, z, _)| r.z >= z) {
+                best = Some((e, r.z, local));
+            }
+        }
+        target = best.map(|(e, _, local)| (e, local));
+    }
     if let Some((pane, local_pt)) = target {
+        // Moved directly from one pane onto another without crossing empty
+        // canvas — emit a leave sentinel for the old pane first, or its
+        // hover indicator never clears.
+        if let Some(prev) = last.pane {
+            if prev != pane {
+                writer.write(PaneContentHovered {
+                    pane: prev,
+                    window_pt: pt,
+                    local_pt: Vec2::new(f32::INFINITY, f32::INFINITY),
+                });
+            }
+        }
         writer.write(PaneContentHovered {
             pane,
             window_pt: pt,

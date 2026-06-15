@@ -1,0 +1,8 @@
+{
+  "name": "jim",
+  "displayName": "Jim editor channel",
+  "version": "0.1.1",
+  "description": "Bidirectional agent bus between this Claude session and the Jim editor (jimctl channel).",
+  "author": { "name": "Jimmy Miller" },
+  "license": "MIT"
+}

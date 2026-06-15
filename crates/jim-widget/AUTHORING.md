@@ -57,7 +57,8 @@ them straight:
 | per frame, while animating | `on_frame(dt)` | `tick` `{dt}` |
 | **Claude Code bus** | **`on_bus(kind, payload)`** | `claude-event` `{kind, payload}` |
 | **Widget↔widget bus** | **`on_message(topic, payload, sender)`** | `message` `{topic, payload, sender}` |
-| lifecycle: spawned | `on_init()` | `init` `{width, height, state}` |
+| lifecycle: state setup | `on_init()` | `init` `{width, height, state}` |
+| lifecycle: side effects | `on_start()` | runs every start (fresh/restart/hot-reload) AFTER state is rehydrated — put fetches, `proc_spawn`, `set_animating`, bus subscribes here |
 | lifecycle: closing | (worker `Shutdown`) | `close` |
 
 `checked`, `tab`, and `value` are all computed host-side and handed to

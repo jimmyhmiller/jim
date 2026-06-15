@@ -1,0 +1,75 @@
+// df_view_stat.ft — a VIEW node: headline numbers from a dataset.
+//
+// Sums the first measure column and shows total + latest + peak + avg,
+// with a delta arrow comparing the last two rows. Text-only (no canvas).
+//
+//   in : df/analytics/norm/out   (dataset | error)
+import "host"
+import { first_role, col_sum, col_max, row_val, dsify, pget , col_text, col_muted, col_axis, col_accent, col_err, col_warn } from "df"
+
+fn in_topic() = pget(params, "in", "http/out")
+
+fn init_state() = { ds: { kind: "empty" } }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_message(topic, payload, sender) {
+    if topic != in_topic() { return }
+    reset!(state, { ds: dsify(payload, params) })
+    request_render()
+}
+
+fn banner(text, color) =
+    { kind: "vstack", pad: 14.0, gap: 6.0, children: [
+        { kind: "text", value: "▦ stat", size: 14.0, weight: "bold", color: col_text() },
+        { kind: "text", value: text, size: 12.0, color: color },
+    ]}
+
+fn fmt(n) = str(to_int(round(n)))
+
+fn stat_cell(label, value, color) =
+    { kind: "vstack", gap: 2.0, children: [
+        { kind: "text", value: value, size: 20.0, weight: "bold", color: color },
+        { kind: "text", value: label, size: 10.0, color: col_muted() },
+    ]}
+
+fn render(w, h) {
+    let ds = (@state).ds
+    if ds.kind == "error" { return banner("error: " + ds.message, col_err()) }
+    if ds.kind != "dataset" { return banner("waiting for data…", col_muted()) }
+
+    let ycol = first_role(ds, "measure")
+    if ycol == "" { return banner("no measure column", col_warn()) }
+
+    let n = len(ds.rows)
+    let total = col_sum(ds, ycol)
+    let peak = col_max(ds, ycol)
+    let avg = if n > 0 { total / n } else { 0 }
+    let latest = row_val(ds, ycol, n - 1)
+    let prev = row_val(ds, ycol, n - 2)
+    let delta = latest - prev
+    let arrow = if delta > 0 { "▲" } else if delta < 0 { "▼" } else { "■" }
+    let dcolor = if delta > 0 { col_accent() } else if delta < 0 { col_err() } else { col_muted() }
+
+    {
+        kind: "vstack", gap: 12.0, pad: 14.0, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: "▦ stat", size: 14.0, weight: "bold", color: col_text() },
+                { kind: "badge", value: ds.meta.source },
+            ]},
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: fmt(latest), size: 34.0, weight: "bold", color: col_text() },
+                { kind: "text", value: arrow + " " + fmt(delta), size: 14.0, weight: "bold", color: dcolor },
+            ]},
+            { kind: "text", value: ycol + " (latest)", size: 10.0, color: col_muted() },
+            { kind: "divider" },
+            { kind: "hstack", gap: 24.0, children: [
+                stat_cell("total", fmt(total), col_text()),
+                stat_cell("avg", fmt(avg), col_text()),
+                stat_cell("peak", fmt(peak), col_text()),
+                stat_cell("points", str(n), col_text()),
+            ]},
+        ]
+    }
+}

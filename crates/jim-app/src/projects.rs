@@ -502,7 +502,7 @@ pub struct PendingActions {
     /// Close requests from `tbclose`: `(project_id, kind_filter)`. A
     /// `None` kind closes every pane in the project. Resolved to pane
     /// entities in `apply_pending_actions` (needs a world query).
-    pub close_panes: Vec<(u64, Option<String>)>,
+    pub close_panes: Vec<(u64, Option<String>, Option<Vec<String>>)>,
 }
 
 /// Request to spawn one new pane of a given kind.
@@ -1479,15 +1479,21 @@ fn apply_pending_actions(world: &mut World) {
     // `tbclose` requests: close panes in a project, optionally filtered
     // to a kind. Resolve to entities here (world query), then route
     // through the same close path as a close-button click.
-    for (project_id, kind_filter) in actions.close_panes {
+    for (project_id, kind_filter, title_filter) in actions.close_panes {
         let targets: Vec<Entity> = {
-            let mut q = world.query::<(Entity, &PaneProject, &PaneKindMarker, &PaneTag)>();
+            let mut q = world
+                .query::<(Entity, &PaneProject, &PaneKindMarker, &jim_pane::PaneTitle, &PaneTag)>();
             q.iter(world)
-                .filter(|(_, m, _, _)| m.0 == project_id)
-                .filter(|(_, _, k, _)| {
+                .filter(|(_, m, _, _, _)| m.0 == project_id)
+                .filter(|(_, _, k, _, _)| {
                     kind_filter.as_deref().map_or(true, |want| k.0 == want)
                 })
-                .map(|(e, _, _, _)| e)
+                .filter(|(_, _, _, t, _)| {
+                    title_filter
+                        .as_ref()
+                        .map_or(true, |ts| ts.iter().any(|w| w == &t.0))
+                })
+                .map(|(e, _, _, _, _)| e)
                 .collect()
         };
         if !targets.is_empty() {

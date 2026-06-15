@@ -550,16 +550,17 @@ fn apply_actions_manifest(world: &mut World) {
     let Some(path) = actions_manifest_path() else {
         return;
     };
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return, // missing file → leave whatever's loaded
-    };
-    let manifest: Vec<ManifestAction> = match serde_json::from_slice(&bytes) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("[actions] {}: invalid JSON ({e}); keeping current actions", path.display());
-            return;
-        }
+    // Missing manifest → treat as empty so disk-discovery below still runs;
+    // a present-but-invalid manifest keeps the current set untouched.
+    let manifest: Vec<ManifestAction> = match std::fs::read(&path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("[actions] {}: invalid JSON ({e}); keeping current actions", path.display());
+                return;
+            }
+        },
+        Err(_) => Vec::new(),
     };
 
     // Drop the previous manifest's actions + configs.
@@ -572,6 +573,9 @@ fn apply_actions_manifest(world: &mut World) {
 
     let mut new_ids: Vec<&'static str> = Vec::new();
     let mut new_configs: HashMap<&'static str, serde_json::Value> = HashMap::new();
+    // Scripts a manifest entry already claims, so disk-discovery below
+    // doesn't double-register the same widget.
+    let mut declared_scripts: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in manifest {
         if m.id.trim().is_empty() {
             warn!("[actions] manifest entry with empty id; skipping");
@@ -615,9 +619,42 @@ fn apply_actions_manifest(world: &mut World) {
             default_keys,
             run: ActionRun::SpawnConfigured { kind },
         });
+        if let Some(script) = m.config.get("script").and_then(|v| v.as_str()) {
+            declared_scripts.insert(script.to_string());
+        }
         new_configs.insert(id, m.config);
         new_ids.push(id);
     }
+
+    // Auto-discover every spawnable `.ft` widget in ~/.jim/widgets and
+    // register a `widget.<stem>` action for any not already claimed by the
+    // manifest — so a newly-added widget ALWAYS shows up in the palette with
+    // no manual manifest edit. Tracked in `RuntimeActions::ids` alongside the
+    // manifest ones, so a reload drops + re-derives them cleanly.
+    let mut discovered = 0usize;
+    for w in discover_widget_actions(&declared_scripts) {
+        if world.resource::<ActionRegistry>().get(w.id.as_str()).is_some() {
+            continue; // id already taken by a built-in / pane / manifest action
+        }
+        discovered += 1;
+        let id: &'static str = Box::leak(w.id.into_boxed_str());
+        let title: &'static str = Box::leak(w.title.clone().into_boxed_str());
+        let stem: &'static str = Box::leak(w.stem.into_boxed_str());
+        let keywords: &'static [&'static str] =
+            Box::leak(vec![stem, "widget", "script"].into_boxed_slice());
+        world.resource_mut::<ActionRegistry>().register(Action {
+            id,
+            title,
+            category: "Widgets",
+            keywords,
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::SpawnConfigured { kind: "script_widget" },
+        });
+        new_configs.insert(id, serde_json::json!({ "script": w.script, "title": w.title }));
+        new_ids.push(id);
+    }
+    eprintln!("[actions] auto-registered {discovered} widget action(s) from ~/.jim/widgets");
 
     {
         let mut ra = world.resource_mut::<RuntimeActions>();
@@ -625,6 +662,76 @@ fn apply_actions_manifest(world: &mut World) {
         ra.configs = new_configs;
     }
     rebuild_keymap(world);
+}
+
+/// A `.ft` widget found on disk that should auto-register as a palette action.
+struct DiscoveredWidget {
+    /// Action id, `widget.<stem>`.
+    id: String,
+    /// Human title (prettified stem).
+    title: String,
+    /// Script filename, e.g. `ipc_monitor.ft`.
+    script: String,
+    /// Bare stem, used as a search keyword.
+    stem: String,
+}
+
+/// Scan `~/.jim/widgets/*.ft` for spawnable widgets not already declared in
+/// the manifest. "Spawnable" = the script defines a `render` function (this
+/// filters out library modules like `df.ft` / `host.ft`). Sorted by title for
+/// a stable palette order.
+fn discover_widget_actions(declared_scripts: &std::collections::HashSet<String>) -> Vec<DiscoveredWidget> {
+    let Some(dir) = jim_widget::script_widget::widgets_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ft") {
+            continue;
+        }
+        let (Some(file_name), Some(stem)) = (
+            path.file_name().and_then(|n| n.to_str()).map(String::from),
+            path.file_stem().and_then(|s| s.to_str()).map(String::from),
+        ) else {
+            continue;
+        };
+        // `_`-prefixed files are private helpers by convention.
+        if stem.starts_with('_') || declared_scripts.contains(&file_name) {
+            continue;
+        }
+        // Only scripts that render are spawnable widgets (skips libraries).
+        match std::fs::read_to_string(&path) {
+            Ok(src) if src.contains("fn render") => {}
+            _ => continue,
+        }
+        out.push(DiscoveredWidget {
+            id: format!("widget.{stem}"),
+            title: prettify(&stem),
+            script: file_name,
+            stem,
+        });
+    }
+    out.sort_by(|a, b| a.title.cmp(&b.title));
+    out
+}
+
+/// `df_view_bar` → `Df View Bar`; `set_theme` → `Set Theme`.
+fn prettify(stem: &str) -> String {
+    stem.split(|c| c == '_' || c == '-')
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let mut cs = w.chars();
+            match cs.next() {
+                Some(f) => f.to_uppercase().chain(cs).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// First-run bootstrap (write the default manifest) + start the file
@@ -644,28 +751,47 @@ fn setup_actions_watcher(world: &mut World) {
         }
     }
 
-    // Watch ~/.jim non-recursively but only forward events for
-    // actions.json (the dir sees frequent writes for other state files).
+    // Watch ~/.jim (for actions.json) and ~/.jim/widgets (for *.ft
+    // add/remove/edit) non-recursively, forwarding only the events that
+    // change the action set — the dirs see frequent writes for other state.
     if let Some(dir) = dir {
+        let widgets_dir = jim_widget::script_widget::widgets_dir();
+        if let Some(wd) = &widgets_dir {
+            let _ = std::fs::create_dir_all(wd);
+        }
         let (tx, rx) = mpsc::channel::<()>();
         let target = path.clone();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             if !matches!(
                 ev.kind,
-                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Any
+                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) | EventKind::Any
             ) {
                 return;
             }
-            if ev.paths.iter().any(|p| p == &target) {
+            let hit_manifest = ev.paths.iter().any(|p| p == &target);
+            // A new/removed/renamed .ft widget changes the discovered set.
+            let hit_widget = ev
+                .paths
+                .iter()
+                .any(|p| p.extension().and_then(|e| e.to_str()) == Some("ft"));
+            if hit_manifest || hit_widget {
                 let _ = tx.send(());
             }
         });
         match watcher {
             Ok(mut w) => {
+                let mut ok = true;
                 if let Err(e) = w.watch(&dir, RecursiveMode::NonRecursive) {
                     warn!("[actions] failed to watch {}: {e}", dir.display());
-                } else {
+                    ok = false;
+                }
+                if let Some(wd) = &widgets_dir {
+                    if let Err(e) = w.watch(wd, RecursiveMode::NonRecursive) {
+                        warn!("[actions] failed to watch {}: {e}", wd.display());
+                    }
+                }
+                if ok {
                     let mut ra = world.resource_mut::<RuntimeActions>();
                     ra.rx = Some(Mutex::new(rx));
                     ra._watcher = Some(w);

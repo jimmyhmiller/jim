@@ -14,6 +14,10 @@ naga = { version = "27", features = ["wgsl-in"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytemuck = { version = "1", features = ["derive"] }
+# Parse each bundled font's cmap so the registry knows which glyphs it
+# can render (drives per-glyph font fallback). Matched to Bevy's
+# transitive ttf-parser version to avoid a duplicate.
+ttf-parser = "0.25"
 # funct VM — theme files (`theme.ft`), style presets, and the widget
 # host fns all evaluate through funct. Replaced funct across jim-style.
 funct = "0.1"
