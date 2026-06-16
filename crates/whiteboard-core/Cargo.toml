@@ -1,0 +1,14 @@
+[package]
+name = "whiteboard-core"
+description = "Headless Excalidraw-parity whiteboard library: owns the scene + interaction lifecycle and emits a backend-agnostic draw-command list. No GPU or windowing dependencies."
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+insta = "1"

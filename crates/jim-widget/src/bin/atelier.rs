@@ -17,6 +17,7 @@ use jim_widget::protocol::{
 
 fn text(value: &str) -> Element {
     Element::Text {
+        wrap: true,
         value: value.into(),
         color: Some("fg".into()),
         size: Some(13.0),
@@ -28,6 +29,7 @@ fn text(value: &str) -> Element {
 
 fn muted(value: &str) -> Element {
     Element::Text {
+        wrap: true,
         value: value.into(),
         color: Some("fg_muted".into()),
         size: Some(11.0),
@@ -39,6 +41,7 @@ fn muted(value: &str) -> Element {
 
 fn heading(value: &str) -> Element {
     Element::Text {
+        wrap: true,
         value: value.into(),
         color: Some("fg".into()),
         size: Some(15.0),
@@ -52,6 +55,7 @@ fn eyebrow(value: &str) -> Element {
     // All-caps section label. Spaced via uppercase characters; Inter
     // handles tracking better than mono, but at small sizes both read.
     Element::Text {
+        wrap: true,
         value: value
             .to_uppercase()
             .chars()
@@ -70,6 +74,7 @@ fn eyebrow(value: &str) -> Element {
 
 fn mono(value: &str, color: &str) -> Element {
     Element::Text {
+        wrap: true,
         value: value.into(),
         color: Some(color.into()),
         size: Some(12.0),
@@ -179,6 +184,7 @@ fn palette_card() -> Element {
                     }),
                 },
                 Element::Text {
+                    wrap: true,
                     value: name.into(),
                     color: Some("fg_muted".into()),
                     size: Some(9.0),
@@ -209,6 +215,7 @@ fn typography_card() -> Element {
             pad: 10.0,
             children: vec![
                 Element::Text {
+                    wrap: true,
                     value: glyph.into(),
                     color: Some("accent".into()),
                     size: Some(size),
@@ -217,6 +224,7 @@ fn typography_card() -> Element {
                     selectable: false,
                 },
                 Element::Text {
+                    wrap: true,
                     value: name.into(),
                     color: Some("fg_muted".into()),
                     size: Some(9.0),
@@ -272,6 +280,7 @@ fn radii_card() -> Element {
                     }),
                 },
                 Element::Text {
+                    wrap: true,
                     value: name.into(),
                     color: Some("fg_muted".into()),
                     size: Some(9.0),
@@ -317,6 +326,7 @@ fn shadows_card() -> Element {
                     }),
                 },
                 Element::Text {
+                    wrap: true,
                     value: name.into(),
                     color: Some("fg_muted".into()),
                     size: Some(9.0),
@@ -355,6 +365,7 @@ fn spacing_card() -> Element {
                     }),
                 },
                 Element::Text {
+                    wrap: true,
                     value: name.into(),
                     color: Some("fg_muted".into()),
                     size: Some(10.0),
@@ -506,6 +517,7 @@ fn list_card(selected: &str) -> Element {
             id: (*id).into(),
             children: vec![
                 Element::Text {
+                    wrap: true,
                     value: (*title).into(),
                     color: Some("fg".into()),
                     size: Some(13.0),
@@ -548,6 +560,7 @@ fn dos_donts_card() -> Element {
             8.0,
             vec![
                 Element::Text {
+                    wrap: true,
                     value: if ok { "✓".into() } else { "✗".into() },
                     color: Some(mark_color.into()),
                     size: Some(12.0),
@@ -618,6 +631,7 @@ fn textures_card(textures_dir: &str) -> Element {
 
 fn header() -> Element {
     let title = Element::Text {
+        wrap: true,
         value: "Atelier".into(),
         color: Some("fg".into()),
         size: Some(48.0),
@@ -626,6 +640,7 @@ fn header() -> Element {
         selectable: false,
     };
     let subtitle = Element::Text {
+        wrap: true,
         value: "Elegant & tactile".into(),
         color: Some("fg_muted".into()),
         size: Some(15.0),
@@ -637,6 +652,7 @@ fn header() -> Element {
         gap: 0.0,
         pad: 0.0,
         children: vec![Element::Text {
+            wrap: true,
             value: "THEME · 01".into(),
             color: Some("accent".into()),
             size: Some(10.0),
@@ -665,6 +681,7 @@ fn header() -> Element {
 
 fn intro_card(search: &str, dark_mode: bool) -> Element {
     let blurb = Element::Text {
+        wrap: true,
         value: "A warm, tactile dark theme. Slate cards lifted on \
                 soft shadows; gold accent reserved for action; serif \
                 heading paired with a clean sans for body."

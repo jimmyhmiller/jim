@@ -64,6 +64,7 @@ pub mod protocol;
 pub mod render;
 pub mod script_widget;
 pub mod subprocess;
+pub mod syntax;
 pub mod text_fallback;
 
 pub use msgbus::{BusMessageObserved, PendingMsg, WidgetMsgBus};
@@ -577,6 +578,80 @@ fn char_index_at_x(
     best
 }
 
+/// Word-wrap `text` into visual lines for a content width of `max_w`, using
+/// the same font metrics the renderer wraps with. Each line is a half-open
+/// `[start, end)` char-index range into `text`. A space consumed at a soft
+/// break is dropped from both adjacent line ranges (so a fully-selected line
+/// doesn't trail a highlighted space) — but it still lives in `text`, so a
+/// selection's `[a, b)` copy range stays exact across the break. Hard `\n`
+/// breaks are honored.
+fn wrap_lines(text: &str, max_w: f32, font_size: f32, metrics: &PaneFontMetrics) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return vec![(0, 0)];
+    }
+    if max_w <= 0.0 {
+        return vec![(0, n)];
+    }
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    let mut last_space: Option<usize> = None;
+    let mut i = 0usize;
+    while i < n {
+        if chars[i] == '\n' {
+            lines.push((start, i));
+            i += 1;
+            start = i;
+            last_space = None;
+            continue;
+        }
+        let seg: String = chars[start..=i].iter().collect();
+        if metrics.measure(&seg, font_size) > max_w && i > start {
+            if let Some(sp) = last_space.filter(|sp| *sp > start) {
+                // Break at the last space: it belongs to neither line.
+                lines.push((start, sp));
+                start = sp + 1;
+                last_space = None;
+                i = start;
+            } else {
+                // No break opportunity on this line — hard-break before the
+                // char that overflowed (i stays put, re-measured next pass).
+                lines.push((start, i));
+                start = i;
+                last_space = None;
+            }
+            continue;
+        }
+        if chars[i].is_whitespace() {
+            last_space = Some(i);
+        }
+        i += 1;
+    }
+    lines.push((start, n));
+    lines
+}
+
+/// Map a content-local point to a char index in a (possibly wrapped) run:
+/// pick the visual line by y, then the nearest char boundary by x.
+fn point_to_char(
+    text: &str,
+    rect: Rect,
+    font_size: f32,
+    metrics: &PaneFontMetrics,
+    hit: Vec2,
+) -> usize {
+    let lines = wrap_lines(text, rect.width(), font_size, metrics);
+    let line_h = crate::render::line_height(font_size);
+    let rel_y = (hit.y - rect.min.y).max(0.0);
+    let li = ((rel_y / line_h).floor() as usize).min(lines.len().saturating_sub(1));
+    let chars: Vec<char> = text.chars().collect();
+    let (ls, le) = lines[li];
+    let le = le.min(chars.len());
+    let line_text: String = chars[ls..le].iter().collect();
+    ls + char_index_at_x(&line_text, rect.min.x, font_size, metrics, hit.x)
+}
+
 /// Press: begin a selection if the press landed on a selectable span.
 /// Enforces a single active selection app-wide (clears the others), and
 /// clears the selection when a press on a widget misses every span.
@@ -599,7 +674,7 @@ fn begin_text_selection(
             commands.entity(e).remove::<WidgetTextSelection>();
         }
         if let Some(s) = span {
-            let ci = char_index_at_x(&s.text, s.rect.min.x, s.font_size, &metrics, hit.x);
+            let ci = point_to_char(&s.text, s.rect, s.font_size, &metrics, hit);
             commands.entity(ev.pane).insert(WidgetTextSelection {
                 text: s.text.clone(),
                 rect: s.rect,
@@ -616,6 +691,7 @@ fn begin_text_selection(
 fn update_text_selection(
     mut drags: MessageReader<jim_pane::PaneContentDragged>,
     metrics: Res<PaneFontMetrics>,
+    scrolls: Query<&WidgetScroll>,
     mut q: Query<&mut WidgetTextSelection>,
 ) {
     for ev in drags.read() {
@@ -625,13 +701,11 @@ fn update_text_selection(
         if !sel.dragging {
             continue;
         }
-        sel.focus = char_index_at_x(
-            &sel.text,
-            sel.rect.min.x,
-            sel.font_size,
-            &metrics,
-            ev.local_pt.x,
-        );
+        // Match the press path: spans live in content-local (unscrolled)
+        // coords, so fold the pane's scroll back into the drag point.
+        let scroll_y = scrolls.get(ev.pane).map(|s| s.y).unwrap_or(0.0);
+        let hit = ev.local_pt + Vec2::new(0.0, scroll_y);
+        sel.focus = point_to_char(&sel.text, sel.rect, sel.font_size, &metrics, hit);
     }
 }
 
@@ -1218,6 +1292,7 @@ fn render_dialog_overlay(
     let mut kids: Vec<E> = Vec::new();
     if !dialog.title.is_empty() {
         kids.push(E::Text {
+            wrap: true,
             value: dialog.title.clone(),
             color: dialog
                 .style
@@ -1971,27 +2046,40 @@ fn render_text_selection_highlight(
             continue;
         }
         let chars: Vec<char> = sel.text.chars().collect();
-        let pre: String = chars[..a.min(chars.len())].iter().collect();
-        let mid: String = chars[a.min(chars.len())..b.min(chars.len())]
-            .iter()
-            .collect();
-        let x0 = sel.rect.min.x + metrics.measure(&pre, sel.font_size);
-        let w = metrics.measure(&mid, sel.font_size);
-        if w <= 0.0 {
-            continue;
+        let nchars = chars.len();
+        let (a, b) = (a.min(nchars), b.min(nchars));
+        let line_h = crate::render::line_height(sel.font_size);
+        // One band per visual line the selection touches, so a wrapped
+        // paragraph highlights down the page instead of just the first line.
+        let lines = wrap_lines(&sel.text, sel.rect.width(), sel.font_size, &metrics);
+        for (li, &(ls, le)) in lines.iter().enumerate() {
+            let le = le.min(nchars);
+            let s = a.max(ls);
+            let e = b.min(le);
+            if s >= e {
+                continue;
+            }
+            let pre: String = chars[ls..s].iter().collect();
+            let mid: String = chars[s..e].iter().collect();
+            let x0 = sel.rect.min.x + metrics.measure(&pre, sel.font_size);
+            let w = metrics.measure(&mid, sel.font_size);
+            if w <= 0.0 {
+                continue;
+            }
+            let y = sel.rect.min.y + li as f32 * line_h;
+            commands.spawn((
+                WidgetSelectionHighlight,
+                ChildOf(chrome.content_root),
+                Sprite {
+                    color,
+                    custom_size: Some(Vec2::new(w, line_h)),
+                    ..default()
+                },
+                Anchor::TOP_LEFT,
+                jim_pane::PaneContentNoClip,
+                Transform::from_xyz(x0, -y, 30.0),
+            ));
         }
-        commands.spawn((
-            WidgetSelectionHighlight,
-            ChildOf(chrome.content_root),
-            Sprite {
-                color,
-                custom_size: Some(Vec2::new(w, sel.rect.height())),
-                ..default()
-            },
-            Anchor::TOP_LEFT,
-            jim_pane::PaneContentNoClip,
-            Transform::from_xyz(x0, -sel.rect.min.y, 30.0),
-        ));
     }
 }
 
@@ -2117,7 +2205,6 @@ impl Plugin for WidgetPlugin {
                 stamp_overlay_layers
                     .before(bevy::camera::visibility::VisibilitySystems::CheckVisibility),
             )
-            .add_systems(Update, rerender_script_widgets_on_scroll)
             .add_systems(PostUpdate, (clip_widget_sprites, override_overlay_cursor))
             // Per-glyph font fallback: split any Text2d whose font lacks a
             // glyph into fallback spans, before text is laid out.
@@ -2394,6 +2481,13 @@ fn forward_ticks(
     }
 }
 
+/// The intended (pre-clip) `custom_size` of a widget sprite, captured the
+/// first time [`clip_widget_sprites`] clamps it. Every later clamp is derived
+/// from this base rather than the already-shrunk current size, so a sprite
+/// scrolled back into view restores to full size without re-rendering.
+#[derive(Component, Clone, Copy)]
+struct ClipBaseSize(Vec2);
+
 /// Walks every widget pane's content_root subtree and clamps every
 /// Sprite's `custom_size` so it can't escape the pane's content area.
 ///
@@ -2410,6 +2504,7 @@ fn clip_widget_sprites(
     // script panes carry `PaneChrome` (its `content_root`). Clip both so
     // canvas charts (heatmap cells, etc.) are cut at the pane edge instead
     // of bleeding into neighbours.
+    mut commands: Commands,
     panes: Query<(
         &PaneKindMarker,
         &PaneRect,
@@ -2418,22 +2513,32 @@ fn clip_widget_sprites(
         Option<&WidgetScroll>,
     )>,
     changed_panes: Query<(), (With<PaneKindMarker>, Changed<PaneRect>)>,
+    scrolled_panes: Query<(), (With<PaneKindMarker>, Changed<WidgetScroll>)>,
     mut needs_clip: ResMut<WidgetClipDirty>,
     children_q: Query<&Children>,
     transforms: Query<&Transform>,
     mut sprites: Query<&mut Sprite>,
+    base_q: Query<&ClipBaseSize>,
     anchors: Query<&bevy::sprite::Anchor>,
+    mut vis_q: Query<&mut Visibility>,
 ) {
     // Same idle-fast-path as jim_pane::enforce_pane_content_bounds:
     // walking every widget subtree every frame to clamp sizes that
     // haven't changed is pure waste. Re-walk only when a pane just
-    // resized or `rerender_widgets` (or edit-mode) just spawned new
-    // sprites under a content_root. Use a `ResMut<WidgetClipDirty>`
-    // signal for the latter — we can't ask for `Added<Sprite>` here
-    // because that conflicts with `&mut Sprite`.
+    // resized, was just scrolled, or `rerender_widgets` (or edit-mode)
+    // just spawned new sprites under a content_root. Use a
+    // `ResMut<WidgetClipDirty>` signal for the latter — we can't ask for
+    // `Added<Sprite>` here because that conflicts with `&mut Sprite`.
+    //
+    // Clamping is NON-DESTRUCTIVE: each clamped sprite records its intended
+    // (pre-clip) size in `ClipBaseSize`, and every pass re-derives the
+    // clamp from that base. So a sprite scrolled back into view grows back
+    // to full size — which is why scrolling no longer needs to re-render the
+    // whole widget (that used to be `rerender_script_widgets_on_scroll`, the
+    // big scroll-jank source on tall widgets like the diff viewer).
     let new_content = needs_clip.0;
     needs_clip.0 = false;
-    if changed_panes.is_empty() && !new_content {
+    if changed_panes.is_empty() && !new_content && scrolled_panes.is_empty() {
         return;
     }
     for (kind, rect, wcr, chrome, scroll) in &panes {
@@ -2473,8 +2578,45 @@ fn clip_widget_sprites(
             let avail_w = (content_w - left_offset).max(0.0);
             let avail_h = (content_h - eff_top).max(0.0);
 
+            // Hide content scrolled up into the title-bar band. The per-pane
+            // camera viewport spans the chrome (no GPU clip line there), so
+            // anything with `eff_top < 0` paints over the title. Widget content
+            // is spawned FLAT (every leaf is a direct child of content_root),
+            // so toggling an entity's visibility never hides a sibling's
+            // subtree — which is what made the old content_root-children clip
+            // unsafe before the flat-render refactor. A small slack avoids
+            // flicker on the boundary row.
+            if let Ok(mut vis) = vis_q.get_mut(entity) {
+                let want = if eff_top < -2.0 {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Inherited
+                };
+                if *vis != want {
+                    *vis = want;
+                }
+            }
+
             if let Ok(mut sprite) = sprites.get_mut(entity) {
-                if let Some(want) = sprite.custom_size {
+                if let Some(current) = sprite.custom_size {
+                    // Intended size: the pre-clip size, captured the first
+                    // time we see this sprite (clip runs right after render,
+                    // so `current` is full size then) and reused every pass
+                    // so clamps are computed from the original, not from an
+                    // already-shrunk value — letting sprites grow back on
+                    // scroll without a re-render.
+                    // Use the stored base while the sprite is at-or-below it
+                    // (clip only ever shrinks). If `current` exceeds the base,
+                    // the render/canvas-reconcile just set a NEW intended size
+                    // (e.g. a garden plant growing) — re-capture so growth is
+                    // never frozen by a stale base.
+                    let want = match base_q.get(entity) {
+                        Ok(b) if current.x <= b.0.x + 0.5 && current.y <= b.0.y + 0.5 => b.0,
+                        _ => {
+                            commands.entity(entity).insert(ClipBaseSize(current));
+                            current
+                        }
+                    };
                     // `eff_top` is the sprite's ANCHOR point (canvas y-down).
                     // Which direction the quad extends from it — and thus how
                     // much room it has before escaping the content area —
@@ -2497,8 +2639,11 @@ fn clip_widget_sprites(
                         if room <= 0.0 { 0.0 } else { want.y.min(room) }
                     };
                     let new = Vec2::new(want.x.min(avail_w), new_h);
-                    if (new.x - want.x).abs() > f32::EPSILON
-                        || (new.y - want.y).abs() > f32::EPSILON
+                    // Write when it differs from the CURRENT size, so a sprite
+                    // previously shrunk by an earlier scroll position grows
+                    // back as it returns into view.
+                    if (new.x - current.x).abs() > f32::EPSILON
+                        || (new.y - current.y).abs() > f32::EPSILON
                     {
                         sprite.custom_size = Some(new);
                     }
@@ -2515,18 +2660,6 @@ fn clip_widget_sprites(
                 }
             }
         }
-    }
-}
-
-/// When a script widget is scrolled, force it to re-render. Canvas sprite
-/// sizes get clamped by `clip_widget_sprites` and can't grow back on their
-/// own; re-rendering rebuilds them at full size so the scroll-aware clip
-/// can re-clamp for the new offset.
-fn rerender_script_widgets_on_scroll(
-    mut q: Query<&mut script_widget::ScriptWidget, Changed<WidgetScroll>>,
-) {
-    for mut w in &mut q {
-        w.force_render = true;
     }
 }
 
@@ -4017,6 +4150,7 @@ fn placeholder_frame() -> Element {
         pad: 12.0,
         children: vec![
             Element::Text {
+                wrap: true,
                 value: "Widget not configured".into(),
                 color: Some("#cc8".into()),
                 size: Some(14.0),
@@ -4025,6 +4159,7 @@ fn placeholder_frame() -> Element {
                 selectable: false,
             },
             Element::Text {
+                wrap: true,
                 value: format!("Set {} or save a snapshot with a command.", DEFAULT_CMD_ENV),
                 color: Some("#888".into()),
                 size: None,
@@ -4043,6 +4178,7 @@ fn error_frame(msg: &str) -> Element {
         pad: 12.0,
         children: vec![
             Element::Text {
+                wrap: true,
                 value: "Widget error".into(),
                 color: Some("#e55".into()),
                 size: Some(14.0),
@@ -4051,6 +4187,7 @@ fn error_frame(msg: &str) -> Element {
                 selectable: false,
             },
             Element::Text {
+                wrap: true,
                 value: msg.into(),
                 color: Some("#aaa".into()),
                 size: None,

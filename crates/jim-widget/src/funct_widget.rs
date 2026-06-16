@@ -71,6 +71,10 @@ pub(crate) const HOST_FT: &str = r#"// host.ft — the jim-editor widget host in
 // --- globals the host injects ---
 extern let canvas_w
 extern let canvas_h
+// Vertical scroll offset (px from top). Updated as the pane scrolls; a
+// widget that defines `on_scroll(y)` is re-rendered on change so it can
+// window its content to the visible slice (see the diff viewer).
+extern let scroll_y
 // host-owned persistent state atom (survives hot reload + restart)
 extern let state
 // per-instance params (config) set at spawn — same .ft, different URL /
@@ -80,6 +84,7 @@ extern let params
 // --- render / animation control ---
 extern fn request_render()
 extern fn set_animating(on)
+extern fn set_tick_interval(secs)
 
 // --- subprocess bridge (UCI engines, language servers, …) ---
 extern fn proc_spawn(cmd)
@@ -109,7 +114,25 @@ extern fn rand()
 extern fn rand_int(lo, hi)
 extern fn hash_str(s)
 extern fn time()
+
+// --- syntax highlighting + filesystem (the diff / code-review widget) ---
+// highlight(code, lang) -> [ [ { text, kind }, … ], … ] (one line per entry)
+extern fn highlight(code, lang)
+// read_file(path) -> { ok, text, error };  write_file(path, text) -> bool
+extern fn read_file(path)
+extern fn write_file(path, text)
 "#;
+
+/// Expand a leading `~` / `~/` to the user's home dir for the filesystem
+/// host fns. Anything else is returned unchanged.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" || path.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}{}", &path[1..]);
+        }
+    }
+    path.to_string()
+}
 
 /// Wrapper key used to mark a persisted funct VM snapshot inside the
 /// generic `PaneSnapshot.config.state` JSON, so the funct worker can tell
@@ -151,6 +174,9 @@ struct FunctWorker {
     source: Option<String>,
     canvas_w: f32,
     canvas_h: f32,
+    /// Vertical scroll offset pushed from the host. Exposed as the `scroll_y`
+    /// global so a windowing widget renders only the visible slice.
+    scroll_y: f32,
     /// True once the script has been eval'd (or restored) successfully.
     loaded: bool,
     /// The current paused job, if any. Exactly one runs at a time — the
@@ -281,6 +307,8 @@ impl FunctWorker {
             .set_global("canvas_w", Value::Float(self.canvas_w as f64));
         self.vm
             .set_global("canvas_h", Value::Float(self.canvas_h as f64));
+        self.vm
+            .set_global("scroll_y", Value::Float(self.scroll_y as f64));
         // Provide the host-owned `state` atom only if the script hasn't
         // already bound `state` itself. Created once; persists across
         // reloads so `extern let state` widgets keep their data.
@@ -477,6 +505,15 @@ impl FunctWorker {
                 );
                 self.slots.render_dirty.store(true, Ordering::Release);
             }
+            HostToWorker::Scroll { y } => {
+                self.scroll_y = y;
+                self.vm.set_global("scroll_y", Value::Float(y as f64));
+                // Only a widget that opts in (defines `on_scroll`) re-renders
+                // on scroll — keeps non-virtualized widgets cost-free here.
+                if self.defines("on_scroll") {
+                    self.start_handler("on_scroll", vec![Value::Float(y as f64)], false);
+                }
+            }
             other if !self.loaded => {
                 // Script not up yet (read failed / awaiting Reload). Drop
                 // the event rather than fault; mirrors rhai's behavior.
@@ -619,6 +656,10 @@ impl FunctWorker {
                     false,
                 );
             }
+            HostToWorker::Scroll { y } => {
+                // Mirror the Rhai worker: drives the optional `on_scroll(y)`.
+                self.start_handler("on_scroll", vec![Value::Float(y as f64)], false);
+            }
             HostToWorker::Tick { dt_secs } => {
                 self.start_handler("on_frame", vec![Value::Float(dt_secs as f64)], false);
             }
@@ -655,6 +696,7 @@ pub(crate) fn funct_worker_main(
         source: initial_source.clone(),
         canvas_w: 0.0,
         canvas_h: 0.0,
+        scroll_y: 0.0,
         loaded: false,
         job: None,
         persist_dirty: false,
@@ -778,6 +820,24 @@ fn register_host_surface(
             crate::request_main_loop_wakeup();
         }
     });
+    // Slow tick: the widget wants `on_frame` called roughly every `secs`
+    // seconds (e.g. a 300s auto-refresh poll) WITHOUT pinning the whole
+    // app to 60fps `Continuous`. The host serves these ticks from the
+    // reactive loop instead, so an idle poller costs ~nothing. Passing 0
+    // (or negative) cancels. Use this — not `set_animating(true)` — for
+    // any periodic background work that isn't a real visual animation.
+    let tick_ms = slots.tick_interval_ms.clone();
+    vm.register1("set_tick_interval", move |secs: f64| {
+        let ms = if secs > 0.0 {
+            (secs * 1000.0).round().clamp(1.0, u32::MAX as f64) as u32
+        } else {
+            0
+        };
+        tick_ms.store(ms, Ordering::Release);
+        if ms > 0 {
+            crate::request_main_loop_wakeup();
+        }
+    });
     let dirty = slots.render_dirty.clone();
     vm.register0("request_render", move || {
         dirty.store(true, Ordering::Release);
@@ -850,6 +910,50 @@ fn register_host_surface(
             Ok(j) => Ok(Value::str(j.to_string())),
             Err(e) => Err(e),
         }
+    });
+
+    // ---- syntax highlighting (the diff / code-review widget) ----
+    // highlight(code, lang) -> [ line: [ { text, kind }, … ], … ]. One entry
+    // per `\n`-split line; each line is its left-to-right colored runs. The
+    // widget maps `kind` ("keyword"/"string"/…) to a theme color. Unknown
+    // language → one `{text, kind:"default"}` run per line (renders plain).
+    vm.register2("highlight", |code: String, lang: String| -> Value {
+        let lines = crate::syntax::highlight_lines(&code, &lang);
+        let json = serde_json::Value::Array(
+            lines
+                .into_iter()
+                .map(|line| {
+                    serde_json::Value::Array(
+                        line.into_iter()
+                            .map(|(text, kind)| serde_json::json!({ "text": text, "kind": kind }))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+        Value::from_json(&json)
+    });
+
+    // ---- filesystem bridge ----
+    // read_file(path) -> { ok, text, error }. `~` is expanded. Lets a widget
+    // load a file (a diff, a .md) without the `cat` subprocess dance, and is
+    // the read side of comment/review persistence.
+    vm.register1("read_file", |path: String| -> Value {
+        match std::fs::read_to_string(expand_tilde(&path)) {
+            Ok(text) => Value::from_json(&serde_json::json!({ "ok": true, "text": text })),
+            Err(e) => Value::from_json(
+                &serde_json::json!({ "ok": false, "text": "", "error": e.to_string() }),
+            ),
+        }
+    });
+    // write_file(path, text) -> bool. Creates parent dirs. `~` is expanded.
+    // The write side of review-comment persistence (~/.jim/reviews/*.json).
+    vm.register2("write_file", |path: String, text: String| -> bool {
+        let p = expand_tilde(&path);
+        if let Some(parent) = std::path::Path::new(&p).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&p, text).is_ok()
     });
 
     // ---- subprocess bridge (event-driven, same as rhai) ----

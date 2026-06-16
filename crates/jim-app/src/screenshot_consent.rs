@@ -295,6 +295,7 @@ fn build_toast(world: &World) -> Element {
 
 fn text(s: &str, color: &str, size: f32, weight: Weight) -> Element {
     Element::Text {
+        wrap: true,
         value: s.to_string(),
         color: Some(color.into()),
         size: Some(size),

@@ -63,7 +63,7 @@ pub struct PaneCameraOf(pub Entity);
 /// delay before the camera exists is harmless: it has nothing to
 /// render anyway until Stage 3.
 pub fn spawn_pane_cameras(
-    new_panes: Query<(Entity, &PaneLayer, &PaneRect), Added<PaneLayer>>,
+    new_panes: Query<(Entity, &PaneLayer, &PaneRect, Has<crate::PaneScreenAnchored>), Added<PaneLayer>>,
     windows: Query<&Window>,
     region: Option<Res<PaneCanvasRegion>>,
     viewport: Option<Res<PaneViewport>>,
@@ -74,8 +74,14 @@ pub fn spawn_pane_cameras(
     };
     let region = region.as_deref().copied();
     let viewport = viewport.as_deref().copied().unwrap_or_default();
-    for (pane_entity, layer, rect) in &new_panes {
-        let projected = viewport.projected_rect(rect);
+    for (pane_entity, layer, rect, anchored) in &new_panes {
+        // Anchored panes live in window-pixel space already; everything else is
+        // projected through the canvas viewport.
+        let projected = if anchored {
+            *rect
+        } else {
+            viewport.projected_rect(rect)
+        };
         let cam_setup = pane_camera_setup(&projected, window, region);
         let order = pane_camera_order(rect);
         commands.spawn((
@@ -106,6 +112,7 @@ pub fn spawn_pane_cameras(
 /// per pane).
 pub fn sync_pane_cameras(
     panes: Query<&PaneRect, With<PaneTag>>,
+    anchored: Query<(), With<crate::PaneScreenAnchored>>,
     mut cameras: Query<(&PaneCameraOf, &mut Camera, &mut Transform)>,
     windows: Query<&Window>,
     region: Option<Res<PaneCanvasRegion>>,
@@ -122,7 +129,11 @@ pub fn sync_pane_cameras(
             // close handler will reap it. Skip.
             continue;
         };
-        let projected = viewport.projected_rect(rect);
+        let projected = if anchored.get(owner.0).is_ok() {
+            *rect
+        } else {
+            viewport.projected_rect(rect)
+        };
         let setup = pane_camera_setup(&projected, window, region);
         let new_order = pane_camera_order(rect);
 

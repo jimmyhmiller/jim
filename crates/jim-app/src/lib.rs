@@ -47,8 +47,10 @@ pub mod ipc;
 pub mod projects;
 pub mod radial;
 pub mod run_button;
+pub mod pane_annotation;
 pub mod screenshot_consent;
 pub mod tools;
+pub mod whiteboard_bg;
 pub mod window_geometry;
 pub mod workflow_graph;
 use projects::{
@@ -78,6 +80,15 @@ pub const MENU_OVERLAY_LAYER: usize = 32;
 /// any plausible pane-camera order: pane cameras max out around
 /// `(MAX_PANE_Z * 100) + 1` ≈ 50_001, so 100_000 leaves headroom.
 pub const MENU_OVERLAY_CAMERA_ORDER: isize = 100_000;
+
+/// Dedicated RenderLayer for the canvas whiteboard drawing. The drawing is an
+/// overlay you paint ON TOP of panes, so its geometry lives here and is drawn
+/// by [`WHITEBOARD_OVERLAY_CAMERA_ORDER`] — above every per-pane camera, but
+/// below the toolbar (pinned higher, see `pin_toolbar_z`) and the menu overlay.
+pub const WHITEBOARD_OVERLAY_LAYER: usize = 31;
+/// Camera order for the whiteboard overlay camera. Above any pane
+/// (~50_001) and below the toolbar (~85_001) + menu overlay (100_000).
+pub const WHITEBOARD_OVERLAY_CAMERA_ORDER: isize = 80_000;
 
 /// Whether our OS window currently has keyboard focus. Mirrors the
 /// `WindowFocused` events winit dispatches; we maintain it ourselves
@@ -147,6 +158,7 @@ impl Plugin for AppShellPlugin {
             // draws that pane's content across every project (and over the
             // cube), because that global camera isn't gated by project:
             //   - MENU_OVERLAY_LAYER (32): menus / FPS / status bar.
+            //   - WHITEBOARD_OVERLAY_LAYER (31): the canvas drawing overlay.
             //   - cube::CUBE_LAYER (4096): the prism's structural geometry.
             //   - jim_style::dynamic::OVERLAY_LAYER (30): the dust/shader
             //     canvas overlay, drawn at order 1_000_001 above everything.
@@ -156,6 +168,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(PanePlugin {
                 reserved_layers: vec![
                     MENU_OVERLAY_LAYER,
+                    WHITEBOARD_OVERLAY_LAYER,
                     cube::CUBE_LAYER,
                     jim_style::dynamic::OVERLAY_LAYER,
                 ],
@@ -171,6 +184,18 @@ impl Plugin for AppShellPlugin {
             .add_plugins(screenshot_consent::ScreenshotConsentPlugin)
             .add_plugins(drawer::DrawerPlugin)
             .add_plugins(run_button::RunButtonPlugin)
+            .add_plugins(jim_whiteboard::WhiteboardPlugin)
+            .add_plugins(whiteboard_bg::WhiteboardBackgroundPlugin)
+            // DISABLED: the per-pane annotation surface was a THIRD input
+            // authority. For a draw tool it claimed every press (it "paints
+            // anywhere" and set InputConsumed) WITHOUT excluding the toolbar,
+            // so toolbar clicks were eaten whenever a draw tool was active
+            // (couldn't switch tools). It also made ink stick to / move with
+            // individual panes, which contradicts the fixed drawing-layer model
+            // (ink must not move with panes). The canvas board
+            // (WhiteboardBackgroundPlugin) is the single drawing layer; it
+            // already renders over panes via the overlay camera.
+            // .add_plugins(pane_annotation::PaneAnnotationPlugin)
             .add_plugins(workflow_graph::WorkflowGraphPlugin)
             .add_plugins(fps::FpsOverlayPlugin)
             .add_plugins(debug_bar::DebugBarPlugin)
@@ -412,6 +437,21 @@ fn setup_camera(mut commands: Commands) {
         bevy::camera::visibility::RenderLayers::layer(0),
     ));
 
+    // Whiteboard overlay camera — renders only `WHITEBOARD_OVERLAY_LAYER` at
+    // an order above every per-pane camera, so the canvas drawing paints ON
+    // TOP of panes. Shares the default (identity) transform with the main
+    // camera, so the drawing's baked canvas pan/zoom still lands aligned.
+    // `clear_color: None` keeps panes visible wherever there's no drawing.
+    commands.spawn((
+        Camera2d,
+        bevy::camera::Camera {
+            order: WHITEBOARD_OVERLAY_CAMERA_ORDER,
+            clear_color: bevy::camera::ClearColorConfig::None,
+            ..default()
+        },
+        bevy::camera::visibility::RenderLayers::layer(WHITEBOARD_OVERLAY_LAYER),
+    ));
+
     // Menu overlay camera — renders only `MENU_OVERLAY_LAYER` at a
     // camera order far above any per-pane camera, so radial / context
     // menus draw on top of every pane even when many panes are
@@ -614,6 +654,30 @@ fn drain_ipc_open_requests(
                     origin: position.map(|[x, y]| Vec2::new(x, y)),
                     size: size.map(|[w, h]| Vec2::new(w, h)),
                     config: Value::Object(cfg),
+                });
+            }
+            ipc::IpcRequest::SpawnPane {
+                kind,
+                project,
+                position,
+                size,
+                config,
+            } => {
+                let target = match project {
+                    Some(name) => OpenProjectTarget::ByName(name),
+                    None => OpenProjectTarget::Active,
+                };
+                let Some(project_id) = projects::resolve_project(&target, &projects) else {
+                    eprintln!("[ipc] spawn_pane: no matching project");
+                    continue;
+                };
+                let kind_static: &'static str = Box::leak(kind.into_boxed_str());
+                pending.new_panes.push(NewPaneRequest {
+                    kind: kind_static,
+                    project_id,
+                    origin: position.map(|[x, y]| Vec2::new(x, y)),
+                    size: size.map(|[w, h]| Vec2::new(w, h)),
+                    config: config.unwrap_or(Value::Null),
                 });
             }
             ipc::IpcRequest::ToggleCube => {
@@ -1605,6 +1669,8 @@ fn maintain_winit_mode_for_animation(
     script_widgets: Query<&jim_widget::script_widget::ScriptWidget>,
     widget_anim: Res<jim_widget::anim::WidgetAnim>,
     mut settings: ResMut<bevy::winit::WinitSettings>,
+    time: Res<Time>,
+    mut pin_watch: ResMut<diagnostics::ContinuousWatch>,
 ) {
     let preset_animates = preset.0.as_deref().map_or(false, |name| {
         registry
@@ -1620,6 +1686,16 @@ fn maintain_winit_mode_for_animation(
     // idle, so the widget's `on_frame` tick — and thus its proc-drain —
     // arrives ~5s late even though the underlying work finished in ms.
     let widget_animating = script_widgets.iter().any(|w| w.is_animating());
+    // A *slow-ticking* widget (auto-refresh poll, e.g. http.ft on a 300s
+    // interval) wants periodic `on_frame` ticks but explicitly does NOT
+    // need 60fps. Serving it from the reactive loop instead of Continuous
+    // is the difference between ~150% CPU (one poller pins the whole app
+    // at 60fps) and ~0%. Collect the smallest requested cadence so the
+    // reactive wake is frequent enough for the most eager slow-ticker.
+    let widget_tick_min: Option<f32> = script_widgets
+        .iter()
+        .filter_map(|w| w.tick_interval_secs())
+        .fold(None, |acc, s| Some(acc.map_or(s, |a: f32| a.min(s))));
     // The drawer's slide and the 3D project prism (live textures + camera
     // animation) are the other sources of "needs every frame". The cooldown
     // keeps redrawing briefly after the prism closes so the flat panes
@@ -1639,8 +1715,60 @@ fn maintain_winit_mode_for_animation(
         // 5s otherwise) and keystrokes feel instant.
         || palette.open;
 
+    // Regression canary: time how long we've been Continuous for a
+    // *transient* reason (one that should resolve in seconds). Excludes
+    // the intentionally-sustained sources (animated theme, open palette,
+    // active 3D prism) — those legitimately stay continuous as long as the
+    // user wants and must NOT trip the warning bar. If a transient reason
+    // holds past `CONTINUOUS_WARN_SECS`, `update_continuous_pin_overlay`
+    // shows a yellow bar naming the culprit. See diagnostics.rs.
+    let mut transient_reasons: Vec<String> = Vec::new();
+    if widget_animating {
+        let mut stems: Vec<&str> = script_widgets
+            .iter()
+            .filter(|w| w.is_animating())
+            .filter_map(|w| w.script_path.file_stem().and_then(|s| s.to_str()))
+            .collect();
+        stems.sort_unstable();
+        stems.dedup();
+        transient_reasons.push(format!("widget:{}", stems.join(",")));
+    }
+    if widget_anim.any_in_flight() {
+        transient_reasons.push("glaze-transition".into());
+    }
+    if drawer.animating() {
+        transient_reasons.push("drawer".into());
+    }
+    if prism.continuous_cooldown > 0 {
+        transient_reasons.push("prism-cooldown".into());
+    }
+    if transient_reasons.is_empty() {
+        pin_watch.held_secs = 0.0;
+        pin_watch.reason.clear();
+    } else {
+        pin_watch.held_secs += time.delta_secs();
+        pin_watch.reason = transient_reasons.join(" + ");
+    }
+    // Tick down the post-dismissal snooze. While it's positive the overlay
+    // stays hidden even if the app is still pinned; when it hits zero a
+    // still-stuck pin re-raises the bar.
+    if pin_watch.mute_remaining_secs > 0.0 {
+        pin_watch.mute_remaining_secs =
+            (pin_watch.mute_remaining_secs - time.delta_secs()).max(0.0);
+    }
+
+    // Idle baseline is reactive(5s). A slow-ticker tightens that to its
+    // cadence (clamped to [0.1s, 5s] — never slower than the baseline, and
+    // floored so a sub-100ms request can't masquerade as cheap polling
+    // when it really wants `set_animating`). For a 300s poll this stays at
+    // 5s: the host wakes every 5s, the tick scheduler delivers the actual
+    // `on_frame` only once the widget's 300s elapses. Near-zero CPU.
     let target = if want_continuous {
         bevy::winit::UpdateMode::Continuous
+    } else if let Some(iv) = widget_tick_min {
+        bevy::winit::UpdateMode::reactive(std::time::Duration::from_secs_f32(
+            iv.clamp(0.1, 5.0),
+        ))
     } else {
         bevy::winit::UpdateMode::reactive(std::time::Duration::from_secs(5))
     };
@@ -1654,6 +1782,12 @@ fn maintain_winit_mode_for_animation(
     // animating widget escalates the unfocused mode.
     let unfocused_target = if widget_animating {
         bevy::winit::UpdateMode::Continuous
+    } else if let Some(iv) = widget_tick_min {
+        // Keep slow pollers ticking while unfocused too, but no faster
+        // than they asked and never tighter than the 60s low-power floor.
+        bevy::winit::UpdateMode::reactive_low_power(std::time::Duration::from_secs_f32(
+            iv.clamp(0.1, 60.0),
+        ))
     } else {
         bevy::winit::UpdateMode::reactive_low_power(std::time::Duration::from_secs(60))
     };

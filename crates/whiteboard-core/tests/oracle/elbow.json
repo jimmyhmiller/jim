@@ -1,0 +1,64 @@
+{
+  "kind": "elbow",
+  "excalidrawVersion": "0.18.0-f0063e113",
+  "cases": [
+    {
+      "name": "elbow_to_rect",
+      "target": {
+        "id": "r",
+        "type": "rectangle",
+        "x": 300,
+        "y": 200,
+        "width": 120,
+        "height": 80,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "arrow": {
+        "id": "eb",
+        "type": "arrow",
+        "x": 120,
+        "y": 240,
+        "width": 175,
+        "height": 0.1,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            175,
+            -0.1
+          ]
+        ],
+        "endBinding": {
+          "elementId": "r",
+          "focus": 0,
+          "gap": 20,
+          "fixedPoint": [
+            -0.04166666666666619,
+            0.4987500000000001
+          ]
+        }
+      },
+      "expected": {
+        "endBinding": {
+          "focus": 0,
+          "gap": 20,
+          "fixedPoint": [
+            -0.041667,
+            0.49875
+          ]
+        },
+        "endpointAtBind": [
+          295,
+          239.9
+        ]
+      }
+    }
+  ]
+}

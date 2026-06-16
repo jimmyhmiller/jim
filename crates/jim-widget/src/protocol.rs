@@ -241,6 +241,14 @@ pub struct Style {
     /// Lab painting candidates in their own palettes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_color: Option<String>,
+
+    /// When true, this container becomes a horizontal clip boundary: the
+    /// renderer clamps every descendant text run's `TextBounds` to this
+    /// container's laid-out right edge (and marks them no-host-reclip), so
+    /// overflowing single-line text (e.g. a no-wrap code line) is cut at the
+    /// container edge instead of bleeding out to the pane content edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip: Option<bool>,
 }
 
 impl Style {
@@ -769,6 +777,14 @@ pub enum Element {
         /// out (e.g. text that's part of a custom drag gesture).
         #[serde(default = "default_true")]
         selectable: bool,
+        /// When false, the text is laid out as a SINGLE line (never word-
+        /// wrapped): its min- and max-content width both equal the full
+        /// line, so flex containers can't squeeze it into a taller wrapped
+        /// box. Long lines overflow horizontally and clip at the pane edge
+        /// instead. Use for code/diff rows that must keep a fixed height.
+        /// Defaults true (wrap), matching prior behavior.
+        #[serde(default = "default_true")]
+        wrap: bool,
     },
     /// Clickable button. The host sends `{"event":"click","id":"<id>"}`
     /// back to the widget on press; ids must be unique within a frame.

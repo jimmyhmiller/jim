@@ -1,0 +1,270 @@
+{
+  "kind": "bounds",
+  "excalidrawVersion": "0.18.0-f0063e113",
+  "cases": [
+    {
+      "name": "rectangle",
+      "element": {
+        "id": "r",
+        "type": "rectangle",
+        "x": 100,
+        "y": 120,
+        "width": 200,
+        "height": 90,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "expected": {
+        "bounds": [
+          100,
+          120,
+          300,
+          210
+        ],
+        "absoluteCoords": [
+          100,
+          120,
+          300,
+          210,
+          200,
+          165
+        ]
+      }
+    },
+    {
+      "name": "ellipse",
+      "element": {
+        "id": "e",
+        "type": "ellipse",
+        "x": 100,
+        "y": 120,
+        "width": 80,
+        "height": 80,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "expected": {
+        "bounds": [
+          100,
+          120,
+          180,
+          200
+        ],
+        "absoluteCoords": [
+          100,
+          120,
+          180,
+          200,
+          140,
+          160
+        ]
+      }
+    },
+    {
+      "name": "diamond",
+      "element": {
+        "id": "d",
+        "type": "diamond",
+        "x": 100,
+        "y": 120,
+        "width": 120,
+        "height": 60,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "expected": {
+        "bounds": [
+          100,
+          120,
+          220,
+          180
+        ],
+        "absoluteCoords": [
+          100,
+          120,
+          220,
+          180,
+          160,
+          150
+        ]
+      }
+    },
+    {
+      "name": "line_2pt",
+      "element": {
+        "id": "l2",
+        "type": "line",
+        "x": 50,
+        "y": 50,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            120,
+            40
+          ]
+        ]
+      },
+      "expected": {
+        "bounds": [
+          50,
+          50,
+          170,
+          90
+        ],
+        "absoluteCoords": [
+          50,
+          50,
+          170,
+          90,
+          110,
+          70
+        ]
+      }
+    },
+    {
+      "name": "line_zigzag",
+      "element": {
+        "id": "lz",
+        "type": "line",
+        "x": 50,
+        "y": 50,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            60,
+            -30
+          ],
+          [
+            120,
+            30
+          ],
+          [
+            180,
+            0
+          ]
+        ]
+      },
+      "expected": {
+        "bounds": [
+          50,
+          20,
+          230,
+          80
+        ],
+        "absoluteCoords": [
+          50,
+          20,
+          230,
+          80,
+          140,
+          50
+        ]
+      }
+    },
+    {
+      "name": "arrow_2pt",
+      "element": {
+        "id": "a2",
+        "type": "arrow",
+        "x": 50,
+        "y": 50,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            120,
+            40
+          ]
+        ]
+      },
+      "expected": {
+        "bounds": [
+          50,
+          50,
+          170,
+          90
+        ],
+        "absoluteCoords": [
+          50,
+          50,
+          170,
+          90,
+          110,
+          70
+        ]
+      }
+    },
+    {
+      "name": "arrow_curved",
+      "element": {
+        "id": "ac",
+        "type": "arrow",
+        "x": 50,
+        "y": 50,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": {
+          "type": 2
+        },
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            60,
+            -40
+          ],
+          [
+            120,
+            30
+          ]
+        ]
+      },
+      "expected": {
+        "bounds": [
+          49.926632,
+          9.13057,
+          169.884302,
+          80.226341
+        ],
+        "absoluteCoords": [
+          50,
+          10,
+          170,
+          80,
+          110,
+          45
+        ]
+      }
+    }
+  ]
+}

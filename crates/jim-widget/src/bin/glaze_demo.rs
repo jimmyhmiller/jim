@@ -98,6 +98,7 @@ fn compiled_to_style(c: &CompiledStyle) -> Style {
 
 fn text(value: &str, color: &str, size: f32, bold: bool) -> Element {
     Element::Text {
+        wrap: true,
         value: value.into(),
         color: Some(color.into()),
         size: Some(size),

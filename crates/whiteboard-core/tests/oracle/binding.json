@@ -1,0 +1,258 @@
+{
+  "kind": "binding",
+  "excalidrawVersion": "0.18.0-f0063e113",
+  "cases": [
+    {
+      "name": "arrow_to_rect_left_mid",
+      "target": {
+        "id": "r",
+        "type": "rectangle",
+        "x": 300,
+        "y": 200,
+        "width": 100,
+        "height": 60,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "arrow": {
+        "id": "a",
+        "type": "arrow",
+        "x": 150,
+        "y": 230,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            155,
+            2
+          ]
+        ],
+        "endBinding": {
+          "elementId": "r",
+          "focus": -0.08421052631578835,
+          "gap": 5
+        }
+      },
+      "expected": {
+        "endBinding": {
+          "focus": -0.084211,
+          "gap": 5
+        },
+        "adjacentAtBind": [
+          150,
+          230
+        ],
+        "edgeAtBind": [
+          305,
+          232
+        ],
+        "endpointAtBind": [
+          305,
+          232
+        ],
+        "targetMovedDx": 120,
+        "endpointAfterMove": [
+          415,
+          232.12
+        ]
+      }
+    },
+    {
+      "name": "arrow_to_rect_center",
+      "target": {
+        "id": "r",
+        "type": "rectangle",
+        "x": 300,
+        "y": 200,
+        "width": 100,
+        "height": 60,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "arrow": {
+        "id": "a",
+        "type": "arrow",
+        "x": 150,
+        "y": 230,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            200,
+            0
+          ]
+        ],
+        "endBinding": {
+          "elementId": "r",
+          "focus": 0,
+          "gap": 16
+        }
+      },
+      "expected": {
+        "endBinding": {
+          "focus": 0,
+          "gap": 16
+        },
+        "adjacentAtBind": [
+          150,
+          230
+        ],
+        "edgeAtBind": [
+          350,
+          230
+        ],
+        "endpointAtBind": [
+          350,
+          230
+        ],
+        "targetMovedDx": 120,
+        "endpointAfterMove": [
+          404,
+          230
+        ]
+      }
+    },
+    {
+      "name": "arrow_to_ellipse_center",
+      "target": {
+        "id": "e",
+        "type": "ellipse",
+        "x": 300,
+        "y": 200,
+        "width": 100,
+        "height": 100,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "arrow": {
+        "id": "a",
+        "type": "arrow",
+        "x": 120,
+        "y": 250,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            230,
+            0
+          ]
+        ],
+        "endBinding": {
+          "elementId": "e",
+          "focus": 0,
+          "gap": null
+        }
+      },
+      "expected": {
+        "endBinding": {
+          "focus": 0,
+          "gap": null
+        },
+        "adjacentAtBind": [
+          120,
+          250
+        ],
+        "edgeAtBind": [
+          350,
+          250
+        ],
+        "endpointAtBind": [
+          350,
+          250
+        ],
+        "targetMovedDx": 120,
+        "endpointAfterMove": [
+          470,
+          250
+        ]
+      }
+    },
+    {
+      "name": "arrow_to_diamond",
+      "target": {
+        "id": "d",
+        "type": "diamond",
+        "x": 300,
+        "y": 200,
+        "width": 120,
+        "height": 80,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null
+      },
+      "arrow": {
+        "id": "a",
+        "type": "arrow",
+        "x": 140,
+        "y": 240,
+        "width": 0,
+        "height": 0,
+        "angle": 0,
+        "strokeWidth": 2,
+        "roundness": null,
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            220,
+            0
+          ]
+        ],
+        "endBinding": {
+          "elementId": "d",
+          "focus": 0,
+          "gap": 16
+        }
+      },
+      "expected": {
+        "endBinding": {
+          "focus": 0,
+          "gap": 16
+        },
+        "adjacentAtBind": [
+          140,
+          240
+        ],
+        "edgeAtBind": [
+          360,
+          240
+        ],
+        "endpointAtBind": [
+          360,
+          240
+        ],
+        "targetMovedDx": 120,
+        "endpointAfterMove": [
+          404.184422,
+          240.000013
+        ]
+      }
+    }
+  ]
+}

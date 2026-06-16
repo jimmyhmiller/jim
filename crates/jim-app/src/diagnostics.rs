@@ -62,6 +62,26 @@ const OVERLAY_MARGIN: f32 = 8.0;
 /// Same layer/Z band as the FPS meter so it floats above panes + menus.
 const OVERLAY_Z: f32 = 951.0;
 
+/// How long the app may sit in winit `Continuous` (60fps, ~1.5 cores) for
+/// a *transient* reason before the yellow "GPU pinned" bar appears. This
+/// is a regression canary for the class of bug where a widget holds
+/// `set_animating(true)` (or a Glaze transition / drawer never finishes)
+/// and pins the whole app at full framerate forever. Real animations are
+/// brief: garden growth is 8s, transitions <1s, even a busy back-to-back
+/// agent session rarely keeps it continuous for a solid minute — so a full
+/// minute of *uninterrupted* continuous means something is genuinely
+/// stuck. Intentionally-sustained modes (an animated theme, an open
+/// palette, the 3D prism) are excluded from the timer in
+/// `maintain_winit_mode_for_animation`, so they never trip it.
+/// See [[project_widget_slow_tick_decouple]].
+const CONTINUOUS_WARN_SECS: f32 = 60.0;
+/// Height of the warning bar across the top edge.
+const PIN_BAR_HEIGHT: f32 = 26.0;
+/// Clicking the bar dismisses it and suppresses it for this long, even if
+/// the app stays pinned. After it elapses, a still-stuck pin re-raises the
+/// bar (so a dismissal is a snooze, not a permanent mute).
+const PIN_MUTE_SECS: f32 = 15.0 * 60.0;
+
 pub struct DiagnosticsPlugin;
 
 impl Plugin for DiagnosticsPlugin {
@@ -69,8 +89,35 @@ impl Plugin for DiagnosticsPlugin {
         spawn_footprint_heartbeat();
         append_log("[mem] ---- diagnostics started ----");
         app.init_resource::<MemReadout>()
-            .add_systems(Update, (sample_memory, update_warning_overlay).chain());
+            .init_resource::<ContinuousWatch>()
+            .add_systems(
+                Update,
+                (
+                    sample_memory,
+                    update_warning_overlay,
+                    dismiss_continuous_pin_on_click,
+                    update_continuous_pin_overlay,
+                )
+                    .chain(),
+            );
     }
+}
+
+/// How long (seconds) the app has been continuously in winit `Continuous`
+/// for a transient reason, plus a human-readable reason string. Written by
+/// `maintain_winit_mode_for_animation` each frame; read by
+/// `update_continuous_pin_overlay`. `held_secs` resets to 0 the moment the
+/// app drops back to reactive (or the only reason is an intentionally-
+/// sustained one), so the bar self-clears.
+#[derive(Resource, Default)]
+pub struct ContinuousWatch {
+    pub held_secs: f32,
+    pub reason: String,
+    /// Seconds remaining on the post-dismissal snooze. `> 0` hides the bar
+    /// regardless of `held_secs`; counts down in
+    /// `maintain_winit_mode_for_animation`. Set to `PIN_MUTE_SECS` when the
+    /// user clicks the bar.
+    pub mute_remaining_secs: f32,
 }
 
 /// Latest sample, published by `sample_memory` for the on-screen overlay
@@ -415,6 +462,139 @@ fn update_warning_overlay(
             TextColor(color),
             Anchor::TOP_LEFT,
             Transform::from_xyz(x, y, OVERLAY_Z),
+            RenderLayers::layer(MENU_OVERLAY_LAYER),
+        ));
+    }
+}
+
+#[derive(Component)]
+struct ContinuousPinBar;
+#[derive(Component)]
+struct ContinuousPinText;
+
+/// A left-click anywhere on the warning bar (the top `PIN_BAR_HEIGHT`px
+/// strip, full width) dismisses it and arms the `PIN_MUTE_SECS` snooze.
+/// Only fires while the bar is actually visible, so a normal click in the
+/// top edge of the canvas isn't swallowed when there's no warning up.
+fn dismiss_continuous_pin_on_click(
+    mut watch: ResMut<ContinuousWatch>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+) {
+    if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    // Bar must be on screen to be clickable.
+    if !(watch.held_secs > CONTINUOUS_WARN_SECS && watch.mute_remaining_secs <= 0.0) {
+        return;
+    }
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    // cursor_position: origin top-left, y grows downward — the bar occupies
+    // the top strip, so y within [0, PIN_BAR_HEIGHT] is a hit.
+    if cursor.y <= PIN_BAR_HEIGHT {
+        watch.mute_remaining_secs = PIN_MUTE_SECS;
+        append_log(&format!(
+            "[pin-overlay] dismissed by click after {:.0}s — snoozing {:.0}min",
+            watch.held_secs,
+            PIN_MUTE_SECS / 60.0,
+        ));
+    }
+}
+
+/// The regression canary: a yellow bar across the top edge that appears
+/// once the app has been pinned in `Continuous` (60fps) for a transient
+/// reason longer than `CONTINUOUS_WARN_SECS`, and names the culprit (e.g.
+/// `widget:garden`). Self-clears when the app drops back to reactive, and
+/// a click dismisses it for `PIN_MUTE_SECS`. Mirrors the memory-warning
+/// overlay's spawn/despawn-on-threshold shape.
+fn update_continuous_pin_overlay(
+    mut commands: Commands,
+    watch: Res<ContinuousWatch>,
+    font: Option<Res<MonoFont>>,
+    windows: Query<&Window>,
+    mut bars: Query<
+        (Entity, &mut Sprite, &mut Transform),
+        (With<ContinuousPinBar>, Without<ContinuousPinText>),
+    >,
+    mut texts: Query<
+        (Entity, &mut Text2d, &mut Transform),
+        (With<ContinuousPinText>, Without<ContinuousPinBar>),
+    >,
+    mut was_showing: Local<bool>,
+) {
+    let show = watch.held_secs > CONTINUOUS_WARN_SECS && watch.mute_remaining_secs <= 0.0;
+
+    if show != *was_showing {
+        *was_showing = show;
+        append_log(&format!(
+            "[pin-overlay] {} after {:.1}s continuous — reason: {}",
+            if show { "SHOWN" } else { "cleared" },
+            watch.held_secs,
+            watch.reason,
+        ));
+    }
+
+    if !show {
+        for (e, ..) in &bars {
+            commands.entity(e).despawn();
+        }
+        for (e, ..) in &texts {
+            commands.entity(e).despawn();
+        }
+        return;
+    }
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let w = window.width();
+    let bar_y = window.height() * 0.5 - PIN_BAR_HEIGHT * 0.5;
+    let yellow = Color::srgb(0.96, 0.75, 0.1);
+    // ASCII only — the mono font has no warning glyph (would render tofu).
+    let text = format!(
+        "GPU PINNED CONTINUOUS {:.0}s  -  {}",
+        watch.held_secs, watch.reason,
+    );
+
+    if let Ok((_, mut sprite, mut tx)) = bars.single_mut() {
+        sprite.custom_size = Some(Vec2::new(w, PIN_BAR_HEIGHT));
+        tx.translation.y = bar_y;
+    } else {
+        commands.spawn((
+            ContinuousPinBar,
+            Sprite {
+                color: yellow,
+                custom_size: Some(Vec2::new(w, PIN_BAR_HEIGHT)),
+                ..default()
+            },
+            // Just behind the label, same overlay band as the FPS meter.
+            Transform::from_xyz(0.0, bar_y, OVERLAY_Z - 0.1),
+            RenderLayers::layer(MENU_OVERLAY_LAYER),
+        ));
+    }
+
+    if let Ok((_, mut t, mut tx)) = texts.single_mut() {
+        t.0 = text;
+        tx.translation.y = bar_y;
+    } else {
+        let Some(font) = font else { return };
+        commands.spawn((
+            ContinuousPinText,
+            Text2d::new(text),
+            TextFont {
+                font: font.0.clone(),
+                font_size: FONT_SIZE,
+                ..default()
+            },
+            // Dark text reads on yellow.
+            TextColor(Color::srgb(0.12, 0.06, 0.0)),
+            Anchor::CENTER,
+            Transform::from_xyz(0.0, bar_y, OVERLAY_Z),
             RenderLayers::layer(MENU_OVERLAY_LAYER),
         ));
     }

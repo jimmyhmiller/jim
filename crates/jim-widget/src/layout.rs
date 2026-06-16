@@ -36,6 +36,10 @@ use crate::protocol::{Align, Border, ButtonKind, Edges, Element, Shadow, Style a
 pub struct MeasureCtx {
     pub value: String,
     pub font_size: f32,
+    /// When false, measure as a single line (no word-wrap) — see
+    /// `Element::Text.wrap`. Other leaves (button/badge/input) always
+    /// pass true; only `Text` plumbs this through.
+    pub wrap: bool,
 }
 
 /// Built layout: the Taffy tree + the root node + a parallel vector of
@@ -133,7 +137,9 @@ fn build_node(
                 .collect();
             taffy.new_with_children(st, &kids).unwrap()
         }
-        Element::Text { value, size, .. } => {
+        Element::Text {
+            value, size, wrap, ..
+        } => {
             let font_size = size.unwrap_or(crate::render::DEFAULT_FONT_SIZE);
             let st = taffy::Style {
                 ..taffy::Style::DEFAULT
@@ -144,6 +150,7 @@ fn build_node(
                     MeasureCtx {
                         value: value.clone(),
                         font_size,
+                        wrap: *wrap,
                     },
                 )
                 .unwrap()
@@ -184,6 +191,7 @@ fn build_node(
                 MeasureCtx {
                     value: value.clone(),
                     font_size: crate::render::BADGE_FONT_SIZE,
+                    wrap: true,
                 },
             )
             .unwrap(),
@@ -201,6 +209,7 @@ fn build_node(
                 MeasureCtx {
                     value: label.clone(),
                     font_size: crate::render::DEFAULT_FONT_SIZE,
+                    wrap: true,
                 },
             )
             .unwrap(),
@@ -210,6 +219,7 @@ fn build_node(
                 MeasureCtx {
                     value: label.clone(),
                     font_size: crate::render::DEFAULT_FONT_SIZE,
+                    wrap: true,
                 },
             )
             .unwrap(),
@@ -219,6 +229,7 @@ fn build_node(
                 MeasureCtx {
                     value: label.clone(),
                     font_size: crate::render::DEFAULT_FONT_SIZE,
+                    wrap: true,
                 },
             )
             .unwrap(),
@@ -299,6 +310,7 @@ fn build_node(
                             MeasureCtx {
                                 value: t.label.clone(),
                                 font_size: crate::render::DEFAULT_FONT_SIZE,
+                                wrap: true,
                             },
                         )
                         .unwrap()
@@ -341,6 +353,7 @@ fn build_node(
                             MeasureCtx {
                                 value: o.label.clone(),
                                 font_size: crate::render::DEFAULT_FONT_SIZE,
+                                wrap: true,
                             },
                         )
                         .unwrap()
@@ -382,6 +395,7 @@ fn build_node(
                         MeasureCtx {
                             value: label.clone(),
                             font_size: crate::render::DEFAULT_FONT_SIZE,
+                            wrap: true,
                         },
                     )
                     .unwrap();
@@ -442,6 +456,7 @@ fn build_node(
                         MeasureCtx {
                             value: label.clone(),
                             font_size: crate::render::DEFAULT_FONT_SIZE,
+                            wrap: true,
                         },
                     )
                     .unwrap();
@@ -593,6 +608,7 @@ fn table_cell_leaf(taffy: &mut TaffyTree<MeasureCtx>, text: &str) -> NodeId {
             MeasureCtx {
                 value: text.to_string(),
                 font_size: crate::render::DEFAULT_FONT_SIZE,
+                wrap: true,
             },
         )
         .unwrap()
@@ -687,6 +703,16 @@ fn apply_style_overrides(s: &mut taffy::Style, style: Option<&PStyle>) {
     if let Some(a) = style.align_self {
         s.align_self = Some(align_to_taffy(a));
     }
+    // `clip: true` makes this a horizontal clip boundary. Telling Taffy the
+    // box clips on the x-axis means overflowing children no longer inflate
+    // its content size, so the box stays at its laid-out (e.g. stretched)
+    // width — which is the width the renderer truncates descendant text to.
+    if style.clip == Some(true) {
+        s.overflow = taffy::geometry::Point {
+            x: taffy::style::Overflow::Clip,
+            y: taffy::style::Overflow::Visible,
+        };
+    }
 }
 
 /// Parse a Style width/height/min/max string.
@@ -765,7 +791,6 @@ fn measure_text(
             height: h,
         };
     }
-    let intrinsic_w = metrics.measure(&ctx.value, ctx.font_size);
     let char_w = metrics.char_width(ctx.font_size);
     // Min-content width is the widest *unbreakable word*, NOT the whole line.
     // If a text leaf reported its full single-line width as its minimum, flex
@@ -782,40 +807,57 @@ fn measure_text(
         AvailableSpace::MinContent => longest_word.max(char_w),
         AvailableSpace::MaxContent => f32::INFINITY,
     };
-    if intrinsic_w <= max_w {
-        return Size {
-            width: intrinsic_w,
-            height: line_h,
-        };
-    }
-    // Word-wrap: break on whitespace, accumulate words per line until
-    // the next word would overflow, then start a new line.
-    if char_w <= 0.0 || max_w <= 0.0 {
-        return Size {
-            width: intrinsic_w,
-            height: line_h,
-        };
-    }
-    let mut lines: u32 = 1;
+    // Count visual lines and the widest line, honoring HARD `\n` breaks: each
+    // newline-delimited segment is laid out independently and word-wrapped to
+    // `max_w`. Without this, a multi-line value (e.g. a code block) was sized
+    // as a single line and its text overflowed the box. A blank segment still
+    // occupies one line, and a value with no `\n` behaves exactly as before.
+    // `wrap: false` (code/diff rows) forces a single line: every segment is
+    // measured at its full width regardless of the available space, so the
+    // leaf's min- AND max-content width both equal the full line and no flex
+    // container can squeeze it into a taller wrapped box.
+    let wrappable = ctx.wrap && char_w > 0.0 && max_w > 0.0 && max_w.is_finite();
+    let mut total_lines: u32 = 0;
     let mut max_line_w: f32 = 0.0;
-    let mut line_w: f32 = 0.0;
-    let mut first_word = true;
-    for word in ctx.value.split_whitespace() {
-        let w = word.chars().count() as f32 * char_w;
-        let added = if first_word { w } else { char_w + w };
-        if !first_word && line_w + added > max_w {
-            max_line_w = max_line_w.max(line_w);
-            lines += 1;
-            line_w = w;
-        } else {
-            line_w += added;
-            first_word = false;
+    for segment in ctx.value.split('\n') {
+        let seg_w = metrics.measure(segment, ctx.font_size);
+        if !wrappable || seg_w <= max_w {
+            max_line_w = max_line_w.max(seg_w);
+            total_lines += 1;
+            continue;
         }
+        // Word-wrap this segment: accumulate words per line until the next
+        // word would overflow, then start a new line.
+        let mut lines: u32 = 1;
+        let mut line_w: f32 = 0.0;
+        let mut first_word = true;
+        for word in segment.split_whitespace() {
+            let w = word.chars().count() as f32 * char_w;
+            let added = if first_word { w } else { char_w + w };
+            if !first_word && line_w + added > max_w {
+                max_line_w = max_line_w.max(line_w);
+                lines += 1;
+                line_w = w;
+            } else {
+                line_w += added;
+                first_word = false;
+            }
+        }
+        max_line_w = max_line_w.max(line_w);
+        total_lines += lines;
     }
-    max_line_w = max_line_w.max(line_w);
+    let total_lines = total_lines.max(1);
+    // Clamp to the available width only when we actually wrapped; a no-wrap
+    // line reports its full width so it overflows (and clips) instead of
+    // having its box shrunk under the text, which would re-introduce wrapping.
+    let width = if wrappable && max_w.is_finite() {
+        max_line_w.min(max_w)
+    } else {
+        max_line_w
+    };
     Size {
-        width: max_line_w.min(max_w),
-        height: line_h * lines as f32,
+        width,
+        height: line_h * total_lines as f32,
     }
 }
 
@@ -847,6 +889,146 @@ pub fn absolute_position(laid: &LaidOut, mut node: NodeId, root: NodeId) -> Vec2
 #[allow(dead_code)]
 fn _check_style_imports(_b: Border, _sh: Shadow, _w: Weight, _k: ButtonKind) {}
 
+// ===========================================================================
+// Clip / truncation
+//
+// Bevy's `Text2d` + `TextBounds` only governs WRAPPING, not clipping — a
+// single-line (`no_wrap`) run ignores the bounds width and renders its full
+// length (cut only by the per-pane camera at the pane edge). So to contain a
+// long line inside an inner box (e.g. a diff row's tint), we can't clip pixels
+// — we shorten the STRING to fit the box. The host font is monospace, so this
+// is pixel-exact. `resolve_clipped_runs` is a pure mirror of `render_node`'s
+// clip propagation so the behavior is unit-testable with no Bevy World.
+// ===========================================================================
+
+/// Longest char-boundary prefix of `text` whose rendered width at `font_size`
+/// fits within `avail_w` px (monospace-exact via [`PaneFontMetrics`]).
+/// `avail_w <= 0` → empty; non-positive char width → text unchanged.
+pub fn truncate_to_width(
+    text: &str,
+    font_size: f32,
+    avail_w: f32,
+    metrics: &PaneFontMetrics,
+) -> String {
+    if avail_w <= 0.0 {
+        return String::new();
+    }
+    let cw = metrics.char_width(font_size);
+    if cw <= 0.0 {
+        return text.to_string();
+    }
+    let max_chars = (avail_w / cw).floor() as usize;
+    let n = text.chars().count();
+    if n <= max_chars {
+        return text.to_string();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+/// One text run after clip resolution — what would actually be drawn.
+#[derive(Debug, Clone)]
+pub struct ClippedRun {
+    /// Absolute top-left of the run in content-root space.
+    pub origin: Vec2,
+    /// Clip boundary inherited from the nearest `clip:true` ancestor (None if
+    /// no clipping ancestor).
+    pub clip_right: Option<f32>,
+    /// The original (untruncated) string.
+    pub full: String,
+    /// The string after clip-truncation — this is what renders.
+    pub rendered: String,
+    pub font_size: f32,
+}
+
+impl ClippedRun {
+    /// Right edge of the rendered (truncated) text, in content space.
+    pub fn rendered_right(&self, metrics: &PaneFontMetrics) -> f32 {
+        self.origin.x + metrics.measure(&self.rendered, self.font_size)
+    }
+}
+
+fn el_children(el: &Element) -> &[Element] {
+    match el {
+        Element::Vstack { children, .. }
+        | Element::Hstack { children, .. }
+        | Element::Frame { children, .. }
+        | Element::Scroll { children, .. }
+        | Element::ListItem { children, .. } => children,
+        _ => &[],
+    }
+}
+
+fn el_clips(el: &Element) -> bool {
+    let style = match el {
+        Element::Vstack { style, .. }
+        | Element::Hstack { style, .. }
+        | Element::Frame { style, .. }
+        | Element::ListItem { style, .. } => style.as_ref(),
+        _ => None,
+    };
+    style.and_then(|s| s.clip) == Some(true)
+}
+
+fn walk_clips(
+    laid: &LaidOut,
+    node: NodeId,
+    el: &Element,
+    origin: Vec2,
+    clip_right: Option<f32>,
+    metrics: &PaneFontMetrics,
+    out: &mut Vec<ClippedRun>,
+) {
+    let size = laid.layout(node).size;
+    if let Element::Text { value, size: fs, .. } = el {
+        let font_size = fs.unwrap_or(crate::render::DEFAULT_FONT_SIZE);
+        let rendered = match clip_right {
+            Some(cr) => truncate_to_width(value, font_size, (cr - origin.x).max(0.0), metrics),
+            None => value.clone(),
+        };
+        out.push(ClippedRun {
+            origin,
+            clip_right,
+            full: value.clone(),
+            rendered,
+            font_size,
+        });
+        return;
+    }
+    // Same rule as `render_node::recurse_children`: a clip container tightens
+    // the right boundary to its own laid-out right edge.
+    let child_clip = if el_clips(el) {
+        let edge = origin.x + size.width;
+        Some(clip_right.map_or(edge, |c| c.min(edge)))
+    } else {
+        clip_right
+    };
+    let kids = el_children(el);
+    let cids = laid.taffy.children(node).unwrap_or_default();
+    for (cid, child) in cids.iter().zip(kids.iter()) {
+        let cl = laid.layout(*cid);
+        let cpos = origin + Vec2::new(cl.location.x, cl.location.y);
+        walk_clips(laid, *cid, child, cpos, child_clip, metrics, out);
+    }
+}
+
+/// Lay out `el` in a `content_w × content_h` viewport and resolve every text
+/// run's clip-truncation — a headless mirror of what `render_node` draws.
+/// Used by tests to assert containment without a GPU/World.
+pub fn resolve_clipped_runs(
+    el: &Element,
+    metrics: &PaneFontMetrics,
+    content_w: f32,
+    content_h: f32,
+) -> Vec<ClippedRun> {
+    let mut laid = build_tree(el, metrics);
+    compute(&mut laid, content_w, content_h, metrics);
+    let root_layout = laid.layout(laid.root);
+    let root_origin = Vec2::new(root_layout.location.x, root_layout.location.y);
+    let mut out = Vec::new();
+    walk_clips(&laid, laid.root, el, root_origin, None, metrics, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,6 +1046,149 @@ mod tests {
             height: Some(p.into()),
             ..Default::default()
         }
+    }
+
+    // ---- clip / truncation helpers ----
+    fn text_run(s: &str, size: f32) -> Element {
+        Element::Text {
+            value: s.into(),
+            color: None,
+            size: Some(size),
+            weight: None,
+            family: None,
+            selectable: true,
+            wrap: false,
+        }
+    }
+    /// A fixed-width clip frame.
+    fn clip_frame(width_px: &str, children: Vec<Element>) -> Element {
+        Element::Frame {
+            gap: 0.0,
+            pad: 0.0,
+            style: Some(Style {
+                width: Some(width_px.into()),
+                clip: Some(true),
+                ..Default::default()
+            }),
+            children,
+        }
+    }
+    fn hstack(children: Vec<Element>) -> Element {
+        Element::Hstack {
+            gap: 0.0,
+            pad: 0.0,
+            align: Align::Start,
+            style: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn truncate_to_width_boundaries() {
+        let m = metrics(); // cell_width 8.4 @ 14px
+        let cw = m.char_width(14.0);
+        assert_eq!(truncate_to_width("hello", 14.0, 1000.0, &m), "hello", "fits → unchanged");
+        assert_eq!(truncate_to_width("hello", 14.0, 0.0, &m), "", "zero width → empty");
+        assert_eq!(truncate_to_width("hello", 14.0, -5.0, &m), "", "negative → empty");
+        // exactly 3 chars of room
+        assert_eq!(truncate_to_width("hello", 14.0, cw * 3.0 + 0.1, &m), "hel");
+        // just under 3 → 2
+        assert_eq!(truncate_to_width("hello", 14.0, cw * 3.0 - 0.1, &m), "he");
+        // unicode: count by chars, never split a codepoint
+        assert_eq!(truncate_to_width("héllo", 14.0, cw * 2.0 + 0.1, &m), "hé");
+    }
+
+    /// THE core property (the bug): a long single line in a clip box must render
+    /// no wider than the box — at any box width — and stay on a char boundary.
+    #[test]
+    fn long_line_never_exceeds_clip_box() {
+        let m = metrics();
+        let long = "abcdefghij".repeat(40); // 400 chars
+        for w in ["40", "100", "237", "512"] {
+            let el = clip_frame(w, vec![text_run(&long, 14.0)]);
+            let runs = resolve_clipped_runs(&el, &m, 1000.0, 600.0);
+            assert_eq!(runs.len(), 1);
+            let r = &runs[0];
+            assert!(r.rendered.chars().count() < r.full.chars().count(), "w={w}: should truncate");
+            let clip = r.clip_right.expect("inside clip box");
+            assert!(
+                r.rendered_right(&m) <= clip + 0.01,
+                "w={w}: rendered right {} must not exceed clip {}",
+                r.rendered_right(&m),
+                clip
+            );
+        }
+    }
+
+    /// Multi-run (syntax-highlighted) line: every colored run shares the box's
+    /// right edge — none may bleed past it, and runs starting past it vanish.
+    #[test]
+    fn multi_run_line_all_runs_contained() {
+        let m = metrics();
+        let el = clip_frame(
+            "120",
+            vec![hstack(vec![
+                text_run(&"a".repeat(10), 14.0),
+                text_run(&"b".repeat(10), 14.0),
+                text_run(&"c".repeat(40), 14.0), // pushes well past the box
+            ])],
+        );
+        let runs = resolve_clipped_runs(&el, &m, 1000.0, 600.0);
+        assert_eq!(runs.len(), 3, "three runs");
+        for r in &runs {
+            let clip = r.clip_right.expect("inside clip box");
+            assert!(
+                r.rendered_right(&m) <= clip + 0.01,
+                "run {:?} rendered right {} exceeds clip {}",
+                r.full,
+                r.rendered_right(&m),
+                clip
+            );
+        }
+    }
+
+    /// Nested clip boxes: the tighter (inner) boundary wins.
+    #[test]
+    fn nested_clip_uses_tightest() {
+        let m = metrics();
+        let long = "z".repeat(200);
+        let el = clip_frame("300", vec![clip_frame("80", vec![text_run(&long, 14.0)])]);
+        let runs = resolve_clipped_runs(&el, &m, 1000.0, 600.0);
+        assert_eq!(runs.len(), 1);
+        let r = &runs[0];
+        let clip = r.clip_right.unwrap();
+        assert!((clip - 80.0).abs() < 0.5, "tightest clip should be 80, got {clip}");
+        assert!(r.rendered_right(&m) <= clip + 0.01);
+    }
+
+    /// No clipping ancestor: text is left untouched (overflow handled elsewhere
+    /// by the pane camera).
+    #[test]
+    fn no_clip_leaves_text_untouched() {
+        let m = metrics();
+        let long = "q".repeat(200);
+        let el = Element::Frame {
+            gap: 0.0,
+            pad: 0.0,
+            style: Some(Style {
+                width: Some("100".into()),
+                ..Default::default()
+            }),
+            children: vec![text_run(&long, 14.0)],
+        };
+        let runs = resolve_clipped_runs(&el, &m, 1000.0, 600.0);
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].clip_right.is_none());
+        assert_eq!(runs[0].rendered, runs[0].full, "no clip → unchanged");
+    }
+
+    /// Short text inside a clip box is never altered.
+    #[test]
+    fn short_text_in_clip_unchanged() {
+        let m = metrics();
+        let el = clip_frame("400", vec![text_run("short line", 14.0)]);
+        let runs = resolve_clipped_runs(&el, &m, 1000.0, 600.0);
+        assert_eq!(runs[0].rendered, "short line");
     }
 
     /// A root vstack with `height:"100%"` and a `flex_grow:1` child fills

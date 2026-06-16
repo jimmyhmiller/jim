@@ -716,6 +716,7 @@ fn transcript_children(palette: &CommandPalette, running: bool) -> Vec<Element> 
 
 fn query_text(query: &str) -> Element {
     Element::Text {
+        wrap: true,
         value: format!("› {}▏", query),
         color: Some("fg".into()),
         size: Some(20.0),
@@ -730,6 +731,7 @@ fn list_row(id: &str, title: &str, hint: &str, selected: bool, title_color: &str
         gap: 0.0,
         pad: 0.0,
         children: vec![Element::Text {
+            wrap: true,
             value: title.to_string(),
             color: Some(title_color.into()),
             size: Some(15.0),
@@ -743,6 +745,7 @@ fn list_row(id: &str, title: &str, hint: &str, selected: bool, title_color: &str
         }),
     };
     let hint_el = Element::Text {
+        wrap: true,
         value: hint.to_string(),
         color: Some("fg_muted".into()),
         size: Some(13.0),
@@ -775,6 +778,7 @@ fn text_muted(s: &str, size: f32) -> Element {
 
 fn text_colored(s: &str, color: &str, size: f32) -> Element {
     Element::Text {
+        wrap: true,
         value: s.to_string(),
         color: Some(color.into()),
         size: Some(size),

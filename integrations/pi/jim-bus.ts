@@ -1,13 +1,16 @@
 /**
- * jim-bus.ts — a pi extension that puts THIS interactive pi session on the
- * jim agent bus (see AGENTS-ON-THE-BUS.md). Unlike `jimctl pi` (a headless
- * worker), this runs *inside* your real pi TUI.
+ * jim-bus.ts — a pi extension that puts THIS pi session on the jim agent bus
+ * (see AGENTS-ON-THE-BUS.md). Works the same in an interactive `pi` TUI
+ * (watch/steer it) and a headless `pi --mode rpc` (background agent) — this is
+ * the one integration for both.
  *
  *   inbound:  agent.inbox.<id> / agent.all  →  pi.sendUserMessage (a real turn,
- *             shown in your session)
- *   outbound: the agent's reply to a bus prompt → back to the asker's inbox
- *             (point-to-point); plus jim_send / jim_do tools the agent can
- *             call deliberately.
+ *             shown in your session), framed so the agent knows the sender and
+ *             that it may respond.
+ *   outbound: the agent COLLABORATES DELIBERATELY via the jim_send tool —
+ *             reply to whoever asked, message another agent, or broadcast to
+ *             all. Plus jim_do to drive the editor. There is NO forced
+ *             auto-reply: the agent replies when (and to whom) it chooses.
  *
  * Identity: fixed id ($JIM_PI_ID, else pi-<dir>); name ($JIM_PI_NAME, else
  * <dir>) — change live with /jim-name. /jim-who shows it.
@@ -47,8 +50,6 @@ function publish(topic: string, payload: unknown, retain: boolean, sender: strin
 export default function (pi: ExtensionAPI) {
   const id = process.env.JIM_PI_ID || `pi-${path.basename(process.cwd())}`;
   let name = process.env.JIM_PI_NAME || path.basename(process.cwd());
-  // Sender of the bus prompt currently being answered (null = user typed it).
-  let currentAsker: string | null = null;
 
   const announce = () =>
     publish(`agent.hello.${id}`, { id, pid: process.pid, cwd: process.cwd(), label: name }, true, id);
@@ -58,14 +59,63 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "jim_send",
     label: "jim send",
-    description: "Message another agent on the jim bus. to = an agent id, or 'all' to broadcast.",
-    promptGuidelines: ["Use jim_send to message another agent or broadcast on the jim bus."],
+    description:
+      "Send a message to other agents on the jim bus. `to` is an agent id (to " +
+      "reply to whoever messaged you, or to reach a specific peer), or 'all' to " +
+      "broadcast to every agent. Use this to reply, ask a peer for help, hand off " +
+      "work, or announce something. Find live agents and their ids with jim_roster.",
+    promptGuidelines: [
+      "When you receive a [jim bus] message and want to respond, reply with the " +
+        "jim_send tool (to = the sender's id). You are not required to reply — " +
+        "only do so when it's useful.",
+      "Use jim_send (to='all') to broadcast, or to=<agent id> to message a specific peer.",
+    ],
     parameters: Type.Object({ to: Type.String(), text: Type.String() }),
     async execute(_cid: string, params: { to: string; text: string }) {
       const to = String(params.to).replace(/^agent:/, "");
       const topic = to === "all" ? "agent.all" : `agent.inbox.${to}`;
       publish(topic, { from: id, text: params.text }, false, id);
       return { content: [{ type: "text", text: `sent to ${topic}` }], details: {} };
+    },
+  });
+
+  pi.registerTool({
+    name: "jim_roster",
+    label: "jim roster",
+    description:
+      "List the other agents currently live on the jim bus (their ids, names, and " +
+      "working dirs) so you know who you can jim_send to.",
+    parameters: Type.Object({}),
+    async execute() {
+      const lines: string[] = [];
+      try {
+        const text = fs.readFileSync(LOG, "utf8");
+        const latest = new Map<string, any>();
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          let m: any;
+          try {
+            m = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const t: string = m.topic || "";
+          if (!t.startsWith("agent.hello.")) continue;
+          const sid = t.slice("agent.hello.".length);
+          if (m.payload == null) latest.delete(sid);
+          else latest.set(sid, m.payload);
+        }
+        for (const [sid, info] of latest) {
+          if (sid === id) continue; // skip self
+          const label = info && info.label ? ` "${info.label}"` : "";
+          const cwd = info && info.cwd ? `  ${info.cwd}` : "";
+          lines.push(`${sid}${label}${cwd}`);
+        }
+      } catch {
+        /* bus log absent */
+      }
+      const out = lines.length ? lines.join("\n") : "no other agents on the bus";
+      return { content: [{ type: "text", text: out }], details: {} };
     },
   });
 
@@ -141,34 +191,20 @@ export default function (pi: ExtensionAPI) {
       if (from === id || m.sender === id) continue; // skip our own
       const text =
         m.payload && typeof m.payload.text === "string" ? m.payload.text : JSON.stringify(m.payload);
-      // A marker the reply-router parses back out in before_agent_start.
-      pi.sendUserMessage(`[jim from=${from}] ${text}`);
+      const scope = topic === "agent.all" ? "broadcast" : "direct";
+      // Inject as a real turn, framed so the agent knows it's a bus message,
+      // who it's from, and how to respond. Replying is the agent's choice via
+      // the jim_send tool — there is NO automatic echo of the agent's output
+      // back to the bus.
+      pi.sendUserMessage(
+        `[jim bus · ${scope} message from "${from}"]\n${text}\n\n` +
+          `(You are agent "${id}" on the jim bus. To reply, use the jim_send ` +
+          `tool with to="${from}". To reach another agent use their id, or ` +
+          `to="all" to broadcast. jim_roster lists who's online. Reply once if ` +
+          `it's useful, then stop — don't call tools repeatedly.)`,
+      );
     }
   }, 250);
-
-  // ---- outbound auto-reply: send the answer back to whoever asked ----
-  pi.on("before_agent_start", async (event: any) => {
-    const mt = /^\[jim from=([^\]]+)\]\s/.exec(event.prompt || "");
-    currentAsker = mt ? mt[1] : null; // null ⇒ a locally-typed prompt
-  });
-  pi.on("agent_end", async (event: any) => {
-    if (!currentAsker) return; // local prompt: don't echo to the bus
-    const asker = currentAsker;
-    currentAsker = null;
-    let reply = "";
-    const msgs = event.messages || [];
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role !== "assistant") continue;
-      const parts = (msgs[i].content || [])
-        .filter((c: any) => c.type === "text")
-        .map((c: any) => c.text);
-      if (parts.length) {
-        reply = parts.join("");
-        break;
-      }
-    }
-    if (reply) publish(`agent.inbox.${asker}`, { from: id, to: asker, text: reply }, false, id);
-  });
 
   pi.on("session_start", async (_e: any, ctx: any) => {
     announce();

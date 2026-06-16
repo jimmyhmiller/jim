@@ -1446,6 +1446,9 @@ fn rename_keyboard(
 fn apply_pending_actions(world: &mut World) {
     let actions = std::mem::take(&mut *world.resource_mut::<PendingActions>());
     let sidebar_width = world.resource::<Sidebar>().width;
+    // Project the user is currently looking at; new panes spawned into it
+    // follow the current scroll/pan instead of sitting near the origin.
+    let active_project = world.resource::<Projects>().active;
 
     // Restore persisted panes first so they appear before any new ones
     // queued in the same frame.
@@ -1505,10 +1508,44 @@ fn apply_pending_actions(world: &mut World) {
     }
 
     // Spawn requested panes (radial menu, RunButton creation, etc.).
-    for req in actions.new_panes {
+    for mut req in actions.new_panes {
+        // Make the spawning project's root directory available to funct
+        // widgets via `params.project_root`, so panes like the diff
+        // widget default to the project's git tree instead of the GUI's
+        // launch cwd. Only script widgets carry a `params` blob, and we
+        // never clobber an explicit value the caller already supplied.
+        if req.kind == jim_widget::script_widget::PANE_KIND {
+            if let Some(root) = world
+                .resource::<Projects>()
+                .default_cwd_of(req.project_id)
+                .map(str::to_owned)
+            {
+                if let serde_json::Value::Object(map) = &mut req.config {
+                    let params = map
+                        .entry("params")
+                        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+                    if let serde_json::Value::Object(pmap) = params {
+                        pmap.entry("project_root")
+                            .or_insert(serde_json::Value::String(root));
+                    }
+                }
+            }
+        }
         let pos = req.origin.unwrap_or_else(|| {
             let count_in_project = pane_count_in_project(world, &req.kind, req.project_id);
-            cascade_pos(sidebar_width, count_in_project)
+            let base = cascade_pos(sidebar_width, count_in_project);
+            // Pan is the canvas-space point at the screen origin. Adding it
+            // keeps the pane in the visible region as the user scrolls, but
+            // only for the project they're actually viewing — panes spawned
+            // into a different project keep their origin-relative cascade.
+            if active_project == Some(req.project_id) {
+                base + world
+                    .resource::<crate::canvas::CanvasView>()
+                    .state_for(req.project_id)
+                    .pan
+            } else {
+                base
+            }
         });
         let size = req
             .size
@@ -1567,7 +1604,15 @@ fn apply_pending_actions(world: &mut World) {
         };
         let pos = req.origin.unwrap_or_else(|| {
             let count_in_project = pane_count_in_project(world, "editor", project_id);
-            cascade_pos(sidebar_width, count_in_project)
+            let base = cascade_pos(sidebar_width, count_in_project);
+            if active_project == Some(project_id) {
+                base + world
+                    .resource::<crate::canvas::CanvasView>()
+                    .state_for(project_id)
+                    .pan
+            } else {
+                base
+            }
         });
         let next_z = jim_pane::next_pane_z(world);
         let rect = PaneRect {

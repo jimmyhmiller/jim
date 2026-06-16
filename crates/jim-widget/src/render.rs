@@ -289,7 +289,7 @@ pub fn render(
     crate::layout::compute(&mut laid, max_w, avail_h, &ctx.metrics);
     let root_layout = laid.layout(laid.root);
     let root_origin = origin + Vec2::new(root_layout.location.x, root_layout.location.y);
-    render_node(commands, ctx, targets, &laid, laid.root, el, root_origin, z);
+    render_node(commands, ctx, targets, &laid, laid.root, el, root_origin, z, None);
     Vec2::new(root_layout.size.width, root_layout.size.height)
 }
 
@@ -305,23 +305,35 @@ fn render_node(
     el: &Element,
     origin: Vec2,
     z: f32,
+    // Absolute x (content-space) past which descendant text must be clipped,
+    // set by an ancestor container with `style.clip = true`. `None` = clip
+    // only at the pane content edge (the host default).
+    clip_right: Option<f32>,
 ) {
     let layout = laid.layout(node_id);
     let size = Vec2::new(layout.size.width, layout.size.height);
 
     // Container helper: paint the Style background under the children
     // (if any) and recurse, using Taffy's child-node positions for
-    // each child rather than computing them ourselves.
+    // each child rather than computing them ourselves. A container whose
+    // style sets `clip: true` tightens `clip_right` to its own right edge
+    // for everything below it.
     let recurse_children = |commands: &mut Commands,
                             targets: &mut WidgetTargets,
                             children: &[Element],
                             style: Option<&Style>| {
         paint_style_background(commands, ctx, style, origin, size, z);
+        let child_clip = if style.and_then(|s| s.clip) == Some(true) {
+            let edge = origin.x + size.x;
+            Some(clip_right.map_or(edge, |c| c.min(edge)))
+        } else {
+            clip_right
+        };
         let child_ids = laid.taffy.children(node_id).unwrap_or_default();
         for (cid, child) in child_ids.iter().zip(children.iter()) {
             let cl = laid.layout(*cid);
             let cpos = origin + Vec2::new(cl.location.x, cl.location.y);
-            render_node(commands, ctx, targets, laid, *cid, child, cpos, z + 0.01);
+            render_node(commands, ctx, targets, laid, *cid, child, cpos, z + 0.01, child_clip);
         }
     };
 
@@ -378,6 +390,29 @@ fn render_node(
                     Anchor::TOP_LEFT,
                     Transform::from_xyz(origin.x, -origin.y, z + 0.003),
                 ));
+            } else if ctx.hovered_click_id.as_deref() == Some(id.as_str()) {
+                // Hover affordance: a soft neutral wash so list rows (file
+                // pickers, diff lines, drawer items) signal they're
+                // clickable. `update_widget_hover` re-renders on hover
+                // change, so this updates as the cursor moves.
+                let hov = ctx
+                    .resolve_color("surface_3")
+                    .unwrap_or(Color::srgb(0.13, 0.14, 0.17))
+                    .with_alpha(0.45);
+                paint_rounded_panel(
+                    commands,
+                    ctx,
+                    origin,
+                    size,
+                    ctx.resolve_f32("radius_sm").unwrap_or(4.0),
+                    hov,
+                    Color::srgba(0.0, 0.0, 0.0, 0.0),
+                    0.0,
+                    Color::srgba(0.0, 0.0, 0.0, 0.0),
+                    0.0,
+                    0.0,
+                    z + 0.001,
+                );
             }
             recurse_children(commands, targets, children, style.as_ref());
             targets.clicks.push(ClickTarget {
@@ -393,6 +428,7 @@ fn render_node(
             weight,
             family,
             selectable,
+            wrap,
         } => render_text_at(
             commands,
             ctx,
@@ -403,6 +439,8 @@ fn render_node(
             *weight,
             family.as_deref(),
             *selectable,
+            *wrap,
+            clip_right,
             origin,
             size,
             z,
@@ -826,6 +864,8 @@ fn render_text_at(
     weight: Option<Weight>,
     family: Option<&str>,
     selectable: bool,
+    wrap: bool,
+    clip_right: Option<f32>,
     origin: Vec2,
     size: Vec2,
     z: f32,
@@ -840,13 +880,23 @@ fn render_text_at(
     let font = family
         .and_then(|f| ctx.font_for(f))
         .unwrap_or_else(|| ctx.font.clone());
-    // Multi-line via Bevy's text layout: let it wrap inside the
-    // TextBounds box. font_size is passed in (not inferred from
-    // size.y — that would treat multi-line height as line-height
-    // and over-scale the glyphs).
-    commands.spawn((
+    // CLIP-TRUNCATION. `TextBounds` only governs wrapping — a `no_wrap` run
+    // ignores its width and draws full-length — so we can't pixel-clip a long
+    // line to an inner box. Instead, when an ancestor `clip: true` container
+    // sets `clip_right`, we shorten the STRING to the box width (monospace, so
+    // exact via `PaneFontMetrics`). The drawn text then physically ends at the
+    // container's edge, with no overflow to fight — and it survives resizing,
+    // because every re-render re-truncates to the current width.
+    let rendered: String = match clip_right {
+        Some(cr) => {
+            crate::layout::truncate_to_width(value, font_size, (cr - origin.x).max(0.0), &ctx.metrics)
+        }
+        None => value.to_string(),
+    };
+    // For wrapping (multi-line) runs the box still bounds the wrap width.
+    let mut entity = commands.spawn((
         ChildOf(ctx.content_root),
-        Text2d::new(value.to_string()),
+        Text2d::new(rendered.clone()),
         TextFont {
             font,
             font_size,
@@ -861,14 +911,18 @@ fn render_text_at(
         },
         Transform::from_xyz(origin.x, -origin.y, z),
     ));
-    // Drag-select: register this run as a selectable text span. Char
-    // offsets are measured left-to-right from `origin`, so use the
-    // glyph-origin rect (one line tall for the common single-line value).
-    if selectable && !value.is_empty() {
+    if !wrap {
+        entity.insert(bevy::text::TextLayout::new_with_no_wrap());
+    }
+    // Drag-select: register the run as a selectable text span. Use the
+    // rendered (possibly truncated) text and width so selection matches what's
+    // visible. `size.y` already accounts for wrapped lines.
+    if selectable && !rendered.is_empty() {
         let line_h = line_height(font_size);
+        let span_w = ctx.metrics.measure(&rendered, font_size).min(size.x);
         targets.spans.push(TextSpan {
-            text: value.to_string(),
-            rect: Rect::new(origin.x, origin.y, origin.x + size.x, origin.y + line_h),
+            text: rendered.clone(),
+            rect: Rect::new(origin.x, origin.y, origin.x + span_w, origin.y + size.y.max(line_h)),
             font_size,
         });
     }
@@ -3082,8 +3136,12 @@ fn render_textarea_at(
     let avail = (size.x - 2.0 * INPUT_PAD_X).max(1.0);
 
     if display_value.is_empty() && !is_focused {
-        // Placeholder: short, render as-is on the first line.
+        // Placeholder: wrap + clip to the box so a hint longer than the box
+        // can't render outside it. (The bug was rendering this no-wrap and
+        // unbounded — `render_input_at` already bounds its placeholder; this
+        // is the multi-line counterpart, wrapping within the box's rows.)
         if !placeholder.is_empty() {
+            let inner_h = (size.y - 2.0 * TEXTAREA_PAD_Y).max(line_h);
             commands.spawn((
                 ChildOf(ctx.content_root),
                 Text2d::new(placeholder.to_string()),
@@ -3099,7 +3157,11 @@ fn render_textarea_at(
                     ctx.palette.text_muted,
                 )),
                 Anchor::TOP_LEFT,
-                bevy::text::TextLayout::new_with_no_wrap(),
+                bevy::text::TextBounds {
+                    width: Some(avail),
+                    height: Some(inner_h),
+                },
+                jim_pane::PaneContentNoClip,
                 Transform::from_xyz(
                     origin.x + INPUT_PAD_X,
                     -(origin.y + TEXTAREA_PAD_Y),

@@ -177,6 +177,15 @@ pub struct PaneProject(pub u64);
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct PanePinned;
 
+/// Marker: this pane is anchored to the **screen**, not the canvas. Its
+/// `PaneRect.pos` (and `size`) are interpreted directly in window-logical
+/// pixels, and it does NOT pan or zoom with the canvas — it stays put while the
+/// user scrolls/zooms the surface around it. Used for fixed HUD-style chrome
+/// like the whiteboard toolbar. `position_panes` skips the canvas-viewport
+/// projection for these, and the per-pane camera uses the rect as-is.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct PaneScreenAnchored;
+
 /// A pane between close request and actual despawn. Close is two-phase:
 /// the frame the close is processed (`apply_pending_pane_actions`) the
 /// pane runs its `on_close`, is hidden, and gains this marker; the
@@ -316,6 +325,15 @@ impl KeyboardOwner {
 /// PostUpdate.
 #[derive(Resource, Default)]
 pub struct InputConsumed(pub bool);
+
+/// When `true`, the host is capturing the mouse to draw *over* panes (e.g. the
+/// whiteboard's "draw on the canvas" mode with a drawing tool). While set, a
+/// press over a normal (non-screen-anchored) pane is ignored by the pane mouse
+/// handler so the host can route it to an annotation surface instead. Screen-
+/// anchored panes (the floating toolbar) are unaffected so their buttons still
+/// work. The host clears it when not drawing.
+#[derive(Resource, Default)]
+pub struct PaneInputSuppressed(pub bool);
 
 /// What the left mouse button is doing right now, at the pane-chrome
 /// level. Per-kind content interactions (text-select, cell-select,
@@ -643,6 +661,7 @@ impl Plugin for PanePlugin {
         app.init_resource::<FocusedPane>()
             .init_resource::<KeyboardOwner>()
             .init_resource::<InputConsumed>()
+            .init_resource::<PaneInputSuppressed>()
             .init_resource::<PaneMouseMode>()
             .init_resource::<PendingPaneActions>()
             .init_resource::<PaneRegistry>()
@@ -758,7 +777,13 @@ fn emit_pane_hover(
     mut last: Local<LastHover>,
     mut writer: MessageWriter<PaneContentHovered>,
     panes: Query<
-        (Entity, &PaneRect, Option<&Visibility>, Has<PanePinned>),
+        (
+            Entity,
+            &PaneRect,
+            Option<&Visibility>,
+            Has<PanePinned>,
+            Has<PaneScreenAnchored>,
+        ),
         With<PaneTag>,
     >,
     hot_zones: Query<&PaneHotZones>,
@@ -797,19 +822,35 @@ fn emit_pane_hover(
     // Stage 1: unpinned panes get the full content area. They always sit
     // above pinned panes (pinned are forced to z=0), so any unpinned hit
     // wins outright.
-    let unpinned_rects: Vec<(Entity, PaneRect)> = panes
+    // (entity, rect, anchored). Anchored panes hit-test against the window
+    // cursor; canvas panes against the canvas cursor.
+    let unpinned_rects: Vec<(Entity, PaneRect, bool)> = panes
         .iter()
-        .filter(|(_, _, vis, pinned)| !matches!(vis, Some(Visibility::Hidden)) && !pinned)
-        .map(|(e, r, _, _)| (e, *r))
+        .filter(|(_, _, vis, pinned, _)| !matches!(vis, Some(Visibility::Hidden)) && !pinned)
+        .map(|(e, r, _, _, anchored)| (e, *r, anchored))
         .collect();
-    let mut target = topmost_pane_at(pt_canvas, &unpinned_rects).and_then(|e| {
-        let rect = unpinned_rects.iter().find(|(x, _)| *x == e).map(|(_, r)| r)?;
-        if matches!(region_at(pt_canvas, rect), Some(PaneRegion::Content)) {
-            Some((e, pt_to_content_local(pt_canvas, rect)))
-        } else {
-            None
+    let mut target = {
+        // Topmost unpinned pane under the cursor (in its own coordinate frame).
+        let mut best: Option<(Entity, PaneRect, bool, f32)> = None;
+        for &(e, r, anchored) in &unpinned_rects {
+            let c = hit_cursor(anchored, pt, pt_canvas);
+            let inside = c.x >= r.pos.x
+                && c.x <= r.pos.x + r.size.x
+                && c.y >= r.pos.y
+                && c.y <= r.pos.y + r.size.y;
+            if inside && best.map_or(true, |(_, _, _, z)| r.z > z) {
+                best = Some((e, r, anchored, r.z));
+            }
         }
-    });
+        best.and_then(|(e, r, anchored, _)| {
+            let c = hit_cursor(anchored, pt, pt_canvas);
+            if matches!(region_at(c, &r), Some(PaneRegion::Content)) {
+                Some((e, pt_to_content_local(c, &r)))
+            } else {
+                None
+            }
+        })
+    };
     // Stage 2: no unpinned pane under the cursor — walk pinned panes and
     // hover only when the cursor lands inside a registered hot-zone (a
     // chart publishes its whole plot area; empty space on a pinned pane
@@ -817,14 +858,15 @@ fn emit_pane_hover(
     // and the press path exactly).
     if target.is_none() {
         let mut best: Option<(Entity, f32, Vec2)> = None;
-        for (e, r, vis, pinned) in panes.iter() {
+        for (e, r, vis, pinned, anchored) in panes.iter() {
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
                 continue;
             }
-            if !matches!(region_at(pt_canvas, r), Some(PaneRegion::Content)) {
+            let cur = hit_cursor(anchored, pt, pt_canvas);
+            if !matches!(region_at(cur, r), Some(PaneRegion::Content)) {
                 continue;
             }
-            let local = pt_to_content_local(pt_canvas, r);
+            let local = pt_to_content_local(cur, r);
             let Ok(zones) = hot_zones.get(e) else { continue };
             if !zones.contains(local) {
                 continue;
@@ -1428,6 +1470,20 @@ pub fn region_at(pt: Vec2, rect: &PaneRect) -> Option<PaneRegion> {
     Some(PaneRegion::Content)
 }
 
+/// The cursor coordinate a pane should be hit-tested against, in the same
+/// frame as its [`PaneRect`]: window-logical pixels for screen-anchored panes
+/// (their rects never pan/zoom), canvas units for everything else. Both input
+/// systems below route through this so anchored chrome (the whiteboard toolbar)
+/// stays clickable regardless of canvas pan/zoom.
+#[inline]
+pub fn hit_cursor(anchored: bool, window_pt: Vec2, canvas_pt: Vec2) -> Vec2 {
+    if anchored {
+        window_pt
+    } else {
+        canvas_pt
+    }
+}
+
 pub fn topmost_pane_at(pt: Vec2, panes: &[(Entity, PaneRect)]) -> Option<Entity> {
     let mut best: Option<(Entity, f32)> = None;
     for &(e, r) in panes {
@@ -1518,6 +1574,7 @@ fn handle_pane_mouse(
     buttons: Res<ButtonInput<MouseButton>>,
     mods: Res<ButtonInput<KeyCode>>,
     viewport: Res<PaneViewport>,
+    suppressed: Res<PaneInputSuppressed>,
     mut consumed: ResMut<InputConsumed>,
     mut mode: ResMut<PaneMouseMode>,
     mut focused: ResMut<FocusedPane>,
@@ -1528,7 +1585,13 @@ fn handle_pane_mouse(
     mut content_release: MessageWriter<PaneContentReleased>,
     mut dbl: DoublePress,
     mut panes: Query<
-        (Entity, &mut PaneRect, Option<&Visibility>, Has<PanePinned>),
+        (
+            Entity,
+            &mut PaneRect,
+            Option<&Visibility>,
+            Has<PanePinned>,
+            Has<PaneScreenAnchored>,
+        ),
         With<PaneTag>,
     >,
     hot_zones: Query<&PaneHotZones>,
@@ -1546,11 +1609,12 @@ fn handle_pane_mouse(
 
     if buttons.just_released(MouseButton::Left) {
         if let PaneMouseMode::ContentDrag { pane, pinned } = *mode {
-            if let Ok((_, rect, _, _)) = panes.get(pane) {
+            if let Ok((_, rect, _, _, anchored)) = panes.get(pane) {
+                let cur = hit_cursor(anchored, pt, pt_canvas);
                 content_release.write(PaneContentReleased {
                     pane,
                     window_pt: pt,
-                    local_pt: pt_to_content_local(pt_canvas, &rect),
+                    local_pt: pt_to_content_local(cur, &rect),
                     pinned,
                 });
             }
@@ -1569,16 +1633,41 @@ fn handle_pane_mouse(
         // Stage 1: unpinned panes get the normal chrome/content hit-test.
         // They always sit above pinned panes (pinned are forced to z=0,
         // unpinned start at z=1), so any unpinned hit wins outright.
-        let unpinned_rects: Vec<(Entity, PaneRect)> = panes
+        // (entity, rect, anchored). Anchored panes are hit-tested against the
+        // window cursor; canvas panes against the canvas cursor.
+        let unpinned_rects: Vec<(Entity, PaneRect, bool)> = panes
             .iter()
-            .filter(|(_, _, vis, pinned)| {
-                !matches!(vis, Some(Visibility::Hidden)) && !pinned
+            .filter(|(_, _, vis, pinned, anchored)| {
+                !matches!(vis, Some(Visibility::Hidden))
+                    && !pinned
+                    // While the host is drawing over panes, ignore presses on
+                    // normal panes (they get routed to an annotation surface);
+                    // screen-anchored panes (the toolbar) still respond.
+                    && (!suppressed.0 || *anchored)
             })
-            .map(|(e, r, _, _)| (e, *r))
+            .map(|(e, r, _, _, anchored)| (e, *r, anchored))
             .collect();
-        if let Some(target) = topmost_pane_at(pt_canvas, &unpinned_rects) {
-            let rect = *panes.get(target).unwrap().1;
-            let region = region_at(pt_canvas, &rect);
+        let topmost = {
+            let mut best: Option<(Entity, f32)> = None;
+            for &(e, r, anchored) in &unpinned_rects {
+                let c = hit_cursor(anchored, pt, pt_canvas);
+                let inside = c.x >= r.pos.x
+                    && c.x <= r.pos.x + r.size.x
+                    && c.y >= r.pos.y
+                    && c.y <= r.pos.y + r.size.y;
+                if inside && best.map_or(true, |(_, z)| r.z > z) {
+                    best = Some((e, r.z));
+                }
+            }
+            best.map(|(e, _)| e)
+        };
+        if let Some(target) = topmost {
+            let (rect, anchored) = {
+                let (_, r, _, _, a) = panes.get(target).unwrap();
+                (*r, a)
+            };
+            let cur = hit_cursor(anchored, pt, pt_canvas);
+            let region = region_at(cur, &rect);
             // Double-click on a pane is a "zoom/jump to this pane"
             // gesture — but only when it isn't landing on an interactive
             // element. A content click that hits one of the kind's
@@ -1587,7 +1676,7 @@ fn handle_pane_mouse(
             let on_click_target = matches!(region, Some(PaneRegion::Content))
                 && hot_zones
                     .get(target)
-                    .map_or(false, |z| z.contains(pt_to_content_local(pt_canvas, &rect)));
+                    .map_or(false, |z| z.contains(pt_to_content_local(cur, &rect)));
             if region.is_some() && !on_click_target {
                 dbl.note(target, pt);
             }
@@ -1603,7 +1692,7 @@ fn handle_pane_mouse(
                     bring_to_front(target, &mut panes);
                     *mode = PaneMouseMode::WindowDrag {
                         pane: target,
-                        grab_offset: pt_canvas - rect.pos,
+                        grab_offset: cur - rect.pos,
                     };
                 }
                 Some(PaneRegion::ResizeEdge(edges)) => {
@@ -1613,7 +1702,7 @@ fn handle_pane_mouse(
                     *mode = PaneMouseMode::WindowResize {
                         pane: target,
                         edges,
-                        start_pt: pt_canvas,
+                        start_pt: cur,
                         start_pos: rect.pos,
                         start_size: rect.size,
                     };
@@ -1627,7 +1716,7 @@ fn handle_pane_mouse(
                     content_press.write(PaneContentPressed {
                         pane: target,
                         window_pt: pt,
-                        local_pt: pt_to_content_local(pt_canvas, &rect),
+                        local_pt: pt_to_content_local(cur, &rect),
                         shift,
                         pinned: false,
                     });
@@ -1648,14 +1737,15 @@ fn handle_pane_mouse(
         // decoration" promise). Chrome (drag/resize/close/focus) stays
         // suppressed for pinned panes regardless.
         let mut best: Option<(Entity, f32, Vec2)> = None;
-        for (e, r, vis, pinned) in panes.iter() {
+        for (e, r, vis, pinned, anchored) in panes.iter() {
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
                 continue;
             }
-            if !matches!(region_at(pt_canvas, &r), Some(PaneRegion::Content)) {
+            let cur = hit_cursor(anchored, pt, pt_canvas);
+            if !matches!(region_at(cur, &r), Some(PaneRegion::Content)) {
                 continue;
             }
-            let local = pt_to_content_local(pt_canvas, &r);
+            let local = pt_to_content_local(cur, &r);
             let Ok(zones) = hot_zones.get(e) else { continue };
             if !zones.contains(local) {
                 continue;
@@ -1704,9 +1794,10 @@ fn handle_pane_mouse(
 
     match *mode {
         PaneMouseMode::WindowDrag { pane, grab_offset } => {
-            if let Ok((_, mut rect, _, _)) = panes.get_mut(pane) {
-                // Both grab_offset and pt_canvas are in canvas-units.
-                rect.pos = pt_canvas - grab_offset;
+            if let Ok((_, mut rect, _, _, anchored)) = panes.get_mut(pane) {
+                // grab_offset was captured in the pane's own coordinate frame
+                // (window pixels for anchored panes, canvas units otherwise).
+                rect.pos = hit_cursor(anchored, pt, pt_canvas) - grab_offset;
             }
         }
         PaneMouseMode::WindowResize {
@@ -1716,8 +1807,8 @@ fn handle_pane_mouse(
             start_pos,
             start_size,
         } => {
-            if let Ok((_, mut rect, _, _)) = panes.get_mut(pane) {
-                let delta = pt_canvas - start_pt;
+            if let Ok((_, mut rect, _, _, anchored)) = panes.get_mut(pane) {
+                let delta = hit_cursor(anchored, pt, pt_canvas) - start_pt;
                 let mut new_pos = start_pos;
                 let mut new_size = start_size;
                 if edges.east {
@@ -1748,11 +1839,12 @@ fn handle_pane_mouse(
             }
         }
         PaneMouseMode::ContentDrag { pane, pinned } => {
-            if let Ok((_, rect, _, _)) = panes.get(pane) {
+            if let Ok((_, rect, _, _, anchored)) = panes.get(pane) {
+                let cur = hit_cursor(anchored, pt, pt_canvas);
                 content_drag.write(PaneContentDragged {
                     pane,
                     window_pt: pt,
-                    local_pt: pt_to_content_local(pt_canvas, &rect),
+                    local_pt: pt_to_content_local(cur, &rect),
                     pinned,
                 });
             }
@@ -1771,12 +1863,18 @@ const MAX_PANE_Z: f32 = 500.0;
 fn bring_to_front(
     target: Entity,
     panes: &mut Query<
-        (Entity, &mut PaneRect, Option<&Visibility>, Has<PanePinned>),
+        (
+            Entity,
+            &mut PaneRect,
+            Option<&Visibility>,
+            Has<PanePinned>,
+            Has<PaneScreenAnchored>,
+        ),
         With<PaneTag>,
     >,
 ) {
     // Pinned panes are background decoration — never bump their z.
-    if let Ok((_, _, _, true)) = panes.get(target) {
+    if let Ok((_, _, _, true, _)) = panes.get(target) {
         return;
     }
     // Compute max-z over UNPINNED panes only so pinned panes (kept at
@@ -1784,10 +1882,10 @@ fn bring_to_front(
     // by renormalization.
     let max_z = panes
         .iter()
-        .filter(|(_, _, _, pinned)| !pinned)
-        .map(|(_, r, _, _)| r.z)
+        .filter(|(_, _, _, pinned, _)| !pinned)
+        .map(|(_, r, _, _, _)| r.z)
         .fold(0.0_f32, f32::max);
-    if let Ok((_, mut rect, _, _)) = panes.get_mut(target) {
+    if let Ok((_, mut rect, _, _, _)) = panes.get_mut(target) {
         if rect.z < max_z {
             rect.z = max_z + 1.0;
         }
@@ -1797,12 +1895,12 @@ fn bring_to_front(
     if max_z + 1.0 > MAX_PANE_Z {
         let mut entries: Vec<(Entity, f32)> = panes
             .iter()
-            .filter(|(_, _, _, pinned)| !pinned)
-            .map(|(e, r, _, _)| (e, r.z))
+            .filter(|(_, _, _, pinned, _)| !pinned)
+            .map(|(e, r, _, _, _)| (e, r.z))
             .collect();
         entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         for (i, (e, _)) in entries.into_iter().enumerate() {
-            if let Ok((_, mut rect, _, _)) = panes.get_mut(e) {
+            if let Ok((_, mut rect, _, _, _)) = panes.get_mut(e) {
                 rect.z = (i as f32) + 1.0;
             }
         }
@@ -1818,6 +1916,7 @@ fn position_panes(
     chrome_style: Res<chrome_material::ChromeStyle>,
     viewport: Res<PaneViewport>,
     panes: Query<(&PaneRect, &PaneChrome), With<PaneTag>>,
+    anchored: Query<(), With<PaneScreenAnchored>>,
     mut t_q: Query<&mut Transform>,
     mut sprite_q: Query<&mut Sprite>,
     mut color_q: Query<&mut TextColor>,
@@ -1851,12 +1950,16 @@ fn position_panes(
         // the value hasn't moved. With ~6 chrome entities per pane and
         // several terminal/widget panes alive, the unguarded version
         // burns >300% CPU just keeping itself awake.
+        let is_anchored = anchored.get(entity).is_ok();
         if let Ok(mut t) = t_q.get_mut(entity) {
-            // PaneRect is canvas-space; project to a screen-pixel
-            // position via the canvas viewport, then convert to
-            // Bevy's world coords (centered, y-up). Pane scale = zoom
-            // makes all children (chrome + content) magnify uniformly.
-            let screen_pos = viewport.canvas_to_window(rect.pos);
+            // Screen-anchored panes treat PaneRect.pos as window-logical pixels
+            // directly and never zoom; everything else projects through the
+            // canvas viewport (pan/zoom with the surface).
+            let screen_pos = if is_anchored {
+                rect.pos
+            } else {
+                viewport.canvas_to_window(rect.pos)
+            };
             let want = bevy::math::Vec3::new(
                 screen_pos.x - win_size.x * 0.5,
                 win_size.y * 0.5 - screen_pos.y,
@@ -1865,7 +1968,8 @@ fn position_panes(
             if t.translation != want {
                 t.translation = want;
             }
-            let want_scale = Vec3::new(viewport.zoom, viewport.zoom, 1.0);
+            let zoom = if is_anchored { 1.0 } else { viewport.zoom };
+            let want_scale = Vec3::new(zoom, zoom, 1.0);
             if t.scale != want_scale {
                 t.scale = want_scale;
             }

@@ -13,6 +13,8 @@ claude-bus-bevy = { path = "../claude-bus-bevy" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "0.8"
+# pid-liveness for the agent-roster staleness sweep (msgbus.rs).
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 # PNG/JPEG decoding for widget sprite paths.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -31,6 +33,11 @@ taffy = { version = "0.9", default-features = false, features = [
 # (same out-of-repo practice as the symlinked datalog widgets) until funct
 # is published.
 funct = "0.1"
+# Standalone syntax highlighting for the `highlight` funct host fn (the
+# diff/code-review widget). Same grammars the editor pane uses, but driven
+# as a one-shot pure call from the widget worker thread (no Bevy).
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 bevy = { version = "0.18", default-features = false, features = [
     "2d",

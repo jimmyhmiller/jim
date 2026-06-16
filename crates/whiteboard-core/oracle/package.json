@@ -1,0 +1,19 @@
+{
+  "name": "whiteboard-core-oracle",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Differential oracle: runs the real Excalidraw element/math logic headlessly to generate golden fixtures that whiteboard-core is tested against. See README.md.",
+  "scripts": {
+    "build": "./build.sh",
+    "gen": "node gen.mjs"
+  },
+  "dependencies": {
+    "@excalidraw/common": "0.18.0-f0063e113",
+    "@excalidraw/element": "0.18.0-f0063e113",
+    "@excalidraw/math": "0.18.0-f0063e113"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  }
+}

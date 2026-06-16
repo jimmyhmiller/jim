@@ -12,7 +12,9 @@
 use std::process::ExitCode;
 
 mod agent_bus;
+mod cmd_agent;
 mod cmd_channel;
+mod cmd_mcp;
 mod cmd_codex;
 mod cmd_pi;
 mod cmd_close;
@@ -40,6 +42,8 @@ fn main() -> ExitCode {
         Some("channel") => cmd_channel::run(),
         Some("codex") => cmd_codex::run(),
         Some("pi") => cmd_pi::run(),
+        Some("agent") => cmd_agent::run(),
+        Some("mcp") => cmd_mcp::run(),
         Some("inbox") => cmd_inbox::run(),
         Some("project") => cmd_project::run(),
         Some("suggest") => cmd_suggest::run(),
@@ -70,6 +74,8 @@ fn usage() {
          \tchannel                        MCP channel bridging a Claude session to the agent bus\n\
          \tcodex                          bridge a Codex (codex-cli) session onto the agent bus\n\
          \tpi                             bridge a pi session onto the agent bus\n\
+         \tagent ...                      bus convenience layer (roster/send/recv/announce)\n\
+         \tmcp                            MCP stdio server: jim_send/jim_roster/jim_do tools for any agent\n\
          \tinbox ...                      push to / read a project's inbox\n\
          \tproject ...                    project operations\n\
          \tsuggest ...                    park a pane in the suggestion drawer\n\

@@ -12,6 +12,8 @@ jim_style = { path = "../jim-style" }
 jim_daemon = { path = "../jim-daemon" }
 jim_terminal = { path = "../jim-terminal" }
 jim_widget = { path = "../jim-widget" }
+jim_whiteboard = { path = "../jim-whiteboard" }
+whiteboard-core = { path = "../whiteboard-core" }
 claude-bus-bevy = { path = "../claude-bus-bevy" }
 claude-bus = { path = "../claude-bus" }
 jim_inference = { path = "../jim-inference" }

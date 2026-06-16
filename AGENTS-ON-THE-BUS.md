@@ -72,71 +72,90 @@ jimctl codex --id codex-main --name "Backend Codex"
 codex                         # plain — auto-attaches to the same daemon
 ```
 Now bus messages to `agent.inbox.<id>` / `agent.all` appear as **real turns
-in your live codex TUI**, and the model's reply routes **point-to-point back
-to the asker** (`agent.inbox.<from>`). Runs the injected turn full-auto
-(`approvalPolicy:"never"`). Code in `crates/jimctl/src/cmd_codex.rs`.
+in your live codex TUI**, framed with the sender, and the agent
+**collaborates by choice via tools** — `jim_send` (reply to the asker, message
+a peer, or `to:"all"` to broadcast), `jim_roster`, `jim_do`. Runs the injected
+turn full-auto (`approvalPolicy:"never"`). Code in `crates/jimctl/src/cmd_codex.rs`.
 
-How it works (verified against codex 0.139): `jimctl codex` runs `codex
+**Inbound + outbound are split** (codex can't take an injected tool the way a
+pi extension can):
+- **Inbound** = the app-server injection below.
+- **Outbound** = the `jim` MCP tool server (`jimctl mcp`). `jimctl codex`
+  **auto-registers it** with codex on startup (`codex mcp add jim --env
+  JIM_AGENT_ID=<id> -- jimctl mcp`), so the live session gets the tools. There
+  is **no forced auto-reply** — the agent replies when it chooses, like pi.
+  (Because registration writes codex config, start `jimctl codex` *before*
+  launching `codex`.)
+
+How inbound works (verified against codex 0.139): `jimctl codex` runs `codex
 app-server daemon start` to expose the shared control socket
 (`~/.codex/app-server-control/app-server-control.sock`), then connects to it
 as a **WebSocket-over-unix** client (raw JSON is dropped — it's WS frames,
 JSON-RPC-lite with no `jsonrpc` field, and rejects an `Origin` header). A
 plain `codex` auto-attaches to that daemon. The adapter:
 - discovers the TUI's live thread from the global `thread/started` broadcast;
-- injects with `turn/start{threadId,input:[{type:"text",text}],approvalPolicy:"never"}`;
-- since the connection that *starts* a turn is excluded from that turn's
-  event stream, it reads the reply by polling `thread/resume{threadId,
-  itemsView:"full",limit:3}` once the turn finishes (the thread persists) and
-  pulling the `agentMessage` out of `result.thread.turns[].items[]`;
-- tracks busy/idle via the global `thread/status/changed`.
+- injects framed bus messages with `turn/start{threadId,input,approvalPolicy:"never"}`;
+- tracks busy/idle via `thread/status/changed`, one injected turn in flight at
+  a time. (It no longer reads turn replies — the agent replies via `jim_send`.)
 
 Caveats: experimental protocol (may shift between codex versions); needs the
 daemon (`jimctl codex` starts it); `remote-control` is the WRONG path (it's
-cloud/phone control with local transports off). Follow-up: give Codex the
-`jim_send`/`jim_do` *tools* via `codex mcp` so it can initiate, not just reply.
+cloud/phone control with local transports off).
 
-### pi (`pi` coding CLI) — REAL TUI via extension (`integrations/pi/jim-bus.ts`)
-**This is the real-session integration** — it runs inside your actual
-interactive `pi`, not a separate front-end. Install:
+### pi (`pi` coding CLI) — the `jim-bus.ts` extension IS the integration
+The whole pi↔bus integration lives in **one pi extension**,
+`integrations/pi/jim-bus.ts`. Install it once:
 ```bash
 cp integrations/pi/jim-bus.ts ~/.pi/agent/extensions/jim-bus.ts
 ```
-Then just run `pi` normally — your session is on the bus as `pi-<dir>` (or
-`$JIM_PI_ID`). It uses pi's extension API: `pi.sendUserMessage()` injects a
-bus message as a real turn (inbound); `agent_end` routes the reply back to
-the asker's inbox (point-to-point); `pi.registerTool()` gives the agent
-`jim_send` / `jim_do` (deliberate outbound). `/jim-name <label>` renames
-live, `/jim-who` shows identity. Verified: a bus ask appeared as a turn in
-the live session and its reply went point-to-point to the asker. Only
-locally-typed prompts stay off the bus.
+It auto-loads in **any** pi process and owns all bus I/O:
+- **inbound** — tails the bus and `pi.sendUserMessage()`-injects each
+  `agent.inbox.<id>`/`agent.all` message as a real turn, framed with the
+  sender and the agent's own id;
+- **outbound (the agent's choice)** — registers the tools `jim_send`
+  (reply to the asker, message a specific peer, or `to:"all"` to broadcast),
+  `jim_roster` (who's online), and `jim_do` (drive the editor). **There is no
+  forced auto-reply** — the agent collaborates when and how it decides.
+- identity: `$JIM_PI_ID`/`pi-<dir>` + `$JIM_PI_NAME`; `/jim-name`, `/jim-who`.
 
-A pi extension can inject into a running session because the API exposes
-`sendUserMessage`/`sendMessage` (with `deliverAs: steer|followUp|nextTurn`)
-— pi's docs even list "file watchers, webhooks, CI triggers" as intended
-uses.
+Run it two ways, same extension:
+- **Interactive** — just run `pi`. You watch/steer in the TUI; the agent is
+  on the bus.
+- **Headless** — `jimctl pi` (below). Background agent, no TUI.
 
-### pi headless worker — also available (`jimctl pi`)
-A standalone delegate worker (no interactive session needed), same shape
-and flags as `jimctl codex`:
+Verified e2e: a bus message injected as a turn and the agent deliberately
+called `jim_roster` + `jim_send` to reply point-to-point to the asker.
+
+### pi headless host — `jimctl pi`
+A one-command **headless** pi agent on the bus, same id/name flags as
+`jimctl codex`:
 ```bash
 jimctl pi                                     # id = pi-<dir>, name = <dir>
 jimctl pi --id pi-main --name "pi (frontend)"
 ```
-pi has no async-push protocol, but stable session resume (`--session-id`,
-created if missing). Each ask — typed here or arriving on the bus —
-continues **one persistent pi session** via `pi --mode json --print
---session-id jim-pi-<id> "<msg>"`; the final assistant text (from the
-`agent_end` NDJSON event) goes **point-to-point to the asker's inbox** (or
-prints here if you typed it). A worker thread serializes invocations so
-concurrent asks don't race the session. Same `/name` `/who` `/quit`
-controls and fixed-id/changeable-name identity as Codex. Code in
+It is **just the process host**, not a bus bridge: it spawns one
+`pi --mode rpc --session-id jim-pi-<id>` (the extension loads and does all bus
+I/O), **holds its stdin open** (rpc mode exits the instant stdin hits EOF —
+this is the whole reason the host exists), restarts it if it crashes, prints
+the agent's replies, and lets you type a line to prompt it locally (`/who`,
+`/quit`). The persistent session means context carries across messages and
+the agent can do real multi-step work. Refuses to start if the extension
+isn't installed (else the agent would be on no bus). Code in
 `crates/jimctl/src/cmd_pi.rs`.
 
-Trade-off vs Codex: discrete per-message (process startup each turn) rather
-than a live injected turn — but dead simple and uses only pi's documented
-`--print`. Future upgrades: pi's `--mode rpc` (long-running session) to drop
-per-message startup; a pi extension calling `jim_send`/`jim_do` for
-deliberate outbound (not just replies).
+> ⚠️ Two pi traps this design avoids. (1) **`pi --mode json --print` never
+> exits** — it prints the full turn (`agent_end`) then lingers even with stdin
+> closed, so any wait-for-exit read (`Command::output()`) hangs forever *after*
+> the answer is already produced, and it throws away the session each turn.
+> (2) **`pi --mode rpc` exits on stdin EOF** — a backgrounded `pi --mode rpc &`
+> with no stdin dies right after startup. The host keeps stdin open. RPC mode
+> is the right long-running tool — see `docs/rpc.md` in the pi package.
+
+Either this headless worker or the live-TUI extension (above) puts a real,
+persistent pi session on the bus; pick by whether you want to watch/steer it
+in a terminal (extension) or run it as a background delegate (`jimctl pi`).
+Follow-up: give the headless worker `jim_send`/`jim_do` so it can initiate,
+not just reply (the extension already has them).
 
 ### Custom OpenAI-compatible agent — easiest
 You own the loop, so there's no protocol to reverse-engineer:

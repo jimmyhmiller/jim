@@ -8,9 +8,10 @@
 //! the libghostty dylib / @rpath dance.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, Seek, SeekFrom, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -139,5 +140,122 @@ pub fn sweep_dead_sessions(self_id: &str) {
         if !pid_alive(pid as u32) {
             let _ = publish(&format!("agent.hello.{sid}"), Value::Null, true, "sweep");
         }
+    }
+}
+
+/// Map an addressing string onto a bus topic, the shared convention across
+/// every adapter and the `jim_send` tool: `all` → `agent.all`,
+/// `agent:<id>` → `agent.inbox.<id>`, `topic:<name>` → `<name>` (raw).
+/// Returns `None` for malformed input.
+pub fn resolve_topic(to: &str) -> Option<String> {
+    if to == "all" {
+        return Some("agent.all".to_string());
+    }
+    if let Some(rest) = to.strip_prefix("agent:") {
+        return (!rest.is_empty()).then(|| format!("agent.inbox.{rest}"));
+    }
+    if let Some(rest) = to.strip_prefix("topic:") {
+        return (!rest.is_empty()).then(|| rest.to_string());
+    }
+    None
+}
+
+/// One bus message addressed to us, already unwrapped to the agent payload
+/// convention (`{from, text, data?}`).
+#[derive(Clone)]
+pub struct Inbound {
+    /// The real origin: payload `from` if present, else the bus `sender`.
+    pub from: String,
+    /// Human-readable body (payload `text`, or the whole payload as JSON).
+    pub text: String,
+    /// The topic it arrived on (`agent.inbox.<id>` or `agent.all`).
+    pub topic: String,
+    /// The full raw payload, for callers that want `data` etc.
+    pub payload: Value,
+}
+
+/// Parse one bus-log line into an [`Inbound`] iff it is addressed to
+/// `self_id` (its inbox or `agent.all`) and is not our own emit. This is the
+/// single decoder every adapter shares so the "addressed to me, by whom,
+/// saying what" rules live in one place.
+pub fn parse_inbound(line: &str, self_id: &str, inbox: &str) -> Option<Inbound> {
+    if line.is_empty() {
+        return None;
+    }
+    let m: Value = serde_json::from_str(line).ok()?;
+    let topic = m.get("topic").and_then(Value::as_str).unwrap_or("");
+    if topic != inbox && topic != "agent.all" {
+        return None;
+    }
+    let bus_sender = m.get("sender").and_then(Value::as_str).unwrap_or("");
+    let payload = m.get("payload").cloned().unwrap_or(Value::Null);
+    let from = payload
+        .get("from")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(bus_sender)
+        .to_string();
+    // Skip our own emits (either stamping path).
+    if from == self_id || bus_sender == self_id {
+        return None;
+    }
+    let text = match payload.get("text").and_then(Value::as_str) {
+        Some(t) => t.to_string(),
+        None => serde_json::to_string(&payload).unwrap_or_default(),
+    };
+    Some(Inbound { from, text, topic: topic.to_string(), payload })
+}
+
+/// Follow the bus log from the current end, invoking `on_msg` for every
+/// message addressed to `self_id` (see [`parse_inbound`]). Polls every 200ms
+/// like `tail -f`, resets on truncation (app restart), and — when `sweep` is
+/// set — prunes dead roster peers every ~5s. Returns when `should_stop()`
+/// reports true. This is the inbox stream the adapters used to hand-roll.
+pub fn follow_inbox<F, S>(self_id: &str, sweep: bool, mut on_msg: F, should_stop: S)
+where
+    F: FnMut(Inbound),
+    S: Fn() -> bool,
+{
+    let Some(log) = bus_log_path() else {
+        eprintln!("agent_bus: HOME not set; cannot tail bus");
+        return;
+    };
+    let inbox = format!("agent.inbox.{self_id}");
+    let mut pos: u64 = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    let mut sweep_ctr: u32 = 0;
+
+    while !should_stop() {
+        if let Ok(mut f) = std::fs::File::open(&log) {
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            if len < pos {
+                pos = 0; // truncated on app restart → start over
+            }
+            if len > pos && f.seek(SeekFrom::Start(pos)).is_ok() {
+                let mut reader = std::io::BufReader::new(&mut f);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) if line.ends_with('\n') => {
+                            if let Some(msg) = parse_inbound(line.trim_end(), self_id, &inbox) {
+                                on_msg(msg);
+                            }
+                        }
+                        // Partial line (mid-write) or read error: re-read next pass.
+                        _ => break,
+                    }
+                }
+                pos = f.stream_position().unwrap_or(len);
+            }
+        }
+        if sweep {
+            sweep_ctr += 1;
+            if sweep_ctr >= 25 {
+                sweep_ctr = 0;
+                sweep_dead_sessions(self_id);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }

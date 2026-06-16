@@ -173,6 +173,7 @@ fn build_frame(rows_by_project: &BTreeMap<String, Vec<Row>>, content_w: f32) -> 
             pad: 12.0,
             children: vec![
                 Element::Text {
+                    wrap: true,
                     value: "No Claude Code sessions".into(),
                     color: Some("#cc8".into()),
                     size: Some(13.0),
@@ -181,6 +182,7 @@ fn build_frame(rows_by_project: &BTreeMap<String, Vec<Row>>, content_w: f32) -> 
                     selectable: false,
                 },
                 Element::Text {
+                    wrap: true,
                     value: "Configure ~/.claude/settings.json statusLine to claude-statusline-bridge".into(),
                     color: Some("#888".into()),
                     size: Some(11.0),
@@ -216,6 +218,7 @@ fn build_frame(rows_by_project: &BTreeMap<String, Vec<Row>>, content_w: f32) -> 
             project.clone()
         };
         children.push(Element::Text {
+            wrap: true,
             value: project_label,
             color: Some("#b8bcc4".into()),
             size: Some(12.0),
@@ -238,6 +241,7 @@ fn build_frame(rows_by_project: &BTreeMap<String, Vec<Row>>, content_w: f32) -> 
                     style: None,
                 },
                 Element::Text {
+                    wrap: true,
                     value: pct_label,
                     color: Some("#aab0b8".into()),
                     size: Some(11.0),

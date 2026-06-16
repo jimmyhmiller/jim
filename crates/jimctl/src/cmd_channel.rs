@@ -76,6 +76,73 @@ fn current_cwd() -> String {
         .unwrap_or_default()
 }
 
+/// Seconds since the epoch (for roster heartbeats / staleness).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How often we re-announce, and when a heartbeat is considered stale.
+const HEARTBEAT_SECS: u64 = 10;
+const STALE_SECS: u64 = 35;
+
+/// Was this session actually launched as a channel (`--channels … jim …`)?
+///
+/// A channel MCP server cannot tell from the MCP handshake whether Claude Code
+/// loaded it as a *channel* (inbound delivery on) vs an ordinary plugin MCP
+/// server (tools work, but `notifications/claude/channel` are silently dropped)
+/// — notifications are unacknowledged. The one place the truth lives is the
+/// launch flag, which is per-session (no config form), so we detect it by
+/// walking up our process ancestry for a `claude … --channels … jim` argv.
+/// Only a real channel announces on the roster, so the roster reflects
+/// reachable sessions, not merely "plugin loaded".
+fn on_channel() -> bool {
+    let mut pid = unsafe { libc::getppid() };
+    for _ in 0..6 {
+        if pid <= 1 {
+            break;
+        }
+        let args = proc_args(pid);
+        // Match only the real `claude` process launched with --channels — NOT
+        // any ancestor that merely mentions those words (a shell, a script,
+        // this very tool's command line). Require argv[0]'s basename to be
+        // `claude` and `--channels` to appear as its own token.
+        if let Some(prog) = args.split_whitespace().next() {
+            let is_claude = std::path::Path::new(prog)
+                .file_name()
+                .map(|n| n == "claude")
+                .unwrap_or(false);
+            if is_claude && args.split_whitespace().any(|t| t == "--channels") {
+                return true;
+            }
+        }
+        pid = proc_ppid(pid);
+    }
+    false
+}
+
+/// `ps -o args=` for a pid (empty string on failure).
+fn proc_args(pid: i32) -> String {
+    std::process::Command::new("ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// `ps -o ppid=` for a pid (0 on failure → stops the walk).
+fn proc_ppid(pid: i32) -> i32 {
+    std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// Write one JSON-RPC message as a single line on stdout, serialized
 /// against the shared lock so the tail thread and the request loop don't
 /// interleave.
@@ -178,12 +245,25 @@ pub fn run() -> ExitCode {
             }
 
             "notifications/initialized" => {
-                // Safe to start emitting now. Begin tailing and announce
-                // ourselves on the roster exactly once.
+                // Safe to start emitting now. But only a session actually
+                // launched with `--channels` can RECEIVE — so only those tail
+                // the bus, announce on the roster, and heartbeat. A plain
+                // plugin-MCP load still has working tools (tools/call below);
+                // it just doesn't pollute the roster with an unreachable entry.
                 if !tail_started {
                     tail_started = true;
-                    spawn_tail(out.clone(), shared.clone(), id.clone());
-                    announce(&id, &shared);
+                    if on_channel() {
+                        spawn_tail(out.clone(), shared.clone(), id.clone());
+                        announce(&id, &shared);
+                        spawn_heartbeat(id.clone(), shared.clone());
+                    } else {
+                        eprintln!(
+                            "jimctl channel: not launched with `--channels` — tools work, \
+                             but this session can't receive pings, so it is NOT listed on \
+                             the roster. Relaunch with `claude --channels plugin:jim@jim-local` \
+                             to be reachable."
+                        );
+                    }
                 }
             }
 
@@ -461,10 +541,23 @@ fn announce(id: &str, shared: &Shared) {
         "pid": std::process::id(),
         "cwd": current_cwd(),
         "label": label,
+        "ts": now_secs(),       // heartbeat timestamp for staleness
+        "channel": true,        // marks this as a real --channels session
     });
     if let Err(e) = publish(&format!("agent.hello.{id}"), payload, true, id) {
         eprintln!("jimctl channel: roster announce failed: {e}");
     }
+}
+
+/// Re-announce on a timer so the roster reflects a *currently-live* session:
+/// the `ts` lets viewers/sweepers expire entries that stop heartbeating, which
+/// is what makes dead/stale sessions drop off (a hard-killed session simply
+/// stops refreshing its `ts`).
+fn spawn_heartbeat(id: String, shared: Shared) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(HEARTBEAT_SECS));
+        announce(&id, &shared);
+    });
 }
 
 /// Default roster label: the current directory's basename.
@@ -494,14 +587,27 @@ fn pid_alive(pid: u32) -> bool {
 /// the roster (and the viewer widget) self-heal when a session dies without
 /// a clean exit. Skips our own entry. Runs from a live session's bridge.
 fn sweep_dead_sessions(self_id: &str) {
+    let now = now_secs();
     for (sid, info) in read_roster() {
         if sid == self_id {
             continue;
         }
-        let Some(pid) = info.get("pid").and_then(Value::as_u64) else {
-            continue; // no pid recorded → can't judge; leave it
-        };
-        if !pid_alive(pid as u32) {
+        // A heartbeating session that has gone quiet (`ts` too old) is gone,
+        // even if its pid was reused by something else. Only applies to
+        // entries that carry a `ts` (i.e. heartbeating channel sessions);
+        // others fall back to the pid check so non-heartbeat agents
+        // (codex/pi/CLI) aren't wrongly reaped.
+        let stale_ts = info
+            .get("ts")
+            .and_then(Value::as_u64)
+            .map(|ts| now.saturating_sub(ts) > STALE_SECS)
+            .unwrap_or(false);
+        let dead_pid = info
+            .get("pid")
+            .and_then(Value::as_u64)
+            .map(|pid| !pid_alive(pid as u32))
+            .unwrap_or(false);
+        if stale_ts || dead_pid {
             let _ = publish(&format!("agent.hello.{sid}"), Value::Null, true, "sweep");
         }
     }

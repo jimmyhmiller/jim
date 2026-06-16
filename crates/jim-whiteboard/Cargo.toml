@@ -1,0 +1,25 @@
+[package]
+name = "jim_whiteboard"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+whiteboard-core = { path = "../whiteboard-core" }
+jim_pane = { path = "../jim-pane" }
+jim_style = { path = "../jim-style" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Vector tessellation: turns whiteboard `Path`s (cubic-bezier outlines,
+# polygon fills, thick strokes with round caps/joins) into the triangle
+# meshes Bevy's 2d renderer draws. The whole point of "high quality" lines.
+lyon = "1.0"
+bevy = { version = "0.18", default-features = false, features = [
+    "2d",
+    "x11",
+    "wayland",
+] }
+
+[lib]
+name = "jim_whiteboard"
+path = "src/lib.rs"

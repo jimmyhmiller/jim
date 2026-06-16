@@ -89,7 +89,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -174,6 +174,12 @@ pub(crate) enum HostToWorker {
     /// updates `canvas_w` / `canvas_h` in scope so `render` sees the
     /// new size.
     Resize { canvas_w: f32, canvas_h: f32 },
+    /// The pane's vertical scroll offset changed. Updates the `scroll_y`
+    /// global so a windowing/virtualizing widget can render only the visible
+    /// slice, and drives the optional `on_scroll(y)` handler. Sent only when
+    /// the offset actually changes; widgets that don't define `on_scroll`
+    /// ignore it (no re-render), so non-virtualized widgets are unaffected.
+    Scroll { y: f32 },
     /// A navigation key press routed to the focused widget. Drives
     /// `on_key(key)` in the script. `key` is a stable name like
     /// "ArrowLeft" / "ArrowRight" / "Home" / "End".
@@ -284,6 +290,13 @@ pub(crate) struct WorkerSlots {
     /// each frame and only sends `Tick` if true. Idle widgets =
     /// zero script eval and zero CPU.
     pub(crate) animating: Arc<AtomicBool>,
+    /// Set by the script via `set_tick_interval(secs)`. A *slow* tick
+    /// request (e.g. a 300s auto-refresh poll): the widget wants
+    /// `on_frame` called roughly every N seconds, but does NOT need the
+    /// app pinned to 60fps `Continuous`. The host delivers ticks at this
+    /// cadence from the reactive loop instead — near-zero CPU. 0 = none.
+    /// Distinct from `animating` (60fps); a widget uses one or the other.
+    pub(crate) tick_interval_ms: Arc<AtomicU32>,
     /// Set by the script via `request_render()`. Worker calls
     /// `render(canvas_w, canvas_h)` and publishes a frame whenever
     /// this is set after a handler completes, then clears it.
@@ -311,6 +324,7 @@ impl WorkerSlots {
             frame_gen: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(Mutex::new(None)),
             animating: Arc::new(AtomicBool::new(false)),
+            tick_interval_ms: Arc::new(AtomicU32::new(0)),
             render_dirty: Arc::new(AtomicBool::new(true)),
             outbox: Arc::new(Mutex::new(Vec::new())),
             wants_clicks: Arc::new(AtomicBool::new(false)),
@@ -511,6 +525,25 @@ impl ScriptWidget {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Requested *slow* tick cadence in seconds via
+    /// `set_tick_interval(secs)`, or `None` if the widget isn't slow-
+    /// ticking. Unlike `is_animating()`, this does NOT demand
+    /// `Continuous` 60fps — the host serves it from the reactive loop,
+    /// so a 5-minute auto-refresh poll costs ~nothing instead of pinning
+    /// the whole app at 60fps. See `maintain_winit_mode_for_animation`.
+    pub fn tick_interval_secs(&self) -> Option<f32> {
+        let ms = self
+            .handle
+            .slots
+            .tick_interval_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        if ms == 0 {
+            None
+        } else {
+            Some(ms as f32 / 1000.0)
+        }
+    }
+
     /// Latest frame the worker produced, cloned out of the shared slot.
     /// Used host-side to seed an input's edit buffer on focus.
     pub fn latest_frame(&self) -> Option<Element> {
@@ -561,6 +594,35 @@ struct ScriptWatcher {
     _watcher: RecommendedWatcher,
 }
 
+/// Per-frame wall-clock budget for applying funct-pane frames on the MAIN
+/// thread (the layout + entity-spawn in [`apply_latest_frames`]). The funct
+/// handler itself already runs fuel-sliced on a worker thread, so it can't
+/// block the editor; this bounds the one remaining unbounded main-thread cost.
+///
+/// Once a frame has applied at least one pane and spent this long, the
+/// remaining dirty panes are deferred to later frames — so a heavy or
+/// re-render-spamming widget *smears* its cost across frames instead of
+/// stalling the whole editor. At least one pane always renders per frame, so
+/// progress is guaranteed even with a tiny budget. Default 3ms; override with
+/// `JIM_WIDGET_RENDER_BUDGET_MS`.
+#[derive(Resource, Clone, Copy)]
+pub struct WidgetRenderBudget {
+    pub per_frame: std::time::Duration,
+}
+
+impl Default for WidgetRenderBudget {
+    fn default() -> Self {
+        let ms = std::env::var("JIM_WIDGET_RENDER_BUDGET_MS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|m| *m > 0.0)
+            .unwrap_or(3.0);
+        Self {
+            per_frame: std::time::Duration::from_secs_f64(ms / 1000.0),
+        }
+    }
+}
+
 pub struct ScriptWidgetPlugin;
 
 impl Plugin for ScriptWidgetPlugin {
@@ -568,6 +630,7 @@ impl Plugin for ScriptWidgetPlugin {
         // Idempotent: WidgetPlugin also inits + ticks the store; this keeps
         // funct-only hosts working.
         app.init_resource::<crate::anim::WidgetAnim>()
+            .init_resource::<WidgetRenderBudget>()
             .add_systems(Startup, (register_kind, setup_watcher))
             .add_systems(
                 Update,
@@ -580,6 +643,7 @@ impl Plugin for ScriptWidgetPlugin {
                     forward_hovers_to_workers,
                     forward_keys_to_workers,
                     forward_inputs_to_workers,
+                    forward_scroll_to_workers,
                     apply_latest_frames,
                 )
                     .chain(),
@@ -1075,6 +1139,25 @@ fn forward_releases_to_workers(
     }
 }
 
+/// Push the pane's vertical scroll offset to its worker when it changes, so a
+/// virtualizing widget (the diff viewer) can re-window to the visible slice.
+/// Only widgets that define `on_scroll` act on it; others just update the
+/// `scroll_y` global with no re-render, so non-virtualized widgets are
+/// unaffected (this is NOT the old, removed re-render-everything-on-scroll).
+fn forward_scroll_to_workers(
+    widgets: Query<
+        (&PaneKindMarker, &ScriptWidget, &crate::WidgetScroll),
+        Changed<crate::WidgetScroll>,
+    >,
+) {
+    for (kind, w, scroll) in &widgets {
+        if kind.0 != PANE_KIND {
+            continue;
+        }
+        w.handle.send(HostToWorker::Scroll { y: scroll.y });
+    }
+}
+
 fn forward_hovers_to_workers(
     mut events: MessageReader<PaneContentHovered>,
     widgets: Query<(&PaneKindMarker, &ScriptWidget, Option<&crate::WidgetScroll>)>,
@@ -1211,11 +1294,17 @@ fn forward_inputs_to_workers(
             });
         }
 
-        // Tick only fires while the widget has opted into animation
-        // (`set_animating(true)` in the script). Most widgets stay
-        // event-driven and never receive a Tick — that's the whole
-        // point of the event-driven worker contract.
-        if !w.handle.slots.animating.load(Ordering::Acquire) {
+        // Tick fires in one of two modes; most widgets opt into neither
+        // and stay purely event-driven (zero ticks — the whole point of
+        // the worker contract):
+        //   * `set_animating(true)` → a Tick every frame (60fps), for
+        //     real visual animation. Forces the app into `Continuous`.
+        //   * `set_tick_interval(secs)` → a Tick roughly every N seconds,
+        //     served from the reactive loop. For slow background work
+        //     (auto-refresh polls); does NOT pin the app to 60fps.
+        let fast = w.handle.slots.animating.load(Ordering::Acquire);
+        let slow_ms = w.handle.slots.tick_interval_ms.load(Ordering::Acquire);
+        if !fast && slow_ms == 0 {
             w.last_tick_at = None;
             continue;
         }
@@ -1223,9 +1312,18 @@ fn forward_inputs_to_workers(
             Some(prev) => (now - prev).as_secs_f32(),
             None => 0.0,
         };
-        if dt > 0.0 && dt < ANIMATION_MIN_FRAME_SECS {
-            // Cap animation frame rate; drop sub-frame ticks.
-            continue;
+        if fast {
+            if dt > 0.0 && dt < ANIMATION_MIN_FRAME_SECS {
+                // Cap animation frame rate; drop sub-frame ticks.
+                continue;
+            }
+        } else {
+            // Slow ticker: fire the first tick immediately (last_tick_at
+            // is None), then only once the requested interval has elapsed.
+            let interval = slow_ms as f32 / 1000.0;
+            if w.last_tick_at.is_some() && dt < interval {
+                continue;
+            }
         }
         w.last_tick_at = Some(now);
         w.handle.send(HostToWorker::Tick { dt_secs: dt });
@@ -1249,6 +1347,7 @@ fn apply_latest_frames(
     fonts: Res<jim_style::FontRegistry>,
     pane_zoom: Res<jim_pane::PaneZoom>,
     time: Res<Time>,
+    budget: Res<WidgetRenderBudget>,
     mut q: Query<(
         Entity,
         &PaneKindMarker,
@@ -1266,6 +1365,11 @@ fn apply_latest_frames(
     let zoom = pane_zoom.0.max(0.0001);
     // Caret blink: visible during the first half of each 1s cycle.
     let caret_visible = time.elapsed_secs().rem_euclid(1.0) < 0.5;
+    // Per-frame render deadline (see `WidgetRenderBudget`): smear work across
+    // frames so no single pane can stall the editor.
+    let frame_start = std::time::Instant::now();
+    let mut rendered_any = false;
+    let mut deferred = false;
     for (entity, kind, chrome, rect, mut w, mut targets, mut scroll, hover, input_focus) in &mut q {
         if kind.0 != PANE_KIND {
             continue;
@@ -1282,6 +1386,16 @@ fn apply_latest_frames(
         if current_gen == w.applied_frame_gen && !theme_changed && !focus_changed && !forced {
             continue;
         }
+        // Over the per-frame budget? Defer this (and the rest of the dirty)
+        // panes to a later frame. Mark `force_render` so it's retried no
+        // matter why it was dirty (frame_gen / theme / focus). One pane always
+        // gets through (`rendered_any` gate) so we never livelock.
+        if rendered_any && frame_start.elapsed() >= budget.per_frame {
+            w.force_render = true;
+            deferred = true;
+            continue;
+        }
+        rendered_any = true;
         let _prof = jim_pane::prof::pane_span(entity.to_bits(), "widget");
         w.applied_frame_gen = current_gen;
         w.last_focus_sig = focus_sig;
@@ -1426,6 +1540,12 @@ fn apply_latest_frames(
             }
         }
         clip_dirty.0 = true;
+    }
+    // Deferred panes need another frame to finish their smear; the reactive
+    // loop would otherwise idle. Nudge it so the leftover work continues next
+    // frame instead of waiting for the next unrelated wake.
+    if deferred {
+        crate::request_main_loop_wakeup();
     }
 }
 

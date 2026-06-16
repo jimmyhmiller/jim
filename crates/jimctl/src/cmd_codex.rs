@@ -56,25 +56,6 @@ fn ws_poll(ws: &mut Ws) -> Result<Option<Value>, ()> {
     }
 }
 
-/// Pull the assistant's reply for `turn_id` out of a `thread/resume` result.
-/// Falls back to the most-recent turn if the id isn't matched.
-fn reply_from_resume(result: &Value, turn_id: &str) -> Option<String> {
-    let turns = result.pointer("/thread/turns")?.as_array()?;
-    let pick = turns
-        .iter()
-        .find(|t| t.get("id").and_then(Value::as_str) == Some(turn_id))
-        .or_else(|| turns.first())?;
-    let items = pick.get("items")?.as_array()?;
-    for it in items.iter().rev() {
-        if it.get("type").and_then(Value::as_str) == Some("agentMessage") {
-            if let Some(t) = it.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-                return Some(t.to_string());
-            }
-        }
-    }
-    None
-}
-
 pub fn run() -> ExitCode {
     let (id_arg, name_arg) = parse_args();
     let id = id_arg
@@ -119,8 +100,9 @@ pub fn run() -> ExitCode {
     ws_req(&mut ws, 1, "initialize", json!({ "clientInfo": { "name": "jim", "version": env!("CARGO_PKG_VERSION") } }));
     ws_note(&mut ws, "initialized");
     agent_bus::announce(&id, &label);
+    ensure_codex_mcp(&id);
 
-    let (tx, rx) = mpsc::channel::<(String, String)>();
+    let (tx, rx) = mpsc::channel::<(String, String, bool)>();
     {
         let id = id.clone();
         std::thread::spawn(move || bus_tail(id, tx));
@@ -128,17 +110,16 @@ pub fn run() -> ExitCode {
     eprintln!(
         "jimctl codex: `{id}` attached to the codex daemon. Run `codex` plainly in \
          another terminal — bus messages to agent.inbox.{id} / agent.all become turns \
-         in that live session, and replies route back. Ctrl-C to stop."
+         in that live session, and the agent replies/collaborates via the jim_send \
+         tool when it chooses. Ctrl-C to stop."
     );
 
     let mut active_thread: Option<String> = None;
     let mut thread_busy = false;
-    let mut queue: VecDeque<(String, String)> = VecDeque::new();
-    // The single in-flight injected ask: (asker, our turn id once known, started_at).
-    let mut pending: Option<(String, Option<String>, Instant)> = None;
-    let mut turn_req: Option<u64> = None;   // id of our outstanding turn/start
-    let mut resume_id: Option<u64> = None;  // id of an outstanding reply-poll resume
-    let mut last_resume = Instant::now();
+    let mut queue: VecDeque<(String, String, bool)> = VecDeque::new();
+    // One injected turn in flight at a time. Set on inject; cleared when the
+    // thread returns to idle (with a long safety timeout if we miss the edge).
+    let mut in_flight: Option<Instant> = None;
     let mut next_id: u64 = 2;
 
     loop {
@@ -149,30 +130,8 @@ pub fn run() -> ExitCode {
         loop {
             match ws_poll(&mut ws) {
                 Ok(Some(m)) => {
-                    // Responses (have an id, no method).
-                    if let Some(rid) = m.get("id").and_then(Value::as_u64) {
-                        if Some(rid) == turn_req {
-                            turn_req = None;
-                            if let (Some((_, slot, _)), Some(t)) =
-                                (pending.as_mut(), m.pointer("/result/turn/id").and_then(Value::as_str))
-                            {
-                                *slot = Some(t.to_string());
-                            }
-                        } else if Some(rid) == resume_id {
-                            resume_id = None;
-                            if let Some((asker, Some(tid), _)) = pending.clone() {
-                                if let Some(result) = m.get("result") {
-                                    if let Some(reply) = reply_from_resume(result, &tid) {
-                                        let topic = format!("agent.inbox.{asker}");
-                                        let _ = agent_bus::publish(&topic, json!({ "from": id, "to": asker, "text": reply }), false, &id);
-                                        eprintln!("jimctl codex: → {topic} ({} chars)", reply.len());
-                                        pending = None;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Global notifications.
+                    // We don't read turn replies anymore — the agent replies via
+                    // the jim_send tool. We only track the thread + its busy state.
                     match m.get("method").and_then(Value::as_str).unwrap_or("") {
                         "thread/started" => {
                             if let Some(t) = m.pointer("/params/thread/id").and_then(Value::as_str) {
@@ -187,6 +146,10 @@ pub fn run() -> ExitCode {
                                 .or_else(|| m.pointer("/params/status").and_then(Value::as_str))
                                 .unwrap_or("");
                             thread_busy = st != "idle" && !st.is_empty();
+                            // Returned to idle → the injected turn finished.
+                            if !thread_busy {
+                                in_flight = None;
+                            }
                         }
                         _ => {}
                     }
@@ -196,37 +159,26 @@ pub fn run() -> ExitCode {
             }
         }
 
-        while let Ok(pair) = rx.try_recv() {
-            queue.push_back(pair);
+        while let Ok(triple) = rx.try_recv() {
+            queue.push_back(triple);
         }
 
-        // Inject the next ask when idle and nothing is pending.
-        if pending.is_none() && !thread_busy {
+        // Safety: if we never saw the idle edge, free the slot after a while.
+        if in_flight.map_or(false, |t| t.elapsed() > Duration::from_secs(600)) {
+            in_flight = None;
+        }
+
+        // Inject the next ask when the thread is idle and nothing is in flight.
+        if in_flight.is_none() && !thread_busy {
             if let Some(thread) = active_thread.clone() {
-                if let Some((from, text)) = queue.pop_front() {
+                if let Some((from, text, broadcast)) = queue.pop_front() {
                     let rid = next_id;
                     next_id += 1;
-                    turn_req = Some(rid);
-                    pending = Some((from.clone(), None, Instant::now()));
-                    let input = json!([{ "type": "text", "text": format!("[from {from} via jim] {text}") }]);
+                    in_flight = Some(Instant::now());
+                    let framed = frame_turn(&id, &from, &text, broadcast);
+                    let input = json!([{ "type": "text", "text": framed }]);
                     ws_req(&mut ws, rid, "turn/start", json!({ "threadId": thread, "input": input, "approvalPolicy": "never" }));
                     eprintln!("jimctl codex: injected a turn from {from}");
-                }
-            }
-        }
-
-        // Poll thread/resume for our reply once the turn id is known.
-        if resume_id.is_none() && last_resume.elapsed() > Duration::from_millis(1000) {
-            if let (Some((_, Some(_), started)), Some(thread)) = (pending.clone(), active_thread.clone()) {
-                if started.elapsed() > Duration::from_secs(180) {
-                    eprintln!("jimctl codex: reply timed out; dropping");
-                    pending = None;
-                } else {
-                    let rid = next_id;
-                    next_id += 1;
-                    resume_id = Some(rid);
-                    last_resume = Instant::now();
-                    ws_req(&mut ws, rid, "thread/resume", json!({ "threadId": thread, "itemsView": "full", "limit": 3 }));
                 }
             }
         }
@@ -255,69 +207,55 @@ fn parse_args() -> (Option<String>, Option<String>) {
     (id, name)
 }
 
-fn bus_tail(self_id: String, tx: mpsc::Sender<(String, String)>) {
-    use std::io::{BufRead, Seek, SeekFrom};
-    let Some(log) = agent_bus::bus_log_path() else { return };
-    let inbox = format!("agent.inbox.{self_id}");
-    let mut pos: u64 = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
-    loop {
-        if SHUTDOWN.load(Ordering::SeqCst) {
-            return;
+/// Tail the bus for messages addressed to us; forward `(from, text, broadcast)`.
+fn bus_tail(self_id: String, tx: mpsc::Sender<(String, String, bool)>) {
+    agent_bus::follow_inbox(
+        &self_id,
+        false, // codex bridge doesn't sweep (it announces; keep it simple)
+        |m| {
+            let broadcast = m.topic == "agent.all";
+            let _ = tx.send((m.from, m.text, broadcast));
+        },
+        || SHUTDOWN.load(Ordering::SeqCst),
+    );
+}
+
+/// Ensure the `jim` MCP tool server is registered with codex so the live
+/// session gets jim_send/jim_roster/jim_do. Re-registers each start to keep
+/// `JIM_AGENT_ID` in sync with this bridge's id. Best-effort.
+fn ensure_codex_mcp(id: &str) {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
+        .unwrap_or_else(|| "jimctl".to_string());
+    // Remove any stale entry, then add fresh with our id.
+    let _ = Command::new("codex").args(["mcp", "remove", "jim"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let status = Command::new("codex")
+        .args(["mcp", "add", "jim", "--env", &format!("JIM_AGENT_ID={id}"), "--", &exe, "mcp"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("jimctl codex: registered the `jim` MCP server (jim_send/jim_roster/jim_do) for codex.");
         }
-        if let Ok(mut f) = std::fs::File::open(&log) {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len < pos {
-                pos = 0;
-            }
-            if len > pos && f.seek(SeekFrom::Start(pos)).is_ok() {
-                let mut reader = std::io::BufReader::new(&mut f);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if line.ends_with('\n') {
-                                if let Some(pair) = parse_inbound(line.trim_end(), &self_id, &inbox) {
-                                    let _ = tx.send(pair);
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                pos = f.stream_position().unwrap_or(len);
-            }
+        _ => {
+            eprintln!(
+                "jimctl codex: could not auto-register the MCP server. Add it manually:\n  \
+                 codex mcp add jim --env JIM_AGENT_ID={id} -- {exe} mcp"
+            );
         }
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-fn parse_inbound(line: &str, self_id: &str, inbox: &str) -> Option<(String, String)> {
-    if line.is_empty() {
-        return None;
-    }
-    let m: Value = serde_json::from_str(line).ok()?;
-    let topic = m.get("topic").and_then(Value::as_str).unwrap_or("");
-    if topic != inbox && topic != "agent.all" {
-        return None;
-    }
-    let bus_sender = m.get("sender").and_then(Value::as_str).unwrap_or("");
-    let payload = m.get("payload").cloned().unwrap_or(Value::Null);
-    let from = payload
-        .get("from")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(bus_sender)
-        .to_string();
-    if from == self_id || bus_sender == self_id {
-        return None;
-    }
-    let text = match payload.get("text").and_then(Value::as_str) {
-        Some(t) => t.to_string(),
-        None => serde_json::to_string(&payload).unwrap_or_default(),
-    };
-    Some((from, text))
+/// Frame an incoming bus message as a codex turn: bus context + the agent's
+/// own id + how to reply/collaborate with the jim_send tool.
+fn frame_turn(self_id: &str, from: &str, text: &str, broadcast: bool) -> String {
+    let scope = if broadcast { "broadcast" } else { "direct" };
+    format!(
+        "[jim bus · {scope} message from \"{from}\"]\n{text}\n\n\
+         (You are agent \"{self_id}\" on the jim bus. To reply, use the jim_send tool \
+         with to=\"{from}\". To reach another agent use their id, or to=\"all\" to \
+         broadcast. jim_roster lists who's online. Reply once if it's useful, then stop.)"
+    )
 }

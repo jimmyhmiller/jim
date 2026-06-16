@@ -1,22 +1,32 @@
-//! `jimctl pi` — put a `pi` (coding CLI) session on the jim agent bus, with
-//! an interactive front-end.
+//! `jimctl pi` — run a headless `pi` agent on the jim bus.
 //!
-//! pi has no async-push protocol, but it has stable session resume
-//! (`--session-id`, created if missing). So each message — whether typed
-//! here or arriving on the bus — continues one persistent pi session via
-//! `pi --mode json --print`; pi's reply goes back to the asker's inbox
-//! (point-to-point), or prints here if you typed it. A worker serializes
-//! invocations so concurrent asks don't race the session.
+//! The bus integration lives in the **`jim-bus.ts` pi extension**
+//! (`integrations/pi/jim-bus.ts`, installed to `~/.pi/agent/extensions/`),
+//! which auto-loads in this process and owns ALL bus I/O:
+//!   - inbound: tails the bus, injects each `agent.inbox.<id>`/`agent.all`
+//!     message into the session as a real turn (framed with the sender);
+//!   - outbound: gives the agent the `jim_send` / `jim_roster` / `jim_do`
+//!     tools so it **replies and collaborates when it chooses** (reply to the
+//!     asker, message a peer, or broadcast) — there is no forced auto-reply.
 //!
-//! Interactive: type a line to ask pi; `/name <label>` renames live, `/who`,
-//! `/quit`. Identity: id is fixed (`--id` / `$JIM_PI_ID` / `pi-<dir>`); name
-//! is `--name` / `/name`.
+//! This command is just the headless host. `pi --mode rpc` is a long-running
+//! session that reads commands on stdin and **exits the moment stdin hits
+//! EOF** — so the one job here is to spawn it (extension loaded), HOLD ITS
+//! STDIN OPEN so it stays alive, restart it if it crashes, and let you type a
+//! line to prompt the agent locally. It does NOT do bus I/O itself — that
+//! would double up with the extension. (For a session you watch/steer in a
+//! TUI, just run `pi` directly; the same extension loads.)
+//!
+//! Identity passed to the child as env so the extension uses it: id =
+//! `--id`/`$JIM_PI_ID`/`pi-<dir>`, name = `--name`/`$JIM_PI_NAME`/`<dir>`.
+//! The pi *session* is `--session-id jim-pi-<id>`, so context survives a
+//! restart. Local controls: type a line to prompt; `/who`, `/quit`.
 
-use std::io::{self, BufRead, Seek, SeekFrom};
-use std::process::{Command, ExitCode, Stdio};
+use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -28,17 +38,27 @@ extern "C" fn on_signal(_: i32) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
-const LOCAL: &str = "local";
-
 pub fn run() -> ExitCode {
+    if crate::sub_args().any(|a| a == "-h" || a == "--help" || a == "help") {
+        eprintln!(
+            "usage: jimctl pi [--id <id>] [--name <label>]\n\n  \
+             Runs a headless `pi --mode rpc` agent on the jim bus. Bus I/O is handled by\n  \
+             the jim-bus pi extension (~/.pi/agent/extensions/jim-bus.ts), which gives the\n  \
+             agent jim_send/jim_roster/jim_do and injects incoming messages as turns.\n  \
+             Type a line to prompt the agent locally; /who, /quit."
+        );
+        return ExitCode::SUCCESS;
+    }
     let (id_arg, name_arg) = parse_args();
     let id = id_arg
         .or_else(|| std::env::var("JIM_PI_ID").ok())
         .unwrap_or_else(|| format!("pi-{}", agent_bus::default_label()));
-    let label = Arc::new(Mutex::new(name_arg.unwrap_or_else(agent_bus::default_label)));
+    let name = name_arg
+        .or_else(|| std::env::var("JIM_PI_NAME").ok())
+        .unwrap_or_else(agent_bus::default_label);
     let session_id = format!("jim-pi-{id}");
-    eprintln!("jimctl pi: id={id} name={:?} session={session_id}", *label.lock().unwrap());
 
+    // pi must be on PATH.
     if Command::new("pi")
         .arg("--version")
         .stdout(Stdio::null())
@@ -49,84 +69,112 @@ pub fn run() -> ExitCode {
         eprintln!("jimctl pi: `pi` CLI not found on PATH.");
         return ExitCode::from(1);
     }
+    // The bus integration is the extension — refuse to run without it (else
+    // the agent would be on no bus at all, silently).
+    if let Some(ext) = extension_path() {
+        if !ext.exists() {
+            eprintln!("jimctl pi: jim-bus extension not installed at {}.", ext.display());
+            eprintln!("  install it:  cp integrations/pi/jim-bus.ts ~/.pi/agent/extensions/");
+            return ExitCode::from(1);
+        }
+    }
 
     unsafe {
         libc::signal(libc::SIGINT, on_signal as extern "C" fn(i32) as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_signal as extern "C" fn(i32) as libc::sighandler_t);
     }
 
-    // Worker: one pi invocation at a time, continuing the same session.
-    let (tx, rx) = mpsc::channel::<(String, String)>();
-    {
-        let id = id.clone();
-        let session_id = session_id.clone();
-        std::thread::spawn(move || pi_worker(rx, id, session_id));
-    }
-
-    agent_bus::announce(&id, &label.lock().unwrap());
-
-    // Interactive stdin thread.
-    {
-        let id = id.clone();
-        let label = label.clone();
-        let tx = tx.clone();
-        std::thread::spawn(move || stdin_loop(id, label, tx));
-    }
-
     eprintln!(
-        "jimctl pi: `{id}` is live on the bus and interactive.\n  \
-         Type to ask pi. /name <label> to rename, /who, /quit. \
-         Other agents reach you at agent.inbox.{id}."
+        "jimctl pi: headless `pi --mode rpc` as `{id}` (\"{name}\"), session {session_id}.\n  \
+         Bus I/O is handled by the jim-bus extension (inbound inject + jim_send/jim_roster/jim_do).\n  \
+         Type a line to prompt the agent locally; /who, /quit."
     );
 
-    let Some(log) = agent_bus::bus_log_path() else {
-        eprintln!("jimctl pi: HOME not set");
-        return ExitCode::from(1);
-    };
-    let inbox = format!("agent.inbox.{id}");
-    let mut pos: u64 = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
-    let mut sweep_ctr: u32 = 0;
+    // Local typing → prompt commands for the live session.
+    let (tx, rx) = mpsc::channel::<String>();
+    {
+        let id = id.clone();
+        let name = name.clone();
+        std::thread::spawn(move || local_stdin_loop(id, name, tx));
+    }
 
+    // Supervise: keep exactly one `pi --mode rpc` alive, restarting on crash.
     while !SHUTDOWN.load(Ordering::SeqCst) {
-        if let Ok(mut f) = std::fs::File::open(&log) {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len < pos {
-                pos = 0;
+        let mut child = match spawn_pi_rpc(&id, &name, &session_id) {
+            Some(c) => c,
+            None => {
+                eprintln!("jimctl pi: could not spawn pi; retrying in 2s");
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
             }
-            if len > pos && f.seek(SeekFrom::Start(pos)).is_ok() {
-                let mut reader = io::BufReader::new(&mut f);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if line.ends_with('\n') {
-                                if let Some((from, text)) = inbound(line.trim_end(), &id, &inbox) {
-                                    eprintln!("jimctl pi: ← {from}: {text}");
-                                    let _ = tx.send((from, text));
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
+        };
+        // Holding `stdin` is what keeps pi alive — pi --mode rpc exits on stdin
+        // EOF. Do NOT drop it until we're tearing the child down.
+        let mut stdin = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                continue;
+            }
+        };
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || print_pi_events(out));
+        }
+
+        // Forward local prompts; watch for shutdown or child exit (→ respawn).
+        loop {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            while let Ok(msg) = rx.try_recv() {
+                let cmd = json!({ "type": "prompt", "message": msg }).to_string();
+                if writeln!(stdin, "{cmd}").and_then(|_| stdin.flush()).is_err() {
+                    break;
                 }
-                pos = f.stream_position().unwrap_or(len);
             }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !SHUTDOWN.load(Ordering::SeqCst) {
+                        eprintln!("jimctl pi: pi exited ({status}); restarting");
+                    }
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            std::thread::sleep(Duration::from_millis(150));
         }
-        sweep_ctr += 1;
-        if sweep_ctr >= 25 {
-            sweep_ctr = 0;
-            agent_bus::sweep_dead_sessions(&id);
-        }
-        std::thread::sleep(Duration::from_millis(200));
+        drop(stdin); // close pi's stdin so it shuts down cleanly
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     eprintln!("jimctl pi: shutting down…");
+    // Safety net: the extension tombstones on its own clean exit, but a hard
+    // kill skips that — tombstone here too (idempotent).
     agent_bus::tombstone(&id);
     ExitCode::SUCCESS
+}
+
+fn extension_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".pi/agent/extensions/jim-bus.ts"))
+}
+
+/// Spawn the long-lived `pi --mode rpc` session with the bus identity in env
+/// (the extension reads `JIM_PI_ID`/`JIM_PI_NAME`). stdin piped + held open by
+/// the caller; stdout piped for display; stderr discarded.
+fn spawn_pi_rpc(id: &str, name: &str, session_id: &str) -> Option<Child> {
+    Command::new("pi")
+        .args(["--mode", "rpc", "--session-id", session_id])
+        .env("JIM_PI_ID", id)
+        .env("JIM_PI_NAME", name)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| eprintln!("jimctl pi: spawn failed: {e}"))
+        .ok()
 }
 
 fn parse_args() -> (Option<String>, Option<String>) {
@@ -143,7 +191,10 @@ fn parse_args() -> (Option<String>, Option<String>) {
     (id, name)
 }
 
-fn stdin_loop(id: String, label: Arc<Mutex<String>>, tx: mpsc::Sender<(String, String)>) {
+/// Read this terminal's stdin: a bare line prompts the agent locally; `/who`
+/// and `/quit` are local controls. (Renaming lives in the extension's
+/// `/jim-name`; the roster identity is owned there.)
+fn local_stdin_loop(id: String, name: String, tx: mpsc::Sender<String>) {
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
@@ -151,129 +202,61 @@ fn stdin_loop(id: String, label: Arc<Mutex<String>>, tx: mpsc::Sender<(String, S
         if t.is_empty() {
             continue;
         }
-        if let Some(rest) = t.strip_prefix("/name ") {
-            let new = rest.trim().to_string();
-            if !new.is_empty() {
-                *label.lock().unwrap() = new.clone();
-                agent_bus::announce(&id, &new);
-                println!("(renamed to \"{new}\")");
-            }
-            continue;
-        }
         match t {
-            "/who" => println!("id={id}  name=\"{}\"", label.lock().unwrap()),
+            "/who" => println!("id={id}  name=\"{name}\""),
             "/quit" | "/exit" => {
                 SHUTDOWN.store(true, Ordering::SeqCst);
                 break;
             }
-            _ if t.starts_with('/') => println!("commands: /name <label>, /who, /quit"),
+            _ if t.starts_with('/') => println!("commands: /who, /quit (type a line to prompt the agent)"),
             _ => {
-                let _ = tx.send((LOCAL.to_string(), t.to_string()));
-            }
-        }
-    }
-}
-
-/// Parse a bus-log line; return `(from, text)` if addressed to us and not our
-/// own broadcast.
-fn inbound(line: &str, self_id: &str, inbox: &str) -> Option<(String, String)> {
-    if line.is_empty() {
-        return None;
-    }
-    let m: Value = serde_json::from_str(line).ok()?;
-    let topic = m.get("topic").and_then(Value::as_str).unwrap_or("");
-    if topic != inbox && topic != "agent.all" {
-        return None;
-    }
-    let bus_sender = m.get("sender").and_then(Value::as_str).unwrap_or("");
-    let payload = m.get("payload").cloned().unwrap_or(Value::Null);
-    let from = payload
-        .get("from")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(bus_sender)
-        .to_string();
-    if from == self_id || bus_sender == self_id {
-        return None;
-    }
-    let text = match payload.get("text").and_then(Value::as_str) {
-        Some(t) => t.to_string(),
-        None => serde_json::to_string(&payload).unwrap_or_default(),
-    };
-    Some((from, text))
-}
-
-/// Worker: one pi invocation per message, continuing the same session.
-/// Replies route to the asker's inbox, or print here for locally-typed asks.
-fn pi_worker(rx: mpsc::Receiver<(String, String)>, self_id: String, session_id: String) {
-    for (from, text) in rx {
-        let prompt = if from == LOCAL {
-            text.clone()
-        } else {
-            format!("[from {from} via jim] {text}")
-        };
-        eprintln!("jimctl pi: → pi (from {from})");
-        let out = Command::new("pi")
-            .args(["--mode", "json", "--print", "--session-id", &session_id, &prompt])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        match out {
-            Ok(o) => match parse_pi_reply(&o.stdout) {
-                Some(reply) => {
-                    println!("\n[pi] {reply}\n");
-                    if from != LOCAL {
-                        let topic = format!("agent.inbox.{from}");
-                        let _ = agent_bus::publish(
-                            &topic,
-                            json!({ "from": self_id, "to": from, "text": reply }),
-                            false,
-                            &self_id,
-                        );
-                        eprintln!("jimctl pi: → {topic} ({} chars)", reply.len());
-                    }
+                if tx.send(t.to_string()).is_err() {
+                    break;
                 }
-                None => eprintln!("jimctl pi: no assistant text parsed from pi output"),
-            },
-            Err(e) => eprintln!("jimctl pi: pi invocation failed: {e}"),
+            }
         }
     }
 }
 
-/// Pull pi's final assistant text from its `--mode json` NDJSON: the last
-/// assistant message in the terminal `agent_end` event.
-fn parse_pi_reply(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut reply = None;
-    for line in text.lines() {
-        let Ok(m) = serde_json::from_str::<Value>(line) else {
+/// Surface what the agent says: print the assistant text from each `agent_end`
+/// event on the rpc stdout stream. Display-only — the extension already
+/// published any bus output. Ignores the rest of the (noisy) event stream.
+fn print_pi_events(stdout: std::process::ChildStdout) {
+    let reader = io::BufReader::new(stdout);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let Ok(m) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if m.get("type").and_then(Value::as_str) != Some("agent_end") {
+        if m.get("type").and_then(Value::as_str) == Some("agent_end") {
+            if let Some(text) = reply_from_agent_end(&m) {
+                println!("\n[pi] {text}\n");
+            }
+        }
+    }
+}
+
+/// Pull the last assistant message's text out of a pi `agent_end` event,
+/// concatenating its `text` content blocks (skipping `thinking`, etc.).
+fn reply_from_agent_end(m: &Value) -> Option<String> {
+    let msgs = m.get("messages").and_then(Value::as_array)?;
+    for msg in msgs.iter().rev() {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let Some(msgs) = m.get("messages").and_then(Value::as_array) else {
-            continue;
-        };
-        for msg in msgs.iter().rev() {
-            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            let mut s = String::new();
-            if let Some(content) = msg.get("content").and_then(Value::as_array) {
-                for c in content {
-                    if c.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(t) = c.get("text").and_then(Value::as_str) {
-                            s.push_str(t);
-                        }
+        let mut s = String::new();
+        if let Some(content) = msg.get("content").and_then(Value::as_array) {
+            for c in content {
+                if c.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(t) = c.get("text").and_then(Value::as_str) {
+                        s.push_str(t);
                     }
                 }
             }
-            if !s.is_empty() {
-                reply = Some(s);
-                break;
-            }
+        }
+        if !s.is_empty() {
+            return Some(s);
         }
     }
-    reply
+    None
 }

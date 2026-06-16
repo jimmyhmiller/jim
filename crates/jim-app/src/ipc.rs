@@ -77,6 +77,22 @@ pub enum IpcRequest {
         #[serde(default)]
         params: Option<serde_json::Value>,
     },
+    /// `{"action":"spawn_pane","kind":"whiteboard","project":"Recursion"}` —
+    /// spawn ANY registered pane kind on the canvas (the generic equivalent of
+    /// picking it from the radial menu). `position`/`size` are optional
+    /// window-space top-left and pixel size; `config` is the kind-specific blob
+    /// (same shape its `snapshot` emits). Fire-and-forget.
+    SpawnPane {
+        kind: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        position: Option<[f32; 2]>,
+        #[serde(default)]
+        size: Option<[f32; 2]>,
+        #[serde(default)]
+        config: Option<serde_json::Value>,
+    },
     /// `widget projects` — list known projects so external tools can
     /// pick one by name. Response is written back over the same socket
     /// as a single JSON object then EOF: `{"projects":[{"id":N,

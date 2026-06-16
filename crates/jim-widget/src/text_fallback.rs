@@ -51,8 +51,16 @@ pub fn apply_text_fallback(
             continue;
         }
         let runs = reg.split_runs(&font.font, &text.0);
-        if runs.len() <= 1 {
-            continue; // fully covered by the base font — nothing to do
+        if runs.is_empty() {
+            continue;
+        }
+        // Nothing to do ONLY when the whole string already draws in the base
+        // font. A single run whose font differs from the base — e.g. a label
+        // that is entirely symbols like "↻" — still has to be re-inserted, or
+        // it keeps the base font that can't draw it and renders as tofu. (This
+        // was the bug: `runs.len() <= 1` skipped that all-fallback case.)
+        if runs.len() == 1 && runs[0].1 == font.font {
+            continue;
         }
         let size = font.font_size;
         let col = color.0;

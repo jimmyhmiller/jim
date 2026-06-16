@@ -274,6 +274,78 @@ fn send_sub_message(io: &WidgetIO, topic: String, payload: Value, sender: String
     }
 }
 
+/// An `agent.hello.<id>` entry is stale once its heartbeat is this old.
+const ROSTER_STALE_SECS: u64 = 35;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Is a process still alive? (Prunes dead roster entries whose session never
+/// tombstoned.) `kill(pid, 0)`: 0 = alive; EPERM = alive but not ours.
+fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Periodically expire stale `agent.hello.<id>` roster entries from the
+/// retained store, so the agent roster / viewer widget self-heal when a
+/// session dies without tombstoning. Unlike the bridges (which sweep by
+/// reading the bus log), this runs in the editor and sees the in-memory
+/// retained store directly — so it also clears legacy entries that predate
+/// the log's last truncation. An entry is stale when its announced `pid` is
+/// gone, or (for heartbeating sessions) its `ts` is too old. We publish a
+/// retained tombstone so live widgets drop it immediately, exactly like a
+/// clean exit would.
+fn sweep_stale_roster(mut bus: ResMut<WidgetMsgBus>, time: Res<Time>, mut acc: Local<f32>) {
+    *acc += time.delta_secs();
+    if *acc < 10.0 {
+        return;
+    }
+    *acc = 0.0;
+
+    let now = now_secs();
+    let stale: Vec<String> = bus
+        .retained
+        .iter()
+        .filter_map(|((proj, topic), (payload, _))| {
+            if proj.is_some() || payload.is_null() {
+                return None; // agent bus is the global (None) channel; skip tombstones
+            }
+            let id = topic.strip_prefix("agent.hello.")?;
+            let pid_dead = payload
+                .get("pid")
+                .and_then(Value::as_i64)
+                .map(|p| !pid_alive(p))
+                .unwrap_or(false);
+            let ts_stale = payload
+                .get("ts")
+                .and_then(Value::as_u64)
+                .map(|ts| now.saturating_sub(ts) > ROSTER_STALE_SECS)
+                .unwrap_or(false);
+            (pid_dead || ts_stale).then(|| id.to_string())
+        })
+        .collect();
+
+    for id in stale {
+        bus.push_external(PendingMsg {
+            project: None,
+            topic: format!("agent.hello.{id}"),
+            payload: Value::Null,
+            sender: "roster-sweep".to_string(),
+            retain: true,
+        });
+    }
+}
+
 pub struct WidgetMsgBusPlugin;
 
 impl Plugin for WidgetMsgBusPlugin {
@@ -281,6 +353,6 @@ impl Plugin for WidgetMsgBusPlugin {
         truncate_bus_log();
         app.init_resource::<WidgetMsgBus>()
             .add_message::<BusMessageObserved>()
-            .add_systems(Update, pump_widget_messages);
+            .add_systems(Update, (pump_widget_messages, sweep_stale_roster));
     }
 }
