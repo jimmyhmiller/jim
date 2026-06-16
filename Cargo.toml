@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = ["crates/glaze", "crates/editor-core", "crates/jim-editor", "crates/jim-pane", "crates/jim-style", "crates/jim-app", "crates/jim-terminal", "crates/jim-daemon", "crates/jim-widget", "crates/whiteboard-core", "crates/jim-whiteboard", "crates/claude-bus", "crates/claude-bus-bevy", "crates/claude-statusline-bridge", "crates/claude-context-bars", "crates/claude-event-logger", "crates/claude-queue-drain", "crates/jim-inference", "crates/diff-core", "crates/jim-diff", "crates/jimctl"]
+# A bare `cargo build --release` builds exactly the runtime set: the `jim`
+# GUI, the `jimctl` control CLI, and the widget bins (incl. the `glaze_ui`
+# subprocess widget) — all of which the app resolves next to its own exe.
+# Keeps the build to one command with no `-p` juggling; other crates still
+# build on demand as dependencies. Build a specific demo with `-p`/`--bin`.
+default-members = ["crates/jim-app", "crates/jimctl", "crates/jim-widget"]
 
 [workspace.package]
 license = "MIT"

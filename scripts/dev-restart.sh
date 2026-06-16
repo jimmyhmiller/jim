@@ -40,7 +40,10 @@ while [ $# -gt 0 ]; do
 done
 
 echo "[dev-restart] building ($PROFILE)..."
-cargo build $CARGO_PROFILE_ARGS -p jim_app -p jimctl --bin jim --bin jimctl
+# Bare build → workspace default-members (jim_app + jimctl + jim_widget),
+# which covers `jim`, `jimctl`, and the `glaze_ui` widget that make-bundle
+# copies into the .app. One command, no -p juggling.
+cargo build $CARGO_PROFILE_ARGS
 
 # Refresh the .app bundle so it carries the freshly-built binary and
 # libghostty-vt dylib (copied in, not symlinked into target/).

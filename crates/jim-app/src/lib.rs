@@ -67,6 +67,17 @@ pub fn data_dir() -> Option<PathBuf> {
     jim_daemon::data_dir()
 }
 
+/// Directory holding the running `jim` executable. Both `cargo build` and
+/// the `.app` bundle co-locate our sibling binaries (`jimctl`, `glaze_ui`,
+/// …) next to `jim` — `target/release/` in dev, `Contents/MacOS/` in the
+/// bundle — so this is the one place to resolve them without baking the
+/// builder's absolute paths into the binary (which break on another Mac).
+pub fn exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
 /// Dedicated RenderLayer for menu overlays (radial menu, per-pane
 /// context menu) so they draw on top of every per-pane camera. Pane
 /// cameras have order `(rect.z * 100) + 1`, which can climb past 600
@@ -1513,20 +1524,15 @@ fn action_cycle_pan_preset(ctx: &mut actions::ActionCtx) {
 /// window. The binary is looked up next to the running executable
 /// first, then in the dev target dir this build came from.
 fn action_open_glaze_ui(ctx: &mut actions::ActionCtx) {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("glaze_ui"));
-        }
-    }
-    candidates.push(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/glaze_ui"),
-    );
-    let Some(bin) = candidates.iter().find(|p| p.exists()) else {
+    // glaze_ui ships next to `jim` (target/release in dev, Contents/MacOS in
+    // the bundle), so resolve it relative to the running exe. No baked-in
+    // builder path — that only ever exists on the machine that compiled.
+    let candidate = exe_dir().map(|d| d.join("glaze_ui"));
+    let Some(bin) = candidate.filter(|p| p.exists()) else {
         error!(
-            "glaze_ui binary not found (looked in {:?}) — build it with \
-             `cargo build --release -p jim_widget --bin glaze_ui`",
-            candidates
+            "glaze_ui binary not found next to {:?} — build it with \
+             `cargo build --release` (it's a default workspace member)",
+            exe_dir()
         );
         return;
     };

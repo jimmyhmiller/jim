@@ -196,13 +196,26 @@ kill Jim's daemon processes, unless the user explicitly asked. Keep the user's d
 fn run_shell(cmd: &str) -> String {
     use std::process::{Command, Stdio};
 
-    let child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    // The agent drives the app by shelling out to `jimctl`, which ships next
+    // to `jim` (the bundle's Contents/MacOS, or target/release in dev) but is
+    // NOT on the system PATH on a fresh machine. Prepend the exe dir so those
+    // commands resolve without the user having to install jimctl globally.
+    if let Some(dir) = crate::exe_dir() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries = vec![dir];
+        entries.extend(std::env::split_paths(&path));
+        if let Ok(joined) = std::env::join_paths(entries) {
+            command.env("PATH", joined);
+        }
+    }
+    let child = command.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return format!("exit: -1\nfailed to spawn shell: {e}"),

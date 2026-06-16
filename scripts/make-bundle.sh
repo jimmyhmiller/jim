@@ -53,12 +53,35 @@ fi
 
 mkdir -p "$MACOS" "$FRAMEWORKS" "$RES"
 
+# Drop any stale binaries from earlier builds (e.g. the legacy `terminal`
+# bin from before the rename). A leftover Mach-O in MacOS/ that the final
+# codesign doesn't expect invalidates the whole bundle seal, so the app
+# fails Gatekeeper / won't launch cleanly. Only `jim` + the siblings below
+# should live here.
+rm -f "$MACOS/terminal"
+
 # Copy (don't symlink) the binary and dylib. A symlink into target/
 # would dangle after `cargo clean`; copies make the .app portable and
 # self-contained — you can launch it from Finder, the Dock, or move it
 # to /Applications without any env vars.
 cp "$SRC_BIN" "$MACOS/$EXEC_NAME"
 cp "$SRC_DYLIB" "$FRAMEWORKS/libghostty-vt.dylib"
+
+# Bundle the sibling binaries the app resolves at runtime relative to its
+# own exe (jim_app::exe_dir): `jimctl` is what the in-app agent shells out
+# to, and `glaze_ui` is the design-system showcase subprocess widget.
+# Without these in MacOS/, those features die on a machine that doesn't
+# have jimctl on PATH or a dev target/ tree — i.e. a fresh Mac.
+# `cargo build --release` produces all of them (workspace default-members).
+for sib in jimctl glaze_ui; do
+    SRC_SIB="target/$PROFILE/$sib"
+    if [ -x "$SRC_SIB" ]; then
+        cp "$SRC_SIB" "$MACOS/$sib"
+    else
+        echo "[make-bundle] WARNING: $SRC_SIB missing under target/$PROFILE — run the $PROFILE cargo build first." >&2
+        echo "[make-bundle]          The in-app agent ($sib) won't work in this bundle." >&2
+    fi
+done
 
 # Install the app icon from the tracked source (assets/icon/icon.icns).
 # Info.plist's CFBundleIconFile is "icon", so it lands as Resources/icon.icns.
@@ -96,9 +119,14 @@ else
 fi
 
 # install_name_tool invalidated the existing signature. Re-sign nested
-# code (the dylib) first; the whole bundle is signed at the end, after
-# Info.plist is in place, so the seal covers the usage-description strings.
+# code (the dylib + sibling executables) first; the whole bundle is signed
+# at the end, after Info.plist is in place, so the seal covers the
+# usage-description strings. Every Mach-O under the bundle must carry a
+# valid signature or the outer seal is invalid and the app fails Gatekeeper.
 codesign --force --sign "$SIGN_ARG" "$FRAMEWORKS/libghostty-vt.dylib" >/dev/null 2>&1 || true
+for sib in jimctl glaze_ui; do
+    [ -f "$MACOS/$sib" ] && codesign --force --sign "$SIGN_ARG" "$MACOS/$sib" >/dev/null 2>&1 || true
+done
 
 # Info.plist — CFBundleIdentifier drives Dock identity. The NS*UsageDescription
 # keys are REQUIRED for the corresponding TCC access: without

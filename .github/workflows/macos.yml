@@ -1,0 +1,64 @@
+name: macOS build
+
+# Proves a clean checkout builds and links on a fresh Apple Silicon Mac —
+# i.e. that you can stand the app up on a future work computer. The runner
+# has none of your local environment (no ~/.jim, no dev paths, no signing
+# identity), so a green run means the toolchain + deps are self-sufficient.
+#
+# GUI rendering is NOT tested: GitHub's macOS runners are headless, so a
+# windowed Bevy app can't open a surface. This gate covers build/link/dylib;
+# the actual on-screen smoke test still happens on your own machine.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macos-latest is Apple Silicon (arm64) — the only arch we ship.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # libghostty-vt-sys compiles vendored ghostty with zig; the version
+      # must match what the pinned libghostty-rs rev expects (see Cargo.toml).
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      # Rust toolchain comes from rust-toolchain.toml (channel 1.95.0) — the
+      # preinstalled rustup honors it automatically on the first cargo call.
+      - uses: Swatinem/rust-cache@v2
+
+      # One command — workspace default-members builds jim + jimctl + the
+      # widget bins (incl. glaze_ui), the exact runtime set the app resolves
+      # next to its own exe.
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Verify arch + sibling wiring
+        run: |
+          set -euo pipefail
+          BIN=target/release/jim
+          echo "archs: $(lipo -archs "$BIN")"
+          [ "$(lipo -archs "$BIN")" = "arm64" ] || { echo "::error::expected arm64-only binary"; exit 1; }
+          # The only non-system dependency must be the ghostty VT dylib that
+          # make-bundle.sh copies into the .app. Anything else won't resolve
+          # on a machine without your dev tree.
+          otool -L "$BIN" | grep -q 'ghostty-vt.dylib' || { echo "::error::ghostty dylib link missing"; exit 1; }
+          # The app shells out to these next to its own exe; if the build
+          # stops producing them the bundle silently loses agent/glaze_ui.
+          for sib in jimctl glaze_ui; do
+            [ -x "target/release/$sib" ] || { echo "::error::missing sibling binary $sib"; exit 1; }
+          done
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: jim-arm64
+          path: |
+            target/release/jim
+            target/release/jimctl
+            target/release/glaze_ui
+          if-no-files-found: error
