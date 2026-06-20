@@ -30,6 +30,8 @@ pub fn run() -> ExitCode {
     let mut project: Option<String> = None;
     let mut titles: Vec<String> = Vec::new();
     let mut template: Option<String> = None;
+    let mut empty = false;
+    let mut slots: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -47,15 +49,22 @@ pub fn run() -> ExitCode {
                 template = args.get(i + 1).cloned();
                 i += 1;
             }
+            "--empty" | "-e" => {
+                empty = true;
+            }
+            "--slots" | "-s" => {
+                slots = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: jimctl dock --project P [--title T ...] [--template columns|rows|sidebar|grid|main-bottom]"
+                    "usage: jimctl dock --project P [--title T ...] [--template columns|rows|sidebar|grid|main-bottom|columns-bottom] [--empty [--slots N]]"
                 );
                 return ExitCode::SUCCESS;
             }
             other => {
                 eprintln!("jimctl dock: unexpected arg `{}`", other);
-                eprintln!("usage: jimctl dock --project P [--title T ...] [--template T]");
+                eprintln!("usage: jimctl dock --project P [--title T ...] [--template T] [--empty [--slots N]]");
                 return ExitCode::from(2);
             }
         }
@@ -71,6 +80,8 @@ pub fn run() -> ExitCode {
         "project": project,
         "titles": titles,
         "template": template,
+        "empty": empty,
+        "slots": slots,
     });
 
     let Some(sock) = socket_path() else {

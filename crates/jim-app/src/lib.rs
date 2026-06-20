@@ -904,7 +904,7 @@ fn drain_ipc_open_requests(
                 };
                 pending.close_panes.push((project_id, kind, titles));
             }
-            ipc::IpcRequest::DockPanes { project, titles, template } => {
+            ipc::IpcRequest::DockPanes { project, titles, template, empty, slots } => {
                 let target = match project.as_deref() {
                     Some("active") | None => OpenProjectTarget::Active,
                     Some(name) => OpenProjectTarget::ByName(name.to_string()),
@@ -913,7 +913,9 @@ fn drain_ipc_open_requests(
                     eprintln!("[ipc] dock_panes: no matching project");
                     continue;
                 };
-                pending.dock_panes.push((project_id, titles, template));
+                pending
+                    .dock_panes
+                    .push((project_id, titles, template, empty, slots));
             }
             ipc::IpcRequest::WidgetMessage { project, topic, payload, retain, sender } => {
                 // `"global"`/`"*"` → the global channel (`None`), delivered

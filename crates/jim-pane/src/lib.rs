@@ -77,8 +77,8 @@ pub use chrome_material::{
     PaneChromeMaterial, PaneChromeShader, PaneChromeStyle, PaneShadowMaterial, ShadowParams,
 };
 pub use dock::{
-    create_dock, create_dock_template, dock_co_members, Dock, DockMember, DockNode, DockPlugin,
-    DockTemplate, DropEdge, PendingDockLink, DOCK_KIND,
+    create_dock, create_dock_template, create_template_skeleton, dock_co_members, Dock, DockMember,
+    DockNode, DockPlugin, DockTemplate, DropEdge, PendingDockLink, DOCK_KIND,
 };
 pub use layers::{PaneLayer, PaneLayerAllocator};
 

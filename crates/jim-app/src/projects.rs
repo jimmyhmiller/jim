@@ -503,10 +503,11 @@ pub struct PendingActions {
     /// `None` kind closes every pane in the project. Resolved to pane
     /// entities in `apply_pending_actions` (needs a world query).
     pub close_panes: Vec<(u64, Option<String>, Option<Vec<String>>)>,
-    /// Dock requests from `jimctl dock`: `(project_id, titles, template)`.
-    /// Empty `titles` docks every free top-level pane in the project.
-    /// Resolved to entities + framed into a dock in `apply_pending_actions`.
-    pub dock_panes: Vec<(u64, Vec<String>, Option<String>)>,
+    /// Dock requests from `jimctl dock`:
+    /// `(project_id, titles, template, empty, slots)`. With `empty`, spawn
+    /// a template skeleton of `slots` empty cells; otherwise dock the
+    /// matched `titles` (empty titles = all free top-level panes).
+    pub dock_panes: Vec<(u64, Vec<String>, Option<String>, bool, Option<usize>)>,
 }
 
 /// Request to spawn one new pane of a given kind.
@@ -1516,7 +1517,26 @@ fn apply_pending_actions(world: &mut World) {
     // `jimctl dock` requests: frame existing panes into a new dock. Pick
     // the members (by title order, or all free panes when no titles), then
     // hand them to `create_dock` (the same path the snap gesture builds).
-    for (project_id, titles, template) in actions.dock_panes {
+    for (project_id, titles, template, empty, slots) in actions.dock_panes {
+        let tmpl = template
+            .as_deref()
+            .and_then(jim_pane::DockTemplate::from_str)
+            .unwrap_or(jim_pane::DockTemplate::Columns);
+        // Empty skeleton: spawn a template of empty slots to fill by drag.
+        if empty {
+            let count = pane_count_in_project(world, jim_pane::DOCK_KIND, project_id);
+            let pos = cascade_pos(sidebar_width, count);
+            jim_pane::create_template_skeleton(
+                world,
+                tmpl,
+                slots,
+                Some(project_id),
+                pos,
+                Vec2::new(760.0, 520.0),
+            );
+            world.resource_mut::<Projects>().terminals_dirty = true;
+            continue;
+        }
         let rows: Vec<(Entity, String, bool)> = {
             // (entity, title, free?) for panes in this project. "free" =
             // a real top-level pane, not a dock/member/pinned one.

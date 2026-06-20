@@ -280,9 +280,17 @@ pub enum IpcRequest {
         #[serde(default)]
         titles: Vec<String>,
         /// Layout template: columns (default), rows, sidebar, grid,
-        /// main-bottom. Unknown values fall back to columns.
+        /// main-bottom, columns-bottom. Unknown values fall back to columns.
         #[serde(default)]
         template: Option<String>,
+        /// Spawn an EMPTY template skeleton (slots you drag panes into)
+        /// instead of docking existing `titles`.
+        #[serde(default)]
+        empty: bool,
+        /// Number of empty slots for `empty` (defaults to the template's
+        /// natural count).
+        #[serde(default)]
+        slots: Option<usize>,
     },
 }
 

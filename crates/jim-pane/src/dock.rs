@@ -525,6 +525,7 @@ impl Plugin for DockPlugin {
                     collapse_member_chrome,
                     dock_focus_raise,
                     dock_layout,
+                    render_dock_slots,
                 )
                     .chain()
                     .before(crate::PaneViewportReaders),
@@ -749,12 +750,13 @@ fn dock_layout(
         walk_layout(root, inner_pos, inner_size, &[], &mut cells, &mut handles);
 
         for cell in cells {
+            let Some(member) = cell.slot else { continue }; // empty slot
             let want = PaneRect {
                 pos: cell.pos,
                 size: Vec2::new(cell.size.x.max(1.0), cell.size.y.max(1.0)),
                 z: member_z,
             };
-            if let Ok(mut r) = rects.get_mut(cell.entity) {
+            if let Ok(mut r) = rects.get_mut(member) {
                 if r.pos != want.pos || r.size != want.size || r.z != want.z {
                     *r = want;
                 }
