@@ -28,8 +28,9 @@ flame-format-jimtrace = { path = "../flame-format-jimtrace" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "2d",
+    "system_font_discovery",
     "3d",
     "x11",
     "wayland",

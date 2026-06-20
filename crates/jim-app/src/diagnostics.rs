@@ -446,7 +446,7 @@ fn update_warning_overlay(
     if let Ok((_, mut t, mut tcolor, mut tfont, mut tx)) = existing.single_mut() {
         t.0 = text;
         tcolor.0 = color;
-        tfont.font_size = size;
+        tfont.font_size = FontSize::Px(size);
         tx.translation.x = x;
         tx.translation.y = y;
     } else {
@@ -455,8 +455,8 @@ fn update_warning_overlay(
             MemWarnOverlay,
             Text2d::new(text),
             TextFont {
-                font: font.0.clone(),
-                font_size: size,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(size),
                 ..default()
             },
             TextColor(color),
@@ -587,8 +587,8 @@ fn update_continuous_pin_overlay(
             ContinuousPinText,
             Text2d::new(text),
             TextFont {
-                font: font.0.clone(),
-                font_size: FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(FONT_SIZE),
                 ..default()
             },
             // Dark text reads on yellow.

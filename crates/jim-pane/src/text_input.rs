@@ -419,8 +419,8 @@ fn spawn_text_input_inner(
                 ..default()
             },
             TextFont {
-                font: style.font.clone(),
-                font_size: style.font_size,
+                font: (style.font.clone()).into(),
+                font_size: FontSize::Px(style.font_size),
                 ..default()
             },
             LineHeight::Px(style.line_height),

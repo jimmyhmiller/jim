@@ -326,8 +326,8 @@ fn build_island(
                     commands.spawn((
                         Text2d::new("Clear"),
                         TextFont {
-                            font: font.0.clone(),
-                            font_size: 12.0,
+                            font: (font.0.clone()).into(),
+                            font_size: FontSize::Px(12.0),
                             ..default()
                         },
                         TextColor(theme.label),
@@ -418,8 +418,8 @@ fn island_tooltip(
         commands.spawn((
             Text2d::new(label),
             TextFont {
-                font: font.0.clone(),
-                font_size: 12.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(12.0),
                 ..default()
             },
             TextColor(theme.label),

@@ -538,8 +538,8 @@ fn sync_overlay_visibility(
                     FpsOverlay,
                     Text2d::new("fps --"),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: FONT_SIZE,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(FONT_SIZE),
                         ..default()
                     },
                     TextColor(Color::srgb(1.0, 1.0, 0.4)),
@@ -807,8 +807,8 @@ fn update_prof_panel(
             ProfPanel,
             Text2d::new(text),
             TextFont {
-                font: font.0.clone(),
-                font_size: size,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(size),
                 ..default()
             },
             TextColor(Color::srgb(0.6, 1.0, 0.7)),
@@ -1098,8 +1098,8 @@ fn update_cpu_graph(
                 CpuGraphLabel,
                 Text2d::new(label_text),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: FONT_SIZE * 0.85,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(FONT_SIZE * 0.85),
                     ..default()
                 },
                 TextColor(Color::srgb(0.3, 0.9, 0.4)),
@@ -1642,8 +1642,8 @@ fn ensure_chart(commands: &mut Commands, chart: &mut ProfChart, font: &MonoFont)
                     ChartPart,
                     Text2d::new(""),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: FONT_SIZE * 0.8,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(FONT_SIZE * 0.8),
                         ..default()
                     },
                     TextColor(Color::srgb(0.7, 0.75, 0.85)),
@@ -1662,8 +1662,8 @@ fn ensure_chart(commands: &mut Commands, chart: &mut ProfChart, font: &MonoFont)
                     ChartPart,
                     Text2d::new(""),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: FONT_SIZE * 0.85,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(FONT_SIZE * 0.85),
                         ..default()
                     },
                     TextColor(Color::srgb(0.85, 0.9, 0.8)),

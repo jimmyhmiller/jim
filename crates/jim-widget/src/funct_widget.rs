@@ -40,7 +40,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use std::time::Duration;
 
-use funct::{Cause, Fault, Funct, RunResult, Status, Value, VmState};
+use funct::{Cause, Fault, Funct, RunResult, Value, VmState};
 use serde_json::Value as Json;
 
 use crate::protocol::Element;

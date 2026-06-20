@@ -23,8 +23,9 @@ skrifa = "0.39"
 # We deliberately skip the `ui` feature (Node/bevy_ui): the editor renders
 # its own caret/selection as sprite quads so layout is driven by cosmic-text
 # glyph positions, not Bevy UI.
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "2d",
+    "system_font_discovery",
     "x11",
     "wayland",
 ] }

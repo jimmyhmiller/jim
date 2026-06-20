@@ -435,7 +435,7 @@ fn apply_uniform_writes(
     let Some(e) = bg.0 else { return };
     let Ok(handle) = handles.get(e) else { return };
     let Ok(bg_comp) = backgrounds.get(e) else { return };
-    let Some(material) = materials.get_mut(&handle.0) else { return };
+    let Some(mut material) = materials.get_mut(&handle.0) else { return };
     let Some(schema) = schemas.get(bg_comp.shader.id()) else {
         // Schema not loaded yet — drop writes for this frame; script
         // will re-issue them next tick. (Avoids racing the shader's
@@ -469,7 +469,7 @@ fn apply_mask_ops(
     let Some(e) = bg.0 else { return };
     let Ok(handle) = handles.get(e) else { return };
     let Ok(bg_comp) = backgrounds.get(e) else { return };
-    let Some(material) = materials.get_mut(&handle.0) else { return };
+    let Some(mut material) = materials.get_mut(&handle.0) else { return };
     let Some(schema) = schemas.get(bg_comp.shader.id()) else {
         pending.mask_ops.clear();
         return;
@@ -493,8 +493,8 @@ fn apply_mask_ops(
                 if let Some(binding) = schema.textures.get(&name) {
                     material.set_texture(*binding, mask_handle.clone());
                 }
-                if let Some(image) = images.get_mut(&mask_handle) {
-                    paint_brush(image, x, y, radius, value, win_size);
+                if let Some(mut image) = images.get_mut(&mask_handle) {
+                    paint_brush(&mut image, x, y, radius, value, win_size);
                 }
             }
             MaskOp::Fill(name, value) => {
@@ -507,7 +507,7 @@ fn apply_mask_ops(
                 if let Some(binding) = schema.textures.get(&name) {
                     material.set_texture(*binding, mask_handle.clone());
                 }
-                if let Some(image) = images.get_mut(&mask_handle)
+                if let Some(mut image) = images.get_mut(&mask_handle)
                     && let Some(data) = image.data.as_mut()
                 {
                     let v = (value.clamp(0.0, 1.0) * 255.0) as u8;

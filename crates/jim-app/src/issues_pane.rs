@@ -1057,8 +1057,8 @@ fn rebuild_rows(
             ChildOf(chrome.content_root),
             Text2d::new("+ New issue"),
             TextFont {
-                font: font.0.clone(),
-                font_size: TEXT_FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(TEXT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(ADD_BTN_H),
@@ -1286,8 +1286,8 @@ fn spawn_issue_block(
             ChildOf(parent),
             Text2d::new("✓"),
             TextFont {
-                font: font.0.clone(),
-                font_size: 12.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(12.0),
                 ..default()
             },
             LineHeight::Px(CHECKBOX_SIZE),
@@ -1305,8 +1305,8 @@ fn spawn_issue_block(
         ChildOf(parent),
         Text2d::new(if issue.expanded { "▾" } else { "▸" }),
         TextFont {
-            font: font.0.clone(),
-            font_size: 12.0,
+            font: (font.0.clone()).into(),
+            font_size: FontSize::Px(12.0),
             ..default()
         },
         LineHeight::Px(CHECKBOX_SIZE),
@@ -1348,8 +1348,8 @@ fn spawn_issue_block(
             ChildOf(parent),
             Text2d::new(title_display),
             TextFont {
-                font: font.0.clone(),
-                font_size: TEXT_FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(TEXT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(WRAP_LINE_H),
@@ -1381,8 +1381,8 @@ fn spawn_issue_block(
         ChildOf(parent),
         Text2d::new("×"),
         TextFont {
-            font: font.0.clone(),
-            font_size: 14.0,
+            font: (font.0.clone()).into(),
+            font_size: FontSize::Px(14.0),
             ..default()
         },
         LineHeight::Px(16.0),
@@ -1463,8 +1463,8 @@ fn spawn_issue_block(
                 ChildOf(parent),
                 Text2d::new(body_text),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: TEXT_FONT_SIZE,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(TEXT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(WRAP_LINE_H),
@@ -1534,8 +1534,8 @@ fn spawn_issue_block(
                     ChildOf(parent),
                     Text2d::new(key.clone()),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: SMALL_FONT_SIZE,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(SMALL_FONT_SIZE),
                         ..default()
                     },
                     LineHeight::Px(key_line_h),
@@ -1574,8 +1574,8 @@ fn spawn_issue_block(
                     ChildOf(parent),
                     Text2d::new(value_display),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: SMALL_FONT_SIZE,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(SMALL_FONT_SIZE),
                         ..default()
                     },
                     LineHeight::Px(SMALL_WRAP_LINE_H),
@@ -1602,8 +1602,8 @@ fn spawn_issue_block(
                 ChildOf(parent),
                 Text2d::new("×"),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: 12.0,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(12.0),
                     ..default()
                 },
                 LineHeight::Px(key_line_h),
@@ -1645,8 +1645,8 @@ fn spawn_issue_block(
             ChildOf(parent),
             Text2d::new("+ Add field"),
             TextFont {
-                font: font.0.clone(),
-                font_size: SMALL_FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(SMALL_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(af_h),

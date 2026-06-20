@@ -97,8 +97,8 @@ fn claude_events_spawn(world: &mut World, entity: Entity, content_root: Entity, 
             ChildOf(content_root),
             Text2d::new(String::new()),
             TextFont {
-                font,
-                font_size: TEXT_FONT_SIZE,
+                font: font.into(),
+                font_size: FontSize::Px(TEXT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(TEXT_LINE_HEIGHT),
@@ -108,7 +108,7 @@ fn claude_events_spawn(world: &mut World, entity: Entity, content_root: Entity, 
             // is invisibly clipped by the per-pane camera viewport
             // (see pane-bevy's top-of-file docs) — no per-line
             // truncation needed here.
-            TextLayout::new_with_no_wrap(),
+            TextLayout::no_wrap(),
             Transform::from_xyz(TEXT_INNER_PAD_X, -TEXT_INNER_PAD_Y, 0.0),
         ))
         .id();

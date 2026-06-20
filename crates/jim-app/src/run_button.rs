@@ -326,8 +326,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new("Title"),
             TextFont {
-                font: font.clone(),
-                font_size: FORM_LABEL_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(FORM_LABEL_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(FORM_LABEL_FONT_SIZE * 1.4),
@@ -354,7 +354,7 @@ fn run_button_spawn_from_config(
 
     let title_input = {
         let style = TextInputStyle {
-            font: font.clone(),
+            font: (font.clone()).into(),
             font_size: FORM_INPUT_FONT_SIZE,
             line_height: FORM_INPUT_FONT_SIZE * 1.4,
             cell_width: input_cell_width(measured_cell, FORM_INPUT_FONT_SIZE),
@@ -388,8 +388,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new("Command"),
             TextFont {
-                font: font.clone(),
-                font_size: FORM_LABEL_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(FORM_LABEL_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(FORM_LABEL_FONT_SIZE * 1.4),
@@ -416,7 +416,7 @@ fn run_button_spawn_from_config(
 
     let command_input = {
         let style = TextInputStyle {
-            font: font.clone(),
+            font: (font.clone()).into(),
             font_size: FORM_INPUT_FONT_SIZE,
             line_height: FORM_INPUT_FONT_SIZE * 1.4,
             cell_width: input_cell_width(measured_cell, FORM_INPUT_FONT_SIZE),
@@ -450,8 +450,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new("CWD"),
             TextFont {
-                font: font.clone(),
-                font_size: FORM_LABEL_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(FORM_LABEL_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(FORM_LABEL_FONT_SIZE * 1.4),
@@ -478,7 +478,7 @@ fn run_button_spawn_from_config(
 
     let cwd_input = {
         let style = TextInputStyle {
-            font: font.clone(),
+            font: (font.clone()).into(),
             font_size: FORM_INPUT_FONT_SIZE,
             line_height: FORM_INPUT_FONT_SIZE * 1.4,
             cell_width: input_cell_width(measured_cell, FORM_INPUT_FONT_SIZE),
@@ -526,8 +526,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new("Save"),
             TextFont {
-                font: font.clone(),
-                font_size: SAVE_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(SAVE_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(SAVE_FONT_SIZE * 1.4),
@@ -544,8 +544,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new("▶"),
             TextFont {
-                font: font.clone(),
-                font_size: ICON_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(ICON_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(ICON_FONT_SIZE),
@@ -561,8 +561,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new("$"),
             TextFont {
-                font: font.clone(),
-                font_size: COMMAND_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(COMMAND_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(COMMAND_FONT_SIZE * 1.4),
@@ -578,8 +578,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new(command.clone()),
             TextFont {
-                font: font.clone(),
-                font_size: COMMAND_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(COMMAND_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(COMMAND_FONT_SIZE * 1.4),
@@ -609,8 +609,8 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new("\u{25B8} Details"),
             TextFont {
-                font: font.clone(),
-                font_size: DETAILS_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(DETAILS_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(DETAILS_FONT_SIZE * 1.4),
@@ -626,14 +626,14 @@ fn run_button_spawn_from_config(
             ChildOf(content_root),
             Text2d::new(String::new()),
             TextFont {
-                font,
-                font_size: OUTPUT_FONT_SIZE,
+                font: font.into(),
+                font_size: FontSize::Px(OUTPUT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(OUTPUT_FONT_SIZE * 1.45),
             TextColor(palette.output),
             Anchor::TOP_LEFT,
-            bevy::text::TextLayout::new_with_no_wrap(),
+            bevy::text::TextLayout::no_wrap(),
             TextBounds {
                 width: Some(0.0),
                 height: Some(0.0),

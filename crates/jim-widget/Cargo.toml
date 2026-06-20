@@ -22,6 +22,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 # block layout. We feed it the Element tree, get back computed
 # (x, y, width, height) per node, and render from those.
 taffy = { version = "0.9", default-features = false, features = [
+    "taffy_tree",
     "std",
     "block_layout",
     "flexbox",
@@ -40,8 +41,9 @@ tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-json = "0.24"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "2d",
+    "system_font_discovery",
     "x11",
     "wayland",
 ] }
@@ -95,3 +97,7 @@ path = "src/bin/glaze_ui.rs"
 [[bin]]
 name = "widget-snapshot"
 path = "src/bin/snapshot.rs"
+
+[[bin]]
+name = "editable_text_demo"
+path = "src/bin/editable_text_demo.rs"

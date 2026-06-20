@@ -43,9 +43,6 @@ const INDENT_PX: f32 = 24.0;
 /// Extra left pad inside code blocks / blockquotes.
 const BLOCK_PAD: f32 = 10.0;
 
-/// Glyph `position` from Bevy's layout is the glyph quad *center*; left
-/// edge is `position.x - size.x/2`. Flip if calibration shows otherwise.
-const GLYPH_POS_IS_CENTER: bool = true;
 
 fn heading_size(level: u8) -> f32 {
     match level {
@@ -186,14 +183,14 @@ pub fn setup_markdown_fonts(
     editor_font: Option<Res<crate::EditorFont>>,
 ) {
     commands.insert_resource(MarkdownCodeHl(Highlighter::new()));
-    let body = fonts.add(Font::try_from_bytes(INTER_VF.to_vec()).expect("Inter-VF must parse"));
+    let body = fonts.add(Font::from_bytes(INTER_VF.to_vec()));
     let italic =
-        fonts.add(Font::try_from_bytes(INTER_ITALIC_VF.to_vec()).expect("Inter-Italic-VF must parse"));
+        fonts.add(Font::from_bytes(INTER_ITALIC_VF.to_vec()));
     // Reuse the editor's mono font handle when present; else load ours.
     let mono = match editor_font {
         Some(f) => f.0.clone(),
         None => fonts.add(
-            Font::try_from_bytes(crate::EMBEDDED_FONT.to_vec()).expect("mono font must parse"),
+            Font::from_bytes(crate::EMBEDDED_FONT.to_vec()),
         ),
     };
     commands.insert_resource(MarkdownFonts { body, italic, mono });
@@ -261,7 +258,7 @@ fn resolve_style(
         // Markers render in the body/mono face, dim, at the block size.
         let mono = matches!(block, BlockKind::CodeBlock);
         return ResolvedStyle {
-            font: if mono { fonts.mono.clone() } else { fonts.body.clone() },
+            font: (if mono { fonts.mono.clone() } else { fonts.body.clone() }).into(),
             weight: if matches!(block, BlockKind::Heading(_)) {
                 FontWeight::BOLD
             } else {
@@ -606,8 +603,8 @@ fn build_line(
         commands.entity(entity).with_child((
             TextSpan::new(rendered.clone()),
             TextFont {
-                font: rs.font,
-                font_size: rs.size,
+                font: (rs.font).into(),
+                font_size: FontSize::Px(rs.size),
                 weight: rs.weight,
                 ..default()
             },
@@ -735,8 +732,8 @@ fn build_code_line(
         commands.entity(entity).with_child((
             TextSpan::new(text.clone()),
             TextFont {
-                font: fonts.mono.clone(),
-                font_size: CODE_SIZE,
+                font: (fonts.mono.clone()).into(),
+                font_size: FontSize::Px(CODE_SIZE),
                 ..default()
             },
             LineHeight::Px(row_height),
@@ -780,62 +777,77 @@ pub fn markdown_readback(
                 continue;
             };
             let rh = lref.row_height;
-            // Byte offset where each rendered span starts within the
-            // concatenated buffer line. `PositionedGlyph.byte_index` is
-            // LINE-relative (into the whole concatenation), not
-            // span-relative — so we map it back through these offsets.
-            // Single-span lines happen to work either way; multi-span
-            // lines (lists with a visible `- ` prefix, inline emphasis /
-            // code) do NOT without this.
-            let mut span_byte_start: Vec<usize> = Vec::with_capacity(lref.spans.len());
-            {
-                let mut acc = 0usize;
-                for (_, text) in &lref.spans {
-                    span_byte_start.push(acc);
-                    acc += text.len();
-                }
+            // Glyph positions are in PHYSICAL pixels (Bevy scales them by the
+            // window scale factor; only `info.size` is divided back to
+            // logical). Our transforms are logical, so divide here.
+            let sf = if info.scale_factor > 0.0 {
+                info.scale_factor
+            } else {
+                1.0
+            };
+            // Bevy 0.19 / parley: `PositionedGlyph` no longer carries per-glyph
+            // byte offsets or size — only a `section_index`, `line_index`, a
+            // center `position`, and the atlas `rect`. We rebuild source char
+            // ranges by counting glyphs in logical order within each rendered
+            // span (section), and derive horizontal extents from neighbouring
+            // glyph centers on the same row. This assumes one glyph per source
+            // char, which holds for the editor's LTR mono/Inter text; ligature
+            // clusters can drift the caret by a fraction of a cell.
+            struct G {
+                row: usize,
+                x: f32,
+                half: f32,
+                section: usize,
             }
-            let mut glyphs: Vec<MdGlyph> = Vec::with_capacity(info.glyphs.len());
-            for g in &info.glyphs {
-                // span_index 0 is the (empty) root section; children are 1..
-                if g.span_index == 0 {
-                    continue;
-                }
-                let k = g.span_index - 1;
-                let (Some((src_start, text)), Some(&span_start)) =
-                    (lref.spans.get(k), span_byte_start.get(k))
+            let mut gs: Vec<G> = info
+                .glyphs
+                .iter()
+                // section 0 is the (empty) root section; spans are 1..
+                .filter(|g| g.section_index != 0)
+                .map(|g| G {
+                    row: g.line_index,
+                    x: g.position.x / sf,
+                    half: (g.atlas_info.rect.width() * 0.5 / sf).max(0.5),
+                    section: g.section_index,
+                })
+                .collect();
+            // Sort by row then x: logical order for LTR text.
+            gs.sort_by(|a, b| a.row.cmp(&b.row).then(a.x.total_cmp(&b.x)));
+
+            // Per-span running char counter -> source char offsets.
+            let mut span_char: Vec<usize> = vec![0; lref.spans.len()];
+            let mut glyphs: Vec<MdGlyph> = Vec::with_capacity(gs.len());
+            let n = gs.len();
+            for i in 0..n {
+                let g = &gs[i];
+                let prev_same = i > 0 && gs[i - 1].row == g.row;
+                let next_same = i + 1 < n && gs[i + 1].row == g.row;
+                // Cell boundaries = midpoints between glyph centers; fall back
+                // to the glyph's own half-width at the row ends.
+                let left = if prev_same {
+                    (gs[i - 1].x + g.x) * 0.5
+                } else {
+                    g.x - g.half
+                };
+                let right = if next_same {
+                    (g.x + gs[i + 1].x) * 0.5
+                } else {
+                    g.x + g.half
+                };
+                let k = g.section - 1;
+                let (Some((src_start, _text)), Some(cnt)) =
+                    (lref.spans.get(k), span_char.get_mut(k))
                 else {
                     continue;
                 };
-                // Convert the line-relative byte index to within-span.
-                let within = g.byte_index.saturating_sub(span_start).min(text.len());
-                let char_index = text
-                    .get(..within)
-                    .map(|s| s.chars().count())
-                    .unwrap_or(0);
-                let src_len = text
-                    .get(within..within + g.byte_length)
-                    .map(|s| s.chars().count().max(1))
-                    .unwrap_or(1);
-                // Glyph positions/sizes are in PHYSICAL pixels (Bevy scales
-                // them by the window scale factor; only `info.size` is
-                // divided back to logical). Our transforms are logical, so
-                // divide here — otherwise the caret drifts right by the
-                // scale factor, growing with column.
-                let sf = if info.scale_factor > 0.0 {
-                    info.scale_factor
-                } else {
-                    1.0
-                };
-                let half = if GLYPH_POS_IS_CENTER { g.size.x * 0.5 } else { 0.0 };
-                let left = lref.x_offset + (g.position.x - half) / sf;
-                let right = left + g.size.x / sf;
+                let char_index = *cnt;
+                *cnt += 1;
                 glyphs.push(MdGlyph {
                     src_char: src_start + char_index,
-                    src_len,
-                    left,
-                    right,
-                    row: g.line_index,
+                    src_len: 1,
+                    left: lref.x_offset + left,
+                    right: lref.x_offset + right,
+                    row: g.row,
                 });
             }
             glyphs.sort_by(|a, b| a.row.cmp(&b.row).then(a.left.total_cmp(&b.left)));

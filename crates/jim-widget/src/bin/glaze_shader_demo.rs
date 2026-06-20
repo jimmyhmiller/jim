@@ -224,7 +224,7 @@ fn animate(
 ) {
     let t = time.elapsed_secs();
     for handle in &mats_q {
-        if let Some(m) = mats.get_mut(&handle.0) {
+        if let Some(mut m) = mats.get_mut(&handle.0) {
             m.u.time = t;
             m.u.dt = time.delta_secs();
         }

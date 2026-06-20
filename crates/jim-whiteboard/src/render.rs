@@ -328,8 +328,8 @@ fn spawn_text(
     let mut e = commands.spawn((
         Text2d::new(run.text.clone()),
         TextFont {
-            font: font.clone(),
-            font_size: (run.font.size as f32 * scale).max(4.0),
+            font: (font.clone()).into(),
+            font_size: FontSize::Px((run.font.size as f32 * scale).max(4.0)),
             ..default()
         },
         TextColor(color),

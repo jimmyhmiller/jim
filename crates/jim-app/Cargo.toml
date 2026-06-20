@@ -35,8 +35,9 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 # PNG decoding for the embedded garden sprite sheet (CC0 OpenGameArt
 # "Flowers" plant pack, 78 12x24 plants on a 936x24 strip).
 image = { version = "0.25", default-features = false, features = ["png"] }
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "2d",
+    "system_font_discovery",
     # Real perspective 3D (Camera3d + PBR meshes + StandardMaterial),
     # used by the project-prism "cube" mode (src/cube.rs) to texture each
     # project's live render target onto a face of a rotating N-gon prism.

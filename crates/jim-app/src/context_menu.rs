@@ -334,8 +334,8 @@ fn context_render(
             ContextMenuEntity,
             Text2d::new(action.label()),
             TextFont {
-                font: font.0.clone(),
-                font_size: FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(ROW_H),

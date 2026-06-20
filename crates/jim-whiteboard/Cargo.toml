@@ -14,8 +14,9 @@ serde_json = "1"
 # polygon fills, thick strokes with round caps/joins) into the triangle
 # meshes Bevy's 2d renderer draws. The whole point of "high quality" lines.
 lyon = "1.0"
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "2d",
+    "system_font_discovery",
     "x11",
     "wayland",
 ] }

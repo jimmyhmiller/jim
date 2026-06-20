@@ -28,6 +28,9 @@
 use bevy::math::Vec2;
 use jim_pane::PaneFontMetrics;
 use taffy::prelude::*;
+// taffy 0.9.2's prelude no longer re-exports `TaffyTree` (it lives at the
+// crate root), so import it explicitly.
+use taffy::TaffyTree;
 
 use crate::protocol::{Align, Border, ButtonKind, Edges, Element, Shadow, Style as PStyle, Weight};
 

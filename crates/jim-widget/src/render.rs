@@ -589,8 +589,8 @@ fn render_node(
                 ChildOf(ctx.content_root),
                 Text2d::new(label.clone()),
                 TextFont {
-                    font: ctx.font.clone(),
-                    font_size: DEFAULT_FONT_SIZE,
+                    font: (ctx.font.clone()).into(),
+                    font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
@@ -603,7 +603,7 @@ fn render_node(
                     ctx.palette.text,
                 )),
                 Anchor::CENTER_LEFT,
-                bevy::text::TextLayout::new_with_no_wrap(),
+                bevy::text::TextLayout::no_wrap(),
                 Transform::from_xyz(origin.x + SELECT_PAD_X, -cy, z + 0.01),
             ));
             let rect = Rect::new(origin.x, origin.y, origin.x + size.x, origin.y + size.y);
@@ -930,8 +930,8 @@ fn render_text_at(
         ChildOf(ctx.content_root),
         Text2d::new(rendered.clone()),
         TextFont {
-            font,
-            font_size,
+            font: font.into(),
+            font_size: FontSize::Px(font_size),
             ..default()
         },
         LineHeight::Px(line_height(font_size)),
@@ -944,7 +944,7 @@ fn render_text_at(
         Transform::from_xyz(origin.x, -origin.y, z),
     ));
     if !wrap {
-        entity.insert(bevy::text::TextLayout::new_with_no_wrap());
+        entity.insert(bevy::text::TextLayout::no_wrap());
     }
     // Drag-select: register the run as a selectable text span. Use the
     // rendered (possibly truncated) text and width so selection matches what's
@@ -1004,8 +1004,8 @@ fn render_badge_at(
         ChildOf(ctx.content_root),
         Text2d::new(value.to_string()),
         TextFont {
-            font: ctx.font.clone(),
-            font_size: BADGE_FONT_SIZE,
+            font: (ctx.font.clone()).into(),
+            font_size: FontSize::Px(BADGE_FONT_SIZE),
             ..default()
         },
         LineHeight::Px(line_height(BADGE_FONT_SIZE)),
@@ -1015,7 +1015,7 @@ fn render_badge_at(
             ctx.palette.badge_label,
         )),
         Anchor::TOP_LEFT,
-        bevy::text::TextLayout::new_with_no_wrap(),
+        bevy::text::TextLayout::no_wrap(),
         Transform::from_xyz(origin.x + BADGE_PAD_X, -(origin.y + BADGE_PAD_Y), z + 0.01),
     ));
     if selectable && !value.is_empty() {
@@ -1185,8 +1185,8 @@ fn render_button_at(
         ChildOf(ctx.content_root),
         Text2d::new(label.to_string()),
         TextFont {
-            font: ctx.font.clone(),
-            font_size: DEFAULT_FONT_SIZE,
+            font: (ctx.font.clone()).into(),
+            font_size: FontSize::Px(DEFAULT_FONT_SIZE),
             ..default()
         },
         LineHeight::Px(DEFAULT_FONT_SIZE * LINE_HEIGHT_MUL),
@@ -1196,7 +1196,7 @@ fn render_button_at(
             default_label,
         )),
         Anchor::TOP_LEFT,
-        bevy::text::TextLayout::new_with_no_wrap(),
+        bevy::text::TextLayout::no_wrap(),
         Transform::from_xyz(
             origin.x + BUTTON_PAD_X,
             -(origin.y + BUTTON_PAD_Y),
@@ -1746,8 +1746,8 @@ fn render_link_at(
         ChildOf(ctx.content_root),
         Text2d::new(label.to_string()),
         TextFont {
-            font: ctx.font.clone(),
-            font_size: DEFAULT_FONT_SIZE,
+            font: (ctx.font.clone()).into(),
+            font_size: FontSize::Px(DEFAULT_FONT_SIZE),
             ..default()
         },
         LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
@@ -1909,14 +1909,14 @@ fn render_tooltip_at(
         ChildOf(ctx.content_root),
         Text2d::new(label.to_string()),
         TextFont {
-            font: ctx.font.clone(),
-            font_size: DEFAULT_FONT_SIZE,
+            font: (ctx.font.clone()).into(),
+            font_size: FontSize::Px(DEFAULT_FONT_SIZE),
             ..default()
         },
         LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
         TextColor(ctx.palette.link),
         Anchor::TOP_LEFT,
-        bevy::text::TextLayout::new_with_no_wrap(),
+        bevy::text::TextLayout::no_wrap(),
         Transform::from_xyz(origin.x, -origin.y, z + 0.01),
     ));
     targets.tooltips.push(crate::TooltipTarget {
@@ -1975,8 +1975,8 @@ fn render_select_trigger_at(
         ChildOf(ctx.content_root),
         Text2d::new(label),
         TextFont {
-            font: ctx.font.clone(),
-            font_size: DEFAULT_FONT_SIZE,
+            font: (ctx.font.clone()).into(),
+            font_size: FontSize::Px(DEFAULT_FONT_SIZE),
             ..default()
         },
         LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
@@ -1988,7 +1988,7 @@ fn render_select_trigger_at(
             color,
         )),
         Anchor::CENTER_LEFT,
-        bevy::text::TextLayout::new_with_no_wrap(),
+        bevy::text::TextLayout::no_wrap(),
         Transform::from_xyz(origin.x + SELECT_PAD_X, -cy, z + 0.01),
     ));
     // chevron (right)
@@ -1996,14 +1996,14 @@ fn render_select_trigger_at(
         ChildOf(ctx.content_root),
         Text2d::new("\u{25be}"),
         TextFont {
-            font: ctx.font.clone(),
-            font_size: DEFAULT_FONT_SIZE,
+            font: (ctx.font.clone()).into(),
+            font_size: FontSize::Px(DEFAULT_FONT_SIZE),
             ..default()
         },
         LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
         TextColor(ctx.palette.text_muted),
         Anchor::CENTER_RIGHT,
-        bevy::text::TextLayout::new_with_no_wrap(),
+        bevy::text::TextLayout::no_wrap(),
         Transform::from_xyz(origin.x + size.x - SELECT_PAD_X, -cy, z + 0.01),
     ));
 
@@ -2045,14 +2045,14 @@ fn spawn_centered_text(
         ChildOf(ctx.content_root),
         Text2d::new(text.to_string()),
         TextFont {
-            font: ctx.font.clone(),
-            font_size,
+            font: (ctx.font.clone()).into(),
+            font_size: FontSize::Px(font_size),
             ..default()
         },
         LineHeight::Px(lh),
         TextColor(color),
         Anchor::TOP_LEFT,
-        bevy::text::TextLayout::new_with_no_wrap(),
+        bevy::text::TextLayout::no_wrap(),
         Transform::from_xyz(x, -y, z),
     ));
 }
@@ -2308,14 +2308,14 @@ fn render_tabs_at(
             ChildOf(ctx.content_root),
             Text2d::new(tab.label.clone()),
             TextFont {
-                font: ctx.font.clone(),
-                font_size: DEFAULT_FONT_SIZE,
+                font: (ctx.font.clone()).into(),
+                font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
             TextColor(label_color),
             Anchor::TOP_LEFT,
-            bevy::text::TextLayout::new_with_no_wrap(),
+            bevy::text::TextLayout::no_wrap(),
             Transform::from_xyz(cell_pos.x + TAB_PAD_X, -(cell_pos.y + TAB_PAD_Y), z + 0.01),
         ));
         if is_selected {
@@ -2453,8 +2453,8 @@ fn render_radio_at(
             ChildOf(ctx.content_root),
             Text2d::new(opt.label.clone()),
             TextFont {
-                font: ctx.font.clone(),
-                font_size: DEFAULT_FONT_SIZE,
+                font: (ctx.font.clone()).into(),
+                font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
@@ -2466,7 +2466,7 @@ fn render_radio_at(
                 if is_selected { ctx.palette.text } else { ctx.palette.text_muted },
             )),
             Anchor::TOP_LEFT,
-            bevy::text::TextLayout::new_with_no_wrap(),
+            bevy::text::TextLayout::no_wrap(),
             Transform::from_xyz(
                 cell_pos.x + RADIO_RING + RADIO_GAP,
                 -(cell_pos.y + RADIO_PAD_Y),
@@ -2694,8 +2694,8 @@ fn render_toggle_at(
                 ChildOf(ctx.content_root),
                 Text2d::new(label.to_string()),
                 TextFont {
-                    font: ctx.font.clone(),
-                    font_size: DEFAULT_FONT_SIZE,
+                    font: (ctx.font.clone()).into(),
+                    font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
@@ -2707,7 +2707,7 @@ fn render_toggle_at(
                     ctx.palette.text,
                 )),
                 Anchor::TOP_LEFT,
-                bevy::text::TextLayout::new_with_no_wrap(),
+                bevy::text::TextLayout::no_wrap(),
                 Transform::from_xyz(
                     origin.x + ll.location.x,
                     -(origin.y + ll.location.y),
@@ -2869,8 +2869,8 @@ fn render_checkbox_at(
                 ChildOf(ctx.content_root),
                 Text2d::new(label.to_string()),
                 TextFont {
-                    font: ctx.font.clone(),
-                    font_size: DEFAULT_FONT_SIZE,
+                    font: (ctx.font.clone()).into(),
+                    font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_height(DEFAULT_FONT_SIZE)),
@@ -2882,7 +2882,7 @@ fn render_checkbox_at(
                     ctx.palette.text,
                 )),
                 Anchor::TOP_LEFT,
-                bevy::text::TextLayout::new_with_no_wrap(),
+                bevy::text::TextLayout::no_wrap(),
                 Transform::from_xyz(
                     origin.x + ll.location.x,
                     -(origin.y + ll.location.y),
@@ -3027,8 +3027,8 @@ fn render_input_at(
                 ChildOf(ctx.content_root),
                 Text2d::new(placeholder.to_string()),
                 TextFont {
-                    font: ctx.font.clone(),
-                    font_size: DEFAULT_FONT_SIZE,
+                    font: (ctx.font.clone()).into(),
+                    font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_h),
@@ -3038,7 +3038,7 @@ fn render_input_at(
                     ctx.palette.text_muted,
                 )),
                 Anchor::TOP_LEFT,
-                bevy::text::TextLayout::new_with_no_wrap(),
+                bevy::text::TextLayout::no_wrap(),
                 bevy::text::TextBounds {
                     width: Some(content_w),
                     height: None,
@@ -3064,8 +3064,8 @@ fn render_input_at(
                 ChildOf(ctx.content_root),
                 Text2d::new(visible),
                 TextFont {
-                    font: ctx.font.clone(),
-                    font_size: DEFAULT_FONT_SIZE,
+                    font: (ctx.font.clone()).into(),
+                    font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_h),
@@ -3075,7 +3075,7 @@ fn render_input_at(
                     ctx.palette.text,
                 )),
                 Anchor::TOP_LEFT,
-                bevy::text::TextLayout::new_with_no_wrap(),
+                bevy::text::TextLayout::no_wrap(),
                 bevy::text::TextBounds {
                     width: Some(content_w),
                     height: None,
@@ -3178,8 +3178,8 @@ fn render_textarea_at(
                 ChildOf(ctx.content_root),
                 Text2d::new(placeholder.to_string()),
                 TextFont {
-                    font: ctx.font.clone(),
-                    font_size: DEFAULT_FONT_SIZE,
+                    font: (ctx.font.clone()).into(),
+                    font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_h),
@@ -3227,14 +3227,14 @@ fn render_textarea_at(
                 ChildOf(ctx.content_root),
                 Text2d::new(seg),
                 TextFont {
-                    font: ctx.font.clone(),
-                    font_size: DEFAULT_FONT_SIZE,
+                    font: (ctx.font.clone()).into(),
+                    font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_h),
                 TextColor(text_color),
                 Anchor::TOP_LEFT,
-                bevy::text::TextLayout::new_with_no_wrap(),
+                bevy::text::TextLayout::no_wrap(),
                 Transform::from_xyz(
                     origin.x + INPUT_PAD_X,
                     -(origin.y + TEXTAREA_PAD_Y + li as f32 * line_h),
@@ -3498,7 +3498,7 @@ fn render_table_at(
         } else {
             rows.get(r - 1)
                 .and_then(|row| row.get(ci))
-                .cloned()
+                .map(|s| s.clone())
                 .unwrap_or_default()
         };
         if text.is_empty() {
@@ -3536,8 +3536,8 @@ fn render_table_at(
             ChildOf(ctx.content_root),
             Text2d::new(text),
             TextFont {
-                font: ctx.font.clone(),
-                font_size: DEFAULT_FONT_SIZE,
+                font: (ctx.font.clone()).into(),
+                font_size: FontSize::Px(DEFAULT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(line_h),
@@ -3557,7 +3557,7 @@ fn render_table_at(
             Anchor::TOP_LEFT,
             // No wrap: we already truncated to the column width, so a long
             // unbroken token stays on one line instead of char-wrapping.
-            bevy::text::TextLayout::new_with_no_wrap(),
+            bevy::text::TextLayout::no_wrap(),
             TextBounds {
                 width: None,
                 height: None,

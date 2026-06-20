@@ -21,8 +21,9 @@ bincode = { version = "2", features = ["serde"] }
 libc = "0.2"
 skrifa = "0.39"
 swash = "0.2"
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "2d",
+    "system_font_discovery",
     "3d",
     "x11",
     "wayland",

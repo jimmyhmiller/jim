@@ -409,8 +409,8 @@ fn glyph(
     commands.spawn((
         Text2d::new(text.to_string()),
         TextFont {
-            font: font.clone(),
-            font_size: 13.0,
+            font: (font.clone()).into(),
+            font_size: FontSize::Px(13.0),
             ..default()
         },
         TextColor(color),
@@ -449,8 +449,8 @@ fn build_ui(
             commands.spawn((
                 Text2d::new(l.text),
                 TextFont {
-                    font: font.clone(),
-                    font_size: 11.0,
+                    font: (font.clone()).into(),
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(theme.label),
@@ -566,8 +566,8 @@ fn build_ui(
                     commands.spawn((
                         Text2d::new("Clear"),
                         TextFont {
-                            font: font.clone(),
-                            font_size: 13.0,
+                            font: (font.clone()).into(),
+                            font_size: FontSize::Px(13.0),
                             ..default()
                         },
                         TextColor(theme.label),

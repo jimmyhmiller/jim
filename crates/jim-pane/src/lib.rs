@@ -1096,7 +1096,7 @@ fn sync_chrome_uniforms(
             transform.translation.y = -rect.size.y * 0.5;
             transform.scale.x = rect.size.x.max(1.0);
             transform.scale.y = rect.size.y.max(1.0);
-            if let Some(mat) = chrome_mats.get_mut(&handle.0) {
+            if let Some(mut mat) = chrome_mats.get_mut(&handle.0) {
                 mat.params = style.params_for_title_cover(rect.size, is_focused, TITLE_H);
             }
         }
@@ -1107,7 +1107,7 @@ fn sync_chrome_uniforms(
             transform.translation.y = -rect.size.y * 0.5;
             transform.scale.x = rect.size.x.max(1.0);
             transform.scale.y = rect.size.y.max(1.0);
-            if let Some(mat) = chrome_mats.get_mut(&handle.0) {
+            if let Some(mut mat) = chrome_mats.get_mut(&handle.0) {
                 mat.params = style.params_for(rect.size, is_focused);
                 if frag_changed {
                     mat.fragment = frag.clone();
@@ -1125,7 +1125,7 @@ fn sync_chrome_uniforms(
                 transform.translation.y = -rect.size.y * 0.5;
                 transform.scale.x = sp.mesh_size.x;
                 transform.scale.y = sp.mesh_size.y;
-                if let Some(mat) = shadow_mats.get_mut(&handle.0) {
+                if let Some(mut mat) = shadow_mats.get_mut(&handle.0) {
                     mat.params = sp;
                 }
             }
@@ -1332,8 +1332,8 @@ pub fn spawn_pane(
             ChildOf(pane),
             Text2d::new(title_str),
             TextFont {
-                font: font.clone(),
-                font_size: TITLE_FONT_SIZE,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(TITLE_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(TITLE_H),
@@ -1356,8 +1356,8 @@ pub fn spawn_pane(
             ChildOf(pane),
             Text2d::new("\u{00D7}"),
             TextFont {
-                font,
-                font_size: 16.0,
+                font: font.into(),
+                font_size: FontSize::Px(16.0),
                 ..default()
             },
             LineHeight::Px(CLOSE_BTN_SIZE),

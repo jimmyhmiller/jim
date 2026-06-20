@@ -649,8 +649,8 @@ fn drawer_render(
         DrawerEntity,
         Text2d::new(header_text),
         TextFont {
-            font: font.0.clone(),
-            font_size: 12.0,
+            font: (font.0.clone()).into(),
+            font_size: FontSize::Px(12.0),
             ..default()
         },
         LineHeight::Px(12.0),
@@ -665,8 +665,8 @@ fn drawer_render(
         DrawerEntity,
         Text2d::new(hint),
         TextFont {
-            font: font.0.clone(),
-            font_size: 10.0,
+            font: (font.0.clone()).into(),
+            font_size: FontSize::Px(10.0),
             ..default()
         },
         LineHeight::Px(10.0),
@@ -689,8 +689,8 @@ fn drawer_render(
             DrawerEntity,
             Text2d::new(msg),
             TextFont {
-                font: font.0.clone(),
-                font_size: 12.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(12.0),
                 ..default()
             },
             LineHeight::Px(12.0),
@@ -740,8 +740,8 @@ fn drawer_render(
             DrawerEntity,
             Text2d::new(icon),
             TextFont {
-                font: font.0.clone(),
-                font_size: 15.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(15.0),
                 ..default()
             },
             LineHeight::Px(15.0),
@@ -764,8 +764,8 @@ fn drawer_render(
             DrawerEntity,
             Text2d::new(truncate_to_width(&item.title, 13.0, text_w)),
             TextFont {
-                font: font.0.clone(),
-                font_size: 13.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(13.0),
                 ..default()
             },
             LineHeight::Px(13.0),
@@ -780,8 +780,8 @@ fn drawer_render(
                 DrawerEntity,
                 Text2d::new(truncate_to_width(reason, 11.0, text_w)),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: 11.0,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 LineHeight::Px(11.0),
@@ -801,8 +801,8 @@ fn drawer_render(
             DrawerEntity,
             Text2d::new("×"),
             TextFont {
-                font: font.0.clone(),
-                font_size: 16.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(16.0),
                 ..default()
             },
             LineHeight::Px(16.0),
@@ -831,8 +831,8 @@ fn drawer_render(
             DrawerEntity,
             Text2d::new(format!("+{} more (dismiss some to see them)", hidden)),
             TextFont {
-                font: font.0.clone(),
-                font_size: 11.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(11.0),
                 ..default()
             },
             LineHeight::Px(11.0),

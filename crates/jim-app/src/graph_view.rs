@@ -212,14 +212,14 @@ pub fn render(
                     ChildOf(content_root),
                     Text2d::new(model.caption.clone()),
                     TextFont {
-                        font: font.clone(),
-                        font_size: CAPTION_SIZE,
+                        font: (font.clone()).into(),
+                        font_size: FontSize::Px(CAPTION_SIZE),
                         ..default()
                     },
                     LineHeight::Px(CAPTION_SIZE * 1.4),
                     TextColor(palette.caption),
                     Anchor::TOP_LEFT,
-                    bevy::text::TextLayout::new_with_no_wrap(),
+                    bevy::text::TextLayout::no_wrap(),
                     Transform::from_translation(Vec3::new(PAD, -PAD, 0.3)),
                 ))
                 .id(),
@@ -314,14 +314,14 @@ pub fn render(
                     ChildOf(content_root),
                     Text2d::new(n.label.clone()),
                     TextFont {
-                        font: font.clone(),
-                        font_size: label_size,
+                        font: (font.clone()).into(),
+                        font_size: FontSize::Px(label_size),
                         ..default()
                     },
                     LineHeight::Px(label_size * 1.3),
                     TextColor(palette.label),
                     Anchor::TOP_LEFT,
-                    bevy::text::TextLayout::new_with_no_wrap(),
+                    bevy::text::TextLayout::no_wrap(),
                     TextBounds {
                         width: Some(inner_w),
                         height: Some(label_size * 1.5),
@@ -341,14 +341,14 @@ pub fn render(
                     ChildOf(content_root),
                     Text2d::new(n.sublabel.clone()),
                     TextFont {
-                        font: font.clone(),
-                        font_size: sub_size,
+                        font: (font.clone()).into(),
+                        font_size: FontSize::Px(sub_size),
                         ..default()
                     },
                     LineHeight::Px(sub_size * 1.3),
                     TextColor(palette.sublabel),
                     Anchor::TOP_LEFT,
-                    bevy::text::TextLayout::new_with_no_wrap(),
+                    bevy::text::TextLayout::no_wrap(),
                     TextBounds {
                         width: Some(inner_w),
                         height: Some(sub_size * 1.5),

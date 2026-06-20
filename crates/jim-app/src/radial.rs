@@ -466,8 +466,8 @@ fn radial_render(
             RadialEntity,
             Text2d::new(item.icon),
             TextFont {
-                font: font.0.clone(),
-                font_size: 18.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(18.0),
                 ..default()
             },
             LineHeight::Px(18.0),
@@ -484,8 +484,8 @@ fn radial_render(
             RadialEntity,
             Text2d::new(item.label),
             TextFont {
-                font: font.0.clone(),
-                font_size: 11.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(11.0),
                 ..default()
             },
             LineHeight::Px(11.0),

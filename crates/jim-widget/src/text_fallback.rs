@@ -56,13 +56,19 @@ pub fn apply_text_fallback(
         if children.is_some() {
             continue;
         }
+        // Bevy 0.19: TextFont.font is a `FontSource`. The fallback registry is
+        // keyed by concrete `Handle<Font>`; widget text always uses one, so a
+        // generic-family source just bypasses the per-glyph cascade.
+        let FontSource::Handle(base_font) = &font.font else {
+            continue;
+        };
         // For any codepoint no registered font can draw, ask the OS for a font
         // that has it and load it. Once a system font is registered its whole
         // coverage is known, so a single lookup serves every glyph it covers —
         // `has_glyph` dedups subsequent chars. This is what lets widget text
         // render arbitrary Unicode instead of tofu.
         for ch in text.0.chars() {
-            if reg.has_glyph(&font.font, ch) {
+            if reg.has_glyph(base_font, ch) {
                 continue;
             }
             if let Some(hit) = sysfont.bytes_for(ch) {
@@ -83,14 +89,15 @@ pub fn apply_text_fallback(
                 if !jim_style::fonts::is_safe_fallback_font(hit.bytes) {
                     continue;
                 }
-                if let Ok(f) = Font::try_from_bytes(hit.bytes.to_vec()) {
-                    let cov = Arc::new(jim_style::fonts::coverage_of(hit.bytes));
-                    let handle = fonts.add(f);
-                    reg.register_system_font(handle, cov);
-                }
+                // Bevy 0.19: Font::from_bytes is infallible; the safe-font
+                // guard above already screened out color/.ttc fonts.
+                let f = Font::from_bytes(hit.bytes.to_vec());
+                let cov = Arc::new(jim_style::fonts::coverage_of(hit.bytes));
+                let handle = fonts.add(f);
+                reg.register_system_font(handle, cov);
             }
         }
-        let runs = reg.split_runs(&font.font, &text.0);
+        let runs = reg.split_runs(base_font, &text.0);
         if runs.is_empty() {
             continue;
         }
@@ -99,7 +106,7 @@ pub fn apply_text_fallback(
         // that is entirely symbols like "↻" — still has to be re-inserted, or
         // it keeps the base font that can't draw it and renders as tofu. (This
         // was the bug: `runs.len() <= 1` skipped that all-fallback case.)
-        if runs.len() == 1 && runs[0].1 == font.font {
+        if runs.len() == 1 && *base_font == runs[0].1 {
             continue;
         }
         let size = font.font_size;
@@ -109,7 +116,7 @@ pub fn apply_text_fallback(
         commands.entity(entity).insert((
             Text2d::new(runs[0].0.clone()),
             TextFont {
-                font: runs[0].1.clone(),
+                font: (runs[0].1.clone()).into(),
                 font_size: size,
                 ..default()
             },
@@ -119,7 +126,7 @@ pub fn apply_text_fallback(
                 ChildOf(entity),
                 TextSpan::new(s.clone()),
                 TextFont {
-                    font: f.clone(),
+                    font: (f.clone()).into(),
                     font_size: size,
                     ..default()
                 },

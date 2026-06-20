@@ -88,14 +88,14 @@ fn spawn(world: &mut World, entity: Entity, content_root: Entity, config: &Value
             ChildOf(content_root),
             Text2d::new(String::new()),
             TextFont {
-                font,
-                font_size: TEXT_FONT_SIZE,
+                font: font.into(),
+                font_size: FontSize::Px(TEXT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(TEXT_LINE_HEIGHT),
             TextColor(text_color),
             Anchor::TOP_LEFT,
-            TextLayout::new_with_no_wrap(),
+            TextLayout::no_wrap(),
             Transform::from_xyz(TEXT_INNER_PAD_X, -TEXT_INNER_PAD_Y, 0.0),
         ))
         .id();

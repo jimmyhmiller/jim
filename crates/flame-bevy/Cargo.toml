@@ -15,7 +15,7 @@ log.workspace = true
 # Bevy uses wgpu 27 internally; flame-render is on wgpu 29 (forced by glyphon
 # 0.11). We deliberately keep the two stacks isolated and bridge via CPU
 # pixel readback into a `bevy::Image`. See `src/lib.rs` for the details.
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "bevy_asset",
     "bevy_image",
     "bevy_render",

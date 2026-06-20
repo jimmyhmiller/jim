@@ -854,8 +854,8 @@ fn sidebar_layout(
             SidebarEntity,
             Text2d::new("PROJECTS"),
             TextFont {
-                font: font.0.clone(),
-                font_size: HEADER_FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(HEADER_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(line_h),
@@ -988,8 +988,8 @@ fn sidebar_layout(
                 SidebarEntity,
                 Text2d::new(label),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: TEXT_FONT_SIZE,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(TEXT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(line_h),
@@ -1047,8 +1047,8 @@ fn sidebar_layout(
                     SidebarEntity,
                     Text2d::new(badge_text),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: TEXT_FONT_SIZE,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(TEXT_FONT_SIZE),
                         ..default()
                     },
                     LineHeight::Px(line_h),
@@ -1084,8 +1084,8 @@ fn sidebar_layout(
                 SidebarEntity,
                 Text2d::new("\u{00D7}"), // multiplication sign — looks better than ASCII 'x'
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: glyph_size,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(glyph_size),
                     ..default()
                 },
                 LineHeight::Px(line_h),
@@ -1180,8 +1180,8 @@ fn sidebar_layout(
             SidebarEntity,
             Text2d::new("+  New Project"),
             TextFont {
-                font: font.0.clone(),
-                font_size: TEXT_FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(TEXT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(line_h),
@@ -1238,8 +1238,8 @@ fn spawn_eye(
         SidebarEntity,
         Text2d::new("\u{25CB}"), // ○ white circle
         TextFont {
-            font: font.clone(),
-            font_size: outer_size,
+            font: (font.clone()).into(),
+            font_size: FontSize::Px(outer_size),
             ..default()
         },
         TextColor(color),
@@ -1251,8 +1251,8 @@ fn spawn_eye(
             SidebarEntity,
             Text2d::new("\u{25CF}"), // ● black circle (pupil)
             TextFont {
-                font: font.clone(),
-                font_size: outer_size * 0.46,
+                font: (font.clone()).into(),
+                font_size: FontSize::Px(outer_size * 0.46),
                 ..default()
             },
             TextColor(color),

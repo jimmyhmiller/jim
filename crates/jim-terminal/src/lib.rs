@@ -336,7 +336,7 @@ pub fn setup_terminal_font(world: &mut World) {
 
     let font_handle = world
         .resource_mut::<Assets<Font>>()
-        .add(Font::try_from_bytes(font_bytes.to_vec()).expect("SFMono must parse"));
+        .add(Font::from_bytes(font_bytes.to_vec()));
     world.insert_resource(MonoFont(font_handle.clone()));
     // pane-bevy uses this for chrome glyphs (close button, title text).
     world.insert_resource(PaneFont(font_handle));
@@ -1322,16 +1322,16 @@ fn sync_grid(
             );
             // Replace cells image in place — keep the same Handle so the
             // material doesn't need rebinding.
-            if let Some(img) = images.get_mut(&grid.cells_image) {
+            if let Some(mut img) = images.get_mut(&grid.cells_image) {
                 *img = make_cells_image(cols as u32, rows as u32, bg_packed);
             }
             // Replace mesh contents (same handle stays bound).
             let grid_w = cols as f32 * metrics.cell_width;
             let grid_h = rows as f32 * LINE_HEIGHT;
-            if let Some(mesh) = meshes.get_mut(&grid.mesh) {
+            if let Some(mut mesh) = meshes.get_mut(&grid.mesh) {
                 *mesh = Mesh::from(Rectangle::new(grid_w, grid_h));
             }
-            if let Some(mat) = materials.get_mut(&grid.material) {
+            if let Some(mut mat) = materials.get_mut(&grid.material) {
                 mat.params.cols = cols as u32;
                 mat.params.rows = rows as u32;
             }
@@ -1442,7 +1442,7 @@ fn sync_grid(
             }
         }
         if needs_upload {
-            if let Some(img) = images.get_mut(&grid.cells_image) {
+            if let Some(mut img) = images.get_mut(&grid.cells_image) {
                 let dst: &mut [GpuCell] = bytemuck::cast_slice_mut(
                     img.data
                         .as_mut()

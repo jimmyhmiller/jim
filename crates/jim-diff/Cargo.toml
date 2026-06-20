@@ -15,8 +15,9 @@ jim_editor = { path = "../jim-editor" }
 ropey = "1.6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.19", default-features = false, features = [
     "2d",
+    "system_font_discovery",
     "x11",
     "wayland",
 ] }

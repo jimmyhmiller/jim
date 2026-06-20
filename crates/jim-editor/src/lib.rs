@@ -22,7 +22,7 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
-use bevy::text::{CosmicFontSystem, LineHeight, TextSpan};
+use bevy::text::{LineHeight, TextSpan};
 use editor_core::commands::{
     cursor_char_left, cursor_char_right, cursor_doc_end, cursor_doc_start, cursor_line_down,
     cursor_line_end, cursor_line_start, cursor_line_up, cursor_word_left, cursor_word_right,
@@ -238,11 +238,7 @@ impl Plugin for EditorPlugin {
         .insert_resource(ClearColor(Color::srgb(0.10, 0.11, 0.13)))
         .add_systems(
             Startup,
-            (
-                setup_editor_camera,
-                setup_editor_font,
-                load_fallback_fonts,
-            ),
+            (setup_editor_camera, setup_editor_font),
         )
         .add_systems(PostStartup, release_os_focus)
         .add_plugins(PanePlugin::default())
@@ -279,9 +275,10 @@ impl Plugin for HeadlessEditorPlugin {
     }
 }
 
-fn load_fallback_fonts(mut fonts: ResMut<CosmicFontSystem>) {
-    fonts.0.db_mut().load_system_fonts();
-}
+// Bevy 0.19 migrated text shaping from cosmic-text to parley. System-font
+// fallback is now discovered automatically by parley/fontique, so the old
+// explicit `CosmicFontSystem::db_mut().load_system_fonts()` startup pass is
+// gone — see the `FontCx` resource in bevy_text.
 
 const EMBEDDED_FONT: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 
@@ -758,8 +755,8 @@ fn sync_editor_lines(
                         ChildOf(view.render_root),
                         Text2d::new(String::new()),
                         TextFont {
-                            font: font.0.clone(),
-                            font_size: FONT_SIZE,
+                            font: (font.0.clone()).into(),
+                            font_size: FontSize::Px(FONT_SIZE),
                             ..default()
                         },
                         LineHeight::Px(LINE_HEIGHT),
@@ -804,8 +801,8 @@ fn rebuild_line_spans(
             ChildOf(parent),
             TextSpan::new(text),
             TextFont {
-                font: font.0.clone(),
-                font_size: FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(LINE_HEIGHT),

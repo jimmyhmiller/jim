@@ -62,8 +62,8 @@ fn spawn_debug_bar(mut commands: Commands, font: Option<Res<MonoFont>>) {
             DebugBarLabel,
             Text2d::new("DEBUG BUILD \u{2014} not the release app (expect lag)"),
             TextFont {
-                font: font.0.clone(),
-                font_size: 13.0,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(13.0),
                 ..default()
             },
             TextColor(Color::WHITE),

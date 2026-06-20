@@ -244,7 +244,7 @@ fn render_and_upload(mut q: Query<&mut FlameGraph>, mut images: ResMut<Assets<Im
         }
         // Split borrow: we need &mut Image and &mut FlameGpu separately.
         let (w, h) = flame.gpu.render_and_readback();
-        let Some(img) = images.get_mut(&flame.image) else {
+        let Some(mut img) = images.get_mut(&flame.image) else {
             log::warn!(
                 "flame-bevy: FlameGraph's image handle is not in Assets<Image>; \
                  dropping this frame"

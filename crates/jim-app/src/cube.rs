@@ -1295,7 +1295,7 @@ fn animate_sky(
         return;
     }
     if let Some(handle) = &prism.sky_mat {
-        if let Some(mat) = sky_materials.get_mut(handle) {
+        if let Some(mut mat) = sky_materials.get_mut(handle) {
             mat.params.x = prism.sky_mode;
             mat.params.y = time.elapsed_secs();
         }

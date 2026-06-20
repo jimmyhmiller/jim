@@ -498,7 +498,7 @@ fn flame_track_resize(
         }
         let pw = (content_w * pane.scale_factor).round().max(1.0) as u32;
         let ph = (content_h * pane.scale_factor).round().max(1.0) as u32;
-        if let Some(img) = images.get_mut(&flame.image()) {
+        if let Some(mut img) = images.get_mut(&flame.image()) {
             let cur = img.texture_descriptor.size;
             if cur.width != pw || cur.height != ph {
                 img.texture_descriptor.size = Extent3d {

@@ -940,7 +940,7 @@ fn render_select_overlay(
         .id();
 
     let octx = render::LayoutCtx {
-        font: pane_font.0.clone(),
+        font: (pane_font.0.clone()).into(),
         metrics: *metrics,
         owner_pane: os.pane,
         content_root: root,
@@ -1055,14 +1055,14 @@ fn render_select_overlay(
             ChildOf(root),
             Text2d::new(opt.label.clone()),
             TextFont {
-                font: pane_font.0.clone(),
-                font_size: render::DEFAULT_FONT_SIZE,
+                font: (pane_font.0.clone()).into(),
+                font_size: FontSize::Px(render::DEFAULT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(render::line_height(render::DEFAULT_FONT_SIZE)),
             TextColor(color),
             bevy::sprite::Anchor::CENTER_LEFT,
-            bevy::text::TextLayout::new_with_no_wrap(),
+            bevy::text::TextLayout::no_wrap(),
             Transform::from_xyz(pad + render::SELECT_PAD_X, -(y + item_h * 0.5), 0.02),
         ));
 
@@ -1264,7 +1264,7 @@ fn render_dialog_overlay(
         .id();
     if let Some(plan) = dialog.style.as_ref().and_then(|s| s.scrim.as_ref()) {
         let sctx = render::LayoutCtx {
-            font: pane_font.0.clone(),
+            font: (pane_font.0.clone()).into(),
             metrics: *metrics,
             owner_pane: pane,
             content_root: scrim_root,
@@ -1309,7 +1309,7 @@ fn render_dialog_overlay(
         ))
         .id();
     let pctx = render::LayoutCtx {
-        font: pane_font.0.clone(),
+        font: (pane_font.0.clone()).into(),
         metrics: *metrics,
         owner_pane: pane,
         content_root: panel_root,
@@ -1529,7 +1529,7 @@ fn render_popover_overlay(
         ))
         .id();
     let pctx = render::LayoutCtx {
-        font: pane_font.0.clone(),
+        font: (pane_font.0.clone()).into(),
         metrics: *metrics,
         owner_pane: op.pane,
         content_root: root,
@@ -1738,7 +1738,7 @@ fn render_toast_overlay(
             ))
             .id();
         let octx = render::LayoutCtx {
-            font: pane_font.0.clone(),
+            font: (pane_font.0.clone()).into(),
             metrics: *metrics,
             owner_pane: pane,
             content_root: root,
@@ -1773,8 +1773,8 @@ fn render_toast_overlay(
             ChildOf(root),
             Text2d::new(toast.text.clone()),
             TextFont {
-                font: pane_font.0.clone(),
-                font_size: render::DEFAULT_FONT_SIZE,
+                font: (pane_font.0.clone()).into(),
+                font_size: FontSize::Px(render::DEFAULT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(render::line_height(render::DEFAULT_FONT_SIZE)),
@@ -1788,7 +1788,7 @@ fn render_toast_overlay(
                 octx.palette.text,
             )),
             bevy::sprite::Anchor::CENTER_LEFT,
-            bevy::text::TextLayout::new_with_no_wrap(),
+            bevy::text::TextLayout::no_wrap(),
             // Hard cap on width so the label can never spill past the toast
             // (minus the × area). Width-only keeps the CENTER_LEFT vertical
             // centering intact (a height bound would top-align the text).
@@ -1803,14 +1803,14 @@ fn render_toast_overlay(
             ChildOf(root),
             Text2d::new("\u{00d7}"),
             TextFont {
-                font: pane_font.0.clone(),
-                font_size: render::DEFAULT_FONT_SIZE,
+                font: (pane_font.0.clone()).into(),
+                font_size: FontSize::Px(render::DEFAULT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(render::line_height(render::DEFAULT_FONT_SIZE)),
             TextColor(octx.palette.text_muted),
             bevy::sprite::Anchor::CENTER_RIGHT,
-            bevy::text::TextLayout::new_with_no_wrap(),
+            bevy::text::TextLayout::no_wrap(),
             Transform::from_xyz(toast_w - pad, -(th * 0.5), 0.02),
         ));
         y_from_bottom += th + gap;
@@ -2002,7 +2002,7 @@ fn render_tooltip_overlay(
         ))
         .id();
     let octx = render::LayoutCtx {
-        font: pane_font.0.clone(),
+        font: (pane_font.0.clone()).into(),
         metrics: *metrics,
         owner_pane: tip.pane,
         content_root: root,
@@ -2037,8 +2037,8 @@ fn render_tooltip_overlay(
         ChildOf(root),
         Text2d::new(tip.text.clone()),
         TextFont {
-            font: pane_font.0.clone(),
-            font_size: render::DEFAULT_FONT_SIZE,
+            font: (pane_font.0.clone()).into(),
+            font_size: FontSize::Px(render::DEFAULT_FONT_SIZE),
             ..default()
         },
         LineHeight::Px(render::line_height(render::DEFAULT_FONT_SIZE)),
@@ -2051,7 +2051,7 @@ fn render_tooltip_overlay(
             octx.palette.text,
         )),
         bevy::sprite::Anchor::CENTER_LEFT,
-        bevy::text::TextLayout::new_with_no_wrap(),
+        bevy::text::TextLayout::no_wrap(),
         Transform::from_xyz(pad, -(bubble_h * 0.5), 0.02),
     ));
 }
@@ -3141,7 +3141,7 @@ fn rerender_widgets(
     themes: Res<jim_style::ProjectThemes>,
     fonts: Res<jim_style::FontRegistry>,
     time: Res<Time>,
-    pane_zoom: Res<jim_pane::PaneZoom>,
+    _pane_zoom: Res<jim_pane::PaneZoom>,
     mut clip_dirty: ResMut<WidgetClipDirty>,
     mut anim_store: ResMut<anim::WidgetAnim>,
     mut images: ResMut<Assets<Image>>,
@@ -3258,7 +3258,7 @@ fn rerender_widgets(
             );
         } else {
             let ctx = render::LayoutCtx {
-                font: pane_font.0.clone(),
+                font: (pane_font.0.clone()).into(),
                 metrics: *metrics,
                 owner_pane: pane,
                 content_root: root.0,
@@ -3421,13 +3421,13 @@ pub(crate) fn render_canvas_items(
                     ChildOf(content_root),
                     Text2d::new(value.clone()),
                     TextFont {
-                        font,
-                        font_size,
+                        font: font.into(),
+                        font_size: FontSize::Px(font_size),
                         ..default()
                     },
                     TextColor(col),
                     anchor_cmp,
-                    bevy::text::TextLayout::new_with_no_wrap(),
+                    bevy::text::TextLayout::no_wrap(),
                     Transform::from_xyz(origin.x + *x, -(origin.y + *y), z_base + *z),
                     Visibility::Inherited,
                 ));
@@ -4295,7 +4295,7 @@ mod line_math_tests {
         // Monospace: cell_width 10 at font_size 10 → each char is 10px.
         let m = PaneFontMetrics {
             cell_width: 10.0,
-            font_size: 10.0,
+            font_size: FontSize::Px(10.0),
         };
         // Boundaries land at 0,10,20,30,40,50 for "hello".
         assert_eq!(char_index_at_x("hello", 0.0, 10.0, &m, 0.0), 0);

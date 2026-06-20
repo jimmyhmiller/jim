@@ -366,7 +366,7 @@ impl GlyphAtlas {
             self.cols_per_row,
         );
 
-        let image = images.get_mut(&self.image).expect("atlas image asset");
+        let mut image = images.get_mut(&self.image).expect("atlas image asset");
         blit_glyph(
             image.data.as_mut().expect("atlas image data"),
             ATLAS_DIM,
@@ -379,7 +379,7 @@ impl GlyphAtlas {
             placement.3,
         );
 
-        let layout = layouts.get_mut(&self.layout).expect("atlas layout asset");
+        let mut layout = layouts.get_mut(&self.layout).expect("atlas layout asset");
         layout.add_texture(rect);
 
         self.slots.insert(ch, slot);

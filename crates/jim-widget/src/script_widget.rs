@@ -1424,7 +1424,7 @@ fn forward_keys_to_workers(
 
 fn forward_inputs_to_workers(
     time: Res<Time>,
-    pane_zoom: Res<jim_pane::PaneZoom>,
+    _pane_zoom: Res<jim_pane::PaneZoom>,
     theme: Res<jim_style::Theme>,
     metrics: Res<jim_pane::PaneFontMetrics>,
     mut theme_events: MessageReader<jim_style::ThemeChanged>,
@@ -1572,7 +1572,7 @@ fn apply_latest_frames(
     children_q: Query<&Children>,
 ) {
     let theme_changed = theme.is_changed();
-    let zoom = pane_zoom.0.max(0.0001);
+    let _zoom = pane_zoom.0.max(0.0001);
     // Caret blink: visible during the first half of each 1s cycle.
     let caret_visible = time.elapsed_secs().rem_euclid(1.0) < 0.5;
     // Per-frame render deadline (see `WidgetRenderBudget`): smear work across
@@ -1700,7 +1700,7 @@ fn apply_latest_frames(
                     (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0),
                 );
                 let ctx = crate::render::LayoutCtx {
-                    font: pane_font.0.clone(),
+                    font: (pane_font.0.clone()).into(),
                     metrics: *pane_metrics,
                     owner_pane: entity,
                     content_root: chrome.content_root,
@@ -2076,7 +2076,7 @@ fn diff_render(
                 // never break mid-word. Without this, "New game" wraps
                 // to "New\ngame" inside a narrow canvas because Bevy's
                 // default TextLayout still inserts soft breaks.
-                let layout = bevy::text::TextLayout::new_with_no_wrap();
+                let layout = bevy::text::TextLayout::no_wrap();
 
                 // Per-glyph font fallback. Bevy draws a Text2d in ONE font
                 // and silently drops codepoints it lacks, so geometric
@@ -2099,8 +2099,8 @@ fn diff_render(
                         commands.entity(e).try_insert((
                             Text2d::new(root_str),
                             TextFont {
-                                font: root_font,
-                                font_size,
+                                font: (root_font).into(),
+                                font_size: FontSize::Px(font_size),
                                 ..default()
                             },
                             TextColor(col),
@@ -2117,8 +2117,8 @@ fn diff_render(
                                 ChildOf(content_root),
                                 Text2d::new(root_str),
                                 TextFont {
-                                    font: root_font,
-                                    font_size,
+                                    font: (root_font).into(),
+                                    font_size: FontSize::Px(font_size),
                                     ..default()
                                 },
                                 TextColor(col),
@@ -2146,8 +2146,8 @@ fn diff_render(
                             commands.entity(se).try_insert((
                                 bevy::text::TextSpan::new(s.clone()),
                                 TextFont {
-                                    font: f.clone(),
-                                    font_size,
+                                    font: (f.clone()).into(),
+                                    font_size: FontSize::Px(font_size),
                                     ..default()
                                 },
                                 TextColor(col),
@@ -2159,8 +2159,8 @@ fn diff_render(
                                     ChildOf(text_entity),
                                     bevy::text::TextSpan::new(s.clone()),
                                     TextFont {
-                                        font: f.clone(),
-                                        font_size,
+                                        font: (f.clone()).into(),
+                                        font_size: FontSize::Px(font_size),
                                         ..default()
                                     },
                                     TextColor(col),

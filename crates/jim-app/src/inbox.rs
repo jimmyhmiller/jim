@@ -632,14 +632,14 @@ fn rebuild_rows(
             ChildOf(chrome.content_root),
             Text2d::new(header_label),
             TextFont {
-                font: font.0.clone(),
-                font_size: TEXT_FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(TEXT_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(HEADER_H),
             TextColor(fg_muted),
             Anchor::CENTER_LEFT,
-            TextLayout::new_with_no_wrap(),
+            TextLayout::no_wrap(),
             jim_pane::PaneContentNoClip,
             Transform::from_xyz(ROW_PAD_X, -(y + HEADER_H * 0.5), 0.1),
         ));
@@ -668,14 +668,14 @@ fn rebuild_rows(
             ChildOf(chrome.content_root),
             Text2d::new("Mark all read"),
             TextFont {
-                font: font.0.clone(),
-                font_size: SMALL_FONT_SIZE,
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(SMALL_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(ACTION_BTN_H),
             TextColor(accent),
             Anchor::CENTER,
-            TextLayout::new_with_no_wrap(),
+            TextLayout::no_wrap(),
             jim_pane::PaneContentNoClip,
             Transform::from_xyz(
                 mark_x + mark_w * 0.5,
@@ -716,14 +716,14 @@ fn rebuild_rows(
                     ChildOf(chrome.content_root),
                     Text2d::new(toggle_label),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: SMALL_FONT_SIZE,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(SMALL_FONT_SIZE),
                         ..default()
                     },
                     LineHeight::Px(ACTION_BTN_H),
                     TextColor(fg_muted),
                     Anchor::CENTER,
-                    TextLayout::new_with_no_wrap(),
+                    TextLayout::no_wrap(),
                     jim_pane::PaneContentNoClip,
                     Transform::from_xyz(
                         toggle_x + toggle_w * 0.5,
@@ -771,8 +771,8 @@ fn rebuild_rows(
                 ChildOf(chrome.content_root),
                 Text2d::new(empty_label),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: SMALL_FONT_SIZE,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(SMALL_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(ROW_H),
@@ -827,8 +827,8 @@ fn rebuild_rows(
                 ChildOf(chrome.content_root),
                 Text2d::new(if expanded { "▾" } else { "▸" }),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: 12.0,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(12.0),
                     ..default()
                 },
                 LineHeight::Px(ROW_H),
@@ -851,14 +851,14 @@ fn rebuild_rows(
                 ChildOf(chrome.content_root),
                 Text2d::new(summary),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: TEXT_FONT_SIZE,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(TEXT_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(ROW_H),
                 TextColor(title_color),
                 Anchor::CENTER_LEFT,
-                TextLayout::new_with_no_wrap(),
+                TextLayout::no_wrap(),
                 jim_pane::PaneContentNoClip,
                 Transform::from_xyz(summary_x, -(y + ROW_H * 0.5), 0.1),
             ));
@@ -870,14 +870,14 @@ fn rebuild_rows(
                 ChildOf(chrome.content_root),
                 Text2d::new(ts_text),
                 TextFont {
-                    font: font.0.clone(),
-                    font_size: SMALL_FONT_SIZE,
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(SMALL_FONT_SIZE),
                     ..default()
                 },
                 LineHeight::Px(ROW_H),
                 TextColor(fg_muted),
                 Anchor::CENTER_RIGHT,
-                TextLayout::new_with_no_wrap(),
+                TextLayout::no_wrap(),
                 jim_pane::PaneContentNoClip,
                 Transform::from_xyz(content_w - ROW_PAD_X, -(y + ROW_H * 0.5), 0.1),
             ));
@@ -901,8 +901,8 @@ fn rebuild_rows(
                     ChildOf(chrome.content_root),
                     Text2d::new(body_text),
                     TextFont {
-                        font: font.0.clone(),
-                        font_size: TEXT_FONT_SIZE,
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(TEXT_FONT_SIZE),
                         ..default()
                     },
                     LineHeight::Px(TEXT_FONT_SIZE * 1.3),
@@ -946,14 +946,14 @@ fn rebuild_rows(
                             ChildOf(parent),
                             Text2d::new(label.to_string()),
                             TextFont {
-                                font: font.0.clone(),
-                                font_size: SMALL_FONT_SIZE,
+                                font: (font.0.clone()).into(),
+                                font_size: FontSize::Px(SMALL_FONT_SIZE),
                                 ..default()
                             },
                             LineHeight::Px(btn_h),
                             TextColor(color),
                             Anchor::CENTER,
-                            TextLayout::new_with_no_wrap(),
+                            TextLayout::no_wrap(),
                             jim_pane::PaneContentNoClip,
                             Transform::from_xyz(x + w * 0.5, -(y + btn_h * 0.5), 0.2),
                         ));

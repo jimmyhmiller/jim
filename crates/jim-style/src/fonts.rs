@@ -265,13 +265,9 @@ pub fn ensure_initialized(registry: &mut FontRegistry, fonts: &mut Assets<Font>)
             }
             continue;
         }
-        let font = match Font::try_from_bytes(bytes.to_vec()) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("[font-registry] bundled font {:?} failed to parse: {}", name, e);
-                continue;
-            }
-        };
+        // Bevy 0.19: Font::from_bytes is infallible (parley parses lazily);
+        // bundled fonts are trusted, so wrap directly.
+        let font = Font::from_bytes(bytes.to_vec());
         let handle = fonts.add(font);
         if first.is_none() {
             first = Some(handle.clone());

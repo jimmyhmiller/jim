@@ -242,7 +242,7 @@ fn update_glaze_materials(
     }
 
     for (entity, target, handle) in &layers {
-        let Some(m) = mats.get_mut(&handle.0) else {
+        let Some(mut m) = mats.get_mut(&handle.0) else {
             continue;
         };
 
