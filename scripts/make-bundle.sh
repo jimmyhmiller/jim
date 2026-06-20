@@ -69,11 +69,13 @@ cp "$SRC_DYLIB" "$FRAMEWORKS/libghostty-vt.dylib"
 
 # Bundle the sibling binaries the app resolves at runtime relative to its
 # own exe (jim_app::exe_dir): `jimctl` is what the in-app agent shells out
-# to, and `glaze_ui` is the design-system showcase subprocess widget.
+# to, `glaze_ui` is the design-system showcase subprocess widget, and
+# `jim-lsp` is the rust-analyzer sidecar daemon the LSP explorer spawns
+# (via `jimctl lsp`, which looks for it next to its own exe).
 # Without these in MacOS/, those features die on a machine that doesn't
-# have jimctl on PATH or a dev target/ tree — i.e. a fresh Mac.
+# have them on PATH or a dev target/ tree — i.e. a fresh Mac.
 # `cargo build --release` produces all of them (workspace default-members).
-for sib in jimctl glaze_ui; do
+for sib in jimctl glaze_ui jim-lsp; do
     SRC_SIB="target/$PROFILE/$sib"
     if [ -x "$SRC_SIB" ]; then
         cp "$SRC_SIB" "$MACOS/$sib"
@@ -124,7 +126,7 @@ fi
 # usage-description strings. Every Mach-O under the bundle must carry a
 # valid signature or the outer seal is invalid and the app fails Gatekeeper.
 codesign --force --sign "$SIGN_ARG" "$FRAMEWORKS/libghostty-vt.dylib" >/dev/null 2>&1 || true
-for sib in jimctl glaze_ui; do
+for sib in jimctl glaze_ui jim-lsp; do
     [ -f "$MACOS/$sib" ] && codesign --force --sign "$SIGN_ARG" "$MACOS/$sib" >/dev/null 2>&1 || true
 done
 

@@ -62,9 +62,12 @@ use serde_json::Value;
 
 pub mod camera;
 pub mod chrome_material;
+pub mod churn;
+pub mod dock;
 pub mod layers;
 pub mod prof;
 pub mod text_input;
+pub mod trace;
 
 pub use camera::{
     pane_camera_setup_for, PaneCameraOf, PaneCameraSetup, PaneCanvasRegion,
@@ -72,6 +75,10 @@ pub use camera::{
 pub use chrome_material::{
     ActiveChromeShader, ChromeMaterialPlugin, ChromeParams, ChromeStyle, ChromeTextStyle,
     PaneChromeMaterial, PaneChromeShader, PaneChromeStyle, PaneShadowMaterial, ShadowParams,
+};
+pub use dock::{
+    create_dock, create_dock_template, dock_co_members, Dock, DockMember, DockNode, DockPlugin,
+    DockTemplate, DropEdge, PendingDockLink, DOCK_KIND,
 };
 pub use layers::{PaneLayer, PaneLayerAllocator};
 
@@ -185,6 +192,14 @@ pub struct PanePinned;
 /// projection for these, and the per-pane camera uses the rect as-is.
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct PaneScreenAnchored;
+
+/// Marker: this pane has its own zoom and captures trackpad pinch gestures
+/// while the cursor is over it. Canvas pinch-to-zoom skips a pinch when the
+/// topmost pane under the cursor carries this, so a pane like the flame graph
+/// can zoom itself instead of the canvas zooming underneath it. The pane kind
+/// is responsible for actually handling the `PinchGesture` events.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct PaneCapturesPinch;
 
 /// A pane between close request and actual despawn. Close is two-phase:
 /// the frame the close is processed (`apply_pending_pane_actions`) the
@@ -555,6 +570,15 @@ pub struct PaneSnapshot {
     /// `serde(default)` keeps old saves loadable.
     #[serde(default)]
     pub pinned: bool,
+    /// If this pane belonged to a dock at snapshot time, the dock
+    /// group's stable id (the dock entity's `to_bits()`). The dock
+    /// container pane itself also carries its own id here so the restore
+    /// path can find it. `None` for free panes. See [`dock`].
+    #[serde(default)]
+    pub dock_group: Option<u64>,
+    /// Member slot (column order) within the dock; 0 for the container.
+    #[serde(default)]
+    pub dock_slot: usize,
 }
 
 fn default_value_null() -> Value {

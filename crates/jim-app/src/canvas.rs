@@ -385,6 +385,10 @@ fn handle_pan_zoom_input(
     mut view: ResMut<CanvasView>,
     mut drag: ResMut<PanDragState>,
     panes: Query<(&PaneRect, Option<&Visibility>), With<PaneTag>>,
+    capture_panes: Query<
+        (Entity, &PaneRect, Option<&Visibility>),
+        (With<PaneTag>, With<jim_pane::PaneCapturesPinch>),
+    >,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -435,8 +439,22 @@ fn handle_pan_zoom_input(
         pinch_total += ev.0;
         had_pinch = true;
     }
+    // A pane that owns its own zoom (e.g. the flame graph, via the
+    // `PaneCapturesPinch` marker) swallows the pinch when the cursor is over
+    // it, so the canvas doesn't zoom underneath it. The pane kind handles the
+    // `PinchGesture` events itself.
+    let pinch_over_capture_pane = had_pinch && {
+        let cursor_canvas = unproject_pos(pt, &view.state_for(active), screen_origin(&sidebar));
+        let rects: Vec<(Entity, PaneRect)> = capture_panes
+            .iter()
+            .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
+            .map(|(e, r, _)| (e, *r))
+            .collect();
+        jim_pane::topmost_pane_at(cursor_canvas, &rects).is_some()
+    };
     if had_pinch
         && !in_block_zone
+        && !pinch_over_capture_pane
         && config.zoom_enabled
         && config.pinch_to_zoom
     {

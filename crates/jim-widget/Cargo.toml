@@ -38,12 +38,26 @@ funct = "0.1"
 # as a one-shot pure call from the widget worker thread (no Bevy).
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
+tree-sitter-json = "0.24"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 bevy = { version = "0.18", default-features = false, features = [
     "2d",
     "x11",
     "wayland",
 ] }
+# Native audio capture for the audio-recorder widget. cpal runs the input
+# stream on its own realtime thread (CoreAudio), so recording quality is
+# fully decoupled from GUI/worker load; hound writes the WAV. Exposed to
+# funct widgets as the audio_* host fns (see src/audio.rs).
+cpal = "0.15"
+hound = "3.5"
+
+# macOS CoreText system-font cascade for widget text: when no bundled font
+# covers a codepoint, ask the OS which installed font does and load it, so
+# widgets render ANY Unicode (same approach jim-terminal uses for the TTY).
+[target.'cfg(target_os = "macos")'.dependencies]
+core-text = "21"
+core-foundation = "0.10"
 
 [dev-dependencies]
 # The Style Lab generator (style-muse) emits protocol-shaped JSON; the

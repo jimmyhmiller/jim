@@ -491,6 +491,20 @@ fn build_node(
             apply_style_overrides(&mut s, style.as_ref());
             taffy.new_leaf(s).unwrap()
         }
+        Element::Editor { style, .. } => {
+            // A live editor portal. Default to a roomy box; `style`
+            // (flex_grow, width/height incl. "100%", min/max) overrides so
+            // it can fill its pane like any other leaf.
+            let mut s = taffy::Style {
+                size: Size {
+                    width: Dimension::length(420.0),
+                    height: Dimension::length(280.0),
+                },
+                ..taffy::Style::DEFAULT
+            };
+            apply_style_overrides(&mut s, style.as_ref());
+            taffy.new_leaf(s).unwrap()
+        }
         Element::TextArea {
             width,
             rows,
@@ -587,7 +601,17 @@ fn build_node(
             }
             taffy.new_with_children(st, &cells).unwrap()
         }
-        Element::Canvas { .. } => taffy.new_leaf(taffy::Style::DEFAULT).unwrap(),
+        // A nested Canvas is a sized leaf in the flex tree: it draws its
+        // own children absolutely, so it has no intrinsic content size.
+        // Apply the style overrides (width/height/flex_grow/min_*) so it
+        // can claim space; with no style it stays zero-size (the old
+        // behavior). A top-level Canvas never reaches here — it bypasses
+        // the flow layout entirely.
+        Element::Canvas { style, .. } => {
+            let mut st = taffy::Style::DEFAULT;
+            apply_style_overrides(&mut st, style.as_ref());
+            taffy.new_leaf(st).unwrap()
+        }
     }
 }
 

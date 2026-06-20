@@ -808,9 +808,41 @@ fn render_node(
             size,
             z,
         ),
-        // Canvas renders only at the top level via render_canvas_items.
-        // Nested Canvas inside flow layout becomes a 0-size leaf.
-        Element::Canvas { .. } => {}
+        // A nested Canvas: paint its style background, then record its
+        // Taffy box + items. `render_canvas_items` draws them after this
+        // walk (in the host system that owns the image assets), offset to
+        // this origin. A top-level Canvas never reaches here — it bypasses
+        // the flow renderer entirely.
+        Element::Canvas { children, style } => {
+            paint_style_background(commands, ctx, style.as_ref(), origin, size, z);
+            targets.canvas_regions.push(crate::CanvasRegionTarget {
+                rect: Rect::from_corners(origin, origin + size),
+                z,
+                items: children.clone(),
+            });
+        }
+        // The editor is a persistent live child entity, not painted here.
+        // Record its id + Taffy box; `reconcile_editor_portals` spawns /
+        // repositions the real `jim-editor` after the render walk, so it
+        // survives the per-frame flow teardown.
+        Element::Editor {
+            id,
+            value,
+            path,
+            lang,
+            read_only,
+            ..
+        } => {
+            targets.editor_portals.push(crate::EditorPortalTarget {
+                id: id.clone(),
+                rect: Rect::from_corners(origin, origin + size),
+                value: value.clone(),
+                path: path.clone(),
+                lang: lang.clone(),
+                read_only: *read_only,
+                z,
+            });
+        }
     }
 }
 
@@ -3176,31 +3208,36 @@ fn render_textarea_at(
         // the text engine wrap) so the caret math matches exactly.
         let chars: Vec<char> = display_value.chars().collect();
         let visual = wrap_visual_lines(&chars, &ctx.metrics, avail);
-        let display: String = visual
-            .iter()
-            .map(|&(s, e)| chars[s..e].iter().collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !display.is_empty() {
+        let text_color = style_text_color(
+            ctx,
+            style.and_then(|s| s.text_color.as_deref()),
+            ctx.palette.text,
+        );
+        // Render each visual line as its OWN Text2d, positioned by line index.
+        // Bevy's `NoWrap` layout does NOT honor embedded hard `\n` — it draws
+        // them as missing-glyph boxes — so a single Text2d joined with "\n"
+        // turns every line break into tofu. One entity per line avoids any
+        // embedded newline and matches the per-line caret math below.
+        for (li, &(s, e)) in visual.iter().enumerate() {
+            let seg: String = chars[s..e].iter().collect();
+            if seg.is_empty() {
+                continue;
+            }
             commands.spawn((
                 ChildOf(ctx.content_root),
-                Text2d::new(display),
+                Text2d::new(seg),
                 TextFont {
                     font: ctx.font.clone(),
                     font_size: DEFAULT_FONT_SIZE,
                     ..default()
                 },
                 LineHeight::Px(line_h),
-                TextColor(style_text_color(
-                    ctx,
-                    style.and_then(|s| s.text_color.as_deref()),
-                    ctx.palette.text,
-                )),
+                TextColor(text_color),
                 Anchor::TOP_LEFT,
                 bevy::text::TextLayout::new_with_no_wrap(),
                 Transform::from_xyz(
                     origin.x + INPUT_PAD_X,
-                    -(origin.y + TEXTAREA_PAD_Y),
+                    -(origin.y + TEXTAREA_PAD_Y + li as f32 * line_h),
                     z + 0.01,
                 ),
             ));

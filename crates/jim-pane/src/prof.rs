@@ -154,10 +154,16 @@ fn record_sys(name: &'static str, dur: Duration, nested: bool) {
 }
 
 /// RAII timing guard. Records its elapsed lifetime into the accumulator on
-/// drop. Created disabled (a no-op) when profiling is off.
+/// drop. Created disabled (a no-op) when both the aggregate profiler and the
+/// rich [`crate::trace`] recorder are off.
+///
+/// The same guard feeds both layers: the aggregate `prof` map (gated on
+/// [`enabled`]) and, independently, the rich per-span trace ring (gated on
+/// [`crate::trace::enabled`]). Either, both, or neither can be on.
 #[must_use = "the span times until it is dropped; bind it to a local"]
 pub struct Span {
     start: Option<Instant>,
+    trace: Option<crate::trace::Pending>,
     target: Target,
 }
 
@@ -168,11 +174,29 @@ enum Target {
 
 impl Drop for Span {
     fn drop(&mut self) {
-        let Some(start) = self.start else { return };
-        let dur = start.elapsed();
-        match self.target {
-            Target::Pane { entity_bits, kind } => record_pane(entity_bits, kind, dur),
-            Target::Sys { name, nested } => record_sys(name, dur, nested),
+        if let Some(start) = self.start {
+            let dur = start.elapsed();
+            match self.target {
+                Target::Pane { entity_bits, kind } => record_pane(entity_bits, kind, dur),
+                Target::Sys { name, nested } => record_sys(name, dur, nested),
+            }
+        }
+        // The rich trace keeps each span instance individually (the aggregate
+        // above collapses them). `end` is a no-op when `trace` was off at
+        // construction, so depth bookkeeping stays balanced.
+        if self.trace.is_some() {
+            let pending = self.trace.take();
+            match self.target {
+                Target::Pane { entity_bits, kind } => {
+                    crate::trace::end(pending, kind, "pane", entity_bits)
+                }
+                Target::Sys { name, nested } => crate::trace::end(
+                    pending,
+                    name,
+                    if nested { "sys.nested" } else { "sys" },
+                    0,
+                ),
+            }
         }
     }
 }
@@ -184,6 +208,7 @@ impl Drop for Span {
 pub fn pane_span(entity_bits: u64, kind: &'static str) -> Span {
     Span {
         start: if enabled() { Some(Instant::now()) } else { None },
+        trace: crate::trace::begin(),
         target: Target::Pane { entity_bits, kind },
     }
 }
@@ -194,6 +219,7 @@ pub fn pane_span(entity_bits: u64, kind: &'static str) -> Span {
 pub fn sys_span(name: &'static str) -> Span {
     Span {
         start: if enabled() { Some(Instant::now()) } else { None },
+        trace: crate::trace::begin(),
         target: Target::Sys {
             name,
             nested: false,
@@ -208,6 +234,7 @@ pub fn sys_span(name: &'static str) -> Span {
 pub fn sys_span_nested(name: &'static str) -> Span {
     Span {
         start: if enabled() { Some(Instant::now()) } else { None },
+        trace: crate::trace::begin(),
         target: Target::Sys { name, nested: true },
     }
 }

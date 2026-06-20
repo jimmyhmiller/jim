@@ -83,7 +83,7 @@ pub fn spawn_pane_cameras(
             viewport.projected_rect(rect)
         };
         let cam_setup = pane_camera_setup(&projected, window, region);
-        let order = pane_camera_order(rect);
+        let order = pane_camera_order(rect, pane_entity);
         commands.spawn((
             Camera2d,
             Camera {
@@ -135,7 +135,7 @@ pub fn sync_pane_cameras(
             viewport.projected_rect(rect)
         };
         let setup = pane_camera_setup(&projected, window, region);
-        let new_order = pane_camera_order(rect);
+        let new_order = pane_camera_order(rect, owner.0);
 
         let needs_viewport_update = match &cam.viewport {
             Some(v) => {
@@ -163,8 +163,27 @@ pub fn sync_pane_cameras(
 /// over lower z, mirroring the existing world-space transform ordering.
 /// Multiplied by 100 to preserve sub-integer z; +1 keeps every pane
 /// strictly above the main camera (order 0).
-fn pane_camera_order(rect: &PaneRect) -> isize {
-    ((rect.z.max(0.0) * 100.0) as isize) + 1
+/// Render order for a pane's window camera.
+///
+/// Two active cameras that share an `order` on the same render target make
+/// Bevy log a camera-order ambiguity *every frame* ("unpredictable render
+/// results") — and with many panes idling at the same `z` (e.g. z=0 before
+/// they're ever focused) the old `z*100+1` collided constantly, spamming the
+/// log thousands of times a session. We keep `z` dominant (so focus-stacking
+/// of *overlapping* panes is unchanged) but fold the pane's entity index in as
+/// a small tiebreaker, giving every pane camera a distinct order.
+///
+/// `z` is clamped to `MAX_PANE_Z` (500) and scaled by 150, so the order stays
+/// in `[1, 75150)` — safely below `WHITEBOARD_OVERLAY_CAMERA_ORDER` (80_000),
+/// the floor of the overlay/cube cameras that must always draw on top. The
+/// 150-wide tiebreaker window never bleeds into the next `z` level (steps are
+/// 150 apart), so same-z panes disambiguate without ever reordering across z.
+fn pane_camera_order(rect: &PaneRect, pane: Entity) -> isize {
+    const Z_STEP: isize = 150;
+    let z = (rect.z.clamp(0.0, 500.0) * Z_STEP as f32) as isize;
+    // `Entity::index()` is an `EntityIndex` newtype in Bevy 0.18; `.index()`
+    // again unwraps the raw `u32`.
+    z + (pane.index().index() as isize % Z_STEP) + 1
 }
 
 /// What the pane camera needs derived from PaneRect + render target.

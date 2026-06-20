@@ -38,24 +38,71 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
+use std::time::Duration;
+
 use funct::{Cause, Fault, Funct, RunResult, Status, Value, VmState};
 use serde_json::Value as Json;
 
 use crate::protocol::Element;
 use crate::script_widget::{HostToWorker, OutMsg, WorkerSlots};
 
-/// Instruction budget per `run` slice. A handler that finishes within
-/// this many bytecode steps behaves exactly like run-to-completion (the
-/// common case). One that doesn't is paused and resumed on the next loop
-/// turn, so the worker can still see `Shutdown` and the editor never
-/// stalls behind a pathological script. Tunable; sized so a normal
-/// render/handler completes in a single slice.
-const FUEL_PER_SLICE: u64 = 200_000;
+/// Wall-clock budget per `run` slice, expressed in epoch ticks. A handler that
+/// finishes within this behaves like run-to-completion (the common case); one
+/// that doesn't is paused and resumed next loop turn, so the worker stays
+/// responsive to `Shutdown`/new events and the editor never stalls behind a
+/// pathological script.
+///
+/// TIME, not instruction count, is the right metric: one funct "instruction"
+/// can be a host call (`highlight`/`parse_json`/a big allocation) costing
+/// milliseconds, so a fixed instruction budget bounds the wrong thing. We
+/// drive funct's epoch-interruption (`StopWhen::Epoch` + `set_deadline`) from
+/// ONE shared ~1ms ticker ([`shared_epoch_ticker`]) rather than funct's own
+/// per-VM `Deadline` ticker — which would be one always-on thread PER WIDGET.
+/// At [`EPOCH_TICK`] (1ms) per tick, this is a ~4ms slice.
+///
+/// (Caveat: the epoch is only checked BETWEEN funct instructions, never inside
+/// a single native host call, so a slow host fn still runs to completion.)
+const SLICE_TICKS: u64 = 4;
 
 /// After this many consecutive paused slices on one job we log a warning
 /// (a handler is looping or doing far too much work) — but keep slicing,
 /// never busy-block the worker.
 const RUNAWAY_SLICE_WARN: u64 = 50;
+
+/// Granularity of the shared epoch ticker.
+const EPOCH_TICK: Duration = Duration::from_millis(1);
+
+/// Register a VM's epoch counter with the single process-wide ticker thread,
+/// which advances every live registered epoch every [`EPOCH_TICK`]. This is
+/// what makes time-based slicing cost ONE background thread total instead of
+/// funct's lazily-spawned per-VM `Deadline` ticker (one always-on 1ms thread
+/// per widget — exactly the kind of idle CPU we avoid). Dead VMs' epochs
+/// (held weakly) are pruned as the ticker runs.
+fn register_shared_epoch(epoch: &std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex, OnceLock, Weak};
+    type Reg = Arc<Mutex<Vec<Weak<std::sync::atomic::AtomicU64>>>>;
+    static REG: OnceLock<Reg> = OnceLock::new();
+    let reg = REG.get_or_init(|| {
+        let reg: Reg = Arc::new(Mutex::new(Vec::new()));
+        let ticker = reg.clone();
+        let _ = std::thread::Builder::new()
+            .name("funct-shared-epoch-ticker".into())
+            .spawn(move || loop {
+                std::thread::sleep(EPOCH_TICK);
+                let mut live = ticker.lock().unwrap();
+                live.retain(|w| match w.upgrade() {
+                    Some(e) => {
+                        e.fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
+                    None => false,
+                });
+            });
+        reg
+    });
+    reg.lock().unwrap().push(Arc::downgrade(epoch));
+}
 
 /// The shared host interface every funct widget imports with
 /// `import "host"`. Bootstrapped to `~/.jim/widgets/host.ft` so module
@@ -186,6 +233,26 @@ struct FunctWorker {
     /// A non-Tick handler ran since the last persist, so the next render
     /// completion should snapshot durable state.
     persist_dirty: bool,
+    /// Hash of the last frame we actually published. A widget on a tick
+    /// (or a bus/http poller) re-runs `render` constantly but usually emits
+    /// the *same* tree; without this we'd bump `frame_gen` every time and the
+    /// host would despawn+respawn the whole entity subtree for an unchanged
+    /// picture — the dominant source of frame spikes. Skipping the bump when
+    /// the tree is identical means the host never re-renders, zero churn.
+    last_frame_hash: Option<u64>,
+}
+
+/// Stable content hash of a produced frame. Serializes the `Element` tree
+/// (cheap — microseconds for a few hundred nodes) and hashes the bytes, so
+/// two renders that describe the same picture compare equal regardless of how
+/// the script built them. A 64-bit collision would only skip one redraw, which
+/// is cosmetically harmless, so this is plenty.
+fn frame_hash(element: &Option<Element>) -> u64 {
+    use std::hash::Hasher;
+    let bytes = serde_json::to_vec(element).unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(&bytes);
+    h.finish()
 }
 
 impl FunctWorker {
@@ -222,6 +289,8 @@ impl FunctWorker {
             "on_input_focus",
             "on_input_change",
             "on_input_submit",
+            "on_editor_change",
+            "on_editor_submit",
         ];
         let wants = INTERACTIVE.iter().any(|n| self.defines(n));
         self.slots.wants_clicks.store(wants, Ordering::Release);
@@ -231,6 +300,9 @@ impl FunctWorker {
         self.slots
             .wants_hover
             .store(self.defines("on_hover"), Ordering::Release);
+        self.slots
+            .wants_pinch
+            .store(self.defines("on_pinch"), Ordering::Release);
     }
 
     /// Evaluate the script source: defines functions, runs top-level
@@ -367,8 +439,11 @@ impl FunctWorker {
         let Some(mut job) = self.job.take() else {
             return;
         };
-        match self.vm.run(&mut job.st, funct::StopWhen::Fuel(FUEL_PER_SLICE)) {
-            RunResult::Paused(Cause::FuelExhausted) => {
+        // Pause once the shared ticker has advanced our epoch SLICE_TICKS past
+        // now — a wall-clock budget, driven by the one shared ticker thread.
+        self.vm.set_deadline(self.vm.epoch_now() + SLICE_TICKS);
+        match self.vm.run(&mut job.st, funct::StopWhen::Epoch) {
+            RunResult::Paused(Cause::DeadlineReached) => {
                 job.slices += 1;
                 if job.slices == RUNAWAY_SLICE_WARN {
                     let what = match job.kind {
@@ -376,17 +451,17 @@ impl FunctWorker {
                         JobKind::Handler { .. } => "handler",
                     };
                     eprintln!(
-                        "[funct] {what} still running after {} fuel slices (~{} instrs) — \
+                        "[funct] {what} still running after {} time slices (~{}ms each) — \
                          time-slicing it across frames",
                         job.slices,
-                        job.slices * FUEL_PER_SLICE
+                        SLICE_TICKS * EPOCH_TICK.as_millis() as u64
                     );
                 }
                 self.job = Some(job); // resume next turn
             }
             RunResult::Done(v) => self.finish_job(job.kind, Ok(v)),
             RunResult::Faulted(f) => self.finish_job(job.kind, Err(f)),
-            // Only StopWhen::Fuel is used, which pauses solely on fuel.
+            // We only use fuel/deadline budgets, so any other pause is a bug.
             RunResult::Paused(other) => {
                 self.set_error(format!("unexpected pause cause: {other:?}"));
             }
@@ -407,19 +482,38 @@ impl FunctWorker {
             JobKind::Render => match result {
                 Ok(frame) => match funct_frame_to_element(&frame) {
                     Ok(element) => {
-                        if let Ok(mut slot) = self.slots.latest_frame.lock() {
-                            *slot = element;
+                        // Only publish (and bump frame_gen, which drives the
+                        // host's despawn+respawn of the whole subtree) when the
+                        // rendered tree actually changed. An unchanged re-render
+                        // — the common case for tick/bus/poll widgets — is
+                        // dropped here, so the host does zero work and zero
+                        // entity churn for it.
+                        //
+                        // Exception: a widget in `animating` (60fps) mode is
+                        // explicitly driving per-frame visual motion, and some
+                        // of that motion is interpolated host-side from anim
+                        // specs in an otherwise-identical tree — so it needs the
+                        // re-render even when the tree hashes equal. Its churn is
+                        // the documented cost of opting into animation.
+                        let animating = self.slots.animating.load(Ordering::Acquire);
+                        let hash = frame_hash(&element);
+                        if animating || self.last_frame_hash != Some(hash) {
+                            self.last_frame_hash = Some(hash);
+                            if let Ok(mut slot) = self.slots.latest_frame.lock() {
+                                *slot = element;
+                            }
+                            self.slots.frame_gen.fetch_add(1, Ordering::Release);
+                            // Worker runs off the main thread; nudge the
+                            // reactive loop so async re-renders show promptly.
+                            crate::request_main_loop_wakeup();
                         }
-                        self.slots.frame_gen.fetch_add(1, Ordering::Release);
-                        // Persist durable state once the frame reflecting a
-                        // real change has been produced.
+                        // Persist durable state whenever a handler that touched
+                        // it has rendered — independent of whether the visible
+                        // tree changed (state can change without the UI moving).
                         if self.persist_dirty {
                             self.persist_state();
                             self.persist_dirty = false;
                         }
-                        // Worker runs off the main thread; nudge the
-                        // reactive loop so async re-renders show promptly.
-                        crate::request_main_loop_wakeup();
                     }
                     Err(msg) => self.set_error(msg),
                 },
@@ -514,6 +608,36 @@ impl FunctWorker {
                     self.start_handler("on_scroll", vec![Value::Float(y as f64)], false);
                 }
             }
+            HostToWorker::Wheel { local_x, local_y, dx, dy } => {
+                // Cursor-aware wheel: on_wheel(x, y, dx, dy). dx/dy are the
+                // horizontal/vertical deltas so a widget can pan a timeline by
+                // the dominant axis (avoids jitter from the minor axis).
+                if self.defines("on_wheel") {
+                    self.start_handler(
+                        "on_wheel",
+                        vec![
+                            Value::Float(local_x as f64),
+                            Value::Float(local_y as f64),
+                            Value::Float(dx as f64),
+                            Value::Float(dy as f64),
+                        ],
+                        false,
+                    );
+                }
+            }
+            HostToWorker::Pinch { local_x, local_y, delta } => {
+                if self.defines("on_pinch") {
+                    self.start_handler(
+                        "on_pinch",
+                        vec![
+                            Value::Float(local_x as f64),
+                            Value::Float(local_y as f64),
+                            Value::Float(delta as f64),
+                        ],
+                        false,
+                    );
+                }
+            }
             other if !self.loaded => {
                 // Script not up yet (read failed / awaiting Reload). Drop
                 // the event rather than fault; mirrors rhai's behavior.
@@ -580,6 +704,24 @@ impl FunctWorker {
             }
             HostToWorker::InputChange { id, value } => {
                 self.start_handler("on_input_change", vec![Value::str(id), Value::str(value)], true);
+            }
+            HostToWorker::EditorChange { id, value } => {
+                self.start_handler(
+                    "on_editor_change",
+                    vec![Value::str(id), Value::str(value)],
+                    true,
+                );
+            }
+            HostToWorker::EditorSubmit {
+                id,
+                selection,
+                full,
+            } => {
+                self.start_handler(
+                    "on_editor_submit",
+                    vec![Value::str(id), Value::str(selection), Value::str(full)],
+                    true,
+                );
             }
             HostToWorker::InputSubmit { id, value } => {
                 self.start_handler("on_input_submit", vec![Value::str(id), Value::str(value)], true);
@@ -683,6 +825,9 @@ pub(crate) fn funct_worker_main(
     if let Some(dir) = crate::script_widget::widgets_dir() {
         vm.set_module_root(dir); // so `import "host"` resolves
     }
+    // Drive this VM's epoch from the one shared ticker so time-based slicing
+    // (`StopWhen::Epoch` in `run_slice`) doesn't spin up a per-widget thread.
+    register_shared_epoch(&vm.epoch());
     register_host_surface(&mut vm, &slots, &widget_id, self_tx);
     // Per-instance params → funct global `params` (host.ft: `extern let
     // params`). Set before the script evaluates so `on_init` can read it.
@@ -700,6 +845,7 @@ pub(crate) fn funct_worker_main(
         loaded: false,
         job: None,
         persist_dirty: false,
+        last_frame_hash: None,
     };
 
     // ALWAYS evaluate the current source first — this re-reads the widget
@@ -873,6 +1019,29 @@ fn register_host_surface(
         let r = rand_state(nanos as u64) as i64;
         lo + r.rem_euclid(hi - lo + 1)
     });
+    // Real text measurement for canvas layout (transcript word-wrap, etc.).
+    // The default canvas font is monospace, so the host's measured
+    // cell_width gives an EXACT width — far better than a guessed
+    // `chars * size * ratio`. Metrics are pushed in by the main thread
+    // (WorkerSlots.font_metrics); fall back to a 0.6 ratio before the
+    // first push.
+    {
+        let fm = slots.font_metrics.clone();
+        let advance = move |size: f64| -> f64 {
+            let (cw, fs) = fm.lock().map(|g| *g).unwrap_or((0.0, 0.0));
+            if cw > 0.0 && fs > 0.0 {
+                (cw as f64) * (size / fs as f64)
+            } else {
+                size * 0.6
+            }
+        };
+        let a1 = advance.clone();
+        vm.register2("measure_text", move |s: String, size: f64| -> f64 {
+            a1(size) * (s.chars().count() as f64)
+        });
+        let a2 = advance.clone();
+        vm.register1("char_width", move |size: f64| -> f64 { a2(size) });
+    }
     vm.register1("hash_str", |s: String| -> i64 {
         let mut h: u64 = 14695981039346656037;
         for b in s.bytes() {
@@ -1031,6 +1200,90 @@ fn register_host_surface(
             }
         });
     }
+
+    // ---- time + directory listing (audio-recorder sidebar) ----
+    // Local "YYYY-MM-DD_HH-MM-SS" stamp for unique, human-readable
+    // filenames. funct has no date formatting, so we format via libc's
+    // localtime_r (libc is already a dep).
+    vm.register0("datetime_stamp", || -> String {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0) as libc::time_t;
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            libc::localtime_r(&secs, &mut tm);
+            format!(
+                "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            )
+        }
+    });
+    // list_dir(path) -> [{ name, size, mtime }] for regular files only,
+    // newest first. `~` is expanded. Powers the recordings sidebar.
+    vm.register1("list_dir", |path: String| -> Value {
+        let p = expand_tilde(&path);
+        let mut entries: Vec<(String, u64, u64)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&p) {
+            for e in rd.flatten() {
+                if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let (size, mtime) = e
+                        .metadata()
+                        .map(|m| {
+                            let mt = m
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            (m.len(), mt)
+                        })
+                        .unwrap_or((0, 0));
+                    entries.push((name, size, mtime));
+                }
+            }
+        }
+        entries.sort_by(|a, b| b.2.cmp(&a.2)); // newest first
+        let arr: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|(name, size, mtime)| serde_json::json!({ "name": name, "size": size, "mtime": mtime }))
+            .collect();
+        Value::from_json(&serde_json::Value::Array(arr))
+    });
+
+    // ---- native audio capture (audio-recorder widget) ----
+    // Recording runs on cpal's own realtime thread (see audio.rs), so its
+    // quality is decoupled from GUI/worker load; the widget just polls the
+    // level stream. No subprocess, no log-line parsing.
+    vm.register0("audio_inputs", || -> Value {
+        let arr: Vec<serde_json::Value> = crate::audio::inputs()
+            .into_iter()
+            .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+            .collect();
+        Value::from_json(&serde_json::Value::Array(arr))
+    });
+    vm.register3(
+        "audio_record_start",
+        |device: String, path: String, dual: bool| -> bool {
+            crate::audio::record_start(&device, &path, dual)
+        },
+    );
+    vm.register0("audio_record_stop", || -> bool { crate::audio::record_stop() });
+    vm.register0("audio_levels", || -> Value {
+        let arr: Vec<serde_json::Value> = crate::audio::take_levels()
+            .into_iter()
+            .map(|v| serde_json::json!(v))
+            .collect();
+        Value::from_json(&serde_json::Value::Array(arr))
+    });
+    vm.register0("audio_recording", || -> bool { crate::audio::is_recording() });
+    vm.register0("audio_status", || -> String { crate::audio::status() });
 
     // ---- widget<->widget message bus ----
     {

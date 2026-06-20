@@ -1108,9 +1108,20 @@ pub enum Element {
     /// parent stack layout. Use this for games / gardens / visualizers
     /// where you don't want flow layout. Canvas children are
     /// CanvasItems (sprites, rects), not full Elements.
+    ///
+    /// Two hosting modes:
+    /// - **Top-level** (the whole widget frame is a `Canvas`): the legacy
+    ///   path — fills the pane, diff-rendered, `style` ignored.
+    /// - **Nested** (a `Canvas` inside a vstack/hstack/frame): it's a leaf
+    ///   in the flex tree. Give it a size via `style` (`width`/`height`,
+    ///   or `flex_grow` + `min_height`) so it claims real space; its items
+    ///   draw in coordinates relative to the canvas box's top-left. This is
+    ///   how you mix real controls (buttons, inputs) with custom drawing.
     Canvas {
         #[serde(default)]
         children: Vec<CanvasItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<Style>,
     },
     /// Colored block, fixed size. Useful for color swatches inside
     /// theme/picker UIs — render a solid square of the given color
@@ -1132,6 +1143,32 @@ pub enum Element {
         color: String,
         #[serde(default = "default_swatch_size")]
         size: f32,
+    },
+    /// Live embedded code editor — a real `jim-editor` mounted inside the
+    /// widget. Unlike every other element, it persists a child entity
+    /// across re-render diffs (keyed by `id`), so caret/selection/scroll/
+    /// undo survive the script redrawing around it. Sized like `Input`
+    /// (fills via `style.flex_grow` / `width` / `height`).
+    ///
+    /// Backing: `value` seeds the text and, if it changes between frames,
+    /// resyncs the buffer (script-owned content). `path` instead binds it
+    /// to a file (Cmd/Ctrl+S saves). Edits fire `on_editor_change(id,
+    /// value)`. Provide one of `value`/`path`; `value` wins if both given.
+    Editor {
+        id: String,
+        #[serde(default)]
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+        /// Selectable but not editable — keeps caret/selection/copy/scroll
+        /// + I-beam, drops all edits. Turns any text dump into something
+        /// with real cosmic-text selection.
+        #[serde(default)]
+        read_only: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<Style>,
     },
 }
 

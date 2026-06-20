@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 editor_core = { path = "../editor-core" }
+markdown_core = { path = "../markdown-core" }
 jim_pane = { path = "../jim-pane" }
 jim_style = { path = "../jim-style" }
 serde = { version = "1", features = ["derive"] }

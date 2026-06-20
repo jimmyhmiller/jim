@@ -150,6 +150,19 @@ impl Plugin for AppShellPlugin {
         app.insert_resource(jim_terminal::TerminalDirtyHook(Box::new(|world| {
             world.resource_mut::<Projects>().terminals_dirty = true;
         })));
+        // Flame-graph widget crate: registers the "flame" pane kind and the
+        // generic flame-bevy offscreen-render + CPU readback systems. The
+        // rendered trace is shown as a Sprite filling the pane content.
+        app.add_plugins(jim_flame::FlamePlugin);
+        // Channel the async (non-modal) Open dialog hands chosen paths
+        // back on. `action_open_file` clones the sender and `await`s the
+        // sheet off the main thread; `drain_file_picks` routes results
+        // into `PendingActions`. NonSend because the mpsc ends are `!Sync`
+        // and both touchpoints run on the main thread.
+        {
+            let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+            app.insert_non_send_resource(FilePickChannel { tx, rx });
+        }
         app.insert_resource(ClearColor(Color::srgb(0.072, 0.075, 0.085)))
             .insert_resource(AppFocused::default())
             .insert_resource(bevy::winit::WinitSettings {
@@ -182,8 +195,10 @@ impl Plugin for AppShellPlugin {
                     WHITEBOARD_OVERLAY_LAYER,
                     cube::CUBE_LAYER,
                     jim_style::dynamic::OVERLAY_LAYER,
+                    jim_pane::dock::DOCK_OVERLAY_LAYER,
                 ],
             })
+            .add_plugins(jim_pane::DockPlugin)
             .add_plugins(diagnostics::DiagnosticsPlugin)
             .add_plugins(projects::ProjectsPlugin)
             .add_plugins(actions::ActionsPlugin)
@@ -409,6 +424,7 @@ impl Plugin for AppShellPlugin {
                 Update,
                 (
                     drain_ipc_open_requests,
+                    drain_file_picks,
                     dispatch_bus_actions,
                 ),
             )
@@ -888,6 +904,17 @@ fn drain_ipc_open_requests(
                 };
                 pending.close_panes.push((project_id, kind, titles));
             }
+            ipc::IpcRequest::DockPanes { project, titles, template } => {
+                let target = match project.as_deref() {
+                    Some("active") | None => OpenProjectTarget::Active,
+                    Some(name) => OpenProjectTarget::ByName(name.to_string()),
+                };
+                let Some(project_id) = projects::resolve_project(&target, &projects) else {
+                    eprintln!("[ipc] dock_panes: no matching project");
+                    continue;
+                };
+                pending.dock_panes.push((project_id, titles, template));
+            }
             ipc::IpcRequest::WidgetMessage { project, topic, payload, retain, sender } => {
                 // `"global"`/`"*"` → the global channel (`None`), delivered
                 // to every widget; otherwise resolve a project id.
@@ -952,42 +979,74 @@ fn dispatch_bus_actions(mut events: MessageReader<jim_widget::BusMessageObserved
     }
 }
 
-/// Cmd+O opens a native file picker and queues the chosen file as a
-/// new editor pane in the active project. The picker is synchronous —
-/// it blocks the calling thread until the user picks or cancels, which
-/// matches how every other macOS app handles file dialogs.
+/// Channel the async Open dialog delivers chosen paths back on.
+/// `action_open_file` clones [`FilePickChannel::tx`] into the off-thread
+/// task that awaits the sheet; [`drain_file_picks`] reads
+/// [`FilePickChannel::rx`] each frame. Stored NonSend (both mpsc ends are
+/// `!Sync`); both touchpoints run on the main thread.
+struct FilePickChannel {
+    tx: std::sync::mpsc::Sender<PathBuf>,
+    rx: std::sync::mpsc::Receiver<PathBuf>,
+}
+
+/// `file.open` action (Cmd+O). Opens the native Open dialog and routes the
+/// chosen file to an editor pane in the active project.
 ///
-/// The `NonSendMarker` is load-bearing: `rfd::FileDialog::pick_file` on
-/// macOS does `dispatch_sync(main_queue, ...)` internally. If this system
-/// ran on a Compute Task Pool thread (Bevy's default), the worker would
-/// `dispatch_sync` to main while the main thread sat parked in the
-/// executor waiting for the worker to finish — instant deadlock. The
-/// marker pins us to the main thread so the dispatch is a no-op.
+/// Crucially this uses `rfd::AsyncFileDialog`, **not** the blocking
+/// `FileDialog::pick_file`. The blocking variant runs `-[NSOpenPanel
+/// runModal]`, a nested modal run loop on the main thread; while it spins,
+/// AppKit still pumps re-entrant native events (e.g. a drag-and-drop in
+/// progress), which can drive a winit/rfd `block2` closure that panics —
+/// and a Rust panic cannot unwind out through an Objective-C block, so the
+/// process `abort()`s. The async variant begins a *sheet* modal attached
+/// to the main window (`beginSheetModalForWindow:completionHandler:`),
+/// which integrates with the existing run loop instead of nesting one, so
+/// there is no re-entrancy to crash on.
 ///
-/// We swallow Cmd+O ourselves so the focused pane (terminal or editor)
-/// never sees a stray "o" insert. Both pane keyboard handlers already
-/// skip Cmd-modified keys, but we still bail explicitly here in case
-/// that contract loosens.
-/// `file.open` action (Cmd+O). Opens a native file picker and routes
-/// the chosen file to an editor pane in the active project. Runs on the
-/// main thread via the exclusive action dispatcher, so the blocking
-/// `rfd` dialog is fine. Cmd+O is swallowed by the keybind matcher so
-/// the focused pane never sees a stray "o" insert.
+/// `AsyncFileDialog::pick_file()` builds the panel eagerly and must touch
+/// AppKit on the main thread; this action runs there (exclusive dispatcher
+/// + Cmd+O swallowed by the keybind matcher). We then `await` the (Send)
+/// future on the IO task pool so the main thread stays live, and hand the
+/// path back over [`FilePickChannel`].
 fn action_open_file(ctx: &mut actions::ActionCtx) {
-    let dialog = rfd::FileDialog::new()
-        .set_directory(std::env::current_dir().unwrap_or_else(|_| ".".into()))
-        .set_title("Open file");
-    let Some(path) = dialog.pick_file() else {
+    let Some(tx) = ctx
+        .world
+        .get_non_send_resource::<FilePickChannel>()
+        .map(|c| c.tx.clone())
+    else {
         return;
     };
-    ctx.world
-        .resource_mut::<PendingActions>()
-        .open_files
-        .push(OpenFileRequest {
+    // Build the dialog (and begin the sheet) on the main thread.
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_directory(std::env::current_dir().unwrap_or_else(|_| ".".into()))
+        .set_title("Open file");
+    let fut = dialog.pick_file();
+    // Await off the main thread; the sheet's completion handler wakes it.
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            if let Some(handle) = fut.await {
+                let _ = tx.send(handle.path().to_path_buf());
+            }
+        })
+        .detach();
+}
+
+/// Drains paths chosen by the async Open dialog into `PendingActions`,
+/// where `apply_pending_actions` turns each into an editor pane in the
+/// active project. NonSend pins this to the main thread (mpsc `Receiver`
+/// is `!Sync`).
+fn drain_file_picks(
+    channel: Option<NonSend<FilePickChannel>>,
+    mut pending: ResMut<PendingActions>,
+) {
+    let Some(channel) = channel else { return };
+    while let Ok(path) = channel.rx.try_recv() {
+        pending.open_files.push(OpenFileRequest {
             path,
             project: OpenProjectTarget::Active,
             origin: None,
         });
+    }
 }
 
 
@@ -1674,6 +1733,9 @@ fn maintain_winit_mode_for_animation(
     palette: Res<command_palette::CommandPalette>,
     script_widgets: Query<&jim_widget::script_widget::ScriptWidget>,
     widget_anim: Res<jim_widget::anim::WidgetAnim>,
+    // While the trace recorder is capturing it reads the span ring each tick;
+    // it needs a steady ~10Hz reactive wake (not full Continuous) to advance.
+    trace_recorder: Option<Res<jim_flame::TraceRecorder>>,
     mut settings: ResMut<bevy::winit::WinitSettings>,
     time: Res<Time>,
     mut pin_watch: ResMut<diagnostics::ContinuousWatch>,
@@ -1769,9 +1831,18 @@ fn maintain_winit_mode_for_animation(
     // when it really wants `set_animating`). For a 300s poll this stays at
     // 5s: the host wakes every 5s, the tick scheduler delivers the actual
     // `on_frame` only once the widget's 300s elapses. Near-zero CPU.
+    // An active trace recorder tightens the reactive cadence to ~10Hz (like a
+    // fast slow-ticker) so its capture advances smoothly without Continuous.
+    let recording = trace_recorder.map_or(false, |r| r.recording);
+    let effective_tick = match (widget_tick_min, recording) {
+        (Some(iv), true) => Some(iv.min(0.1)),
+        (Some(iv), false) => Some(iv),
+        (None, true) => Some(0.1),
+        (None, false) => None,
+    };
     let target = if want_continuous {
         bevy::winit::UpdateMode::Continuous
-    } else if let Some(iv) = widget_tick_min {
+    } else if let Some(iv) = effective_tick {
         bevy::winit::UpdateMode::reactive(std::time::Duration::from_secs_f32(
             iv.clamp(0.1, 5.0),
         ))

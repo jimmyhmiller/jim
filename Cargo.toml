@@ -1,15 +1,46 @@
 [workspace]
 resolver = "2"
-members = ["crates/glaze", "crates/editor-core", "crates/jim-editor", "crates/jim-pane", "crates/jim-style", "crates/jim-app", "crates/jim-terminal", "crates/jim-daemon", "crates/jim-widget", "crates/whiteboard-core", "crates/jim-whiteboard", "crates/claude-bus", "crates/claude-bus-bevy", "crates/claude-statusline-bridge", "crates/claude-context-bars", "crates/claude-event-logger", "crates/claude-queue-drain", "crates/jim-inference", "crates/diff-core", "crates/jim-diff", "crates/jimctl"]
+members = ["crates/glaze", "crates/editor-core", "crates/markdown-core", "crates/jim-editor", "crates/jim-pane", "crates/jim-style", "crates/jim-app", "crates/jim-terminal", "crates/jim-daemon", "crates/jim-lsp", "crates/jim-widget", "crates/whiteboard-core", "crates/jim-whiteboard", "crates/claude-bus", "crates/claude-bus-bevy", "crates/claude-statusline-bridge", "crates/claude-context-bars", "crates/claude-event-logger", "crates/claude-queue-drain", "crates/jim-inference", "crates/diff-core", "crates/jim-diff", "crates/jimctl", "crates/flame-core", "crates/flame-format-folded", "crates/flame-format-chrome", "crates/flame-format-speedscope", "crates/flame-format-firefox", "crates/flame-format-otel", "crates/flame-format-jimtrace", "crates/flame-live", "crates/flame-render", "crates/flame-bevy", "crates/jim-flame"]
 # A bare `cargo build --release` builds exactly the runtime set: the `jim`
 # GUI, the `jimctl` control CLI, and the widget bins (incl. the `glaze_ui`
 # subprocess widget) — all of which the app resolves next to its own exe.
 # Keeps the build to one command with no `-p` juggling; other crates still
 # build on demand as dependencies. Build a specific demo with `-p`/`--bin`.
-default-members = ["crates/jim-app", "crates/jimctl", "crates/jim-widget"]
+default-members = ["crates/jim-app", "crates/jimctl", "crates/jim-widget", "crates/jim-lsp"]
 
 [workspace.package]
 license = "MIT"
+# version/edition are inherited by the vendored flame-* crates (they use
+# `version.workspace = true` / `edition.workspace = true`). jim-* crates pin
+# their own edition explicitly and are unaffected.
+version = "0.1.0"
+edition = "2021"
+
+# Shared deps for the vendored flame-graph crates (flame-*). Mirrors the
+# upstream flame-graph workspace so its crates compile here unchanged. The
+# wgpu 29 / glyphon 0.11 stack lives ONLY behind flame-render and is bridged
+# to Bevy's wgpu 27 via CPU pixel readback in flame-bevy — see that crate.
+[workspace.dependencies]
+flame-core              = { path = "crates/flame-core" }
+flame-format-folded     = { path = "crates/flame-format-folded" }
+flame-format-chrome     = { path = "crates/flame-format-chrome" }
+flame-format-speedscope = { path = "crates/flame-format-speedscope" }
+flame-format-firefox    = { path = "crates/flame-format-firefox" }
+flame-format-otel       = { path = "crates/flame-format-otel" }
+flame-format-jimtrace   = { path = "crates/flame-format-jimtrace" }
+flame-live              = { path = "crates/flame-live" }
+flame-render            = { path = "crates/flame-render" }
+
+wgpu       = "29"
+glyphon    = "0.11"
+glam       = "0.32"
+bytemuck   = { version = "1", features = ["derive"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+ahash      = "0.8"
+thiserror  = "2"
+pollster   = "0.4"
+log        = "0.4"
 
 # Pin libghostty-rs to a git rev that includes the zig optimize-mode
 # fix (upstream 3378f0b). Without it, vendored ghostty builds default

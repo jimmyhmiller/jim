@@ -268,6 +268,22 @@ pub enum IpcRequest {
         #[serde(default)]
         ask: bool,
     },
+    /// `jimctl dock --project P [--title T]...` — snap existing panes into
+    /// a new dock (sidebar+main columns), the scriptable equivalent of
+    /// dragging them together. `titles` selects panes by exact title
+    /// within `project`, in order (= column order; first is the sidebar).
+    /// Empty `titles` docks every free top-level pane in the project.
+    /// Needs ≥2 matched panes. Fire-and-forget; no response body.
+    DockPanes {
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        titles: Vec<String>,
+        /// Layout template: columns (default), rows, sidebar, grid,
+        /// main-bottom. Unknown values fall back to columns.
+        #[serde(default)]
+        template: Option<String>,
+    },
 }
 
 /// One accepted IPC connection: the parsed request plus the open socket,

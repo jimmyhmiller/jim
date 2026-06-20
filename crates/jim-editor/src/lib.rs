@@ -41,8 +41,10 @@ use jim_pane::{
 use serde_json::Value;
 
 pub mod highlight;
+pub mod markdown;
 pub mod wrap;
 use highlight::{color_for, Highlighter, SyntaxPalette};
+use markdown::{wysiwyg_active, MarkdownMode, MdLayout};
 
 pub const FONT_SIZE: f32 = 16.0;
 pub const LINE_HEIGHT: f32 = 20.0;
@@ -77,6 +79,51 @@ pub struct EditorWrapLayout(pub wrap::WrapLayout);
 pub struct EditorScroll {
     pub x: f32,
     pub y: f32,
+}
+
+/// Mount-agnostic geometry for an editor: *where* its text content lives
+/// and *how big* the viewport is, with no pane chrome in the picture.
+///
+/// Every render system (wrap layout, line rows, caret, selection, scroll
+/// transform) reads this one component, so the same systems drive both a
+/// real floating pane and an embedded "portal" living inside a funct
+/// widget. For pane editors, [`sync_pane_editor_view`] fills it each
+/// frame from `PaneRect` + `PaneChrome`; embedders fill it themselves.
+#[derive(Component, Clone, Copy)]
+pub struct EditorView {
+    /// Scroll-root entity. Text rows, the caret, and selection rects are
+    /// spawned as children of this. Its `Transform.translation` is set
+    /// each frame to `origin + (0, scroll.y)`.
+    pub render_root: Entity,
+    /// Content-area (viewport) size in canvas units. Drives wrap columns,
+    /// the visible row range, and caret/selection visibility clipping.
+    pub size: Vec2,
+    /// Offset of `render_root` within its parent's local space. For a
+    /// pane this clears the title bar + margin (`MARGIN, -(TITLE_H +
+    /// MARGIN)`); for a flush-mounted portal it is zero.
+    pub origin: Vec2,
+}
+
+/// Pane → [`EditorView`] adapter: keep an editor pane's view geometry in
+/// sync with its chrome. Writes only when something actually changed, so
+/// `EditorView` change-detection stays meaningful for `compute_wrap_layout`.
+fn sync_pane_editor_view(
+    pane_zoom: Res<jim_pane::PaneZoom>,
+    mut editors: Query<(&PaneRect, &PaneChrome, &mut EditorView, &PaneKindMarker), With<PaneTag>>,
+) {
+    let zoom = pane_zoom.0;
+    let origin = Vec2::new(MARGIN, -(TITLE_H + MARGIN));
+    for (rect, chrome, mut view, kind) in &mut editors {
+        if kind.0 != PANE_KIND {
+            continue;
+        }
+        let size = content_area_size_zoomed(rect, zoom);
+        if view.render_root != chrome.content_root || view.size != size || view.origin != origin {
+            view.render_root = chrome.content_root;
+            view.size = size;
+            view.origin = origin;
+        }
+    }
 }
 
 /// Anchor char offset of an in-progress text-selection drag.
@@ -118,22 +165,52 @@ pub struct EditorEmbedPlugin;
 impl Plugin for EditorEmbedPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(highlight::HighlightPlugin)
-            .add_systems(Startup, register_editor_kind)
+            .init_resource::<FocusedEmbeddedEditor>()
+            .add_message::<EmbeddedEditorPress>()
+            .add_message::<EmbeddedEditorDrag>()
+            .add_message::<EmbeddedEditorRelease>()
+            .add_message::<EmbeddedEditorScroll>()
+            .add_message::<EmbeddedEditorSubmit>()
+            .add_systems(Startup, (register_editor_kind, markdown::setup_markdown_fonts))
             .add_systems(
                 Update,
                 (
+                    markdown::detect_markdown_mode,
                     handle_pane_content_press,
                     handle_text_select_drag,
                     handle_scroll,
                     handle_input,
+                    handle_embedded_press,
+                    handle_embedded_drag,
+                    handle_embedded_release,
+                    handle_embedded_scroll,
+                    handle_embedded_keys,
+                    sync_pane_editor_view,
                     compute_wrap_layout,
                     update_highlight,
                     sync_text,
                     sync_content_root,
                     sync_caret,
                     sync_selection,
+                    markdown::markdown_render,
+                    markdown::markdown_decorations,
                 )
                     .chain(),
+            )
+            .add_systems(
+                PostUpdate,
+                // Read back fresh glyph layout and position the caret /
+                // selection / lines in the SAME frame the text was laid
+                // out — *after* text layout so the geometry is current,
+                // *before* transform propagation so the transforms we set
+                // reach GlobalTransform this frame. Positioning from a
+                // prior frame's layout would map the caret against stale
+                // source offsets (every keystroke shifts them), making it
+                // flicker onto the next line / jump to the doc end.
+                (markdown::markdown_readback, markdown::markdown_position)
+                    .chain()
+                    .after(bevy::sprite::update_text2d_layout)
+                    .before(bevy::transform::TransformSystems::Propagate),
             );
     }
 }
@@ -309,6 +386,14 @@ fn populate_editor_pane(
         LineRows::default(),
         EditorScroll::default(),
         TextDragAnchor::default(),
+        // Seeded with the pane offset; `sync_pane_editor_view` fills the
+        // real size on the first frame. `size = ZERO` keeps the wrap
+        // layout from building against a bogus width before then.
+        EditorView {
+            render_root: content_root,
+            size: Vec2::ZERO,
+            origin: Vec2::new(MARGIN, -(TITLE_H + MARGIN)),
+        },
     ));
     let caret_color = world
         .get_resource::<jim_style::Theme>()
@@ -334,7 +419,7 @@ fn populate_editor_pane(
 /// the pane's editor state without needing the pane chrome to track
 /// caret separately.
 #[derive(Component)]
-struct EditorCaret(Entity);
+pub struct EditorCaret(pub Entity);
 
 /// Registry callback — invoked by pane-bevy on restore. The config
 /// blob is whatever `editor_snapshot` produced (currently `{ text,
@@ -427,14 +512,6 @@ fn max_cols(content_width: f32, cell_width: f32) -> usize {
     ((content_width / cell_width).floor() as usize).max(1)
 }
 
-/// Wrap width (in monospace columns) for an editor pane: how many cells
-/// fit across the content area. The single source of truth that both the
-/// layout builder and every consumer compute from, so they never drift.
-fn editor_wrap_cols(rect: &PaneRect, cell_width: f32, zoom: f32) -> usize {
-    let content = content_area_size_zoomed(rect, zoom);
-    max_cols(content.x, cell_width)
-}
-
 /// Rebuild each editor's [`EditorWrapLayout`] when its doc or width
 /// changes. Runs after input edits and before the render/caret/selection
 /// systems, so they all see a layout consistent with the current frame.
@@ -442,30 +519,21 @@ fn editor_wrap_cols(rect: &PaneRect, cell_width: f32, zoom: f32) -> usize {
 /// frame's layout — which is exactly what the user clicked on.
 fn compute_wrap_layout(
     metrics: Option<Res<EditorMetrics>>,
-    pane_zoom: Res<jim_pane::PaneZoom>,
     mut commands: Commands,
-    mut editors: Query<
-        (
-            Entity,
-            Ref<EditorStateComp>,
-            Ref<PaneRect>,
-            Option<&mut EditorWrapLayout>,
-            &PaneKindMarker,
-        ),
-        With<PaneTag>,
-    >,
+    mut editors: Query<(
+        Entity,
+        Ref<EditorStateComp>,
+        Ref<EditorView>,
+        Option<&mut EditorWrapLayout>,
+    )>,
 ) {
     let Some(metrics) = metrics else {
         return;
     };
-    let zoom = pane_zoom.0;
-    for (entity, state, rect, layout, kind) in &mut editors {
-        if kind.0 != PANE_KIND {
-            continue;
-        }
-        let cols = editor_wrap_cols(&rect, metrics.cell_width, zoom);
+    for (entity, state, view, layout) in &mut editors {
+        let cols = max_cols(view.size.x, metrics.cell_width);
         let stale = match &layout {
-            Some(l) => l.0.cols != cols || state.is_changed() || rect.is_changed(),
+            Some(l) => l.0.cols != cols || state.is_changed() || view.is_changed(),
             None => true,
         };
         if !stale {
@@ -501,15 +569,13 @@ fn update_highlight(mut editors: Query<(&EditorStateComp, &mut EditorHighlighter
 
 fn ensure_caret_visible(
     state: &EditorState,
-    rect: &PaneRect,
+    content: Vec2,
     scroll: &mut EditorScroll,
     layout: &wrap::WrapLayout,
-    zoom: f32,
 ) {
     let head = state.selection.primary_range().head;
     let (line, col) = char_to_line_col(&state.doc, head);
     let (row, _x_col) = layout.pos_to_visual(line, col);
-    let content = content_area_size_zoomed(rect, zoom);
     if content.y <= 0.0 {
         return;
     }
@@ -531,29 +597,27 @@ fn sync_text(
     metrics: Res<EditorMetrics>,
     palette: Res<SyntaxPalette>,
     project_palettes: Res<highlight::ProjectSyntaxPalettes>,
-    pane_zoom: Res<jim_pane::PaneZoom>,
-    mut editors: Query<
-        (
-            Entity,
-            &EditorStateComp,
-            &PaneRect,
-            &PaneChrome,
-            &EditorScroll,
-            &EditorHighlighter,
-            &mut LineRows,
-            &PaneKindMarker,
-            Option<&jim_pane::PaneProject>,
-            Option<&EditorWrapLayout>,
-        ),
-        With<PaneTag>,
-    >,
+    mut editors: Query<(
+        Entity,
+        &EditorStateComp,
+        &EditorView,
+        &EditorScroll,
+        &EditorHighlighter,
+        &mut LineRows,
+        Option<&jim_pane::PaneProject>,
+        Option<&EditorWrapLayout>,
+        Option<&MarkdownMode>,
+    )>,
     mut line_q: Query<&mut LineRender>,
     children_q: Query<&Children>,
     mut commands: Commands,
 ) {
-    let zoom = pane_zoom.0;
-    for (entity, state, rect, chrome, scroll, hl, mut pool, kind, proj, layout) in &mut editors {
-        if kind.0 != PANE_KIND {
+    for (entity, state, view, scroll, hl, mut pool, proj, layout, md) in &mut editors {
+        // WYSIWYG markdown owns rendering; tear down grid rows.
+        if wysiwyg_active(md) {
+            for (_row, e) in pool.0.drain() {
+                commands.entity(e).despawn();
+            }
             continue;
         }
         let Some(layout) = layout else {
@@ -566,8 +630,7 @@ fn sync_text(
             .unwrap_or(&palette);
         sync_editor_lines(
             &state.0,
-            rect,
-            chrome,
+            view,
             *scroll,
             &layout.0,
             &hl.0,
@@ -578,7 +641,6 @@ fn sync_text(
             &mut line_q,
             &children_q,
             &mut commands,
-            zoom,
         );
     }
 }
@@ -586,8 +648,7 @@ fn sync_text(
 #[allow(clippy::too_many_arguments)]
 fn sync_editor_lines(
     state: &EditorState,
-    rect: &PaneRect,
-    chrome: &PaneChrome,
+    view: &EditorView,
     scroll: EditorScroll,
     layout: &wrap::WrapLayout,
     hl: &Highlighter,
@@ -598,12 +659,21 @@ fn sync_editor_lines(
     line_q: &mut Query<&mut LineRender>,
     children_q: &Query<&Children>,
     commands: &mut Commands,
-    zoom: f32,
 ) {
     let _ = metrics; // cell width is baked into the layout's column model
     let rope = &state.doc;
     let total_rows = layout.total_rows();
-    let content_size = content_area_size_zoomed(rect, zoom);
+    let content_size = view.size;
+    // Viewport not sized yet, or transiently collapsed by a host re-layout
+    // (e.g. a flex parent that resolves to ~0 height for a frame). Don't
+    // re-pool against a zero viewport: `viewport_row_range` would collapse
+    // to row 0, despawn every currently-visible row, and — if we're scrolled
+    // down — leave row 0 off-screen, blanking the portal until the next
+    // content change repaints it. Keep what's drawn; the next sized frame
+    // re-pools correctly.
+    if content_size.y <= 0.0 {
+        return;
+    }
     // Pool entries are keyed by GLOBAL VISUAL ROW (one wrapped row each).
     let (first, last) = viewport_row_range(content_size.y, scroll.y, total_rows);
 
@@ -637,12 +707,31 @@ fn sync_editor_lines(
         }
         match pool.0.get(&row).copied() {
             Some(entity) => {
-                let needs_rebuild = line_q
+                let content_changed = line_q
                     .get(entity)
                     .map(|lr| {
                         lr.text != slice || lr.rev != hl.rev || lr.palette_rev != palette.rev
                     })
                     .unwrap_or(true);
+                // Invariant: a pooled, visible, non-empty row must own its
+                // glyph spans. If it somehow lost them (e.g. a transient
+                // hierarchy churn during a select+scroll gesture) the
+                // content-change check above stays false for a static doc,
+                // so the row would render blank forever until the next real
+                // edit. Detect the empty-children case and force a rebuild
+                // so the portal can never get stuck blank.
+                let spans_missing = children_q
+                    .get(entity)
+                    .map(|c| c.is_empty())
+                    .unwrap_or(true);
+                if spans_missing && !content_changed {
+                    eprintln!(
+                        "[editor] repaired blank row {row} (spans lost; doc unchanged) \
+                         total_rows={total_rows} scroll={:.1} size={:?}",
+                        scroll.y, content_size
+                    );
+                }
+                let needs_rebuild = content_changed || spans_missing;
                 if needs_rebuild {
                     rebuild_line_spans(
                         commands, entity, children_q, hl, palette, rope, line, start_byte, &slice,
@@ -666,7 +755,7 @@ fn sync_editor_lines(
             None => {
                 let entity = commands
                     .spawn((
-                        ChildOf(chrome.content_root),
+                        ChildOf(view.render_root),
                         Text2d::new(String::new()),
                         TextFont {
                             font: font.0.clone(),
@@ -750,19 +839,18 @@ fn viewport_row_range(content_height: f32, scroll: f32, total_rows: usize) -> (u
     (first, last)
 }
 
-/// Apply scroll Y to the content_root transform. (X scroll is handled
-/// by per-line slicing inside sync_editor_lines.)
+/// Apply scroll Y to the scroll-root transform. (X scroll is handled
+/// by per-line slicing inside sync_editor_lines.) The root sits at the
+/// view's `origin` (pane chrome offset, or zero for a portal) plus the
+/// current vertical scroll.
 fn sync_content_root(
-    editors: Query<(&EditorScroll, &PaneChrome, &PaneKindMarker), With<PaneTag>>,
+    editors: Query<(&EditorScroll, &EditorView), With<EditorStateComp>>,
     mut t_q: Query<&mut Transform>,
 ) {
-    for (scroll, chrome, kind) in &editors {
-        if kind.0 != PANE_KIND {
-            continue;
-        }
-        if let Ok(mut t) = t_q.get_mut(chrome.content_root) {
-            t.translation.x = MARGIN;
-            t.translation.y = -(TITLE_H + MARGIN) + scroll.y;
+    for (scroll, view) in &editors {
+        if let Ok(mut t) = t_q.get_mut(view.render_root) {
+            t.translation.x = view.origin.x;
+            t.translation.y = view.origin.y + scroll.y;
         }
     }
 }
@@ -770,16 +858,14 @@ fn sync_content_root(
 fn sync_caret(
     metrics: Res<EditorMetrics>,
     theme: Res<jim_style::Theme>,
-    pane_zoom: Res<jim_pane::PaneZoom>,
     editors: Query<
         (
             &EditorStateComp,
-            &PaneRect,
+            &EditorView,
             &EditorScroll,
-            &PaneKindMarker,
             Option<&EditorWrapLayout>,
+            Option<&MarkdownMode>,
         ),
-        With<PaneTag>,
     >,
     carets: Query<(Entity, &EditorCaret)>,
     mut t_q: Query<&mut Transform>,
@@ -788,19 +874,19 @@ fn sync_caret(
 ) {
     let caret_color = Color::LinearRgba(theme.color(jim_style::tokens::CARET));
     let theme_changed = theme.is_changed();
-    let zoom = pane_zoom.0;
     for (caret_entity, parent) in &carets {
-        let Ok((state, rect, scroll, kind, layout)) = editors.get(parent.0) else {
+        let Ok((state, view, scroll, layout, md)) = editors.get(parent.0) else {
             continue;
         };
-        if kind.0 != PANE_KIND {
+        // Markdown WYSIWYG positions the caret itself (markdown_position).
+        if wysiwyg_active(md) {
             continue;
         }
         let Some(layout) = layout else { continue };
         let head = state.0.selection.primary_range().head;
         let (line, col) = char_to_line_col(&state.0.doc, head);
         let (row, x_col) = layout.0.pos_to_visual(line, col);
-        let content = content_area_size_zoomed(rect, zoom);
+        let content = view.size;
 
         // No horizontal scroll under wrap: the caret's x is its column
         // within the wrapped row.
@@ -844,29 +930,25 @@ pub fn char_to_line_col(doc: &ropey::Rope, char_idx: usize) -> (usize, usize) {
 fn sync_selection(
     metrics: Res<EditorMetrics>,
     theme: Res<jim_style::Theme>,
-    pane_zoom: Res<jim_pane::PaneZoom>,
     editors: Query<
         (
             Entity,
             &EditorStateComp,
-            &PaneRect,
-            &EditorScroll,
-            &PaneChrome,
-            &PaneKindMarker,
+            &EditorView,
             Option<&EditorWrapLayout>,
+            Option<&MarkdownMode>,
         ),
-        With<PaneTag>,
     >,
     existing: Query<(Entity, &SelRect)>,
     mut commands: Commands,
 ) {
-    let zoom = pane_zoom.0;
     for (entity, _) in &existing {
         commands.entity(entity).despawn();
     }
 
-    for (editor_entity, state, rect, _scroll, chrome, kind, layout) in &editors {
-        if kind.0 != PANE_KIND {
+    for (editor_entity, state, view, layout, md) in &editors {
+        // Markdown WYSIWYG draws its own selection (markdown_position).
+        if wysiwyg_active(md) {
             continue;
         }
         let Some(layout) = layout else { continue };
@@ -879,7 +961,7 @@ fn sync_selection(
         let (start_line, start_col) = char_to_line_col(&state.0.doc, from);
         let (end_line, end_col) = char_to_line_col(&state.0.doc, to);
 
-        let content = content_area_size_zoomed(rect, zoom);
+        let content = view.size;
         let rope = &state.0.doc;
         for line in start_line..=end_line {
             let line_chars = line_char_len(rope, line);
@@ -922,7 +1004,7 @@ fn sync_selection(
                     SelRect {
                         editor: editor_entity,
                     },
-                    ChildOf(chrome.content_root),
+                    ChildOf(view.render_root),
                     Sprite {
                         color: Color::LinearRgba(theme.color(jim_style::tokens::SELECTION)),
                         custom_size: Some(Vec2::new((x1 - x0).max(1.0), LINE_HEIGHT)),
@@ -974,6 +1056,8 @@ fn handle_scroll(
             &mut EditorScroll,
             &PaneKindMarker,
             Option<&EditorWrapLayout>,
+            Option<&MarkdownMode>,
+            Option<&MdLayout>,
         ),
         With<PaneTag>,
     >,
@@ -1012,7 +1096,7 @@ fn handle_scroll(
     else {
         return;
     };
-    let Ok((_, _, _, _, kind, _)) = editors.get(editor) else {
+    let Ok((_, _, _, _, kind, _, _, _)) = editors.get(editor) else {
         return;
     };
     if kind.0 != PANE_KIND {
@@ -1020,14 +1104,18 @@ fn handle_scroll(
     }
     let _ = dx_px; // soft-wrap: no horizontal scrolling
 
-    if let Ok((_, rect, state, mut scroll, _, layout)) = editors.get_mut(editor) {
+    if let Ok((_, rect, state, mut scroll, _, layout, md, md_layout)) = editors.get_mut(editor) {
         let content_size = content_area_size_zoomed(rect, zoom);
-        // Document height is total *visual* rows (wrapped), falling back
-        // to logical lines until the layout's been built.
-        let total_rows = layout
-            .map(|l| l.0.total_rows())
-            .unwrap_or_else(|| state.0.doc.len_lines());
-        let doc_height = total_rows as f32 * LINE_HEIGHT;
+        let doc_height = if wysiwyg_active(md) {
+            md_layout.map(|l| l.total_height).unwrap_or(0.0)
+        } else {
+            // Document height is total *visual* rows (wrapped), falling
+            // back to logical lines until the layout's been built.
+            let total_rows = layout
+                .map(|l| l.0.total_rows())
+                .unwrap_or_else(|| state.0.doc.len_lines());
+            total_rows as f32 * LINE_HEIGHT
+        };
         let y_max = (doc_height - content_size.y).max(0.0);
         scroll.y = (scroll.y - dy_px).clamp(0.0, y_max);
         scroll.x = 0.0;
@@ -1049,6 +1137,8 @@ fn handle_input(
             &PaneKindMarker,
             Option<&EditorFilePath>,
             Option<&EditorWrapLayout>,
+            Option<&mut MarkdownMode>,
+            Option<&MdLayout>,
         ),
         With<PaneTag>,
     >,
@@ -1064,7 +1154,7 @@ fn handle_input(
         keys.read().for_each(|_| {});
         return;
     }
-    let Ok((mut state_comp, rect, mut scroll, kind, file_path, wrap_layout)) =
+    let Ok((mut state_comp, rect, mut scroll, kind, file_path, wrap_layout, mut md, md_layout)) =
         editors.get_mut(target)
     else {
         keys.read().for_each(|_| {});
@@ -1112,8 +1202,31 @@ fn handle_input(
             } else {
                 run(state, cursor_char_right)
             }),
-            KeyCode::ArrowUp => Some(visual_vertical_move(state, wrap_layout, shift, -1)),
-            KeyCode::ArrowDown => Some(visual_vertical_move(state, wrap_layout, shift, 1)),
+            // Cmd/Ctrl+/ toggles the rendered/raw markdown view.
+            KeyCode::Slash if mod_doc => {
+                if let Some(m) = md.as_deref_mut() {
+                    if m.enabled {
+                        m.raw = !m.raw;
+                    }
+                }
+                Some(None)
+            }
+            KeyCode::ArrowUp => {
+                let wys = md.as_deref().map(|m| m.enabled && !m.raw).unwrap_or(false);
+                Some(if wys {
+                    md_vertical_move(state, md_layout, shift, -1)
+                } else {
+                    visual_vertical_move(state, wrap_layout, shift, -1)
+                })
+            }
+            KeyCode::ArrowDown => {
+                let wys = md.as_deref().map(|m| m.enabled && !m.raw).unwrap_or(false);
+                Some(if wys {
+                    md_vertical_move(state, md_layout, shift, 1)
+                } else {
+                    visual_vertical_move(state, wrap_layout, shift, 1)
+                })
+            }
             KeyCode::Home => Some(if shift {
                 if mod_doc {
                     run(state, select_doc_start)
@@ -1213,8 +1326,22 @@ fn handle_input(
     }
 
     if state_mutated {
-        if let Some(layout) = wrap_layout {
-            ensure_caret_visible(state, rect, &mut scroll, &layout.0, zoom);
+        let wys = md.as_deref().map(|m| m.enabled && !m.raw).unwrap_or(false);
+        if wys {
+            if let Some(layout) = md_layout {
+                let head = state.selection.primary_range().head;
+                if let Some((_x, y, h)) = markdown::caret_pos(layout, head) {
+                    let content_h = content_area_size(rect).y;
+                    if y < scroll.y {
+                        scroll.y = y;
+                    } else if y + h > scroll.y + content_h {
+                        scroll.y = y + h - content_h;
+                    }
+                    scroll.y = scroll.y.max(0.0);
+                }
+            }
+        } else if let Some(layout) = wrap_layout {
+            ensure_caret_visible(state, content_area_size_zoomed(rect, zoom), &mut scroll, &layout.0);
         }
     }
     let _ = metrics;
@@ -1262,6 +1389,26 @@ fn visual_vertical_move(
     Some((state.apply(&tr), true))
 }
 
+/// Markdown-mode vertical caret motion, driven by the WYSIWYG glyph
+/// layout instead of the monospace grid.
+fn md_vertical_move(
+    state: &EditorState,
+    layout: Option<&MdLayout>,
+    shift: bool,
+    delta: i32,
+) -> Option<(EditorState, bool)> {
+    let layout = layout?;
+    let range = state.selection.primary_range();
+    let new_head = markdown::vertical_move(layout, range.head, delta)?;
+    let new_sel = if shift {
+        Selection::single(Range::new(range.anchor, new_head))
+    } else {
+        Selection::cursor(new_head)
+    };
+    let tr = Transaction::new().select(new_sel);
+    Some((state.apply(&tr), true))
+}
+
 pub fn mouse_col_at_x(local_x: f32, cell_width: f32) -> usize {
     if cell_width <= 0.0 {
         return 0;
@@ -1293,6 +1440,8 @@ fn handle_pane_content_press(
             &mut TextDragAnchor,
             &PaneKindMarker,
             Option<&EditorWrapLayout>,
+            Option<&MarkdownMode>,
+            Option<&MdLayout>,
         ),
         With<PaneTag>,
     >,
@@ -1302,19 +1451,27 @@ fn handle_pane_content_press(
         return;
     };
     for ev in presses.read() {
-        let Ok((mut state_comp, scroll, mut drag, kind, layout)) = editors.get_mut(ev.pane) else {
+        let Ok((mut state_comp, scroll, mut drag, kind, layout, md, md_layout)) =
+            editors.get_mut(ev.pane)
+        else {
             continue;
         };
         if kind.0 != PANE_KIND {
             continue;
         }
-        let Some(layout) = layout else { continue };
         let state = &mut state_comp.0;
-        // No horizontal scroll under wrap; only scroll.y offsets rows.
-        let row = ((ev.local_pt.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
-        let x_col = mouse_col_at_x(ev.local_pt.x, metrics.cell_width);
-        let (line, col) = layout.0.visual_to_pos(row, x_col);
-        let pos = char_from_line_col(state, line, col);
+        let pos = if wysiwyg_active(md) {
+            let Some(md_layout) = md_layout else { continue };
+            markdown::offset_at_point(md_layout, ev.local_pt.x, ev.local_pt.y + scroll.y)
+                .unwrap_or(0)
+        } else {
+            let Some(layout) = layout else { continue };
+            // No horizontal scroll under wrap; only scroll.y offsets rows.
+            let row = ((ev.local_pt.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
+            let x_col = mouse_col_at_x(ev.local_pt.x, metrics.cell_width);
+            let (line, col) = layout.0.visual_to_pos(row, x_col);
+            char_from_line_col(state, line, col)
+        };
         if ev.shift {
             let anchor = state.selection.primary_range().anchor;
             drag.0 = Some(anchor);
@@ -1341,6 +1498,8 @@ fn handle_text_select_drag(
             &mut TextDragAnchor,
             &PaneKindMarker,
             Option<&EditorWrapLayout>,
+            Option<&MarkdownMode>,
+            Option<&MdLayout>,
         ),
         With<PaneTag>,
     >,
@@ -1349,7 +1508,7 @@ fn handle_text_select_drag(
         return;
     };
     if buttons.just_released(MouseButton::Left) {
-        for (_, _, _, mut drag, kind, _) in &mut editors {
+        for (_, _, _, mut drag, kind, _, _, _) in &mut editors {
             if kind.0 == PANE_KIND {
                 drag.0 = None;
             }
@@ -1363,17 +1522,23 @@ fn handle_text_select_drag(
     let Some(pt) = window.cursor_position() else { return };
     let pt_canvas = viewport.window_to_canvas(pt);
 
-    for (mut state_comp, rect, scroll, drag, kind, layout) in &mut editors {
+    for (mut state_comp, rect, scroll, drag, kind, layout, md, md_layout) in &mut editors {
         if kind.0 != PANE_KIND {
             continue;
         }
         let Some(anchor) = drag.0 else { continue };
-        let Some(layout) = layout else { continue };
         let local = jim_pane::pt_to_content_local(pt_canvas, rect);
-        let row = ((local.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
-        let x_col = mouse_col_at_x(local.x, metrics.cell_width);
-        let (line, col) = layout.0.visual_to_pos(row, x_col);
-        let head = char_from_line_col(&state_comp.0, line, col);
+        let head = if wysiwyg_active(md) {
+            let Some(md_layout) = md_layout else { continue };
+            markdown::offset_at_point(md_layout, local.x, local.y + scroll.y)
+                .unwrap_or(anchor)
+        } else {
+            let Some(layout) = layout else { continue };
+            let row = ((local.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
+            let x_col = mouse_col_at_x(local.x, metrics.cell_width);
+            let (line, col) = layout.0.visual_to_pos(row, x_col);
+            char_from_line_col(&state_comp.0, line, col)
+        };
         let cur = state_comp.0.selection.primary_range();
         if cur.anchor != anchor || cur.head != head {
             state_comp.0 = apply_selection(&state_comp.0, anchor, head);
@@ -1384,6 +1549,491 @@ fn handle_text_select_drag(
 fn apply_selection(state: &EditorState, anchor: usize, head: usize) -> EditorState {
     let tr = Transaction::new().select(Selection::single(Range::new(anchor, head)));
     state.apply_with_history(&tr)
+}
+
+// ---------- Embedded editors (portals) ----------
+//
+// A real, live editor mounted *inside* something that isn't a floating
+// pane — currently a funct widget. The host owns geometry (it positions
+// the portal's scroll-root at a layout rect and fills `EditorView`); this
+// crate owns the editor itself (text, caret, selection, scroll, syntax,
+// keyboard). All the render systems are already mount-agnostic (they key
+// off `EditorStateComp` + `EditorView`), so a portal only needs its own
+// *input* path — pane input filters on `With<PaneTag>`, which portals
+// lack. The systems below are that path, driven by host-sent messages
+// (pointer) and `FocusedEmbeddedEditor` (keyboard).
+
+/// Marker for an embedded editor (portal) entity, as opposed to a pane
+/// editor. The entity itself carries `EditorStateComp` + `EditorView`
+/// and is a child of the host's content root.
+#[derive(Component)]
+pub struct EmbeddedEditor;
+
+/// Read-only embedded editor: keyboard caret motion, selection, copy, and
+/// scroll all still work (so any multi-line text dump gets real cosmic-text
+/// selection + an I-beam), but every document mutation — typing, delete,
+/// paste, undo/redo, save — is dropped. The host can still replace the
+/// whole buffer via [`set_embedded_editor_text`] (e.g. to push new output).
+#[derive(Component)]
+pub struct EditorReadOnly;
+
+/// The embedded editor that currently owns the keyboard, if any. The
+/// host sets this when a portal is clicked and clears it when focus
+/// leaves the host pane. Distinct from `FocusedPane`: a portal lives
+/// inside a widget pane, so the *pane* keeps pane-focus while the portal
+/// owns text input.
+#[derive(Resource, Default)]
+pub struct FocusedEmbeddedEditor(pub Option<Entity>);
+
+/// Host → editor: a pointer pressed inside a portal at `local_pt`
+/// (scroll-root local space, top-left origin, pre-scroll). Places the
+/// caret / starts a selection — the portal analogue of
+/// `PaneContentPressed`.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct EmbeddedEditorPress {
+    pub editor: Entity,
+    pub local_pt: Vec2,
+    pub shift: bool,
+}
+
+/// Host → editor: pointer dragged (button held) over a portal; extends
+/// the in-progress selection to `local_pt`.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct EmbeddedEditorDrag {
+    pub editor: Entity,
+    pub local_pt: Vec2,
+}
+
+/// Host → editor: the pointer button was released; ends any selection drag.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct EmbeddedEditorRelease;
+
+/// Host → editor: wheel scrolled over a portal by `dy` pixels (positive =
+/// content moves up, same sign convention as the pane scroll handler).
+#[derive(Message, Clone, Copy, Debug)]
+pub struct EmbeddedEditorScroll {
+    pub editor: Entity,
+    pub dy: f32,
+}
+
+/// Editor → host: the user hit the submit/"run" chord (Cmd/Ctrl+Enter)
+/// while a portal was focused. Carries the current selection text (empty
+/// if nothing is selected) and the full buffer, so a host can run
+/// "selection if non-empty else whole buffer" with no extra round-trip.
+/// Drives the funct `on_editor_submit(id, selection, full)` handler. Fired
+/// for read-only editors too — it's non-mutating.
+#[derive(Message, Clone, Debug)]
+pub struct EmbeddedEditorSubmit {
+    pub editor: Entity,
+    pub selection: String,
+    pub full: String,
+}
+
+/// Config for [`spawn_embedded_editor`].
+pub struct EmbeddedEditorConfig {
+    pub text: String,
+    /// File to save to on Cmd/Ctrl+S. `None` for value-backed editors.
+    pub path: Option<PathBuf>,
+    /// Language hint (informational; the highlighter is Rust-only today,
+    /// matching the pane editor).
+    pub lang: Option<String>,
+    /// Initial viewport size; the host keeps `EditorView.size` current.
+    pub size: Vec2,
+    pub caret_color: Color,
+    /// Selectable but not editable (see [`EditorReadOnly`]).
+    pub read_only: bool,
+}
+
+/// Spawn a live embedded editor under `parent` (the host's content root).
+/// Returns the **container** entity, which carries `EditorStateComp` and
+/// is what the host positions each frame; its child scroll-root is
+/// `EditorView.render_root`. The host tracks the returned entity so it
+/// survives the widget re-render diff.
+pub fn spawn_embedded_editor(
+    commands: &mut Commands,
+    parent: Entity,
+    cfg: EmbeddedEditorConfig,
+) -> Entity {
+    let _ = &cfg.lang; // highlighter is Rust-only for now (see EmbeddedEditorConfig)
+    let container = commands
+        .spawn((
+            EmbeddedEditor,
+            EditorStateComp(
+                EditorState::new(ropey::Rope::from_str(&cfg.text), Selection::cursor(0))
+                    .with_indent_unit("    "),
+            ),
+            EditorHighlighter(Highlighter::new()),
+            LineRows::default(),
+            EditorScroll::default(),
+            TextDragAnchor::default(),
+            ChildOf(parent),
+            Transform::default(),
+            Visibility::Inherited,
+        ))
+        .id();
+    let scroll_root = commands
+        .spawn((
+            ChildOf(container),
+            Transform::default(),
+            Visibility::Inherited,
+        ))
+        .id();
+    commands.entity(container).insert(EditorView {
+        render_root: scroll_root,
+        size: cfg.size,
+        origin: Vec2::ZERO,
+    });
+    commands.spawn((
+        ChildOf(scroll_root),
+        EditorCaret(container),
+        Sprite {
+            color: cfg.caret_color,
+            custom_size: Some(Vec2::new(2.0, LINE_HEIGHT)),
+            ..default()
+        },
+        Anchor::TOP_LEFT,
+        Transform::from_xyz(0.0, 0.0, 1.0),
+    ));
+    if let Some(path) = cfg.path {
+        commands.entity(container).insert(EditorFilePath(path));
+    }
+    if cfg.read_only {
+        commands.entity(container).insert(EditorReadOnly);
+    }
+    container
+}
+
+/// Replace a portal's whole document (value-backed two-way resync). Drops
+/// undo history and resets the caret — intended for when the *script*
+/// changes the bound value, not for live typing.
+pub fn set_embedded_editor_text(state_comp: &mut EditorStateComp, text: &str) {
+    state_comp.0 = EditorState::new(ropey::Rope::from_str(text), Selection::cursor(0))
+        .with_indent_unit("    ");
+}
+
+/// Safely resync a live portal to a new buffer (the script changed the
+/// bound `value`). Beyond swapping the text + caret, this resets scroll to
+/// the top and **drops the cached [`EditorWrapLayout`]**: the new buffer may
+/// be shorter than the old, and every render system reads the wrap layout
+/// for its visual-row→line map. If the layout still described the old
+/// (longer) doc, `sync_editor_lines` would index a now-out-of-range line
+/// against the shorter rope and panic (`rope.line(N)` past the end). All the
+/// render systems guard `Some(layout)`, so dropping it makes them skip for
+/// the one frame until `compute_wrap_layout` rebuilds it against the new
+/// rope. Use this — not raw `EditorStateComp` mutation — for value resync.
+pub fn resync_embedded_editor(world: &mut World, editor: Entity, text: &str) {
+    let Some(mut sc) = world.get_mut::<EditorStateComp>(editor) else {
+        return;
+    };
+    set_embedded_editor_text(&mut sc, text);
+    if let Some(mut scroll) = world.get_mut::<EditorScroll>(editor) {
+        scroll.x = 0.0;
+        scroll.y = 0.0;
+    }
+    world.entity_mut(editor).remove::<EditorWrapLayout>();
+}
+
+fn handle_embedded_press(
+    mut presses: MessageReader<EmbeddedEditorPress>,
+    metrics: Option<Res<EditorMetrics>>,
+    mut editors: Query<
+        (
+            &mut EditorStateComp,
+            &EditorScroll,
+            &mut TextDragAnchor,
+            Option<&EditorWrapLayout>,
+        ),
+        With<EmbeddedEditor>,
+    >,
+) {
+    let Some(metrics) = metrics else {
+        presses.read().for_each(|_| {});
+        return;
+    };
+    for ev in presses.read() {
+        let Ok((mut sc, scroll, mut drag, layout)) = editors.get_mut(ev.editor) else {
+            continue;
+        };
+        let Some(layout) = layout else { continue };
+        let state = &mut sc.0;
+        let row = ((ev.local_pt.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
+        let x_col = mouse_col_at_x(ev.local_pt.x, metrics.cell_width);
+        let (line, col) = layout.0.visual_to_pos(row, x_col);
+        let pos = char_from_line_col(state, line, col);
+        if ev.shift {
+            let anchor = state.selection.primary_range().anchor;
+            drag.0 = Some(anchor);
+            *state = apply_selection(state, anchor, pos);
+        } else {
+            drag.0 = Some(pos);
+            *state = apply_selection(state, pos, pos);
+        }
+    }
+}
+
+fn handle_embedded_drag(
+    mut drags: MessageReader<EmbeddedEditorDrag>,
+    metrics: Option<Res<EditorMetrics>>,
+    mut editors: Query<
+        (
+            &mut EditorStateComp,
+            &EditorScroll,
+            &TextDragAnchor,
+            Option<&EditorWrapLayout>,
+        ),
+        With<EmbeddedEditor>,
+    >,
+) {
+    let Some(metrics) = metrics else {
+        drags.read().for_each(|_| {});
+        return;
+    };
+    for ev in drags.read() {
+        let Ok((mut sc, scroll, drag, layout)) = editors.get_mut(ev.editor) else {
+            continue;
+        };
+        let Some(anchor) = drag.0 else { continue };
+        let Some(layout) = layout else { continue };
+        let row = ((ev.local_pt.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
+        let x_col = mouse_col_at_x(ev.local_pt.x, metrics.cell_width);
+        let (line, col) = layout.0.visual_to_pos(row, x_col);
+        let head = char_from_line_col(&sc.0, line, col);
+        let cur = sc.0.selection.primary_range();
+        if cur.anchor != anchor || cur.head != head {
+            sc.0 = apply_selection(&sc.0, anchor, head);
+        }
+    }
+}
+
+fn handle_embedded_release(
+    mut rel: MessageReader<EmbeddedEditorRelease>,
+    mut editors: Query<&mut TextDragAnchor, With<EmbeddedEditor>>,
+) {
+    if rel.read().count() == 0 {
+        return;
+    }
+    for mut drag in &mut editors {
+        drag.0 = None;
+    }
+}
+
+fn handle_embedded_scroll(
+    mut scrolls: MessageReader<EmbeddedEditorScroll>,
+    mut editors: Query<
+        (
+            &EditorView,
+            &mut EditorScroll,
+            &EditorStateComp,
+            Option<&EditorWrapLayout>,
+        ),
+        With<EmbeddedEditor>,
+    >,
+) {
+    for ev in scrolls.read() {
+        let Ok((view, mut scroll, sc, layout)) = editors.get_mut(ev.editor) else {
+            continue;
+        };
+        let total_rows = layout
+            .map(|l| l.0.total_rows())
+            .unwrap_or_else(|| sc.0.doc.len_lines());
+        let doc_height = total_rows as f32 * LINE_HEIGHT;
+        let y_max = (doc_height - view.size.y).max(0.0);
+        scroll.y = (scroll.y - ev.dy).clamp(0.0, y_max);
+        scroll.x = 0.0;
+    }
+}
+
+/// Keyboard for the focused portal. Mirrors `handle_input`'s non-markdown
+/// arms (kept separate so the pane editor stays untouched). `KeyboardInput`
+/// is read per-system, so this and `handle_input` never fight over events:
+/// `handle_input` no-ops unless `FocusedPane` is an editor *pane*, and this
+/// no-ops unless `FocusedEmbeddedEditor` is set.
+fn handle_embedded_keys(
+    mut keys: MessageReader<KeyboardInput>,
+    mods: Res<ButtonInput<KeyCode>>,
+    focused: Res<FocusedEmbeddedEditor>,
+    mut submit_w: MessageWriter<EmbeddedEditorSubmit>,
+    mut editors: Query<
+        (
+            &mut EditorStateComp,
+            &EditorView,
+            &mut EditorScroll,
+            Option<&EditorWrapLayout>,
+            Option<&EditorFilePath>,
+            Option<&EditorReadOnly>,
+        ),
+        With<EmbeddedEditor>,
+    >,
+) {
+    let Some(target) = focused.0 else {
+        keys.read().for_each(|_| {});
+        return;
+    };
+    let Ok((mut state_comp, view, mut scroll, wrap_layout, file_path, read_only)) =
+        editors.get_mut(target)
+    else {
+        keys.read().for_each(|_| {});
+        return;
+    };
+    let read_only = read_only.is_some();
+    let state = &mut state_comp.0;
+    let mut state_mutated = false;
+
+    let shift = mods.pressed(KeyCode::ShiftLeft) || mods.pressed(KeyCode::ShiftRight);
+    let ctrl = mods.pressed(KeyCode::ControlLeft) || mods.pressed(KeyCode::ControlRight);
+    let alt = mods.pressed(KeyCode::AltLeft) || mods.pressed(KeyCode::AltRight);
+    let meta = mods.pressed(KeyCode::SuperLeft) || mods.pressed(KeyCode::SuperRight);
+    let mod_word = alt || ctrl;
+    let mod_doc = meta || ctrl;
+
+    for ev in keys.read() {
+        if !ev.state.is_pressed() {
+            continue;
+        }
+        // Submit/"run" chord: Cmd/Ctrl+Enter forwards the buffer to the host
+        // (drives `on_editor_submit`) instead of inserting a newline. Fires
+        // for read-only editors too (non-mutating). Pre-empts the plain
+        // Enter arm below.
+        if matches!(ev.key_code, KeyCode::Enter | KeyCode::NumpadEnter) && mod_doc {
+            let range = state.selection.primary_range();
+            let selection = if range.from() != range.to() {
+                state.doc.slice(range.from()..range.to()).to_string()
+            } else {
+                String::new()
+            };
+            submit_w.write(EmbeddedEditorSubmit {
+                editor: target,
+                selection,
+                full: state.doc.to_string(),
+            });
+            continue;
+        }
+        let cmd_result: Option<Option<(EditorState, bool)>> = match ev.key_code {
+            KeyCode::ArrowLeft => Some(if shift {
+                if mod_word {
+                    run(state, select_word_left)
+                } else {
+                    run(state, select_char_left)
+                }
+            } else if mod_word {
+                run(state, cursor_word_left)
+            } else {
+                run(state, cursor_char_left)
+            }),
+            KeyCode::ArrowRight => Some(if shift {
+                if mod_word {
+                    run(state, select_word_right)
+                } else {
+                    run(state, select_char_right)
+                }
+            } else if mod_word {
+                run(state, cursor_word_right)
+            } else {
+                run(state, cursor_char_right)
+            }),
+            KeyCode::ArrowUp => Some(visual_vertical_move(state, wrap_layout, shift, -1)),
+            KeyCode::ArrowDown => Some(visual_vertical_move(state, wrap_layout, shift, 1)),
+            KeyCode::Home => Some(if shift {
+                if mod_doc {
+                    run(state, select_doc_start)
+                } else {
+                    run(state, select_line_start)
+                }
+            } else if mod_doc {
+                run(state, cursor_doc_start)
+            } else {
+                run(state, cursor_line_start)
+            }),
+            KeyCode::End => Some(if shift {
+                if mod_doc {
+                    run(state, select_doc_end)
+                } else {
+                    run(state, select_line_end)
+                }
+            } else if mod_doc {
+                run(state, cursor_doc_end)
+            } else {
+                run(state, cursor_line_end)
+            }),
+            KeyCode::Backspace => Some(run_history(state, delete_char_backward)),
+            KeyCode::Delete => Some(run_history(state, delete_char_forward)),
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                Some(run_history(state, insert_newline_and_indent))
+            }
+            KeyCode::Tab => Some(run_history(state, indent_more)),
+            KeyCode::KeyA if mod_doc => Some(run(state, select_all)),
+            KeyCode::KeyZ if mod_doc => Some(if shift {
+                redo(state).map(|new| (new, true))
+            } else {
+                undo(state).map(|new| (new, true))
+            }),
+            KeyCode::KeyC if mod_doc => {
+                copy_selection(state);
+                Some(None)
+            }
+            KeyCode::KeyX if mod_doc => {
+                copy_selection(state);
+                Some(delete_selection(state))
+            }
+            KeyCode::KeyV if mod_doc && !shift => Some(paste_from_clipboard(state)),
+            KeyCode::KeyS if mod_doc => {
+                match file_path {
+                    Some(path) if !read_only => {
+                        let text = state.doc.to_string();
+                        match std::fs::write(&path.0, text) {
+                            Ok(()) => eprintln!("[editor] saved {}", path.0.display()),
+                            Err(e) => eprintln!("[editor] save failed {}: {}", path.0.display(), e),
+                        }
+                    }
+                    _ => {}
+                }
+                Some(None)
+            }
+            _ => None,
+        };
+
+        if let Some(Some((new_state, _))) = cmd_result {
+            // Read-only: keep caret/selection moves (doc unchanged) but
+            // drop any command that would mutate the document (undo/redo,
+            // cut, …).
+            if read_only && new_state.doc != state.doc {
+                continue;
+            }
+            *state = new_state;
+            state_mutated = true;
+            continue;
+        }
+        if let Some(None) = cmd_result {
+            continue;
+        }
+        if mod_doc || alt || read_only {
+            continue;
+        }
+        let text: Option<String> = match &ev.logical_key {
+            Key::Character(s) => Some(s.chars().take(1).collect()),
+            Key::Space => Some(" ".into()),
+            _ => None,
+        };
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            let tr = Transaction::new()
+                .change(Change::new(
+                    state.selection.primary_range().from(),
+                    state.selection.primary_range().to(),
+                    text.clone(),
+                ))
+                .select(Selection::cursor(
+                    state.selection.primary_range().from() + text.chars().count(),
+                ));
+            *state = state.apply_with_history(&tr);
+            state_mutated = true;
+        }
+    }
+
+    if state_mutated {
+        if let Some(layout) = wrap_layout {
+            ensure_caret_visible(state, view.size, &mut scroll, &layout.0);
+        }
+    }
 }
 
 fn copy_selection(state: &EditorState) {

@@ -33,6 +33,17 @@ pub struct FontRegistry {
     /// Broad-coverage fallback font (DejaVu Sans) consulted per-glyph
     /// when the requested family lacks a codepoint.
     symbols: Handle<Font>,
+    /// System fonts loaded on demand (macOS CoreText cascade) to cover
+    /// codepoints absent from every bundled family. Consulted in order
+    /// after `symbols`. Populated by the widget text-fallback system as it
+    /// encounters glyphs nothing bundled can draw — so widgets render any
+    /// Unicode the OS has a font for, instead of tofu.
+    system: Vec<Handle<Font>>,
+    /// Bundled COLOR emoji font (Twemoji, COLRv0). Color glyphs render via
+    /// cosmic-text's `SwashContent::Color` path. We bundle a COLR font on
+    /// purpose: macOS's own Apple Color Emoji is `sbix` (bitmap) in a `.ttc`,
+    /// which crashes Bevy's rasterizer — COLR scales cleanly.
+    emoji: Handle<Font>,
 }
 
 impl FontRegistry {
@@ -92,6 +103,55 @@ impl FontRegistry {
         }
     }
 
+    /// Resolve `ch` to the actual `(glyph, font)` to draw. Like
+    /// [`font_for_char`], but when NEITHER the base family nor the broad
+    /// `symbols` font has the codepoint, it substitutes the Unicode
+    /// replacement character `�` (U+FFFD, which DejaVu Sans has) so an
+    /// unsupported glyph renders a VISIBLE box instead of silently
+    /// vanishing or showing inconsistent tofu. That's the guarantee: text
+    /// never disappears just because a font lacks a glyph.
+    fn resolve_glyph(&self, base: &Handle<Font>, ch: char) -> (char, Handle<Font>) {
+        if self.covers(base, ch) {
+            return (ch, base.clone());
+        }
+        if self.symbols != Handle::default() && self.covers(&self.symbols, ch) {
+            return (ch, self.symbols.clone());
+        }
+        // Bundled COLOR emoji font (covers the emoji codepoints).
+        if self.emoji != Handle::default() && self.covers(&self.emoji, ch) {
+            return (ch, self.emoji.clone());
+        }
+        // On-demand system fonts (CoreText cascade) loaded by the widget text
+        // path. The OS indexes every installed font's coverage, so this is what
+        // makes arbitrary Unicode actually render.
+        for h in &self.system {
+            if self.covers(h, ch) {
+                return (ch, h.clone());
+            }
+        }
+        if self.symbols != Handle::default() && self.covers(&self.symbols, '\u{FFFD}') {
+            return ('\u{FFFD}', self.symbols.clone());
+        }
+        (ch, base.clone())
+    }
+
+    /// Does ANY currently-registered font (the requested `base`, the broad
+    /// `symbols` fallback, or a loaded system font) cover `ch`? Drives the
+    /// widget text path's decision to lazily load a system font.
+    pub fn has_glyph(&self, base: &Handle<Font>, ch: char) -> bool {
+        self.covers(base, ch)
+            || (self.symbols != Handle::default() && self.covers(&self.symbols, ch))
+            || (self.emoji != Handle::default() && self.covers(&self.emoji, ch))
+            || self.system.iter().any(|h| self.covers(h, ch))
+    }
+
+    /// Register a system fallback font (loaded on demand) with its coverage so
+    /// `resolve_glyph`/`split_runs` route matching codepoints to it.
+    pub fn register_system_font(&mut self, handle: Handle<Font>, coverage: Arc<HashSet<u32>>) {
+        self.coverage.insert(handle.clone(), coverage);
+        self.system.push(handle);
+    }
+
     /// Split `text` into maximal runs that share one font, applying
     /// per-glyph fallback. Returns `[(run_text, font)]`. The overwhelmingly
     /// common case — every glyph covered by `base` — yields a single run,
@@ -99,10 +159,10 @@ impl FontRegistry {
     pub fn split_runs(&self, base: &Handle<Font>, text: &str) -> Vec<(String, Handle<Font>)> {
         let mut runs: Vec<(String, Handle<Font>)> = Vec::new();
         for ch in text.chars() {
-            let font = self.font_for_char(base, ch);
+            let (glyph, font) = self.resolve_glyph(base, ch);
             match runs.last_mut() {
-                Some((s, f)) if *f == font => s.push(ch),
-                _ => runs.push((ch.to_string(), font)),
+                Some((s, f)) if *f == font => s.push(glyph),
+                _ => runs.push((glyph.to_string(), font)),
             }
         }
         runs
@@ -124,13 +184,50 @@ const BUNDLED_FONTS: &[(&str, &[u8])] = &[
     // symbols) consulted per-glyph when the chosen family lacks a
     // codepoint. Also selectable as a family by name.
     ("symbols", include_bytes!("../assets/fonts/DejaVuSans.ttf")),
+    // COLOR emoji (Twemoji, COLRv0). Per-glyph fallback for emoji codepoints.
+    ("emoji", include_bytes!("../assets/fonts/TwemojiMozilla.ttf")),
 ];
 
-/// The family name whose handle becomes the per-glyph fallback font.
+/// The family name whose handle becomes the per-glyph symbol fallback.
 const FALLBACK_FAMILY: &str = "symbols";
+/// The family name whose handle becomes the per-glyph emoji fallback.
+const EMOJI_FAMILY: &str = "emoji";
+
+/// Is `bytes` a font we can SAFELY hand to Bevy's `Text2d` as a system
+/// fallback? Bevy's rasterizer (cosmic-text + swash) PANICS — taking the whole
+/// app down — on glyphs it can't scale, namely:
+///   * color/bitmap (emoji) fonts: `sbix` / `COLR` / `CBDT` / `CBLC` / `SVG `;
+///   * TrueType Collections (`.ttc`): `Font::try_from_bytes` and our cmap
+///     coverage can pick different faces, so a glyph id we route here may not
+///     exist in the face cosmic-text loaded → "failed to get scaled glyph
+///     image" panic. (Apple ships CJK *and* emoji as `.ttc`.)
+/// We only accept a single-face font with real outlines (`glyf` or `CFF`).
+/// Anything else falls through to the `�` replacement — visible, never a crash.
+pub fn is_safe_fallback_font(bytes: &[u8]) -> bool {
+    // A `.ttc` collection has several faces; check EVERY one. If any face is a
+    // color/bitmap font, reject the whole file (that's how Apple Color Emoji
+    // ships). Non-color collections (Apple's CJK fonts) are fine — cosmic-text
+    // loads them consistently, so CJK renders.
+    let n = ttf_parser::fonts_in_collection(bytes).unwrap_or(1).max(1);
+    let mut any_outline = false;
+    for i in 0..n {
+        let Ok(face) = ttf_parser::Face::parse(bytes, i) else {
+            return false;
+        };
+        let raw = face.raw_face();
+        let has = |t: &[u8; 4]| raw.table(ttf_parser::Tag::from_bytes(t)).is_some();
+        if has(b"sbix") || has(b"COLR") || has(b"CBDT") || has(b"CBLC") || has(b"SVG ") {
+            return false;
+        }
+        if has(b"glyf") || has(b"CFF ") || has(b"CFF2") {
+            any_outline = true;
+        }
+    }
+    any_outline
+}
 
 /// Parse a font's cmap into the set of Unicode codepoints it can render.
-fn coverage_of(bytes: &[u8]) -> HashSet<u32> {
+pub fn coverage_of(bytes: &[u8]) -> HashSet<u32> {
     let mut set = HashSet::new();
     if let Ok(face) = ttf_parser::Face::parse(bytes, 0) {
         if let Some(cmap) = face.tables().cmap {
@@ -186,6 +283,9 @@ pub fn ensure_initialized(registry: &mut FontRegistry, fonts: &mut Assets<Font>)
             .insert(handle.clone(), Arc::new(coverage_of(bytes)));
         if *name == FALLBACK_FAMILY {
             registry.symbols = handle.clone();
+        }
+        if *name == EMOJI_FAMILY {
+            registry.emoji = handle.clone();
         }
         registry.by_name.insert((*name).to_string(), handle);
     }

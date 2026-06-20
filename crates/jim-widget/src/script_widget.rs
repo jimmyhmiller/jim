@@ -180,6 +180,17 @@ pub(crate) enum HostToWorker {
     /// the offset actually changes; widgets that don't define `on_scroll`
     /// ignore it (no re-render), so non-virtualized widgets are unaffected.
     Scroll { y: f32 },
+    /// A raw wheel tick over the pane, with the cursor's content-local
+    /// position and the pixel delta. Drives the optional `on_wheel(x, y,
+    /// dy)` handler so a widget can route the wheel to whatever region is
+    /// under the cursor (e.g. scroll its own sidebar list) instead of the
+    /// whole pane. `dy > 0` is scroll-up/away. Only delivered to widgets
+    /// that define `on_wheel`; others are unaffected.
+    Wheel { local_x: f32, local_y: f32, dx: f32, dy: f32 },
+    /// A trackpad pinch over the pane. Drives `on_pinch(x, y, delta)` —
+    /// `delta > 0` is pinch-out (zoom in). The host yields the gesture via
+    /// the `PaneCapturesPinch` marker so the canvas doesn't also zoom.
+    Pinch { local_x: f32, local_y: f32, delta: f32 },
     /// A navigation key press routed to the focused widget. Drives
     /// `on_key(key)` in the script. `key` is a stable name like
     /// "ArrowLeft" / "ArrowRight" / "Home" / "End".
@@ -217,6 +228,19 @@ pub(crate) enum HostToWorker {
     /// owns the live edit buffer + caret, so the script does NOT need to
     /// echo `value` back to keep typing responsive.
     InputChange { id: String, value: String },
+    /// User edited a live `Element::Editor` portal. Drives
+    /// `on_editor_change(id, value)` with the full new buffer text. Like
+    /// `InputChange`, the host owns the live edit so no echo is needed.
+    EditorChange { id: String, value: String },
+    /// User hit the submit/"run" chord (Cmd/Ctrl+Enter) in an
+    /// `Element::Editor`. Drives `on_editor_submit(id, selection, full)` —
+    /// `selection` is the selected text (empty if none), `full` the whole
+    /// buffer; run "selection if non-empty else full".
+    EditorSubmit {
+        id: String,
+        selection: String,
+        full: String,
+    },
     /// User submitted a focused `Element::Input` (Enter). Drives
     /// `on_input_submit(id, value)`.
     InputSubmit { id: String, value: String },
@@ -314,6 +338,15 @@ pub(crate) struct WorkerSlots {
     /// chart with tooltips, no `on_click`) still publishes a content
     /// hot-zone — otherwise pinned-pane hover hit-testing skips it.
     pub(crate) wants_hover: Arc<AtomicBool>,
+    /// Does the loaded script define `on_pinch`? When true the host marks
+    /// the pane `PaneCapturesPinch` so a trackpad pinch over it zooms the
+    /// widget (forwarded as `on_pinch(x, y, delta)`) instead of the canvas.
+    pub(crate) wants_pinch: Arc<AtomicBool>,
+    /// Host monospace font metrics `(cell_width, font_size)`, written by
+    /// the main thread. Lets the worker measure canvas text accurately
+    /// (the default canvas font is monospace) via the `measure_text` /
+    /// `char_width` host fns, instead of guessing a per-char ratio.
+    pub(crate) font_metrics: Arc<Mutex<(f32, f32)>>,
 }
 
 impl WorkerSlots {
@@ -329,6 +362,8 @@ impl WorkerSlots {
             outbox: Arc::new(Mutex::new(Vec::new())),
             wants_clicks: Arc::new(AtomicBool::new(false)),
             wants_hover: Arc::new(AtomicBool::new(false)),
+            wants_pinch: Arc::new(AtomicBool::new(false)),
+            font_metrics: Arc::new(Mutex::new((0.0, 0.0))),
         }
     }
 }
@@ -438,6 +473,11 @@ pub struct ScriptWidget {
     /// Sprite id → entity. Lets us diff frames instead of
     /// despawn+respawn.
     pub sprite_entities: HashMap<String, Entity>,
+    /// `Element::Editor` id → live portal. These editor child-entities
+    /// persist across the per-frame flow teardown (the teardown skips
+    /// any entity tracked here) so caret/selection/scroll/undo survive
+    /// the script redrawing around them.
+    pub editor_portals: HashMap<String, EditorPortalEntry>,
     /// While an input/textarea is focused we re-render to show live
     /// keystrokes + the blinking caret. Re-rendering EVERY frame rebuilds
     /// the whole flow tree (expensive with a table), so we only re-render
@@ -456,13 +496,43 @@ pub struct ScriptWidget {
     /// no `on_click`) publish a content hot-zone so pinned-pane hover
     /// hit-testing reaches it. Recomputed on reload.
     pub wants_hover: bool,
+    /// True when the script defines `on_pinch`. Mirrored to the
+    /// `PaneCapturesPinch` marker so trackpad pinch zooms the widget.
+    pub wants_pinch: bool,
     /// Set by `anim::tick_widget_anims` while a state transition is in
     /// flight, so the next `apply_latest_frames` pass re-renders with the
     /// advanced eased values even though the frame itself didn't change.
     pub force_render: bool,
 }
 
+/// A live `Element::Editor` portal tracked across re-render diffs.
+pub struct EditorPortalEntry {
+    /// The `jim-editor` embedded-editor entity (also the entity the host
+    /// repositions each frame). Its child scroll-root is `EditorView.render_root`.
+    pub container: Entity,
+    /// Last text the script and editor agreed on. Used to detect both
+    /// directions of change: a script-driven `value` resync (script → editor)
+    /// and a user edit to forward via `on_editor_change` (editor → script).
+    pub last_value: String,
+    /// File this portal saves to on Cmd/Ctrl+S, if `path`-backed.
+    pub path: Option<String>,
+}
+
 impl ScriptWidget {
+    /// Forward an editor-portal edit to the worker (drives `on_editor_change`).
+    pub fn send_editor_change(&self, id: String, value: String) {
+        self.handle.send(HostToWorker::EditorChange { id, value });
+    }
+
+    /// Forward an editor-portal submit chord to the worker (drives `on_editor_submit`).
+    pub fn send_editor_submit(&self, id: String, selection: String, full: String) {
+        self.handle.send(HostToWorker::EditorSubmit {
+            id,
+            selection,
+            full,
+        });
+    }
+
     /// Forward a slider value change to the worker (drives `on_slider_change`).
     pub fn send_slider_change(&self, id: String, value: f32) {
         self.handle.send(HostToWorker::SliderChange { id, value });
@@ -644,7 +714,10 @@ impl Plugin for ScriptWidgetPlugin {
                     forward_keys_to_workers,
                     forward_inputs_to_workers,
                     forward_scroll_to_workers,
+                    route_editor_portal_input,
                     apply_latest_frames,
+                    forward_editor_portal_changes,
+                    forward_editor_portal_submits,
                 )
                     .chain(),
             );
@@ -863,11 +936,13 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             reload_gen: 0,
             applied_reload_gen: 0,
             sprite_entities: HashMap::new(),
+            editor_portals: HashMap::new(),
             last_focus_sig: None,
             // Starts false; mirrored from the worker's `wants_clicks` slot
             // each frame once the engine has loaded the script.
             wants_clicks: false,
             wants_hover: false,
+            wants_pinch: false,
             force_render: false,
         },
         WidgetTargets::default(),
@@ -963,8 +1038,8 @@ fn poll_watcher(watcher: Option<Res<ScriptWatcher>>, mut widgets: Query<&mut Scr
     }
 }
 
-fn apply_reloads(mut widgets: Query<&mut ScriptWidget>) {
-    for mut w in &mut widgets {
+fn apply_reloads(mut commands: Commands, mut widgets: Query<(Entity, &mut ScriptWidget)>) {
+    for (ent, mut w) in &mut widgets {
         // Mirror the worker-reported interaction-handler flag every frame
         // (cheap atomic load) so pinned-widget click hot-zoning tracks the
         // currently-loaded script for both engines.
@@ -975,6 +1050,17 @@ fn apply_reloads(mut widgets: Query<&mut ScriptWidget>) {
         let wh = w.handle.slots.wants_hover.load(Ordering::Acquire);
         if w.wants_hover != wh {
             w.wants_hover = wh;
+        }
+        // Mirror wants_pinch → the PaneCapturesPinch marker so the canvas
+        // yields trackpad pinch to a widget that defines on_pinch.
+        let wp = w.handle.slots.wants_pinch.load(Ordering::Acquire);
+        if w.wants_pinch != wp {
+            w.wants_pinch = wp;
+            if wp {
+                commands.entity(ent).insert(jim_pane::PaneCapturesPinch);
+            } else {
+                commands.entity(ent).remove::<jim_pane::PaneCapturesPinch>();
+            }
         }
         if w.applied_reload_gen == w.reload_gen {
             continue;
@@ -1034,6 +1120,16 @@ fn forward_clicks_to_workers(
         // visually-rendered position of each rect.
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
         let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_y);
+
+        // A press inside a live editor portal is owned by the editor
+        // (`route_editor_portal_press` focuses it + places the caret); it
+        // must not also fire the script's `on_click`.
+        if targets
+            .map(|t| t.editor_portals.iter().any(|p| p.rect.contains(hit_pt)))
+            .unwrap_or(false)
+        {
+            continue;
+        }
 
         // Find the specific element under the cursor (if any) and route
         // by its kind. Children push their rect BEFORE their clickable
@@ -1101,6 +1197,7 @@ fn forward_clicks_to_workers(
 
 fn forward_drags_to_workers(
     mut events: MessageReader<PaneContentDragged>,
+    focused: Res<jim_editor::FocusedEmbeddedEditor>,
     widgets: Query<(&PaneKindMarker, &ScriptWidget, Option<&crate::WidgetScroll>)>,
 ) {
     for ev in events.read() {
@@ -1108,6 +1205,14 @@ fn forward_drags_to_workers(
             continue;
         };
         if kind.0 != PANE_KIND {
+            continue;
+        }
+        // A drag owned by a focused portal in this pane is the editor's
+        // selection drag — don't also drive the script's `on_drag`.
+        if focused
+            .0
+            .is_some_and(|c| w.editor_portals.values().any(|e| e.container == c))
+        {
             continue;
         }
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
@@ -1121,6 +1226,7 @@ fn forward_drags_to_workers(
 
 fn forward_releases_to_workers(
     mut events: MessageReader<PaneContentReleased>,
+    focused: Res<jim_editor::FocusedEmbeddedEditor>,
     widgets: Query<(&PaneKindMarker, &ScriptWidget, Option<&crate::WidgetScroll>)>,
 ) {
     for ev in events.read() {
@@ -1128,6 +1234,12 @@ fn forward_releases_to_workers(
             continue;
         };
         if kind.0 != PANE_KIND {
+            continue;
+        }
+        if focused
+            .0
+            .is_some_and(|c| w.editor_portals.values().any(|e| e.container == c))
+        {
             continue;
         }
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
@@ -1184,6 +1296,94 @@ fn forward_hovers_to_workers(
     }
 }
 
+/// Route pane pointer events into live editor portals: a press inside a
+/// portal focuses it + places the caret; a press elsewhere clears portal
+/// focus; drags extend the selection; release ends the drag. Mirrors the
+/// pane editor's own pointer handling, but for the embedded case.
+fn route_editor_portal_input(
+    mut presses: MessageReader<PaneContentPressed>,
+    mut drags: MessageReader<PaneContentDragged>,
+    mut releases: MessageReader<PaneContentReleased>,
+    mut focused: ResMut<jim_editor::FocusedEmbeddedEditor>,
+    mut press_w: MessageWriter<jim_editor::EmbeddedEditorPress>,
+    mut drag_w: MessageWriter<jim_editor::EmbeddedEditorDrag>,
+    mut release_w: MessageWriter<jim_editor::EmbeddedEditorRelease>,
+    widgets: Query<(
+        &PaneKindMarker,
+        &ScriptWidget,
+        &WidgetTargets,
+        Option<&crate::WidgetScroll>,
+    )>,
+) {
+    let scroll_of = |pane: Entity| -> f32 {
+        widgets
+            .get(pane)
+            .ok()
+            .and_then(|(_, _, _, s)| s.map(|s| s.y))
+            .unwrap_or(0.0)
+    };
+    // Portal container + its box top-left under a content-local hit point.
+    let portal_at = |pane: Entity, hit_pt: Vec2| -> Option<(Entity, Vec2)> {
+        let (kind, w, targets, _) = widgets.get(pane).ok()?;
+        if kind.0 != PANE_KIND {
+            return None;
+        }
+        let t = targets
+            .editor_portals
+            .iter()
+            .find(|t| t.rect.contains(hit_pt))?;
+        let entry = w.editor_portals.get(&t.id)?;
+        Some((entry.container, t.rect.min))
+    };
+    // Box top-left of an already-focused container (drag may leave the rect,
+    // so we can't rely on `contains`).
+    let portal_min = |pane: Entity, container: Entity| -> Option<Vec2> {
+        let (kind, w, targets, _) = widgets.get(pane).ok()?;
+        if kind.0 != PANE_KIND {
+            return None;
+        }
+        let id = w
+            .editor_portals
+            .iter()
+            .find(|(_, e)| e.container == container)
+            .map(|(id, _)| id.clone())?;
+        targets
+            .editor_portals
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.rect.min)
+    };
+
+    for ev in presses.read() {
+        let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_of(ev.pane));
+        match portal_at(ev.pane, hit_pt) {
+            Some((container, rmin)) => {
+                focused.0 = Some(container);
+                press_w.write(jim_editor::EmbeddedEditorPress {
+                    editor: container,
+                    local_pt: hit_pt - rmin,
+                    shift: ev.shift,
+                });
+            }
+            None => focused.0 = None,
+        }
+    }
+    for ev in drags.read() {
+        let Some(container) = focused.0 else { continue };
+        let Some(rmin) = portal_min(ev.pane, container) else {
+            continue;
+        };
+        let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_of(ev.pane));
+        drag_w.write(jim_editor::EmbeddedEditorDrag {
+            editor: container,
+            local_pt: hit_pt - rmin,
+        });
+    }
+    if releases.read().count() > 0 && focused.0.is_some() {
+        release_w.write(jim_editor::EmbeddedEditorRelease);
+    }
+}
+
 /// Route navigation keys (arrows / Home / End) to the focused funct
 /// widget as `on_key`. Terminals consume these themselves when focused,
 /// so there's no conflict; we only fire when a funct widget holds focus
@@ -1226,6 +1426,7 @@ fn forward_inputs_to_workers(
     time: Res<Time>,
     pane_zoom: Res<jim_pane::PaneZoom>,
     theme: Res<jim_style::Theme>,
+    metrics: Res<jim_pane::PaneFontMetrics>,
     mut theme_events: MessageReader<jim_style::ThemeChanged>,
     mut events: MessageReader<ClaudeBusEvent>,
     mut widgets: Query<(&PaneKindMarker, &PaneRect, &mut ScriptWidget)>,
@@ -1282,6 +1483,15 @@ fn forward_inputs_to_workers(
             });
         }
         w.last_size = content_size;
+
+        // Push the host's measured monospace metrics so the worker's
+        // `measure_text`/`char_width` are exact (cheap; only writes on change).
+        if let Ok(mut fm) = w.handle.slots.font_metrics.lock() {
+            let want = (metrics.cell_width, metrics.font_size);
+            if *fm != want {
+                *fm = want;
+            }
+        }
 
         if theme_changed {
             w.handle.send(HostToWorker::Rerender);
@@ -1422,7 +1632,7 @@ fn apply_latest_frames(
             // Absolute-positioned sprite tree: garden + similar
             // visualizers. Diffs against sprite_entities for cheap
             // per-frame mutation.
-            Element::Canvas { children } => {
+            Element::Canvas { children, .. } => {
                 // Canvas widgets draw absolutely, so the host can't infer
                 // their height for scrolling. Derive it from the items'
                 // lowest extent and set the scroll bound, so a tall canvas
@@ -1474,7 +1684,9 @@ fn apply_latest_frames(
                 // allow but might in the future).
                 if let Ok(children) = children_q.get(chrome.content_root) {
                     for c in children.iter() {
-                        if !w.sprite_entities.values().any(|e| *e == c) {
+                        if !w.sprite_entities.values().any(|e| *e == c)
+                            && !w.editor_portals.values().any(|p| p.container == c)
+                        {
                             // `try_despawn`: a concurrent pane teardown
                             // (recursive despawn) may have already removed
                             // this child before our buffer applies. See the
@@ -1516,6 +1728,8 @@ fn apply_latest_frames(
                 targets.popovers.clear();
                 targets.toasts.clear();
                 targets.anims.clear();
+                targets.editor_portals.clear();
+                targets.canvas_regions.clear();
                 let consumed = crate::render::render(
                     &mut commands,
                     &ctx,
@@ -1526,6 +1740,31 @@ fn apply_latest_frames(
                     0.0,
                 );
                 anim_store.apply_requests(entity, &targets.anims);
+                reconcile_editor_portals(
+                    &mut commands,
+                    &mut w.editor_portals,
+                    &targets.editor_portals,
+                    chrome.content_root,
+                    &theme,
+                );
+                // Nested Canvas regions: draw their items at the laid-out
+                // box origin, here where the image assets are in scope.
+                // These spawn as ordinary flow children (torn down on the
+                // next re-render), so a mixed widget — real buttons/inputs
+                // plus a custom-drawn canvas — works in one frame.
+                for region in &targets.canvas_regions {
+                    crate::render_canvas_items(
+                        &mut commands,
+                        &mut images,
+                        &mut image_cache,
+                        chrome.content_root,
+                        &region.items,
+                        region.rect.min,
+                        region.z + 0.005,
+                        &pane_font.0,
+                        &fonts,
+                    );
+                }
                 // Update scroll bounds based on what the render
                 // actually consumed. Clamp current scroll to new max
                 // so resizing the pane shorter doesn't strand the
@@ -1546,6 +1785,134 @@ fn apply_latest_frames(
     // frame instead of waiting for the next unrelated wake.
     if deferred {
         crate::request_main_loop_wakeup();
+    }
+}
+
+/// Spawn / reposition / despawn live editor portals after a flow render.
+/// Each `Element::Editor` recorded in `targets` becomes (or stays) a
+/// persistent `jim-editor` child of `content_root` that the per-frame
+/// teardown skips (it's tracked in `portals`). Runs every re-render so the
+/// portal tracks the element's layout box.
+fn reconcile_editor_portals(
+    commands: &mut Commands,
+    portals: &mut HashMap<String, EditorPortalEntry>,
+    targets: &[crate::EditorPortalTarget],
+    content_root: Entity,
+    theme: &jim_style::Theme,
+) {
+    let caret_color = Color::LinearRgba(theme.color(jim_style::tokens::CARET));
+    let mut seen: HashSet<String> = HashSet::with_capacity(targets.len());
+    for t in targets {
+        seen.insert(t.id.clone());
+        let size = t.rect.size();
+        // content-local (y-down, top-left) → Bevy (y-up). Editor children
+        // anchor top-left and grow downward from this origin.
+        let pos = Transform::from_xyz(t.rect.min.x, -t.rect.min.y, t.z + 0.001);
+        match portals.get_mut(&t.id) {
+            Some(entry) => {
+                let container = entry.container;
+                commands.entity(container).insert(pos);
+                // Keep the editor viewport sized to the (possibly resized) box.
+                commands.queue(move |world: &mut World| {
+                    if let Some(mut v) = world.get_mut::<jim_editor::EditorView>(container) {
+                        v.size = size;
+                    }
+                });
+                // Script-driven resync (value-backed only): if the script
+                // changed `value`, push it into the live buffer.
+                if t.path.is_none() && t.value != entry.last_value {
+                    entry.last_value = t.value.clone();
+                    let new_text = t.value.clone();
+                    commands.queue(move |world: &mut World| {
+                        // Full safe swap: text + caret + scroll + drop the
+                        // stale wrap layout (a shorter new buffer would
+                        // otherwise panic-index the old line map).
+                        jim_editor::resync_embedded_editor(world, container, &new_text);
+                    });
+                }
+            }
+            None => {
+                let initial = if let Some(path) = &t.path {
+                    std::fs::read_to_string(path).unwrap_or_default()
+                } else {
+                    t.value.clone()
+                };
+                let container = jim_editor::spawn_embedded_editor(
+                    commands,
+                    content_root,
+                    jim_editor::EmbeddedEditorConfig {
+                        text: initial.clone(),
+                        path: t.path.clone().map(std::path::PathBuf::from),
+                        lang: t.lang.clone(),
+                        size,
+                        caret_color,
+                        read_only: t.read_only,
+                    },
+                );
+                commands.entity(container).insert(pos);
+                portals.insert(
+                    t.id.clone(),
+                    EditorPortalEntry {
+                        container,
+                        last_value: initial,
+                        path: t.path.clone(),
+                    },
+                );
+            }
+        }
+    }
+    portals.retain(|id, entry| {
+        if seen.contains(id) {
+            true
+        } else {
+            commands.entity(entry.container).try_despawn();
+            false
+        }
+    });
+}
+
+/// Forward live edits from each editor portal back to its widget's script
+/// as `on_editor_change(id, value)`. Diffs the buffer text against the
+/// last-agreed value, so cursor-only moves don't fire and a script-driven
+/// resync doesn't echo back.
+pub(crate) fn forward_editor_portal_changes(
+    mut widgets: Query<&mut ScriptWidget>,
+    state_q: Query<&jim_editor::EditorStateComp>,
+) {
+    for mut w in &mut widgets {
+        let mut to_send: Vec<(String, String)> = Vec::new();
+        for (id, entry) in w.editor_portals.iter_mut() {
+            if let Ok(sc) = state_q.get(entry.container) {
+                let text = sc.0.doc.to_string();
+                if text != entry.last_value {
+                    entry.last_value = text.clone();
+                    to_send.push((id.clone(), text));
+                }
+            }
+        }
+        for (id, value) in to_send {
+            w.send_editor_change(id, value);
+        }
+    }
+}
+
+/// Forward an editor-portal submit chord (Cmd/Ctrl+Enter) to the owning
+/// widget's script as `on_editor_submit(id, selection, full)`.
+pub(crate) fn forward_editor_portal_submits(
+    mut submits: MessageReader<jim_editor::EmbeddedEditorSubmit>,
+    widgets: Query<&ScriptWidget>,
+) {
+    for ev in submits.read() {
+        for w in &widgets {
+            if let Some((id, _)) = w
+                .editor_portals
+                .iter()
+                .find(|(_, e)| e.container == ev.editor)
+            {
+                w.send_editor_submit(id.clone(), ev.selection.clone(), ev.full.clone());
+                break;
+            }
+        }
     }
 }
 

@@ -1,0 +1,26 @@
+[package]
+name = "jim_lsp"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+# Headless rust-analyzer sidecar. Deliberately dylib-free (no libghostty /
+# Bevy / GUI deps) so the daemon binary deploys on its own and so `jimctl`
+# can depend on the protocol types without dragging in the editor's dynamic
+# link surface — same rationale as `jim_daemon`. The daemon owns ONE
+# rust-analyzer child per workspace root and serves structural queries
+# (document symbols, source slices, references, …) over a Unix socket.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+notify-debouncer-full = "0.6"
+
+[lib]
+name = "jim_lsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jim-lsp"
+path = "src/bin/jim-lsp.rs"

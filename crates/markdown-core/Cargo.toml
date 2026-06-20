@@ -1,0 +1,15 @@
+[package]
+name = "markdown_core"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+name = "markdown_core"
+path = "src/lib.rs"
+
+# Pure model crate: no Bevy, no rendering. Parses a markdown document
+# into blocks / render-lines / styled runs with exact source char-offset
+# coverage, so a WYSIWYG editor can map every caret position back to the
+# rendered glyphs. See `crates/jim-editor/src/markdown` for the renderer.
+[dependencies]

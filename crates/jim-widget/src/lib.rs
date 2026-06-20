@@ -54,6 +54,7 @@ use jim_pane::{
 use serde_json::Value;
 
 pub mod anim;
+pub mod audio;
 pub mod button_material;
 pub mod funct_widget;
 pub mod glaze_material;
@@ -65,6 +66,7 @@ pub mod render;
 pub mod script_widget;
 pub mod subprocess;
 pub mod syntax;
+pub mod system_font;
 pub mod text_fallback;
 
 pub use msgbus::{BusMessageObserved, PendingMsg, WidgetMsgBus};
@@ -221,6 +223,40 @@ pub struct WidgetTargets {
     /// plus built-in component defaults). Synced into [`anim::WidgetAnim`]
     /// after the render so state changes tween instead of snapping.
     pub anims: Vec<anim::AnimRequest>,
+    /// `Element::Editor` portals collected this frame: id + the
+    /// Taffy-computed box. Reconciled after render into persistent live
+    /// editor child-entities (see `reconcile_editor_portals`).
+    pub editor_portals: Vec<EditorPortalTarget>,
+    /// Nested `Element::Canvas` regions collected this frame: the
+    /// Taffy-computed box + the items to draw. Rendered after the flow
+    /// walk by the caller (which has the image assets the flow renderer
+    /// lacks) via [`render_canvas_items`], offset to the box origin.
+    pub canvas_regions: Vec<CanvasRegionTarget>,
+}
+
+/// A nested `Element::Canvas` occurrence collected during a flow render.
+/// `rect` is the canvas box in content_root-local space (y-down,
+/// top-left origin); `items` draw relative to `rect.min`.
+#[derive(Clone, Debug)]
+pub struct CanvasRegionTarget {
+    pub rect: Rect,
+    /// Base z for the canvas subtree (the element's render depth).
+    pub z: f32,
+    pub items: Vec<CanvasItem>,
+}
+
+/// An `Element::Editor` occurrence collected during render. `rect` is the
+/// element box in content_root-local space (y-down, top-left origin).
+#[derive(Clone, Debug)]
+pub struct EditorPortalTarget {
+    pub id: String,
+    pub rect: Rect,
+    pub value: String,
+    pub path: Option<String>,
+    pub lang: Option<String>,
+    pub read_only: bool,
+    /// Base z for the portal subtree (the element's render depth).
+    pub z: f32,
 }
 
 /// A draggable `Element::Slider` hit-region collected during render. `rect` is
@@ -2140,7 +2176,8 @@ pub struct WidgetPlugin;
 
 impl Plugin for WidgetPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<WidgetClipDirty>()
+        app.init_non_send_resource::<system_font::SystemFontSource>()
+            .init_resource::<WidgetClipDirty>()
             .init_resource::<WidgetImageCache>()
             .init_resource::<WidgetOverlayLayer>()
             .init_resource::<WidgetOpenSelect>()
@@ -2194,7 +2231,7 @@ impl Plugin for WidgetPlugin {
                     copy_text_selection,
                     handle_widget_input_typing,
                     poll_widget_children,
-                    handle_widget_wheel,
+                    (handle_widget_wheel, forward_pinch_to_widgets).chain(),
                     apply_widget_scroll,
                     update_widget_hot_zones,
                 )
@@ -2263,6 +2300,7 @@ fn update_widget_hover(
     });
 
     let mut want_pointer = false;
+    let mut want_text = false;
     for (pane, kind, mut hover, render_state, sw, scroll) in &mut widgets {
         let is_widget_kind = kind.0 == PANE_KIND || kind.0 == script_widget::PANE_KIND;
         if !is_widget_kind {
@@ -2278,6 +2316,14 @@ fn update_widget_hover(
                 // offset to the cursor so hover matches the visible target —
                 // same correction the press handler applies.
                 let local = jim_pane::pt_to_content_local(pt, &rect) + Vec2::new(0.0, scroll_y);
+                if let Ok(t) = targets.get(pane) {
+                    // An I-beam over an embedded editor portal. Presses there
+                    // are owned by the real editor (not a click target), so the
+                    // portal rect is checked separately from `clicks`.
+                    if t.editor_portals.iter().any(|p| p.rect.contains(local)) {
+                        want_text = true;
+                    }
+                }
                 targets.get(pane).ok().and_then(|t| {
                     t.clicks
                         .iter()
@@ -2301,7 +2347,13 @@ fn update_widget_hover(
         }
     }
     use bevy::window::{CursorIcon, SystemCursorIcon};
-    if want_pointer {
+    // Text (I-beam) wins over Pointer when hovering an editor portal, even if
+    // a clickable also overlaps — the editor owns the text region.
+    if want_text {
+        commands
+            .entity(win_entity)
+            .insert(CursorIcon::System(SystemCursorIcon::Text));
+    } else if want_pointer {
         commands
             .entity(win_entity)
             .insert(CursorIcon::System(SystemCursorIcon::Pointer));
@@ -2309,6 +2361,51 @@ fn update_widget_hover(
     // Note: we don't clear the cursor here on no-hover; the pane-bevy
     // `update_pane_cursor` system already restores the default cursor
     // when nothing else owns it.
+}
+
+/// Forward a trackpad pinch over a funct widget that defines `on_pinch`
+/// to its worker as `on_pinch(local_x, local_y, delta)`. The pane carries
+/// the `PaneCapturesPinch` marker (synced from `wants_pinch`), so the
+/// canvas already declines to zoom when the cursor is over it — here we
+/// hand the gesture to the widget instead (e.g. the waveform strip zooms).
+fn forward_pinch_to_widgets(
+    mut pinch: MessageReader<bevy::input::gestures::PinchGesture>,
+    windows: Query<&Window>,
+    viewport: Res<jim_pane::PaneViewport>,
+    all_panes: Query<(Entity, &jim_pane::PaneRect, Option<&Visibility>), With<jim_pane::PaneTag>>,
+    widgets: Query<
+        (&jim_pane::PaneRect, &crate::script_widget::ScriptWidget),
+        With<jim_pane::PaneTag>,
+    >,
+) {
+    let mut total = 0.0_f32;
+    for ev in pinch.read() {
+        total += ev.0;
+    }
+    if total == 0.0 {
+        return;
+    }
+    let Ok(win) = windows.single() else { return };
+    let Some(pt) = win.cursor_position() else { return };
+    let candidates: Vec<(Entity, jim_pane::PaneRect)> = all_panes
+        .iter()
+        .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
+        .map(|(e, r, _)| (e, *r))
+        .collect();
+    let canvas_pt = viewport.window_to_canvas(pt);
+    let Some(target) = jim_pane::topmost_pane_at(canvas_pt, &candidates) else {
+        return;
+    };
+    // Only forward to a funct/script widget (the waveform's on_pinch); the
+    // waveform strip is at a fixed (unscrolled) content y, so no scroll add.
+    if let Ok((rect, sw)) = widgets.get(target) {
+        let local = jim_pane::pt_to_content_local(canvas_pt, rect);
+        sw.handle.send(crate::script_widget::HostToWorker::Pinch {
+            local_x: local.x,
+            local_y: local.y,
+            delta: total,
+        });
+    }
 }
 
 /// Read mouse wheel events, route to whichever widget pane (any kind:
@@ -2322,8 +2419,16 @@ fn handle_widget_wheel(
     keys: Res<ButtonInput<KeyCode>>,
     viewport: Res<jim_pane::PaneViewport>,
     all_panes: Query<(Entity, &jim_pane::PaneRect, Option<&Visibility>), With<jim_pane::PaneTag>>,
+    mut portal_scroll_w: MessageWriter<jim_editor::EmbeddedEditorScroll>,
     mut widgets: Query<
-        (Entity, &mut WidgetScroll, &jim_pane::PaneKindMarker),
+        (
+            Entity,
+            &mut WidgetScroll,
+            &jim_pane::PaneKindMarker,
+            &jim_pane::PaneRect,
+            Option<&WidgetTargets>,
+            Option<&crate::script_widget::ScriptWidget>,
+        ),
         With<jim_pane::PaneTag>,
     >,
 ) {
@@ -2335,14 +2440,16 @@ fn handle_widget_wheel(
     use bevy::input::mouse::MouseScrollUnit;
     const LINE_PX: f32 = 16.0;
     let mut dy_px = 0.0_f32;
+    let mut dx_px = 0.0_f32;
     for ev in wheel.read() {
-        let uy = match ev.unit {
-            MouseScrollUnit::Pixel => ev.y,
-            MouseScrollUnit::Line => ev.y * LINE_PX,
+        let scale = match ev.unit {
+            MouseScrollUnit::Pixel => 1.0,
+            MouseScrollUnit::Line => LINE_PX,
         };
-        dy_px += uy;
+        dy_px += ev.y * scale;
+        dx_px += ev.x * scale;
     }
-    if dy_px == 0.0 {
+    if dy_px == 0.0 && dx_px == 0.0 {
         return;
     }
     let Ok(win) = windows.single() else { return };
@@ -2363,9 +2470,42 @@ fn handle_widget_wheel(
         return;
     };
 
-    if let Ok((_, mut scroll, kind)) = widgets.get_mut(target) {
+    if let Ok((_, mut scroll, kind, rect, targets, sw)) = widgets.get_mut(target) {
         if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             return;
+        }
+        // If the cursor is over a live editor portal, the wheel scrolls the
+        // editor's own (overflowing) content — not the widget page. Critical
+        // for a read-only dump, which has no caret to drive caret-scroll.
+        let canvas_pt = viewport.window_to_canvas(pt);
+        let doc_pt = jim_pane::pt_to_content_local(canvas_pt, rect) + Vec2::new(0.0, scroll.y);
+        if let (Some(targets), Some(sw)) = (targets, sw) {
+            if let Some(t) = targets
+                .editor_portals
+                .iter()
+                .find(|t| t.rect.contains(doc_pt))
+            {
+                if let Some(entry) = sw.editor_portals.get(&t.id) {
+                    portal_scroll_w.write(jim_editor::EmbeddedEditorScroll {
+                        editor: entry.container,
+                        dy: dy_px,
+                    });
+                    return;
+                }
+            }
+        }
+        // Give a funct widget first crack at the wheel with the cursor's
+        // content-local position, so it can scroll an internal region (e.g.
+        // a sidebar list) under the cursor. Fit-to-pane widgets have
+        // `max_y == 0`, so the pane-scroll below is then a no-op and the two
+        // don't fight. Only delivered to widgets defining `on_wheel`.
+        if let Some(sw) = sw {
+            sw.handle.send(crate::script_widget::HostToWorker::Wheel {
+                local_x: doc_pt.x,
+                local_y: doc_pt.y,
+                dx: dx_px,
+                dy: dy_px,
+            });
         }
         let new_y = (scroll.y - dy_px).clamp(0.0, scroll.max_y);
         if (new_y - scroll.y).abs() > 0.001 {
@@ -3096,6 +3236,7 @@ fn rerender_widgets(
         targets.popovers.clear();
         targets.toasts.clear();
         targets.anims.clear();
+        targets.canvas_regions.clear();
 
         let frame_clone = render_state.current_frame.clone().unwrap();
 
@@ -3103,14 +3244,15 @@ fn rerender_widgets(
         // entirely — they're absolute-positioned sprite trees, not flow
         // layouts, so trying to measure them through the same pipeline
         // is just wasted work.
-        if let Element::Canvas { children } = &frame_clone {
+        if let Element::Canvas { children, .. } = &frame_clone {
             render_canvas_items(
                 &mut commands,
                 &mut images,
                 &mut image_cache,
                 root.0,
                 children,
-                content_size,
+                Vec2::ZERO,
+                0.0,
                 &pane_font.0,
                 &fonts,
             );
@@ -3139,6 +3281,23 @@ fn rerender_widgets(
                 0.0,
             );
             anim_store.apply_requests(pane, &targets.anims);
+            // Nested Canvas regions: drawn after the flow walk, here where
+            // the image assets live. Items spawn fresh each frame as flow
+            // children (torn down on the next re-render), offset to the
+            // canvas box and lifted just above its background.
+            for region in &targets.canvas_regions {
+                render_canvas_items(
+                    &mut commands,
+                    &mut images,
+                    &mut image_cache,
+                    root.0,
+                    &region.items,
+                    region.rect.min,
+                    region.z + 0.005,
+                    &pane_font.0,
+                    &fonts,
+                );
+            }
             let new_max = (consumed.y - content_size.y).max(0.0);
             if (scroll.max_y - new_max).abs() > 0.1 {
                 scroll.max_y = new_max;
@@ -3160,13 +3319,21 @@ fn rerender_widgets(
 /// Coordinate convention: y grows downward (top-left origin), matching
 /// the `Resize` width/height the widget already sees. Internally we
 /// flip to Bevy's y-up before assigning Transform.
-fn render_canvas_items(
+///
+/// `origin` shifts every item's position (content-local, y-down); `z_base`
+/// is added to each item's z. A top-level canvas passes `Vec2::ZERO` /
+/// `0.0`; a nested canvas passes its laid-out box top-left and render
+/// depth so its drawing lands inside the flex box and above its
+/// background.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_canvas_items(
     commands: &mut Commands,
     images: &mut Assets<Image>,
     cache: &mut WidgetImageCache,
     content_root: Entity,
     items: &[CanvasItem],
-    _content_size: Vec2,
+    origin: Vec2,
+    z_base: f32,
     default_font: &Handle<Font>,
     fonts: &jim_style::FontRegistry,
 ) {
@@ -3195,7 +3362,7 @@ fn render_canvas_items(
                         ..default()
                     },
                     anchor_cmp,
-                    Transform::from_xyz(*x, -*y, *z),
+                    Transform::from_xyz(origin.x + *x, -(origin.y + *y), z_base + *z),
                     Visibility::Inherited,
                 ));
             }
@@ -3212,7 +3379,8 @@ fn render_canvas_items(
             } => {
                 let bevy_color = parse_canvas_color(color).unwrap_or(Color::srgb(0.20, 0.22, 0.26));
                 let anchor_cmp = canvas_anchor_to_bevy(*anchor);
-                let mut transform = Transform::from_xyz(*x, -*y, *z);
+                let mut transform =
+                    Transform::from_xyz(origin.x + *x, -(origin.y + *y), z_base + *z);
                 if *rotation != 0.0 {
                     transform.rotation = Quat::from_rotation_z(-rotation.to_radians());
                 }
@@ -3260,7 +3428,7 @@ fn render_canvas_items(
                     TextColor(col),
                     anchor_cmp,
                     bevy::text::TextLayout::new_with_no_wrap(),
-                    Transform::from_xyz(*x, -*y, *z),
+                    Transform::from_xyz(origin.x + *x, -(origin.y + *y), z_base + *z),
                     Visibility::Inherited,
                 ));
             }

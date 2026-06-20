@@ -75,7 +75,15 @@ fn shrink_payload(mut payload: Value, headroom: usize) -> Value {
                 && let Some(s) = v.as_str()
                 && s.len() > 256
             {
-                *v = Value::String(format!("{}…[truncated]", &s[..256]));
+                // Byte 256 may fall inside a multi-byte UTF-8 character (em
+                // dash, emoji, accented char, …); slicing there panics with
+                // "byte index N is not a char boundary". Back up to the nearest
+                // char boundary at or below 256.
+                let mut end = 256;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                *v = Value::String(format!("{}…[truncated]", &s[..end]));
             }
         }
     }

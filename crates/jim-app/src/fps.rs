@@ -30,7 +30,11 @@ use bevy::input::keyboard::KeyboardInput;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
-use jim_pane::prof;
+use bevy::ecs::hierarchy::ChildOf;
+use bevy::ecs::lifecycle::{Add, Remove};
+use bevy::ecs::observer::On;
+
+use jim_pane::{churn, prof, trace};
 use jim_pane::{PaneProject, PaneTitle};
 
 use crate::projects::Projects;
@@ -118,9 +122,40 @@ impl Plugin for FpsOverlayPlugin {
             order.insert_after(PostUpdate, ProfMark(3)); // closes PostUpdate
             order.insert_after(Last, ProfMark(4)); // closes Last
         }
+        // `JIMTRACE=1` arms the rich per-span trace recorder at startup
+        // (otherwise it's off until Cmd+Shift+G). When armed, a frame whose
+        // app-work exceeds the threshold dumps that frame's full span tree to
+        // `~/.jim/traces/`.
+        if std::env::var("JIMTRACE").is_ok() {
+            trace::set_enabled(true);
+        }
+        app.add_systems(Update, toggle_trace);
+        // Capture runs at end of frame, after the per-span guards have all
+        // dropped (they record on drop), so the ring holds this frame's spans.
+        app.add_systems(Last, capture_slow_frame.after(collect_profile));
+
+        // Entity-churn meter: one tick per parented entity spawned/despawned.
+        // The cost of applying a big spawn/despawn batch lands at a sync point
+        // between systems — inside a stage but inside no span — so without this
+        // a rebuild-from-scratch widget reads as "Update 86ms, all spans 0ms".
+        // Every parented entity has exactly one `ChildOf`, so these count
+        // entities, and both bail on a relaxed load when no profiler is on.
+        app.add_observer(|_: On<Add, ChildOf>| churn::note_spawn());
+        app.add_observer(|_: On<Remove, ChildOf>| churn::note_despawn());
+
         app.add_systems(ProfMark(255), |mut c: ResMut<StageClock>| {
-            if prof::enabled() {
+            if prof::enabled() || trace::enabled() {
                 c.prev = Some(Instant::now());
+            }
+            // Open a new trace frame before any span of this frame is taken,
+            // so every span this frame shares one frame id.
+            if trace::enabled() {
+                trace::begin_frame();
+            }
+            // Zero the churn counters at the very top of the frame so the
+            // end-of-frame read is exactly this frame's spawn/despawn count.
+            if prof::enabled() || trace::enabled() {
+                churn::reset();
             }
         });
         for idx in 0..STAGE_NAMES.len() {
@@ -183,7 +218,9 @@ struct StageClock {
 /// Boundary marker `idx` closes stage `idx` (0-based into `dur_ms`) and
 /// opens the next. Marker `usize::MAX` is the pre-`First` reset.
 fn stage_record(clock: &mut StageClock, idx: usize) {
-    if !prof::enabled() {
+    // Stage timing feeds both the overlay (prof) and the trace dump, so run
+    // it whenever either is active.
+    if !prof::enabled() && !trace::enabled() {
         return;
     }
     let now = Instant::now();
@@ -207,6 +244,9 @@ struct FrameProfileReadout {
     data: Option<prof::FrameData>,
     frame_ms: f32,
     active_ms: f32,
+    /// Entities (spawned, despawned) this frame — the deferred-command churn
+    /// that the per-span timing can't see.
+    churn: (u64, u64),
 }
 
 /// End-of-frame: pull the accumulated spans (which resets the global
@@ -224,7 +264,206 @@ fn collect_profile(
             .start
             .map(|s| s.elapsed().as_secs_f32() * 1000.0)
             .unwrap_or(0.0);
+        // Churn is still this frame's count here in `Last`; it's only zeroed at
+        // the next frame's pre-`First` marker.
+        readout.churn = churn::snapshot();
     }
+}
+
+// ================= rich span trace capture =================
+//
+// `prof` (above) AGGREGATES each frame into per-pane/subsystem totals — good
+// for "what's expensive on average", useless for "what happened during that
+// ONE 90ms frame". `jim_pane::trace` keeps every individual span in a ring
+// buffer; when a frame's app-work crosses a threshold we copy that frame's
+// spans out of the ring and write the full nested timeline to disk for later
+// inspection. Toggle with Cmd+Shift+G or arm at startup with `JIMTRACE=1`.
+
+/// App-work (First→Last) over this many ms triggers a dump. We threshold on
+/// ACTIVE time, not total frame time, so reactive-mode idle sleeps (long
+/// frame, no work) don't trip it. Override with `JIMTRACE_MS`.
+fn trace_threshold_ms() -> f32 {
+    std::env::var("JIMTRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50.0)
+}
+
+/// Cap dumps per session so a sustained slow stretch can't carpet the disk.
+/// Override with `JIMTRACE_MAX`.
+fn trace_max_dumps() -> u32 {
+    std::env::var("JIMTRACE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+}
+
+/// Minimum wall gap between dumps, so one bad second writes one file, not 60.
+const TRACE_MIN_GAP_SECS: f64 = 0.5;
+
+/// Cmd+Shift+G toggles the trace recorder on/off.
+fn toggle_trace(
+    mut events: MessageReader<KeyboardInput>,
+    mods: Res<ButtonInput<KeyCode>>,
+    owner: Res<jim_pane::KeyboardOwner>,
+) {
+    if owner.is_modal() {
+        events.clear();
+        return;
+    }
+    let cmd = mods.pressed(KeyCode::SuperLeft) || mods.pressed(KeyCode::SuperRight);
+    let shift = mods.pressed(KeyCode::ShiftLeft) || mods.pressed(KeyCode::ShiftRight);
+    for ev in events.read() {
+        if ev.state.is_pressed() && cmd && shift && matches!(ev.key_code, KeyCode::KeyG) {
+            let on = !trace::enabled();
+            trace::set_enabled(on);
+            crate::diagnostics::append_log(&format!(
+                "[trace] capture {} (threshold {:.0}ms active)",
+                if on { "ARMED" } else { "off" },
+                trace_threshold_ms(),
+            ));
+        }
+    }
+}
+
+/// End-of-frame: if the app-work this frame crossed the threshold, copy the
+/// frame's spans out of the ring, resolve each pane Entity to a human label
+/// (must happen here, on the main thread, with the `World`), and hand the
+/// owned snapshot to a background thread that serializes + writes it — so the
+/// dump itself doesn't add to the frame we just measured.
+#[allow(clippy::too_many_arguments)]
+fn capture_slow_frame(
+    time: Res<Time<Real>>,
+    clock: Res<FrameClock>,
+    stages: Res<StageClock>,
+    titles: Query<&PaneTitle>,
+    pane_projects: Query<&PaneProject>,
+    projects: Option<Res<Projects>>,
+    mut wall: Local<f64>,
+    mut last_dump: Local<f64>,
+    mut dumps: Local<u32>,
+) {
+    *wall += time.delta_secs_f64();
+    if !trace::enabled() {
+        return;
+    }
+    let active_ms = clock
+        .start
+        .map(|s| s.elapsed().as_secs_f32() * 1000.0)
+        .unwrap_or(0.0);
+    if active_ms < trace_threshold_ms() {
+        return;
+    }
+    if *dumps >= trace_max_dumps() {
+        return;
+    }
+    if *last_dump > 0.0 && *wall - *last_dump < TRACE_MIN_GAP_SECS {
+        return;
+    }
+
+    let frame = trace::current_frame();
+    let ft = trace::collect_frame(frame);
+    if ft.spans.is_empty() {
+        return;
+    }
+    *last_dump = *wall;
+    *dumps += 1;
+
+    // Resolve labels now (needs the World); the thread only sees owned data.
+    let proj_name = |id: u64| -> String {
+        projects
+            .as_ref()
+            .and_then(|p| p.name_of(id))
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    };
+    let spans: Vec<serde_json::Value> = ft
+        .spans
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let (label, project) = if s.entity_bits != 0 {
+                let e = Entity::from_bits(s.entity_bits);
+                let title = titles
+                    .get(e)
+                    .map(|t| t.0.clone())
+                    .unwrap_or_else(|_| format!("#{}", e.index()));
+                let project = pane_projects
+                    .get(e)
+                    .map(|pp| proj_name(pp.0))
+                    .unwrap_or_default();
+                (title, project)
+            } else {
+                (String::new(), String::new())
+            };
+            serde_json::json!({
+                "i": i,
+                "thread": s.thread,
+                "depth": s.depth,
+                "category": s.category,
+                "name": s.name,
+                "entity": if s.entity_bits != 0 { Some(s.entity_bits) } else { None },
+                "label": label,
+                "project": project,
+                "start_ms": (s.start_ns.saturating_sub(ft.frame_start_ns)) as f64 / 1.0e6,
+                "dur_ms": s.dur_ns as f64 / 1.0e6,
+            })
+        })
+        .collect();
+
+    let span_count = spans.len();
+    let (churn_spawned, churn_despawned) = churn::snapshot();
+    let doc = serde_json::json!({
+        "frame": frame,
+        "active_ms": active_ms,
+        "frame_total_ms": time.delta_secs() * 1000.0,
+        // Deferred entity churn this frame — spawn/despawn batches apply at sync
+        // points between systems, so a big number next to a near-empty span list
+        // means the cost was command application (e.g. a widget rebuilding its
+        // whole flow tree), not any single instrumented system.
+        "churn": { "spawned": churn_spawned, "despawned": churn_despawned },
+        "stages": STAGE_NAMES
+            .iter()
+            .zip(stages.dur_ms.iter())
+            .map(|(n, d)| (n.to_string(), *d))
+            .collect::<std::collections::HashMap<_, _>>(),
+        "span_count": span_count,
+        "ring_capacity": trace::CAPACITY,
+        "truncated": ft.truncated,
+        "spans": spans,
+    });
+
+    crate::diagnostics::append_log(&format!(
+        "[trace] frame {} captured: {:.1}ms active, {} spans, churn +{}/-{}{} -> writing",
+        frame,
+        active_ms,
+        span_count,
+        churn_spawned,
+        churn_despawned,
+        if ft.truncated { " (TRUNCATED)" } else { "" },
+    ));
+
+    let dir = crate::data_dir().map(|d| d.join("traces"));
+    std::thread::spawn(move || {
+        let Some(dir) = dir else { return };
+        let _ = std::fs::create_dir_all(&dir);
+        let epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!(
+            "frame-{}-{:.0}ms-{}.json",
+            frame, active_ms, epoch_ms
+        ));
+        match serde_json::to_vec_pretty(&doc) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    eprintln!("[trace] write {} failed: {}", path.display(), e);
+                }
+            }
+            Err(e) => eprintln!("[trace] serialize failed: {}", e),
+        }
+    });
 }
 
 #[derive(Component)]
@@ -458,6 +697,21 @@ fn update_prof_panel(
         "  ACTIVE {:.2}ms  +  remainder {:.2}ms ({})  = {:.2}ms",
         active, remainder, rem_kind, frame_ms,
     ));
+    // Deferred entity churn — invisible to the per-span timing below. A big
+    // number here with a small panes/subsys total IS the cost of the frame.
+    let (spawned, despawned) = readout.churn;
+    if spawned + despawned > 0 {
+        lines.push(format!(
+            "  churn +{}/-{} entities{}",
+            spawned,
+            despawned,
+            if spawned + despawned >= 400 {
+                "  ← deferred spawn/despawn likely the cost"
+            } else {
+                ""
+            },
+        ));
+    }
 
     // ---- stages: the PRIMARY breakdown of active. By schedule, so it
     // covers 100% of active including the engine-internal work (transform
@@ -619,6 +873,11 @@ fn dump_profile_log(
             sys_top,
             (active - attributed).max(0.0),
             (frame_ms - active).max(0.0),
+        ));
+        let (spawned, despawned) = readout.churn;
+        crate::diagnostics::append_log(&format!(
+            "[tbprof] churn +{}/-{} entities (deferred spawn/despawn — uncateg cost)",
+            spawned, despawned,
         ));
         let proj_name = |id: u64| -> String {
             projects
@@ -882,6 +1141,9 @@ struct FrameSample {
     systop: f32,
     gpu: f32,
     cpu_pct: f32,
+    /// Entities spawned/despawned this frame (deferred command churn).
+    churn_spawned: u64,
+    churn_despawned: u64,
     top_pane_bits: u64,
     top_pane_ms: f32,
     top_pane_kind: &'static str,
@@ -993,6 +1255,8 @@ fn record_history(
         systop,
         gpu: sum_render_gpu(&diagnostics),
         cpu_pct,
+        churn_spawned: readout.churn.0,
+        churn_despawned: readout.churn.1,
         top_pane_bits: top_pane.map(|p| p.entity_bits).unwrap_or(0),
         top_pane_ms: top_pane.map(|p| ms(p.total)).unwrap_or(0.0),
         top_pane_kind: top_pane.map(|p| p.kind).unwrap_or(""),
@@ -1284,11 +1548,22 @@ fn build_detail(
         .collect::<Vec<_>>()
         .join("  ");
 
+    // A big churn next to a small panes/subsys total means the frame's cost was
+    // applying deferred spawn/despawn commands (a widget rebuilding its whole
+    // tree), which no per-span timer can see. Flag it loudly.
+    let churn = s.churn_spawned + s.churn_despawned;
+    let churn_note = if churn >= 400 {
+        "  ← heavy entity churn (deferred spawn/despawn likely the cost)"
+    } else {
+        ""
+    };
+
     format!(
         "frame {:.2}ms   cpu {:.0}%   gpu(render) {:.2}ms\n\
          ACTIVE {:.2}ms ({:.0}%)   REMAINDER {:.2}ms ({:.0}%) — {}\n\
          stages: {}\n\
-         detail: panes {:.2}ms (top {}) · subsys {:.2}ms (top {} {:.2}ms)",
+         detail: panes {:.2}ms (top {}) · subsys {:.2}ms (top {} {:.2}ms)\n\
+         churn: +{} / -{} entities{}",
         s.total,
         s.cpu_pct,
         s.gpu,
@@ -1303,6 +1578,9 @@ fn build_detail(
         s.systop,
         if s.top_sys.is_empty() { "—" } else { s.top_sys },
         s.top_sys_ms,
+        s.churn_spawned,
+        s.churn_despawned,
+        churn_note,
     )
 }
 

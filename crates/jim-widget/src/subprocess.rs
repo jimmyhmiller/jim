@@ -57,6 +57,17 @@ use std::sync::{Arc, Mutex};
 /// never read can't grow memory without bound. Oldest lines drop.
 const MAX_BUFFERED_LINES: usize = 4096;
 
+/// PATH with the running executable's directory prepended, so bare-name spawns
+/// of our sibling binaries (`jimctl`, `jim-lsp`) resolve even under the minimal
+/// PATH a Finder/AppKit-launched `.app` inherits. `None` if the exe dir can't
+/// be determined (then the child just inherits the ambient PATH).
+fn augmented_path() -> Option<std::ffi::OsString> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&current))).ok()
+}
+
 /// An event the subprocess reader thread emits to its owner. Lets a host
 /// deliver child output/exit to a script event-driven, instead of the
 /// script polling `read_line` from an animation tick. The owner installs
@@ -113,13 +124,21 @@ impl ProcRegistry {
     /// Spawn `cmd args...`. Returns a positive handle, or -1 if the
     /// process couldn't be started.
     pub fn spawn(&mut self, cmd: &str, args: &[String]) -> i64 {
-        let mut child = match Command::new(cmd)
+        let mut command = Command::new(cmd);
+        command
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        // Prepend the running executable's directory to PATH so a widget can
+        // `proc_spawn("jimctl", …)` / `proc_spawn("jim-lsp", …)` by bare name.
+        // When the GUI is launched from its `.app` by Finder/AppKit the
+        // inherited PATH is minimal and wouldn't otherwise find our sibling
+        // binaries (the same reason `agent.rs` augments PATH for `jimctl`).
+        if let Some(path) = augmented_path() {
+            command.env("PATH", path);
+        }
+        let mut child = match command.spawn() {
             Ok(c) => c,
             Err(_) => return -1,
         };

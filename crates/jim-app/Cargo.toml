@@ -11,6 +11,7 @@ jim_pane = { path = "../jim-pane" }
 jim_style = { path = "../jim-style" }
 jim_daemon = { path = "../jim-daemon" }
 jim_terminal = { path = "../jim-terminal" }
+jim_flame = { path = "../jim-flame" }
 jim_widget = { path = "../jim-widget" }
 jim_whiteboard = { path = "../jim-whiteboard" }
 whiteboard-core = { path = "../whiteboard-core" }
@@ -46,6 +47,9 @@ bevy = { version = "0.18", default-features = false, features = [
     # changes on disk. Without this, AssetServer ignores file changes
     # and the live-edit workflow doesn't work.
     "file_watcher",
+    # TEMP: un-strips system/component names in B0001 query-conflict panics
+    # so we can see which system conflicts. Remove once the conflict is fixed.
+    "debug",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

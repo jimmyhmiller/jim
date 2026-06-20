@@ -18,9 +18,11 @@ mod cmd_mcp;
 mod cmd_codex;
 mod cmd_pi;
 mod cmd_close;
+mod cmd_dock;
 mod cmd_inbox;
 mod cmd_inject;
 mod cmd_issue;
+mod cmd_lsp;
 mod cmd_memory;
 mod cmd_msg;
 mod cmd_open;
@@ -49,7 +51,9 @@ fn main() -> ExitCode {
         Some("suggest") => cmd_suggest::run(),
         Some("msg") => cmd_msg::run(),
         Some("close") => cmd_close::run(),
+        Some("dock") => cmd_dock::run(),
         Some("issue") => cmd_issue::run(),
+        Some("lsp") => cmd_lsp::run(),
         Some("memory") => cmd_memory::run(),
         Some("inject") => cmd_inject::run(),
         Some(other) => {
@@ -81,7 +85,9 @@ fn usage() {
          \tsuggest ...                    park a pane in the suggestion drawer\n\
          \tmsg <topic> <body>             publish on the widget message bus\n\
          \tclose ...                      close a pane\n\
+         \tdock --project P [--title T ...]  snap panes into a dock (sidebar+main)\n\
          \tissue ...                      issue-tracker operations\n\
+         \tlsp ...                        structural code queries via rust-analyzer (ensure/symbols/source/rpc)\n\
          \tmemory ...                     manage the DeepSeek planner's memory\n\
          \tinject ...                     send keystrokes into a session"
     );

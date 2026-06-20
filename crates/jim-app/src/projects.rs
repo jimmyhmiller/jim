@@ -503,6 +503,10 @@ pub struct PendingActions {
     /// `None` kind closes every pane in the project. Resolved to pane
     /// entities in `apply_pending_actions` (needs a world query).
     pub close_panes: Vec<(u64, Option<String>, Option<Vec<String>>)>,
+    /// Dock requests from `jimctl dock`: `(project_id, titles, template)`.
+    /// Empty `titles` docks every free top-level pane in the project.
+    /// Resolved to entities + framed into a dock in `apply_pending_actions`.
+    pub dock_panes: Vec<(u64, Vec<String>, Option<String>)>,
 }
 
 /// Request to spawn one new pane of a given kind.
@@ -744,6 +748,8 @@ fn load_or_seed_projects(
             z: legacy.z,
             config: serde_json::json!({ "session_id": legacy.session_id }),
             pinned: false,
+            dock_group: None,
+            dock_slot: 0,
         });
     }
 
@@ -1507,6 +1513,56 @@ fn apply_pending_actions(world: &mut World) {
         }
     }
 
+    // `jimctl dock` requests: frame existing panes into a new dock. Pick
+    // the members (by title order, or all free panes when no titles), then
+    // hand them to `create_dock` (the same path the snap gesture builds).
+    for (project_id, titles, template) in actions.dock_panes {
+        let rows: Vec<(Entity, String, bool)> = {
+            // (entity, title, free?) for panes in this project. "free" =
+            // a real top-level pane, not a dock/member/pinned one.
+            let mut q = world.query::<(
+                Entity,
+                &PaneProject,
+                &jim_pane::PaneTitle,
+                Has<jim_pane::Dock>,
+                Has<jim_pane::DockMember>,
+                Has<PanePinned>,
+            )>();
+            q.iter(world)
+                .filter(|(_, m, _, _, _, _)| m.0 == project_id)
+                .map(|(e, _, t, d, mem, pin)| (e, t.0.clone(), !d && !mem && !pin))
+                .collect()
+        };
+        let members: Vec<Entity> = if titles.is_empty() {
+            rows.iter().filter(|(_, _, free)| *free).map(|(e, _, _)| *e).collect()
+        } else {
+            let mut picked: Vec<Entity> = Vec::new();
+            for want in &titles {
+                if let Some((e, _, _)) = rows
+                    .iter()
+                    .find(|(e, t, free)| *free && t == want && !picked.contains(e))
+                {
+                    picked.push(*e);
+                }
+            }
+            picked
+        };
+        if members.len() >= 2 {
+            let tmpl = template
+                .as_deref()
+                .and_then(jim_pane::DockTemplate::from_str)
+                .unwrap_or(jim_pane::DockTemplate::Columns);
+            if jim_pane::create_dock_template(world, &members, tmpl).is_some() {
+                world.resource_mut::<Projects>().terminals_dirty = true;
+            }
+        } else {
+            eprintln!(
+                "[ipc] dock_panes: need >=2 matched free panes in project {project_id} (got {})",
+                members.len()
+            );
+        }
+    }
+
     // Spawn requested panes (radial menu, RunButton creation, etc.).
     for mut req in actions.new_panes {
         // Make the spawning project's root directory available to funct
@@ -1685,6 +1741,14 @@ fn restore_pane(world: &mut World, snap: PaneSnapshot) {
         if snap.pinned {
             world.entity_mut(e).insert(PanePinned);
         }
+        // Defer dock relinking: stamp the group id/slot so
+        // `link_restored_docks` can rebuild Dock/DockMember once every
+        // pane in the group has spawned (spawn order is unspecified).
+        if let Some(group) = snap.dock_group {
+            world
+                .entity_mut(e)
+                .insert(jim_pane::PendingDockLink { group, slot: snap.dock_slot });
+        }
     }
 }
 
@@ -1699,6 +1763,7 @@ pub(crate) fn kind_to_static(kind: &str) -> &'static str {
         "editor" => "editor",
         "run-button" => "run-button",
         "script_widget" => "script_widget",
+        "dock" => "dock",
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }
@@ -2070,6 +2135,21 @@ fn save_if_dirty(
 /// and bundle them into a Vec<PaneSnapshot>. `PaneRect` is canvas-space
 /// in the new model, so we just write its values directly.
 fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
+    // Map every docked pane (and each dock container) to its group id +
+    // slot, so membership survives a restart. Group id = the dock
+    // entity's bits; the container records itself at slot 0.
+    let dock_info: std::collections::HashMap<Entity, (u64, usize)> = {
+        let mut q = world.query::<(Entity, &jim_pane::Dock)>();
+        let mut m = std::collections::HashMap::new();
+        for (dock_e, dock) in q.iter(world) {
+            let group = dock_e.to_bits();
+            m.insert(dock_e, (group, 0usize));
+            for (i, mem) in dock.member_entities().iter().enumerate() {
+                m.insert(*mem, (group, i));
+            }
+        }
+        m
+    };
     let entries: Vec<(Entity, String, Option<u64>, PaneRect, bool)> = {
         let mut q = world.query::<(
             Entity,
@@ -2089,6 +2169,10 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
         .filter_map(|(entity, kind, project_id, rect, pinned)| {
             let snap_fn = world.resource::<PaneRegistry>().get(&kind).map(|s| s.snapshot)?;
             let config = (snap_fn)(world, entity);
+            let (dock_group, dock_slot) = dock_info
+                .get(&entity)
+                .map(|(g, s)| (Some(*g), *s))
+                .unwrap_or((None, 0));
             Some(PaneSnapshot {
                 kind,
                 project_id,
@@ -2097,6 +2181,8 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
                 z: rect.z,
                 config,
                 pinned,
+                dock_group,
+                dock_slot,
             })
         })
         .collect();

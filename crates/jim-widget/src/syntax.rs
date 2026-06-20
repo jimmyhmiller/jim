@@ -40,6 +40,9 @@ fn kind_from_capture(name: &str) -> &'static str {
         "attribute"
     } else if name.starts_with("constant") {
         "constant"
+    } else if name.starts_with("number") {
+        // JSON/most grammars tag numerals `@number`; reuse the constant color.
+        "constant"
     } else if name.starts_with("operator") {
         "operator"
     } else if name.starts_with("punctuation") {
@@ -72,6 +75,7 @@ thread_local! {
 fn canon_lang(lang: &str) -> Option<&'static str> {
     match lang.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
         "rust" | "rs" => Some("rust"),
+        "json" => Some("json"),
         _ => None,
     }
 }
@@ -84,6 +88,16 @@ fn make_lang(key: &str) -> Option<LangState> {
             let query = Query::new(
                 &tree_sitter_rust::LANGUAGE.into(),
                 tree_sitter_rust::HIGHLIGHTS_QUERY,
+            )
+            .ok()?;
+            Some(LangState { parser, query })
+        }
+        "json" => {
+            let mut parser = Parser::new();
+            parser.set_language(&tree_sitter_json::LANGUAGE.into()).ok()?;
+            let query = Query::new(
+                &tree_sitter_json::LANGUAGE.into(),
+                tree_sitter_json::HIGHLIGHTS_QUERY,
             )
             .ok()?;
             Some(LangState { parser, query })

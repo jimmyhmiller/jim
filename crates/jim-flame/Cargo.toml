@@ -1,0 +1,40 @@
+[package]
+name = "jim_flame"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+jim_pane = { path = "../jim-pane" }
+# Widget bus: the recorder's control UI is a funct widget that drives the
+# native recorder over the bus (BusMessageObserved in, status out).
+jim_widget = { path = "../jim-widget" }
+
+# The generic Bevy embedding of the flame-graph renderer (offscreen wgpu 29
+# render → CPU readback → bevy::Image). jim-flame is the jim-specific pane
+# integration on top: registration, spawn/snapshot/close, (later) pane-event
+# input routing, theming, and bus control.
+flame-bevy = { path = "../flame-bevy" }
+flame-core = { path = "../flame-core" }
+
+# Trace-format readers. Independently selectable; add more as sources land.
+flame-format-chrome = { path = "../flame-format-chrome" }
+flame-format-folded = { path = "../flame-format-folded" }
+flame-format-speedscope = { path = "../flame-format-speedscope" }
+flame-format-firefox = { path = "../flame-format-firefox" }
+# jim-editor's own ~/.jim/traces/*.json frame dumps.
+flame-format-jimtrace = { path = "../flame-format-jimtrace" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+bevy = { version = "0.18", default-features = false, features = [
+    "2d",
+    "3d",
+    "x11",
+    "wayland",
+] }
+
+[lib]
+name = "jim_flame"
+path = "src/lib.rs"
