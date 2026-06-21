@@ -194,6 +194,14 @@ pub struct WidgetRender {
 #[derive(Component, Default, Debug, Clone)]
 pub struct WidgetHover {
     pub click_id: Option<String>,
+    /// Persistent hover-wash overlay entity (a rounded panel parented under
+    /// the pane's `content_root`). The host repositions/despawns it directly
+    /// as the cursor moves between list rows — WITHOUT re-rendering the pane —
+    /// so the affordance no longer tears down and respawns the whole flow
+    /// tree on every hover change. That full re-render is what made text
+    /// visibly flash as the mouse moved over list-heavy widgets (the podcast
+    /// editor, diff sidebar, file pickers). See [`update_widget_hover`].
+    pub hover_overlay: Option<Entity>,
 }
 
 /// Hit-test geometry collected while rendering the current frame.
@@ -232,6 +240,31 @@ pub struct WidgetTargets {
     /// walk by the caller (which has the image assets the flow renderer
     /// lacks) via [`render_canvas_items`], offset to the box origin.
     pub canvas_regions: Vec<CanvasRegionTarget>,
+    /// List-item hover-wash candidates collected this frame (one per
+    /// `Element::ListItem`). The host paints a soft neutral panel over the
+    /// hovered one as a persistent overlay (see [`update_widget_hover`])
+    /// instead of re-rendering the whole pane on hover — re-rendering made
+    /// text flash as the cursor moved between rows.
+    pub hover_washes: Vec<HoverWash>,
+}
+
+/// A list-item hover-wash region collected during render. The wash is the
+/// soft neutral row-highlight that signals a list row is clickable. It is
+/// drawn lazily by the host as a single overlay sprite that follows the
+/// cursor, so moving the mouse over a list no longer forces a full,
+/// text-flashing re-render. `rect`/`z` are content_root-local (y-down).
+#[derive(Clone, Debug)]
+pub struct HoverWash {
+    pub id: String,
+    pub rect: Rect,
+    /// Base z of the list-item; the wash paints just above it (`z + 0.001`),
+    /// behind the row's text.
+    pub z: f32,
+    /// Pre-resolved wash color (theme `surface_3` at low alpha), captured
+    /// here so the host needn't re-resolve the theme to paint the overlay.
+    pub color: Color,
+    /// Pre-resolved corner radius (theme `radius_sm`).
+    pub radius: f32,
 }
 
 /// A nested `Element::Canvas` occurrence collected during a flow render.
@@ -2279,7 +2312,12 @@ fn update_widget_hover(
         ),
         With<jim_pane::PaneTag>,
     >,
+    // Hover-wash overlay needs each pane's content_root + render layer so it
+    // can parent and layer the overlay sprite correctly.
+    chromes: Query<&jim_pane::PaneChrome>,
+    pane_layers: Query<&jim_pane::PaneLayer>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("update_widget_hover");
     let Ok((win_entity, window)) = windows.single() else {
         return;
     };
@@ -2337,12 +2375,70 @@ fn update_widget_hover(
             want_pointer = true;
         }
         if hover.click_id != new_id {
-            hover.click_id = new_id;
-            if let Some(mut rs) = render_state {
-                rs.force_render = true;
+            let old_id = hover.click_id.take();
+            hover.click_id = new_id.clone();
+
+            let pane_targets = targets.get(pane).ok();
+            // A list row only needs a soft wash, which the host paints as a
+            // standalone overlay — no re-render. Any OTHER clickable (a real
+            // Button) changes its own appearance on hover, so it must
+            // re-render. We re-render only when a non-wash clickable is the
+            // one being entered or left; pure row-to-row hover (the podcast
+            // sidebar, diff/file lists) skips the re-render that used to flash
+            // the pane's text.
+            let is_wash = |id: &str| -> bool {
+                pane_targets
+                    .map(|t| t.hover_washes.iter().any(|w| w.id == id))
+                    .unwrap_or(false)
+            };
+            let nonwash_clickable = |id: &Option<String>| -> bool {
+                matches!(id, Some(s) if !is_wash(s))
+            };
+            let needs_render = nonwash_clickable(&old_id) || nonwash_clickable(&new_id);
+
+            // Move the persistent wash overlay to the newly-hovered row (or
+            // tear it down). Despawn the previous one first; `try_despawn`
+            // since a concurrent re-render may already have removed it.
+            if let Some(prev) = hover.hover_overlay.take() {
+                commands.entity(prev).try_despawn();
             }
-            if let Some(mut rw) = sw {
-                rw.force_render = true;
+            let wash = new_id.as_deref().and_then(|id| {
+                pane_targets.and_then(|t| t.hover_washes.iter().find(|w| w.id == id))
+            });
+            if let (Some(w), Ok(chrome)) = (wash, chromes.get(pane)) {
+                if let Some(ent) = crate::render::paint_rounded_panel_root(
+                    &mut commands,
+                    chrome.content_root,
+                    w.rect.min,
+                    w.rect.size(),
+                    w.radius,
+                    w.color,
+                    Color::srgba(0.0, 0.0, 0.0, 0.0),
+                    0.0,
+                    Color::srgba(0.0, 0.0, 0.0, 0.0),
+                    0.0,
+                    0.0,
+                    w.z + 0.001,
+                ) {
+                    // Stamp the pane's render layer up front so the wash never
+                    // leaks onto the main camera for a frame before
+                    // `propagate_render_layers` catches it.
+                    if let Ok(layer) = pane_layers.get(pane) {
+                        commands
+                            .entity(ent)
+                            .insert(bevy::camera::visibility::RenderLayers::layer(layer.0));
+                    }
+                    hover.hover_overlay = Some(ent);
+                }
+            }
+
+            if needs_render {
+                if let Some(mut rs) = render_state {
+                    rs.force_render = true;
+                }
+                if let Some(mut rw) = sw {
+                    rw.force_render = true;
+                }
             }
         }
     }
@@ -2564,6 +2660,7 @@ fn forward_claude_events(
     mut events: MessageReader<ClaudeBusEvent>,
     widgets: Query<(&PaneKindMarker, &WidgetRender, &WidgetIO)>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("forward_claude_events");
     // Materialize once so every widget sees every event (MessageReader
     // hands each event out exactly once per read site).
     let mut lines: Vec<String> = Vec::new();
@@ -2599,6 +2696,7 @@ fn forward_ticks(
     time: Res<Time>,
     mut widgets: Query<(&PaneKindMarker, &mut WidgetRender, &WidgetIO)>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("forward_ticks");
     const TICK_INTERVAL_SECS: f32 = 1.0 / 30.0;
     let now = time.elapsed_secs();
     for (kind, mut render_state, io) in &mut widgets {
@@ -3045,6 +3143,7 @@ fn tick_widget_io(
     mut titles: Query<&mut PaneTitle>,
     pane_q: Query<Entity, With<PaneKindMarker>>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("tick_widget_io");
     // Walk pane entities so we can update PaneTitle by entity. Bevy 0.18
     // doesn't allow mixing &mut Widget and &mut PaneTitle on the same
     // entity from the same Query when they coexist, so we look up titles
@@ -3216,8 +3315,14 @@ fn rerender_widgets(
 
         let _prof = jim_pane::prof::pane_span(pane.to_bits(), "widget");
 
+        // Preserve the host-owned hover-wash overlay across re-renders (see
+        // the matching note in `script_widget::apply_latest_frames`).
+        let hover_overlay = hover.and_then(|h| h.hover_overlay);
         if let Ok(children) = children_q.get(root.0) {
             for c in children.iter() {
+                if Some(c) == hover_overlay {
+                    continue;
+                }
                 // `try_despawn`: this per-frame rebuild can race a pane
                 // teardown (an exclusive system in another plugin) that
                 // recursively despawns this content. A plain `despawn` on
@@ -3237,6 +3342,7 @@ fn rerender_widgets(
         targets.toasts.clear();
         targets.anims.clear();
         targets.canvas_regions.clear();
+        targets.hover_washes.clear();
 
         let frame_clone = render_state.current_frame.clone().unwrap();
 
@@ -3675,6 +3781,7 @@ fn handle_widget_press(
         &WidgetRender,
     )>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("handle_widget_press");
     for ev in presses.read() {
         let Ok(kind) = kinds.get(ev.pane) else {
             continue;
@@ -4295,7 +4402,7 @@ mod line_math_tests {
         // Monospace: cell_width 10 at font_size 10 → each char is 10px.
         let m = PaneFontMetrics {
             cell_width: 10.0,
-            font_size: FontSize::Px(10.0),
+            font_size: 10.0,
         };
         // Boundaries land at 0,10,20,30,40,50 for "hello".
         assert_eq!(char_index_at_x("hello", 0.0, 10.0, &m, 0.0), 0);

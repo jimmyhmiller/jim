@@ -363,7 +363,18 @@ fn capture_slow_frame(
 
     let frame = trace::current_frame();
     let ft = trace::collect_frame(frame);
-    if ft.spans.is_empty() {
+    // Also collect by WALL-CLOCK WINDOW, not just frame id: the pipelined
+    // render thread renders the previous frame's data concurrently, so its
+    // `render.*` spans carry a neighboring frame id and `collect_frame` misses
+    // them — leaving the render cost as an anonymous gap. Window collection
+    // grabs everything that executed during this frame's active window across
+    // all threads, so the render phases show up where the stall actually is.
+    let win_end = ft.frame_start_ns + (active_ms as f64 * 1.0e6) as u64;
+    let mut rec_spans = trace::collect_window(ft.frame_start_ns, win_end);
+    if rec_spans.is_empty() {
+        rec_spans = ft.spans.clone();
+    }
+    if rec_spans.is_empty() {
         return;
     }
     *last_dump = *wall;
@@ -377,8 +388,7 @@ fn capture_slow_frame(
             .map(|s| s.to_string())
             .unwrap_or_default()
     };
-    let spans: Vec<serde_json::Value> = ft
-        .spans
+    let spans: Vec<serde_json::Value> = rec_spans
         .iter()
         .enumerate()
         .map(|(i, s)| {
@@ -413,10 +423,71 @@ fn capture_slow_frame(
 
     let span_count = spans.len();
     let (churn_spawned, churn_despawned) = churn::snapshot();
+
+    // ---- coverage analysis: where did the untracked time go? ----
+    //
+    // The whole "Update 80ms but every span reads 0ms" mystery is untracked
+    // time: stretches where NO instrumented span was active on ANY thread.
+    // That's either an uninstrumented system running or the whole app parked
+    // on a lock / sync point. It used to be an invisible gap; here we make it
+    // a first-class output. We take the UNION of every span's [start,end]
+    // (across all threads — a worker span covers the main thread's parked
+    // wait), then report the wall time inside `active` that the union leaves
+    // uncovered, plus the largest uncovered intervals so you can see WHERE on
+    // the frame timeline (and thus which stage) the time vanished.
+    let mut intervals: Vec<(f64, f64)> = rec_spans
+        .iter()
+        .map(|s| {
+            let start = (s.start_ns.saturating_sub(ft.frame_start_ns)) as f64 / 1.0e6;
+            (start, start + s.dur_ns as f64 / 1.0e6)
+        })
+        .collect();
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (s, e) in intervals {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => {
+                if e > last.1 {
+                    last.1 = e;
+                }
+            }
+            _ => merged.push((s, e)),
+        }
+    }
+    let active = active_ms as f64;
+    let mut gaps: Vec<(f64, f64)> = Vec::new();
+    let mut cursor = 0.0_f64;
+    for (s, e) in &merged {
+        if *s - cursor > 0.05 {
+            gaps.push((cursor, *s));
+        }
+        cursor = cursor.max(*e);
+    }
+    if active - cursor > 0.05 {
+        gaps.push((cursor, active));
+    }
+    let covered_ms: f64 = merged.iter().map(|(s, e)| e - s).sum();
+    let uncovered_ms = (active - covered_ms).max(0.0);
+    gaps.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));
+    let gaps_json: Vec<serde_json::Value> = gaps
+        .iter()
+        .take(16)
+        .map(|(s, e)| serde_json::json!({ "start_ms": s, "end_ms": e, "dur_ms": e - s }))
+        .collect();
+    let biggest_gap = gaps.first().copied();
+
     let doc = serde_json::json!({
         "frame": frame,
         "active_ms": active_ms,
         "frame_total_ms": time.delta_secs() * 1000.0,
+        // Untracked time: `active` minus the union of all span intervals.
+        // High `uncovered_ms` with a near-empty span list == the cost is
+        // outside every instrumented system (uninstrumented system, command
+        // application, or a parked lock/sync). `untracked_gaps` localizes it
+        // on the frame timeline (cross-reference `stages` to see which stage).
+        "covered_ms": covered_ms,
+        "uncovered_ms": uncovered_ms,
+        "untracked_gaps": gaps_json,
         // Deferred entity churn this frame — spawn/despawn batches apply at sync
         // points between systems, so a big number next to a near-empty span list
         // means the cost was command application (e.g. a widget rebuilding its
@@ -433,13 +504,20 @@ fn capture_slow_frame(
         "spans": spans,
     });
 
+    let gap_note = match biggest_gap {
+        Some((s, e)) => format!(", biggest gap {:.1}->{:.1}ms ({:.1}ms)", s, e, e - s),
+        None => String::new(),
+    };
     crate::diagnostics::append_log(&format!(
-        "[trace] frame {} captured: {:.1}ms active, {} spans, churn +{}/-{}{} -> writing",
+        "[trace] frame {} captured: {:.1}ms active, {:.1}ms UNTRACKED ({:.0}%), {} spans, churn +{}/-{}{}{} -> writing",
         frame,
         active_ms,
+        uncovered_ms,
+        if active_ms > 0.0 { uncovered_ms / active_ms as f64 * 100.0 } else { 0.0 },
         span_count,
         churn_spawned,
         churn_despawned,
+        gap_note,
         if ft.truncated { " (TRUNCATED)" } else { "" },
     ));
 

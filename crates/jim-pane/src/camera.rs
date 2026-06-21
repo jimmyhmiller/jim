@@ -189,6 +189,12 @@ fn pane_camera_order(rect: &PaneRect, pane: Entity) -> isize {
 /// What the pane camera needs derived from PaneRect + render target.
 pub struct PaneCameraSetup {
     pub viewport: Viewport,
+    /// True when the pane has a non-empty on-screen slice (its rect, after
+    /// clamping to the window/region, has positive width AND height). When
+    /// false the pane is scrolled fully off-canvas: its camera renders only a
+    /// forced 1×1 viewport, so it should be deactivated entirely rather than
+    /// extracted+prepared+drawn for one pixel. See `suppress_window_pane_cams`.
+    pub visible: bool,
     /// World-space center of the (possibly clamped) viewport. The
     /// camera transform must sit here so the camera's view (a
     /// `viewport_logical × viewport_logical` window centered on this
@@ -302,6 +308,11 @@ pub fn pane_camera_setup_for(
         depth: 0.0..1.0,
     };
 
+    // On-screen iff the clamped slice was non-empty BEFORE the `.max(1)`
+    // floor above (which only exists to keep wgpu's scissor legal). An empty
+    // slice means the pane is fully off-canvas → its camera should be culled.
+    let visible = vis_w > 0.0 && vis_h > 0.0;
+
     // Step 4: camera center in world coordinates. World origin is at
     // the window center (y-up). The CLAMPED viewport's logical center
     // on screen is `((vis_left + vis_right) * 0.5, (vis_top +
@@ -315,6 +326,7 @@ pub fn pane_camera_setup_for(
 
     PaneCameraSetup {
         viewport,
+        visible,
         cam_center,
     }
 }

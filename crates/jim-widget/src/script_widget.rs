@@ -473,6 +473,15 @@ pub struct ScriptWidget {
     /// Sprite id → entity. Lets us diff frames instead of
     /// despawn+respawn.
     pub sprite_entities: HashMap<String, Entity>,
+    /// One per nested `Element::Canvas` region (indexed by the region's
+    /// order in the flow walk): item id → entity. Lets nested canvas
+    /// regions diff like the top-level Canvas path instead of
+    /// despawn+respawn — without this, a flow widget with an embedded
+    /// canvas (the podcast waveform/transcript) tore down and respawned
+    /// every canvas Text2d on each re-render, flashing the text as the
+    /// user zoomed/panned. The per-frame flow teardown skips entities
+    /// tracked here.
+    pub canvas_region_entities: Vec<HashMap<String, Entity>>,
     /// `Element::Editor` id → live portal. These editor child-entities
     /// persist across the per-frame flow teardown (the teardown skips
     /// any entity tracked here) so caret/selection/scroll/undo survive
@@ -936,6 +945,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             reload_gen: 0,
             applied_reload_gen: 0,
             sprite_entities: HashMap::new(),
+            canvas_region_entities: Vec::new(),
             editor_portals: HashMap::new(),
             last_focus_sig: None,
             // Starts false; mirrored from the worker's `wants_clicks` slot
@@ -1006,6 +1016,7 @@ fn script_widget_close(world: &mut World, entity: Entity) {
 // ============================================================
 
 fn poll_watcher(watcher: Option<Res<ScriptWatcher>>, mut widgets: Query<&mut ScriptWidget>) {
+    let _t_prof = jim_pane::prof::sys_span("poll_watcher");
     let Some(watcher) = watcher else { return };
     let paths: Vec<PathBuf> = {
         let rx = watcher.rx.lock().expect("funct watcher channel poisoned");
@@ -1039,6 +1050,7 @@ fn poll_watcher(watcher: Option<Res<ScriptWatcher>>, mut widgets: Query<&mut Scr
 }
 
 fn apply_reloads(mut commands: Commands, mut widgets: Query<(Entity, &mut ScriptWidget)>) {
+    let _t_prof = jim_pane::prof::sys_span("apply_reloads");
     for (ent, mut w) in &mut widgets {
         // Mirror the worker-reported interaction-handler flag every frame
         // (cheap atomic load) so pinned-widget click hot-zoning tracks the
@@ -1571,6 +1583,7 @@ fn apply_latest_frames(
     )>,
     children_q: Query<&Children>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("apply_latest_frames");
     let theme_changed = theme.is_changed();
     let _zoom = pane_zoom.0.max(0.0001);
     // Caret blink: visible during the first half of each 1s cycle.
@@ -1665,6 +1678,11 @@ fn apply_latest_frames(
                     chrome.content_root,
                     &children,
                     &mut w.sprite_entities,
+                    Vec2::ZERO,
+                    0.0,
+                    // Top-level Canvas: no array-order z bump (these widgets
+                    // set explicit z; preserve the long-standing behavior).
+                    0.0,
                     &pane_font.0,
                     &fonts,
                 );
@@ -1682,10 +1700,21 @@ fn apply_latest_frames(
                 // sprite entities tracked separately (in case a widget
                 // ever mixes both, which the protocol doesn't currently
                 // allow but might in the future).
+                // The host-owned hover-wash overlay lives under content_root
+                // too; keep it across re-renders so an unrelated re-render
+                // (theme/scroll/frame) doesn't drop the wash while the cursor
+                // still rests on a list row. `update_widget_hover` owns its
+                // lifetime.
+                let hover_overlay = hover.and_then(|h| h.hover_overlay);
                 if let Ok(children) = children_q.get(chrome.content_root) {
                     for c in children.iter() {
                         if !w.sprite_entities.values().any(|e| *e == c)
+                            && !w
+                                .canvas_region_entities
+                                .iter()
+                                .any(|m| m.values().any(|e| *e == c))
                             && !w.editor_portals.values().any(|p| p.container == c)
+                            && Some(c) != hover_overlay
                         {
                             // `try_despawn`: a concurrent pane teardown
                             // (recursive despawn) may have already removed
@@ -1730,6 +1759,7 @@ fn apply_latest_frames(
                 targets.anims.clear();
                 targets.editor_portals.clear();
                 targets.canvas_regions.clear();
+                targets.hover_washes.clear();
                 let consumed = crate::render::render(
                     &mut commands,
                     &ctx,
@@ -1749,18 +1779,48 @@ fn apply_latest_frames(
                 );
                 // Nested Canvas regions: draw their items at the laid-out
                 // box origin, here where the image assets are in scope.
-                // These spawn as ordinary flow children (torn down on the
-                // next re-render), so a mixed widget — real buttons/inputs
-                // plus a custom-drawn canvas — works in one frame.
-                for region in &targets.canvas_regions {
-                    crate::render_canvas_items(
+                // Diffed against a PERSISTENT per-region entity cache (id →
+                // entity) so a re-render reuses the canvas items instead of
+                // despawn+respawn. Without this, a flow widget with an
+                // embedded canvas (the podcast waveform + transcript) tore
+                // down and respawned every canvas Text2d on each re-render —
+                // the text visibly flashed while zooming/panning. The flow
+                // teardown above skips these tracked entities. (The top-level
+                // Canvas frame already diffs via `sprite_entities`; this gives
+                // nested regions the same treatment.)
+                //
+                // Cache is keyed by region order. If the widget emits fewer
+                // regions than last frame, despawn the surplus regions' cached
+                // entities so they don't ghost.
+                let region_count = targets.canvas_regions.len();
+                if w.canvas_region_entities.len() > region_count {
+                    for stale in w.canvas_region_entities.drain(region_count..) {
+                        for e in stale.into_values() {
+                            commands.entity(e).try_despawn();
+                        }
+                    }
+                }
+                while w.canvas_region_entities.len() < region_count {
+                    w.canvas_region_entities.push(std::collections::HashMap::new());
+                }
+                for (i, region) in targets.canvas_regions.iter().enumerate() {
+                    diff_render(
                         &mut commands,
                         &mut images,
                         &mut image_cache,
                         chrome.content_root,
                         &region.items,
+                        &mut w.canvas_region_entities[i],
                         region.rect.min,
                         region.z + 0.005,
+                        // Nested region: items typically share z=0 and rely on
+                        // push order for layering (e.g. the podcast waveform's
+                        // highlight → bars → playhead). Encode array order into
+                        // z so reuse can't reshuffle it. Size the per-item step
+                        // so the TOTAL drift stays under one flow z-step (0.01),
+                        // keeping all items inside this region's z band even
+                        // when a widget mixes flow controls above/below it.
+                        0.009 / (region.items.len().max(1) as f32),
                         &pane_font.0,
                         &fonts,
                     );
@@ -1942,6 +2002,7 @@ fn canvas_item_bottom(y: f32, h: f32, anchor: CanvasAnchor) -> f32 {
 ///
 /// Compared to despawn-everything-then-respawn this saves the ECS
 /// from churning hundreds of entities every frame in a busy garden.
+#[allow(clippy::too_many_arguments)]
 fn diff_render(
     commands: &mut Commands,
     images: &mut Assets<Image>,
@@ -1949,15 +2010,40 @@ fn diff_render(
     content_root: Entity,
     items: &[CanvasItem],
     sprite_entities: &mut HashMap<String, Entity>,
+    // Added to every item's position/depth. ZERO/0.0 for a top-level Canvas
+    // frame; the box origin + base depth for a nested canvas region embedded
+    // in a flow layout (so its items land inside their laid-out box).
+    origin: Vec2,
+    z_base: f32,
+    // Per-item depth step encoding array order into z. With diff_render we
+    // REUSE entities, so equal-z items no longer draw in array (push) order —
+    // they'd draw in entity-creation order, which scrambles layering as items
+    // are reused/added across frames (the waveform highlight/playhead/bars all
+    // share z=0 and broke on zoom). A tiny per-index bump restores the
+    // author's intended "later push = on top" layering deterministically.
+    // 0.0 for the top-level Canvas path (those widgets set explicit z and the
+    // path predates this concern), a small value for nested regions.
+    order_eps: f32,
     default_font: &Handle<Font>,
     fonts: &jim_style::FontRegistry,
 ) {
     let mut seen: HashSet<String> = HashSet::with_capacity(items.len());
-    for item in items {
-        let id = match item {
-            CanvasItem::Sprite { id, .. } => id.clone(),
-            CanvasItem::Rect { id, .. } => id.clone(),
-            CanvasItem::Text { id, .. } => id.clone(),
+    for (idx, item) in items.iter().enumerate() {
+        let order_z = idx as f32 * order_eps;
+        let raw_id = match item {
+            CanvasItem::Sprite { id, .. } => id.as_str(),
+            CanvasItem::Rect { id, .. } => id.as_str(),
+            CanvasItem::Text { id, .. } => id.as_str(),
+        };
+        // Items are contractually required to carry a unique id, but be
+        // defensive: an empty id (or accidental duplicate of "") would
+        // otherwise collapse every such item onto one entity. Fall back to a
+        // positional key the author can't collide with (`\u{1}` is illegal in
+        // an author id, same trick the fallback-span keys use below).
+        let id = if raw_id.is_empty() {
+            format!("\u{1}pos{idx}")
+        } else {
+            raw_id.to_string()
         };
         seen.insert(id.clone());
         let existing = sprite_entities.get(&id).copied();
@@ -1982,7 +2068,8 @@ fn diff_render(
                     custom_size: Some(Vec2::new(*w, *h)),
                     ..default()
                 };
-                let transform = Transform::from_xyz(*x, -*y, *z);
+                let transform =
+                    Transform::from_xyz(origin.x + *x, -(origin.y + *y), z_base + *z + order_z);
                 let anchor_cmp = canvas_anchor_to_bevy(*anchor);
                 match existing {
                     Some(e) => {
@@ -2025,7 +2112,8 @@ fn diff_render(
                 // Canvas is y-down but the world is y-up (we render at
                 // -y), so a clockwise canvas rotation is a negative
                 // world rotation about z.
-                let mut transform = Transform::from_xyz(*x, -*y, *z);
+                let mut transform =
+                    Transform::from_xyz(origin.x + *x, -(origin.y + *y), z_base + *z + order_z);
                 if *rotation != 0.0 {
                     transform.rotation = Quat::from_rotation_z(-rotation.to_radians());
                 }
@@ -2071,7 +2159,8 @@ fn diff_render(
                     None => default_font.clone(),
                 };
                 let anchor_cmp = canvas_anchor_to_bevy(*anchor);
-                let transform = Transform::from_xyz(*x, -*y, *z);
+                let transform =
+                    Transform::from_xyz(origin.x + *x, -(origin.y + *y), z_base + *z + order_z);
                 // No-wrap: short labels (button text, status lines) must
                 // never break mid-word. Without this, "New game" wraps
                 // to "New\ngame" inside a narrow canvas because Bevy's

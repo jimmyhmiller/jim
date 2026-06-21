@@ -214,6 +214,7 @@ fn load_cube_params(
     mut last_mtime: Local<Option<std::time::SystemTime>>,
     mut initialized: Local<bool>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("cube_load_params");
     let Some(path) = cube_ft_path() else { return };
     if !*initialized {
         *initialized = true;
@@ -569,6 +570,7 @@ fn overview_apply(
         Option<Res<jim_style::StyleDataDir>>,
     ),
 ) {
+    let _t_prof = jim_pane::prof::sys_span("cube_overview_apply");
     if prism.phase == Phase::Off && prism.continuous_cooldown > 0 {
         prism.continuous_cooldown -= 1;
     }
@@ -1264,19 +1266,58 @@ fn despawn_cube(prism: &mut Prism, commands: &mut Commands, images: &mut Assets<
 fn suppress_window_pane_cams(
     prism: Res<Prism>,
     projects: Res<Projects>,
-    panes: Query<&PaneProject>,
+    panes: Query<(
+        &PaneProject,
+        &PaneRect,
+        Has<jim_pane::PaneScreenAnchored>,
+    )>,
+    windows: Query<&Window>,
+    region: Option<Res<jim_pane::PaneCanvasRegion>>,
+    viewport: Option<Res<jim_pane::PaneViewport>>,
     mut cams: Query<(&PaneCameraOf, &mut Camera)>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("cube_suppress_cams");
     let cube_up = prism.root.is_some();
     let active = projects.active;
+    let win = windows.single().ok();
+    let region = region.as_deref().copied();
+    let viewport = viewport.as_deref().copied().unwrap_or_default();
     for (owner, mut cam) in &mut cams {
-        // No fallback: a pane whose project isn't the active one (or that
-        // somehow has no membership) does not render. Membership is an
-        // enforced invariant — see `assert_pane_project_invariant`.
+        // A pane camera is active only when ALL hold:
+        //   1. the cube overview is down (else the face cameras render),
+        //   2. the pane belongs to the active project (no fallback — project
+        //      membership is an enforced invariant), and
+        //   3. the pane has a non-empty on-screen slice. Panes scrolled fully
+        //      off-canvas keep their entities but their camera is culled, so
+        //      the render thread no longer extracts/prepares/draws them every
+        //      frame just to fill a forced 1×1 viewport. This is the dominant
+        //      cull on a busy canvas: most panes are off-screen at any time.
         let want_active = !cube_up
             && panes
                 .get(owner.0)
-                .map(|p| Some(p.0) == active)
+                .map(|(proj, rect, anchored)| {
+                    if Some(proj.0) != active {
+                        return false;
+                    }
+                    match win {
+                        Some(w) => {
+                            let projected = if anchored {
+                                *rect
+                            } else {
+                                viewport.projected_rect(rect)
+                            };
+                            jim_pane::pane_camera_setup_for(
+                                &projected,
+                                Vec2::new(w.width(), w.height()),
+                                w.scale_factor(),
+                                region,
+                            )
+                            .visible
+                        }
+                        // No window yet (startup): don't cull.
+                        None => true,
+                    }
+                })
                 .unwrap_or(false);
         if cam.is_active != want_active {
             cam.is_active = want_active;
@@ -1291,6 +1332,7 @@ fn animate_sky(
     time: Res<Time>,
     mut sky_materials: ResMut<Assets<SkyMaterial>>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("cube_animate_sky");
     if !prism.active {
         return;
     }

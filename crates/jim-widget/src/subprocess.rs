@@ -57,15 +57,56 @@ use std::sync::{Arc, Mutex};
 /// never read can't grow memory without bound. Oldest lines drop.
 const MAX_BUFFERED_LINES: usize = 4096;
 
-/// PATH with the running executable's directory prepended, so bare-name spawns
-/// of our sibling binaries (`jimctl`, `jim-lsp`) resolve even under the minimal
-/// PATH a Finder/AppKit-launched `.app` inherits. `None` if the exe dir can't
-/// be determined (then the child just inherits the ambient PATH).
+/// Common locations for third-party CLI tools (Homebrew, MacPorts, the
+/// `~/.local/bin`/`~/.cargo/bin` user dirs). When the GUI is launched from
+/// its `.app` by Finder/Dock, the inherited PATH is launchd's minimal
+/// `/usr/bin:/bin:/usr/sbin:/sbin` — which contains none of these — so bare
+/// `proc_spawn("ffmpeg", …)` / `sh -c "ffplay …"` from a widget would fail
+/// to resolve the binary. We append these as a fallback (after the real
+/// PATH, so a terminal launch's richer PATH still wins) to keep widgets that
+/// shell out to brew-installed tools working regardless of launch route.
+fn extra_tool_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/opt/homebrew/sbin"),
+        PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/opt/local/bin"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".cargo/bin"));
+    }
+    dirs
+}
+
+/// Build a PATH from the exe dir, the current PATH, and the third-party tool
+/// dirs — deduped, exe dir first, tool dirs last. Pure (no env reads) so it's
+/// unit-testable against a simulated launchd-minimal PATH.
+fn build_path(
+    exe_dir: std::path::PathBuf,
+    current: &std::ffi::OsStr,
+    extra: Vec<std::path::PathBuf>,
+) -> Option<std::ffi::OsString> {
+    let mut seen = std::collections::HashSet::new();
+    let entries = std::iter::once(exe_dir)
+        .chain(std::env::split_paths(current))
+        .chain(extra)
+        .filter(|p| seen.insert(p.clone()));
+    std::env::join_paths(entries).ok()
+}
+
+/// PATH with the running executable's directory prepended (so bare-name spawns
+/// of our sibling binaries `jimctl`/`jim-lsp` resolve under the minimal PATH a
+/// Finder/AppKit-launched `.app` inherits) and the standard third-party tool
+/// dirs ([`extra_tool_dirs`]) appended as a fallback. `None` if the exe dir
+/// can't be determined (then the child just inherits the ambient PATH).
 fn augmented_path() -> Option<std::ffi::OsString> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
     let current = std::env::var_os("PATH").unwrap_or_default();
-    std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&current))).ok()
+    build_path(dir, &current, extra_tool_dirs())
 }
 
 /// An event the subprocess reader thread emits to its owner. Lets a host
@@ -287,4 +328,42 @@ pub fn clipboard_set(text: &str) -> bool {
         // stdin dropped here at end of scope -> EOF.
     }
     child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // Reproduces the Dock-launch case: launchd hands a GUI app the minimal
+    // `/usr/bin:/bin:/usr/sbin:/sbin` PATH, so Homebrew (`/opt/homebrew/bin`,
+    // where ffmpeg/ffplay live) is absent and a widget's bare `proc_spawn`
+    // would fail. `build_path` must splice the tool dirs back in.
+    #[test]
+    fn dock_minimal_path_gains_homebrew() {
+        let minimal = std::ffi::OsString::from("/usr/bin:/bin:/usr/sbin:/sbin");
+        let extra = vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+        ];
+        let joined = build_path(PathBuf::from("/exe/dir"), &minimal, extra).unwrap();
+        let dirs: Vec<_> = std::env::split_paths(&joined).collect();
+
+        assert_eq!(dirs.first().unwrap(), &PathBuf::from("/exe/dir"));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(dirs.contains(&PathBuf::from("/usr/bin"))); // original entries kept
+    }
+
+    // A terminal launch already has /opt/homebrew/bin; appending the tool dirs
+    // must not duplicate it (and the original, earlier position wins).
+    #[test]
+    fn no_duplicate_when_already_present() {
+        let rich = std::ffi::OsString::from("/opt/homebrew/bin:/usr/bin");
+        let extra = vec![PathBuf::from("/opt/homebrew/bin")];
+        let joined = build_path(PathBuf::from("/exe/dir"), &rich, extra).unwrap();
+        let count = std::env::split_paths(&joined)
+            .filter(|p| p == &PathBuf::from("/opt/homebrew/bin"))
+            .count();
+        assert_eq!(count, 1);
+    }
 }

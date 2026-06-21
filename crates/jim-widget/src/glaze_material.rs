@@ -214,6 +214,7 @@ fn update_glaze_materials(
     mut mats: ResMut<Assets<GlazeMaterial>>,
     mut pressed_layers: Local<HashSet<Entity>>,
 ) {
+    let _t_prof = jim_pane::prof::sys_span("glaze_materials");
     let t = time.elapsed_secs();
     let dt = time.delta_secs();
     let cursor_canvas = windows

@@ -390,30 +390,25 @@ fn render_node(
                     Anchor::TOP_LEFT,
                     Transform::from_xyz(origin.x, -origin.y, z + 0.003),
                 ));
-            } else if ctx.hovered_click_id.as_deref() == Some(id.as_str()) {
-                // Hover affordance: a soft neutral wash so list rows (file
-                // pickers, diff lines, drawer items) signal they're
-                // clickable. `update_widget_hover` re-renders on hover
-                // change, so this updates as the cursor moves.
-                let hov = ctx
+            }
+            // Hover affordance: a soft neutral wash so list rows (file
+            // pickers, diff lines, drawer items) signal they're clickable.
+            // We DON'T paint it here — that tied the wash to a full re-render
+            // of the pane, which tore down and respawned every text entity on
+            // each hover change and made the text visibly flash as the cursor
+            // moved. Instead, register the row as a wash candidate; the host
+            // paints/moves a single overlay sprite over the hovered row
+            // without re-rendering (see `update_widget_hover`).
+            targets.hover_washes.push(crate::HoverWash {
+                id: id.clone(),
+                rect: Rect::new(origin.x, origin.y, origin.x + size.x, origin.y + size.y),
+                z,
+                color: ctx
                     .resolve_color("surface_3")
                     .unwrap_or(Color::srgb(0.13, 0.14, 0.17))
-                    .with_alpha(0.45);
-                paint_rounded_panel(
-                    commands,
-                    ctx,
-                    origin,
-                    size,
-                    ctx.resolve_f32("radius_sm").unwrap_or(4.0),
-                    hov,
-                    Color::srgba(0.0, 0.0, 0.0, 0.0),
-                    0.0,
-                    Color::srgba(0.0, 0.0, 0.0, 0.0),
-                    0.0,
-                    0.0,
-                    z + 0.001,
-                );
-            }
+                    .with_alpha(0.45),
+                radius: ctx.resolve_f32("radius_sm").unwrap_or(4.0),
+            });
             recurse_children(commands, targets, children, style.as_ref());
             targets.clicks.push(ClickTarget {
                 id: id.clone(),
@@ -1227,10 +1222,45 @@ pub(crate) fn paint_rounded_panel(
     shadow_offset_y: f32,
     z: f32,
 ) {
+    let _ = paint_rounded_panel_root(
+        commands,
+        ctx.content_root,
+        origin,
+        size,
+        corner_radius,
+        bg,
+        border_color,
+        border_width,
+        shadow_color,
+        shadow_blur,
+        shadow_offset_y,
+        z,
+    );
+}
+
+/// [`paint_rounded_panel`] without a [`LayoutCtx`]: spawns the SDF panel
+/// directly under `content_root` and returns its entity (so the caller can
+/// track/despawn it). Used by the host's hover-wash overlay, which has no
+/// render context. Returns `None` for a zero-area panel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_rounded_panel_root(
+    commands: &mut Commands,
+    content_root: Entity,
+    origin: Vec2,
+    size: Vec2,
+    corner_radius: f32,
+    bg: Color,
+    border_color: Color,
+    border_width: f32,
+    shadow_color: Color,
+    shadow_blur: f32,
+    shadow_offset_y: f32,
+    z: f32,
+) -> Option<Entity> {
     use crate::button_material::{ButtonParams, WidgetButtonMaterial, WidgetButtonMesh};
 
     if size.x <= 0.0 || size.y <= 0.0 {
-        return;
+        return None;
     }
     // Clamp pill radius to half the shorter side.
     let radius = corner_radius.min(size.x * 0.5).min(size.y * 0.5).max(0.0);
@@ -1257,7 +1287,7 @@ pub(crate) fn paint_rounded_panel(
     // though layout puts them at the same y.
     let entity = commands
         .spawn((
-            ChildOf(ctx.content_root),
+            ChildOf(content_root),
             Transform::from_xyz(
                 origin.x + size.x * 0.5,
                 -(origin.y + size.y * 0.5) + shadow_offset_y,
@@ -1282,6 +1312,7 @@ pub(crate) fn paint_rounded_panel(
             ));
         }
     });
+    Some(entity)
 }
 
 /// Paint the `style.background` (color + image) and border/shadow for

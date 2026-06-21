@@ -222,6 +222,10 @@ fn sample_memory(world: &mut World, mut st: Local<DiagState>) {
         }
     }
     st.last_sample = Some(now);
+    // Exclusive system (&mut World) → runs ALONE, stalling every other thread
+    // while it walks the entire world + all asset stores. Span the real work
+    // (after the throttle early-return) so this periodic stall is visible.
+    let _t_prof = jim_pane::prof::sys_span("sample_memory");
     if st.next_warn == 0 {
         st.next_warn = FIRST_WARN_BYTES;
     }

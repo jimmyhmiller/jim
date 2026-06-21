@@ -558,6 +558,7 @@ fn poll_agent(mut palette: ResMut<CommandPalette>, agent_ch: Res<AgentChannel>) 
 // ---------- Render (exclusive) ----------
 
 fn render_palette(world: &mut World) {
+    let _t_prof = jim_pane::prof::sys_span("render_palette");
     let open = world.resource::<CommandPalette>().open;
     let sig = world.resource::<CommandPalette>().signature();
     let prev_root = world.resource::<CommandPalette>().root;

@@ -807,6 +807,7 @@ fn setup_actions_watcher(world: &mut World) {
 /// Drain manifest-change notifications and re-apply (exclusive, since it
 /// re-registers actions + rebuilds the keymap).
 fn poll_actions_watcher(world: &mut World) {
+    let _t_prof = jim_pane::prof::sys_span("poll_actions_watcher");
     let changed = {
         let Some(ra) = world.get_resource::<RuntimeActions>() else {
             return;
@@ -943,6 +944,7 @@ fn dispatch_action_keybinds(
 /// Looks each action up, copies it out (releasing the registry borrow),
 /// then dispatches with `&mut World`.
 pub fn run_requested_actions(world: &mut World) {
+    let _t_prof = jim_pane::prof::sys_span("run_requested_actions");
     let queued = std::mem::take(&mut world.resource_mut::<ActionInvocations>().0);
     for inv in queued {
         let Some(action) = world.resource::<ActionRegistry>().get(&inv.id).copied() else {

@@ -1451,6 +1451,7 @@ fn rename_keyboard(
 /// `&mut World`. Restores first, then handles project-deletion sweeps,
 /// then new-pane requests, then open-file requests.
 fn apply_pending_actions(world: &mut World) {
+    let _t_prof = jim_pane::prof::sys_span("apply_pending_actions");
     let actions = std::mem::take(&mut *world.resource_mut::<PendingActions>());
     let sidebar_width = world.resource::<Sidebar>().width;
     // Project the user is currently looking at; new panes spawned into it

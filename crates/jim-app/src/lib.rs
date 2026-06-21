@@ -48,6 +48,7 @@ pub mod projects;
 pub mod radial;
 pub mod run_button;
 pub mod pane_annotation;
+pub mod render_trace;
 pub mod screenshot_consent;
 pub mod tools;
 pub mod whiteboard_bg;
@@ -154,6 +155,9 @@ impl Plugin for AppShellPlugin {
         // generic flame-bevy offscreen-render + CPU readback systems. The
         // rendered trace is shown as a Sprite filling the pane content.
         app.add_plugins(jim_flame::FlamePlugin);
+        // Render-thread phase timing into jim's trace (extract/prepare/queue/
+        // passes), so render cost stops being an anonymous "untracked gap".
+        app.add_plugins(render_trace::RenderTracePlugin);
         // Channel the async (non-modal) Open dialog hands chosen paths
         // back on. `action_open_file` clones the sender and `await`s the
         // sheet off the main thread; `drain_file_picks` routes results

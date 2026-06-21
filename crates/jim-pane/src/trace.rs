@@ -310,6 +310,30 @@ pub fn collect_frame(frame: u64) -> FrameTrace {
     }
 }
 
+/// Collect every span whose start falls within the wall-clock window
+/// `[start_ns, end_ns]`, REGARDLESS of which frame id it was tagged with.
+///
+/// [`collect_frame`] keys on frame id, which misses work that ran on another
+/// thread under a different frame id during this frame's wall time — most
+/// importantly the **pipelined render thread**, which renders the *previous*
+/// frame's data while the main thread runs the current frame, so its spans
+/// carry a neighboring id. For "what actually executed during this slow frame
+/// (across all threads)" — the thing you need to explain a main-thread stall
+/// that's really the render sync — window collection is correct. Returns
+/// start-sorted.
+pub fn collect_window(start_ns: u64, end_ns: u64) -> Vec<SpanRecord> {
+    let mut spans: Vec<SpanRecord> = Vec::new();
+    if let Ok(r) = RING.lock() {
+        for s in r.buf.iter() {
+            if s.frame != 0 && s.start_ns >= start_ns && s.start_ns <= end_ns {
+                spans.push(*s);
+            }
+        }
+    }
+    spans.sort_by_key(|s| s.start_ns);
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
