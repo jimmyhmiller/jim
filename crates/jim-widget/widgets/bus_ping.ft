@@ -1,0 +1,51 @@
+// bus_ping.ft — widget↔widget bus demo, "A" side (funct port of bus_ping.rhai).
+//
+// Pairs with bus_pong.ft. Demonstrates the general widget messaging
+// channel (emit / on_message), which is SEPARATE from the Claude bus.
+//
+// On init A publishes a retained "conn.state" (so a late-joining pane
+// learns it) and waits. Click "Ping" to emit("ping", {n: 1}); B replies
+// emit("pong", {n: n+1}); A shows the n it got back. No set_animating —
+// delivery is fully event-driven.
+import "host"
+
+fn init_state() = { sent: 0, last: "—" }
+let state = atom(init_state())
+
+fn on_init() {
+    // Retained: any pane that spawns later receives this on init.
+    emit_retained("conn.state", { host: "localhost", ok: true })
+    request_render()
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "ping" {
+        let s = @state
+        reset!(state, { ..s, sent: s.sent + 1 })
+        emit("ping", { n: (@state).sent })
+        request_render()
+    }
+}
+
+fn on_message(topic, payload, sender) {
+    // Ignore echoes of our own emits.
+    if sender == my_id() { return }
+    if topic == "pong" {
+        let s = @state
+        reset!(state, { ..s, last: "pong n=" + str(payload.n) })
+        host_log("[bus_ping] got pong n=" + str(payload.n) + " from " + sender)
+        request_render()
+    }
+}
+
+fn render(w, h) {
+    let s = @state
+    {
+        kind: "vstack", gap: 10.0, pad: 14.0, children: [
+            { kind: "text", value: "Bus demo · A (ping)", weight: "bold" },
+            { kind: "button", id: "ping", label: "Ping →" },
+            { kind: "text", value: "sent: " + str(s.sent) },
+            { kind: "text", value: "last reply: " + s.last },
+        ]
+    }
+}

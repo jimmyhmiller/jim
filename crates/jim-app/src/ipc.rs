@@ -292,6 +292,21 @@ pub enum IpcRequest {
         #[serde(default)]
         slots: Option<usize>,
     },
+    /// `jimctl trace [--arm|--disarm] [--ms N]` — control the rich frame-trace
+    /// recorder at runtime. Env vars (`JIMTRACE`/`JIMTRACE_MS`) are frozen at
+    /// launch, so this is how you arm capture and dial the slow-frame dump
+    /// threshold while the app keeps running. `arm = Some(true)` enables
+    /// capture (same as Cmd+Shift+G), `Some(false)` disables; `ms` sets the
+    /// active-ms dump threshold. Either field may be omitted to leave it
+    /// unchanged — so `--ms 20` alone retunes without touching the arm state.
+    /// Writes back `{"armed":bool,"threshold_ms":N}` so the CLI can echo the
+    /// live state.
+    TraceControl {
+        #[serde(default)]
+        arm: Option<bool>,
+        #[serde(default)]
+        ms: Option<f32>,
+    },
 }
 
 /// One accepted IPC connection: the parsed request plus the open socket,

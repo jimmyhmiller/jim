@@ -1,0 +1,571 @@
+// lsp_explorer.ft — structural code explorer backed by rust-analyzer.
+//
+// Talks to the `jim-lsp` daemon through one-shot `jimctl lsp` calls (the
+// daemon is spawned on demand and shared; it persists across GUI restarts).
+//
+//   • Search box → `jimctl lsp ws <query>` (workspace symbols).
+//   • If spawned with params.file, also shows that file's document-symbol
+//     outline.
+//   • Click any symbol → spawns an `lsp_symbol.ft` pane showing JUST that
+//     function/struct's source, kept live as the file changes.
+//
+// params: { project_root, file?, project? }   (project_root is host-injected)
+import "host"
+import { col_text, col_muted, col_accent, col_panel } from "df"
+import { virtual_list, should_rewindow } from "virtual"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    query: "", results: [], status: "", file: "",
+    busy_h: -1, busy_kind: "", collapsed: [], last_sy: 0.0,
+    view: "file", hidden: [],   // view: "file" | "type"; hidden: filtered-out kind groups
+}
+
+// Fixed row heights — must match the forced style.height below so the
+// virtualizer's offset math is exact.
+fn row_h() = 22.0
+fn hdr_h() = 28.0
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+// ---- params ----
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+fn root() = param("project_root", "")
+fn project() = param("project", "")
+
+// ---- jimctl argv helpers ----
+fn with_root(argv) {
+    let r = root()
+    if r != "" { push(push(argv, "--root"), r) } else { argv }
+}
+
+// LSP SymbolKind int → lower-case name (mirrors jim_lsp::symbol_kind_name).
+fn kind_name(k) {
+    if k == 5 { "class" } else if k == 6 { "method" } else if k == 8 { "field" }
+    else if k == 9 { "constructor" } else if k == 10 { "enum" } else if k == 11 { "interface" }
+    else if k == 12 { "function" } else if k == 13 { "variable" } else if k == 14 { "constant" }
+    else if k == 22 { "enum_member" } else if k == 23 { "struct" } else if k == 25 { "operator" }
+    else if k == 2 { "module" } else if k == 26 { "type_parameter" } else { "symbol" }
+}
+
+// Kind icons. Widget text now renders any Unicode the OS has a font for
+// (system-font cascade), so these draw fine.
+fn kind_icon(name) {
+    if name == "function" { "ƒ" } else if name == "method" { "→" }
+    else if name == "struct" { "◇" } else if name == "enum" { "▤" }
+    else if name == "class" { "◆" } else if name == "interface" { "◈" }
+    else if name == "constant" { "□" } else if name == "field" { "·" }
+    else if name == "module" { "▸" } else if name == "constructor" { "✦" }
+    else { "•" }
+}
+
+fn kind_color(name) {
+    if name == "function" or name == "method" or name == "constructor" { "#8cc7ff" }
+    else if name == "struct" or name == "enum" or name == "class" or name == "interface" { "#f0d18c" }
+    else if name == "constant" or name == "field" or name == "enum_member" { "#f29e7a" }
+    else if name == "module" { "#c78fe6" }
+    else { col_text() }
+}
+
+// ---- strip a file:// URI to a plain path ----
+fn uri_to_path(uri) {
+    if starts_with(uri, "file://") { slice(uri, 7, len(uri)) } else { uri }
+}
+fn file_base(path) {
+    let parts = split(path, "/")
+    let n = len(parts)
+    if n > 0 { parts[n - 1] } else { path }
+}
+
+// ---- requests ----
+// Warm up rust-analyzer first (it can take a while cold); only then query, so
+// searches don't race the index and come back empty.
+fn ensure_lsp() {
+    let h = proc_spawn("jimctl", with_root(["lsp", "ensure"]))
+    if h == -1 { reset!(state, { ..cur_state(), status: "spawn failed (jimctl not found?)" }); request_render(); return }
+    reset!(state, { ..cur_state(), busy_h: h, busy_kind: "ensure",
+                    status: "starting rust-analyzer (first run can take a minute)…" })
+    request_render()
+}
+
+fn run_search() {
+    let s = cur_state()
+    let q = trim(s.query)
+    if q == "" { reset!(state, { ..s, results: [], status: "Type a query and Search." }); request_render(); return }
+    let h = proc_spawn("jimctl", with_root(["lsp", "ws", q]))
+    if h == -1 { reset!(state, { ..s, status: "spawn failed (jimctl not found?)" }); request_render(); return }
+    reset!(state, { ..s, busy_h: h, busy_kind: "search", status: "searching…" })
+    request_render()
+}
+
+fn load_file_outline() {
+    let s = cur_state()
+    let f = s.file
+    if f == "" { return }
+    let h = proc_spawn("jimctl", with_root(["lsp", "symbols", f]))
+    if h == -1 { reset!(state, { ..s, status: "spawn failed (jimctl not found?)" }); request_render(); return }
+    reset!(state, { ..s, busy_h: h, busy_kind: "file", status: "loading " + file_base(f) + "…" })
+    request_render()
+}
+
+// Whole-project outline — every symbol you define, grouped by file. Shown by
+// default so you don't have to search to see your code's structure.
+fn load_outline() {
+    let h = proc_spawn("jimctl", with_root(["lsp", "outline"]))
+    if h == -1 { reset!(state, { ..cur_state(), status: "spawn failed (jimctl not found?)" }); request_render(); return }
+    reset!(state, { ..cur_state(), busy_h: h, busy_kind: "outline",
+                    status: "loading project outline…" })
+    request_render()
+}
+
+// Outline reply → interleaved [file-header, top-level symbols…] rows. We show
+// only top-level items (structs/enums/fns/traits/impls) — click one to pull it
+// (and its methods) into a pane.
+fn build_outline_rows(files) {
+    let mut out = []
+    let r = root()
+    if typeof(files) != "List" { return out }
+    for fe in files {
+        let rel = unwrap_or(get(fe, "file"), "")
+        let abs = r + "/" + rel
+        let syms = unwrap_or(get(fe, "symbols"), [])
+        let n = if typeof(syms) == "List" { len(syms) } else { 0 }
+        out = push(out, { kind_name: "__file__", name: rel, file: abs, group: rel,
+                          line: 0, depth: 0, container: "", count: n })
+        if typeof(syms) == "List" {
+            for nd in syms {
+                let sr = unwrap_or(get(nd, "selection_range"), ())
+                let start = unwrap_or(get(sr, "start"), ())
+                out = push(out, {
+                    name: unwrap_or(get(nd, "name"), "?"),
+                    kind_name: unwrap_or(get(nd, "kind_name"), "symbol"),
+                    file: abs, group: rel,
+                    line: unwrap_or(get(start, "line"), 0),
+                    depth: 1, container: "",
+                })
+            }
+        }
+    }
+    out
+}
+
+// Project organized by OWNING TYPE — each struct/enum/trait with its methods
+// (inherent + trait, gathered across files), plus a free-functions group.
+fn load_types() {
+    let h = proc_spawn("jimctl", with_root(["lsp", "types"]))
+    if h == -1 { reset!(state, { ..cur_state(), status: "spawn failed (jimctl not found?)" }); request_render(); return }
+    reset!(state, { ..cur_state(), busy_h: h, busy_kind: "types", view: "type",
+                    status: "organizing by type…" })
+    request_render()
+}
+
+// type-outline reply → [type-header, member rows…, …, free-header, free rows].
+fn build_type_rows(types, free) {
+    let mut out = []
+    if typeof(types) == "List" {
+        for t in types {
+            let tname = unwrap_or(get(t, "name"), "?")
+            let members = unwrap_or(get(t, "members"), [])
+            out = push(out, { kind_name: "__type__", name: tname, group: tname,
+                              type_kind: unwrap_or(get(t, "kind"), ""),
+                              file: unwrap_or(get(t, "file"), ""), line: unwrap_or(get(t, "sel_line"), 0),
+                              depth: 0, container: "", count: len(members) })
+            if typeof(members) == "List" {
+                for m in members {
+                    out = push(out, {
+                        name: unwrap_or(get(m, "name"), "?"),
+                        kind_name: unwrap_or(get(m, "kind_name"), "method"),
+                        file: unwrap_or(get(m, "file"), ""), line: unwrap_or(get(m, "sel_line"), 0),
+                        depth: 1, container: tname, group: tname,
+                        sub: unwrap_or(get(m, "trait"), "") })
+                }
+            }
+        }
+    }
+    if typeof(free) == "List" and len(free) > 0 {
+        out = push(out, { kind_name: "__type__", name: "(free functions)", group: "(free functions)",
+                          type_kind: "module", file: "", line: 0, depth: 0, container: "", count: len(free) })
+        for fnr in free {
+            out = push(out, {
+                name: unwrap_or(get(fnr, "name"), "?"),
+                kind_name: unwrap_or(get(fnr, "kind_name"), "function"),
+                file: unwrap_or(get(fnr, "file"), ""), line: unwrap_or(get(fnr, "sel_line"), 0),
+                depth: 1, container: "", group: "(free functions)", sub: "" })
+        }
+    }
+    out
+}
+
+// Map a symbol kind to a filter group (the buttons toggle these).
+fn kind_group(kind) {
+    if kind == "function" or kind == "method" or kind == "constructor" { "fn" }
+    else if kind == "struct" { "struct" }
+    else if kind == "enum" or kind == "enum_member" { "enum" }
+    else if kind == "interface" or kind == "class" { "trait" }
+    else if kind == "constant" { "const" }
+    else if kind == "module" { "mod" }
+    else { "other" }
+}
+fn is_kind_hidden(s, kind) {
+    let g = kind_group(kind)
+    for x in s.hidden { if x == g { return true } }
+    false
+}
+fn is_group_hidden(s, g) {
+    for x in s.hidden { if x == g { return true } }
+    false
+}
+fn toggle_filter(g) {
+    let s = cur_state()
+    if is_group_hidden(s, g) {
+        reset!(state, { ..s, hidden: filter(s.hidden, (x) => x != g) })
+    } else {
+        reset!(state, { ..s, hidden: push(s.hidden, g) })
+    }
+    request_render()
+}
+
+fn is_collapsed(s, rel) {
+    for c in s.collapsed { if c == rel { return true } }
+    false
+}
+fn toggle_collapse(rel) {
+    let s = cur_state()
+    if is_collapsed(s, rel) {
+        reset!(state, { ..s, collapsed: filter(s.collapsed, (c) => c != rel) })
+    } else {
+        reset!(state, { ..s, collapsed: push(s.collapsed, rel) })
+    }
+    request_render()
+}
+
+// ---- reply handling (one-shot: one JSON line then exit) ----
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    if handle != s.busy_h { return }
+    let v = parse_json(line)
+    if typeof(v) != "Record" { return }
+    let err = get(v, "error")
+    if typeof(err) == "Record" {
+        reset!(state, { ..s, status: "lsp: " + unwrap_or(get(err, "message"), "error"), busy_h: -1 })
+        request_render(); return
+    }
+    let res = unwrap_or(get(v, "result"), ())
+    if typeof(res) != "Record" { return }
+    if s.busy_kind == "ensure" {
+        let ready = unwrap_or(get(res, "ready"), false)
+        if ready {
+            reset!(state, { ..s, busy_h: -1 })
+            if s.file != "" { load_file_outline() }
+            else if s.view == "type" { load_types() }
+            else { load_outline() }
+        } else {
+            reset!(state, { ..s, busy_h: -1, status: "rust-analyzer still indexing — click Reload" })
+            request_render()
+        }
+    } else if s.busy_kind == "search" {
+        let rows = parse_ws(unwrap_or(get(res, "symbols"), []))
+        reset!(state, { ..s, results: rows, busy_h: -1,
+                        status: str(len(rows)) + " result(s)" })
+        request_render()
+    } else if s.busy_kind == "file" {
+        let syms = unwrap_or(get(res, "symbols"), [])
+        let rows = flatten_syms(syms, 0, s.file, "", [])
+        reset!(state, { ..s, results: rows, busy_h: -1,
+                        status: file_base(s.file) + " — " + str(len(rows)) + " symbols" })
+        request_render()
+    } else if s.busy_kind == "outline" {
+        let files = unwrap_or(get(res, "files"), [])
+        let rows = build_outline_rows(files)
+        let nfiles = if typeof(files) == "List" { len(files) } else { 0 }
+        reset!(state, { ..s, results: rows, busy_h: -1,
+                        status: str(nfiles) + " files — click a symbol to open it" })
+        request_render()
+    } else if s.busy_kind == "types" {
+        let types = unwrap_or(get(res, "types"), [])
+        let free = unwrap_or(get(res, "free"), [])
+        let rows = build_type_rows(types, free)
+        let nt = if typeof(types) == "List" { len(types) } else { 0 }
+        reset!(state, { ..s, results: rows, busy_h: -1, collapsed: [],
+                        status: str(nt) + " types — click a type or method to open it" })
+        request_render()
+    }
+}
+
+// workspace/symbol results → uniform rows.
+fn parse_ws(arr) {
+    let mut out = []
+    if typeof(arr) != "List" { return out }
+    for it in arr {
+        let loc = unwrap_or(get(it, "location"), ())
+        let uri = unwrap_or(get(loc, "uri"), "")
+        let rng = unwrap_or(get(loc, "range"), ())
+        let start = unwrap_or(get(rng, "start"), ())
+        let line = unwrap_or(get(start, "line"), 0)
+        let kn = kind_name(unwrap_or(get(it, "kind"), 0))
+        out = push(out, {
+            name: unwrap_or(get(it, "name"), "?"),
+            kind_name: kn,
+            file: uri_to_path(uri),
+            line: line,
+            depth: 0,
+            container: unwrap_or(get(it, "containerName"), ""),
+        })
+    }
+    out
+}
+
+// hierarchical document symbols → flat indented rows (carrying the parent name
+// as container so a pulled-out method can be told apart from a same-named one).
+fn flatten_syms(nodes, depth, file, parent, acc) {
+    let mut out = acc
+    if typeof(nodes) != "List" { return out }
+    for n in nodes {
+        let sr = unwrap_or(get(n, "selection_range"), ())
+        let start = unwrap_or(get(sr, "start"), ())
+        let nm = unwrap_or(get(n, "name"), "?")
+        out = push(out, {
+            name: nm,
+            kind_name: unwrap_or(get(n, "kind_name"), "symbol"),
+            file: file,
+            line: unwrap_or(get(start, "line"), 0),
+            depth: depth,
+            container: parent,
+        })
+        let kids = unwrap_or(get(n, "children"), [])
+        if typeof(kids) == "List" and len(kids) > 0 {
+            out = flatten_syms(kids, depth + 1, file, nm, out)
+        }
+    }
+    out
+}
+
+// ---- spawn a symbol pane for a clicked row ----
+fn spawn_pane(p, title) {
+    let mut argv = ["widget", "--kind", "script_widget", "--title", title]
+    let pr = project()
+    if pr != "" { argv = push(push(argv, "--project"), pr) }
+    argv = push(push(argv, "--params"), to_json(p))
+    argv = push(argv, "lsp_symbol.ft")
+    proc_spawn("jimctl", argv)
+}
+fn open_symbol(r) {
+    spawn_pane({ file: r.file, name: r.name, kind: r.kind_name, anchor_line: r.line, container: r.container }, r.name)
+}
+// Open a type definition (from a __type__ header), already showing its impls.
+fn open_type(r) {
+    if r.file == "" { return }   // free-functions group header — nothing to open
+    spawn_pane({ file: r.file, name: r.name, kind: r.type_kind, anchor_line: r.line,
+                 container: "", show: "impls" }, r.name)
+}
+
+// ---- handlers ----
+fn on_init() {}
+
+fn on_start() {
+    let f = param("file", "")
+    reset!(state, { ..cur_state(), file: f, view: param("view", "file") })
+    if root() == "" {
+        reset!(state, { ..cur_state(),
+            status: "no project root — open from a project whose folder is a Rust/Cargo workspace" })
+        request_render(); return
+    }
+    ensure_lsp()
+}
+
+// Coalesced scroll: only re-window when the view has drifted ~1/3 screen.
+// Between re-renders the host translates the already-built window for free.
+fn on_scroll(y) {
+    if should_rewindow(y, cur_state().last_sy, canvas_h) { request_render() }
+}
+
+fn on_input_change(id, value) {
+    if id == "q" { reset!(state, { ..cur_state(), query: value }) }
+}
+fn on_input_submit(id, value) {
+    if id == "q" { reset!(state, { ..cur_state(), query: value }); run_search() }
+}
+
+fn refresh_view() {
+    let s = cur_state()
+    if trim(s.query) != "" { run_search() }
+    else if s.view == "type" { load_types() }
+    else { load_outline() }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "search" { run_search(); return }
+    if id == "reload" { refresh_view(); return }
+    if id == "viewfile" {
+        reset!(state, { ..s, query: "", view: "file" }); load_outline(); return
+    }
+    if id == "viewtype" {
+        reset!(state, { ..s, query: "", view: "type" }); load_types(); return
+    }
+    if starts_with(id, "filt:") { toggle_filter(slice(id, 5, len(id))); return }
+    if starts_with(id, "grp:") { toggle_collapse(slice(id, 4, len(id))); return }
+    if starts_with(id, "topen:") {
+        let i = to_int(unwrap_or(parse_float(slice(id, 6, len(id))), 0.0))
+        if i >= 0 and i < len(s.results) { open_type(s.results[i]) }
+        return
+    }
+    if starts_with(id, "open:") {
+        let i = to_int(unwrap_or(parse_float(slice(id, 5, len(id))), 0.0))
+        if i >= 0 and i < len(s.results) { open_symbol(s.results[i]) }
+        return
+    }
+}
+
+// ---- rendering ----
+fn row_view(i, r) {
+    let indent = to_float(r.depth) * 16.0
+    let icon = { kind: "text", value: kind_icon(r.kind_name), family: "mono", size: 13.0,
+                 color: kind_color(r.kind_name), selectable: false, wrap: false }
+    let name = { kind: "text", value: r.name, family: "mono", size: 13.0,
+                 color: col_text(), selectable: false, wrap: false }
+    // Muted sub-text: an explicit trait label (type view), else container, else file:line.
+    let sub = unwrap_or(get(r, "sub"), "")
+    let subtext = if sub != "" { "impl " + sub }
+        else if r.container != "" { r.container }
+        else { file_base(r.file) + ":" + str(r.line + 1) }
+    let loc = { kind: "text", value: subtext, size: 10.0, color: col_muted(),
+                selectable: false, wrap: false }
+    let inner = { kind: "hstack", gap: 8.0, align: "center", children: [ icon, name, loc ] }
+    { kind: "list-item", id: "open:" + str(i), selected: false, pad: 0.0,
+      style: { width: "100%", radius: "6", height: "22", min_height: "22", clip: true,
+               padding: { top: 3.0, bottom: 3.0, left: 8.0 + indent, right: 8.0 } },
+      children: [ inner ] }
+}
+
+// A collapsible TYPE-group header (by-type view). The collapse arrow and the
+// (row → open the type) are SIBLINGS, not nested — nested clickables are
+// swallowed by the outer one (the click resolver takes the first/outermost
+// match). Clicking the row opens the type (with its impls sidebar); the arrow
+// toggles its members.
+fn type_header_view(i, r, collapsed) {
+    let arrow = if collapsed { "▸" } else { "▾" }
+    let row = { kind: "list-item", id: "topen:" + str(i), selected: false, pad: 0.0,
+        style: { flex_grow: 1.0, min_width: "0", radius: "6", clip: true,
+                 padding: { top: 4.0, bottom: 4.0, left: 4.0, right: 8.0 } },
+        children: [ { kind: "hstack", gap: 6.0, align: "center", children: [
+            { kind: "text", value: kind_icon(r.type_kind), family: "mono", size: 13.0,
+              color: kind_color(r.type_kind), selectable: false, wrap: false },
+            { kind: "text", value: r.name, family: "mono", size: 12.0, weight: "bold",
+              color: col_accent(), selectable: false, wrap: false },
+            { kind: "text", value: str(r.count), size: 10.0, color: col_muted(), selectable: false, wrap: false },
+        ] } ] }
+    { kind: "hstack", gap: 4.0, align: "center",
+      style: { width: "100%", height: "28", min_height: "28", clip: true },
+      children: [ { kind: "button", id: "grp:" + r.group, label: arrow }, row ] }
+}
+
+// A collapsible file-group header. Fixed height = hdr_h(), no margin, so the
+// virtualizer's offsets are exact.
+fn file_header_view(r, collapsed) {
+    let arrow = if collapsed { "▸" } else { "▾" }
+    let inner = { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "text", value: arrow, size: 11.0, color: col_muted(), selectable: false, wrap: false },
+        { kind: "text", value: r.name, family: "mono", size: 12.0, weight: "bold",
+          color: col_accent(), selectable: false, wrap: false },
+        { kind: "text", value: str(r.count), size: 10.0, color: col_muted(),
+          selectable: false, wrap: false },
+    ] }
+    { kind: "list-item", id: "grp:" + r.group, selected: false, pad: 0.0,
+      style: { width: "100%", radius: "6", height: "28", min_height: "28", clip: true,
+               padding: { top: 6.0, bottom: 6.0, left: 8.0, right: 8.0 } },
+      children: [ inner ] }
+}
+
+// Render one windowed entry — a file/type header or a symbol row.
+fn render_entry(s, row) {
+    if row.kind_name == "__file__" { file_header_view(row, is_collapsed(s, row.group)) }
+    else if row.kind_name == "__type__" { type_header_view(row._idx, row, is_collapsed(s, row.group)) }
+    else { row_view(row._idx, row) }
+}
+
+// A small toggle button for a kind filter (lit when enabled / not hidden).
+fn filter_btn(s, g, label) {
+    let on = not is_group_hidden(s, g)
+    { kind: "button", id: "filt:" + g, label: label,
+      style: { background: if on { col_panel() } else { "#0c0e12" },
+               text_color: if on { col_accent() } else { col_muted() } } }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    // Remember the scroll offset we windowed at, so on_scroll knows when the
+    // view has drifted far enough to warrant another (coalesced) re-window.
+    reset!(state, { ..s, last_sy: scroll_y })
+    let bar = { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "text", value: "⌖ explore", size: 13.0, weight: "bold",
+          color: col_text(), selectable: false },
+        { kind: "input", id: "q", value: s.query, placeholder: "filter symbols…",
+          style: { flex_grow: 1.0 } },
+        { kind: "button", id: "search", label: "Search" },
+        { kind: "button", id: "reload", label: "↻" },
+    ] }
+    // View toggle + kind filters.
+    let toolbar = { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "button", id: "viewfile", label: "By file",
+          style: { text_color: if s.view == "file" { col_accent() } else { col_muted() } } },
+        { kind: "button", id: "viewtype", label: "By type",
+          style: { text_color: if s.view == "type" { col_accent() } else { col_muted() } } },
+        { kind: "text", value: "  filter:", size: 10.0, color: col_muted(), selectable: false },
+        filter_btn(s, "fn", "fn"), filter_btn(s, "struct", "struct"), filter_btn(s, "enum", "enum"),
+        filter_btn(s, "trait", "trait"), filter_btn(s, "const", "const"), filter_btn(s, "mod", "mod"),
+    ] }
+    let status = { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false }
+
+    // Type groups whose TYPE kind is filtered out → hide entirely (header + members).
+    let mut hidden_groups = []
+    for r in s.results {
+        if r.kind_name == "__type__" and r.file != "" and is_kind_hidden(s, r.type_kind) {
+            hidden_groups = push(hidden_groups, r.group)
+        }
+    }
+    // Groups with ≥1 kind-visible member — so file/free headers with everything
+    // filtered out are dropped.
+    let mut groups_live = []
+    for r in s.results {
+        if r.depth > 0 {
+            let g = unwrap_or(get(r, "group"), "")
+            if not contains_str(hidden_groups, g) and not is_kind_hidden(s, r.kind_name) {
+                if not contains_str(groups_live, g) { groups_live = push(groups_live, g) }
+            }
+        }
+    }
+    // Build the CURRENTLY VISIBLE rows; tag each with its `results` index for stable ids.
+    let mut visible = []
+    let mut heights = []
+    let mut j = 0
+    for r in s.results {
+        let g = unwrap_or(get(r, "group"), "")
+        if not contains_str(hidden_groups, g) {
+            if r.kind_name == "__type__" {
+                let show = if r.file != "" { true } else { contains_str(groups_live, g) }
+                if show { visible = push(visible, { ..r, _idx: j }); heights = push(heights, hdr_h()) }
+            } else if r.kind_name == "__file__" {
+                if contains_str(groups_live, g) { visible = push(visible, { ..r, _idx: j }); heights = push(heights, hdr_h()) }
+            } else if not is_collapsed(s, g) and not is_kind_hidden(s, r.kind_name) {
+                visible = push(visible, { ..r, _idx: j }); heights = push(heights, row_h())
+            }
+        }
+        j = j + 1
+    }
+    let list = if len(visible) == 0 {
+        { kind: "text", value: s.status, color: col_muted() }
+    } else {
+        virtual_list(visible, heights, scroll_y, h, (row, k) => render_entry(s, row))
+    }
+    { kind: "vstack", gap: 8.0, pad: 12.0, children: [ bar, toolbar, status, { kind: "divider" }, list ] }
+}
+
+fn contains_str(xs, v) {
+    for x in xs { if x == v { return true } }
+    false
+}

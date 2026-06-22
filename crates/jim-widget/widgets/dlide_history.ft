@@ -1,0 +1,87 @@
+// dlide_history.ft — datalog IDE: query history.
+//
+// Logs every command the editor runs (heard off the bus) and lets you
+// click one to reload it into the editor. Pure bus widget — no DB access.
+//
+//   listens: sql.run {sql}            append to history
+//            sql.result {ok,summary}  annotate the newest entry
+//   emits:   sql.set_editor {sql}     (click → editor loads it)
+import "host"
+
+// most recent first: [{ sql, note }]
+fn init_state() = { items: [] }
+let state = atom(init_state())
+
+fn truncate(s, n) {
+    let t = replace(s, "\n", " ")
+    if len(t) > n { slice(t, 0, n) + "…" } else { t }
+}
+
+fn on_message(topic, payload, sender) {
+    if sender == my_id() { return }
+    if topic == "sql.run" {
+        let s = @state
+        let sql = payload.sql
+        // de-dup if identical to the newest entry
+        if len(s.items) == 0 or (s.items[0]).sql != sql {
+            // new entry first, then existing items
+            let mut next = [{ sql: sql, note: "running…" }]
+            for it in s.items { next = push(next, it) }
+            while len(next) > 30 { next = remove_at(next, len(next) - 1) }
+            reset!(state, { ..s, items: next })
+            host_log("[dlide_history] +" + sql + " (" + str(len(next)) + " total)")
+        }
+        request_render()
+    } else if topic == "sql.result" {
+        let s = @state
+        if len(s.items) > 0 {
+            let head = s.items[0]
+            let note = if payload.ok { "ok · " + payload.summary } else { "error" }
+            let items = assoc(s.items, 0, { ..head, note: note })
+            reset!(state, { ..s, items: items })
+            request_render()
+        }
+    }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if starts_with(id, "h:") {
+        let s = @state
+        let idx = parse_int(slice(id, 2, len(id) - 2))
+        if idx >= 0 and idx < len(s.items) {
+            emit("sql.set_editor", { sql: (s.items[idx]).sql })
+        }
+    }
+}
+
+fn note_color(note) {
+    if starts_with(note, "ok") { "#6cc08a" } else if starts_with(note, "error") { "#e0746f" } else { "fg_muted" }
+}
+
+// Re-render on pane resize so layout (e.g. table widths) tracks the
+// new canvas size — render() depends on `w`/`h`.
+fn on_resize(w, h) { request_render() }
+
+fn render(w, h) {
+    let s = @state
+    let mut rows = []
+    rows = push(rows, { kind: "text", value: "HISTORY", size: 10.0, weight: "bold", color: "fg_muted" })
+    if len(s.items) == 0 {
+        rows = push(rows, { kind: "text", value: "nothing run yet", size: 11.0, color: "fg_muted" })
+    }
+    let mut i = 0
+    while i < len(s.items) {
+        let it = s.items[i]
+        rows = push(rows, { kind: "list-item", id: "h:" + str(i), pad: 6.0, children: [
+            { kind: "text", value: truncate(it.sql, 38), size: 11.0, color: "fg", family: "mono" },
+            { kind: "text", value: it.note, size: 10.0, color: note_color(it.note) },
+        ] })
+        i = i + 1
+    }
+    {
+        kind: "vstack", gap: 4.0,
+        style: { background: "surface_1", width: "100%", min_height: "100%",
+                 padding: { top: 10.0, right: 10.0, bottom: 10.0, left: 10.0 } },
+        children: [ { kind: "scroll", pad: 0.0, gap: 4.0, children: rows } ]
+    }
+}

@@ -10,6 +10,7 @@ editor_core = { path = "../editor-core" }
 jim_pane = { path = "../jim-pane" }
 jim_style = { path = "../jim-style" }
 jim_daemon = { path = "../jim-daemon" }
+jim_bus = { path = "../jim-bus" }
 jim_terminal = { path = "../jim-terminal" }
 jim_flame = { path = "../jim-flame" }
 jim_widget = { path = "../jim-widget" }

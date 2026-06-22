@@ -36,29 +36,36 @@ already duplicates jim's socket wire formats, so the bridge gets
 `~/.jim/socket` plumbing for free and `.mcp.json` simply runs
 `jimctl channel`.
 
+The hub is the standalone **`jim_bus` daemon** (`~/.jim/bus.sock`), *not*
+the GUI — so the bus works whether or not the editor is open, the same way
+the terminal works whether or not the GUI is open (via `jim_daemon`). Any
+client that finds the bus down spawns it on demand (`<exe> bus-daemon`).
+The GUI is just another client: it subscribes to deliver messages to
+widget panes and publishes their emits.
+
 ```
-   Claude session A                         jim GUI (the hub)
-  ┌───────────────┐   stdio / MCP JSON-RPC  ┌────────────────────────────┐
-  │  claude        │◄───────────────────────│                            │
-  │   ▲  spawns    │   notifications/        │  ~/.jim/socket  (publish)  │
-  │   │            │   claude/channel ───────┼─► widget_message / IpcReq  │
-  │ ┌─┴──────────┐ │   (in)                  │      │                     │
-  │ │jimctl      │ │   tools: jim_send,      │      ▼                     │
-  │ │  channel   │─┼── jim_do, … (out) ──────┼─►  WidgetMsgBus ──► widgets │
-  │ │  (bridge)  │ │                         │      │   on_message        │
-  │ └─────┬──────┘ │                         │      ▼                     │
-  └───────┼────────┘   tail (subscribe)      │  ~/.jim/widget-bus.log     │
-          └──────────────────────────────────┤  jim.action → dispatch_local
-                                             └────────────────────────────┘
+   Claude session A          jim_bus daemon (the hub)         jim GUI (a client)
+  ┌───────────────┐         ┌────────────────────────┐      ┌──────────────────┐
+  │  claude        │         │  ~/.jim/bus.sock        │      │ subscribe ──────┐ │
+  │   ▲  spawns    │  pub /  │   • retained store      │ pub/ │                 ▼ │
+  │   │            │  sub    │     (persisted to disk) │ sub  │  WidgetMsgBus     │
+  │ ┌─┴──────────┐ │◄───────►│   • resume ring         │◄────►│   │ on_message    │
+  │ │jimctl      │ │         │   • agent roster +      │      │   ▼               │
+  │ │  channel   │ │         │     dead-peer sweep     │      │  widgets          │
+  │ │  (bridge)  │ │         └────────────────────────┘      │  jim.action →     │
+  │ └────────────┘ │            ▲ persists                   │  dispatch_local   │
+  └───────────────┘     ~/.jim/bus-retained.json             └──────────────────┘
    Session B runs its own `jimctl channel` → cross-session is just two
-   bridges on one bus.
+   clients on one daemon (and it keeps working with the GUI closed).
 ```
 
-- **Inbound (bus → Claude):** the bridge tails `~/.jim/widget-bus.log`,
-  filters to this session's subscriptions, and emits a
+- **Inbound (bus → Claude):** the bridge subscribes to the daemon, filters
+  to this session's subscriptions, and emits a
   `notifications/claude/channel` MCP notification. Claude wakes and reacts.
-- **Outbound (Claude → bus):** Claude calls a tool; the bridge publishes
-  a `widget_message` (or `jim.action`) over `~/.jim/socket`.
+- **Outbound (Claude → bus):** Claude calls a tool; the bridge publishes a
+  `Publish` frame (or a `jim.action` message) to the daemon. The GUI, if
+  open, observes `jim.action` via its subscription and re-dispatches it
+  through `dispatch_local()`.
 
 Why this is nearly free on the app side: jim's widget bus **already has a
 global, cross-project scope** (`PendingMsg.project: None`), is reachable
@@ -215,29 +222,37 @@ The new pieces:
 
 ## Decisions / risks
 
-- **Subscribe transport.** Tailing `widget-bus.log` (200ms poll,
-  truncated on app start) is the zero-change path but a little hacky and
-  ~200ms latency. Cleaner long-term: add a `subscribe` mode to
-  `~/.jim/socket` that streams NDJSON. Fine to start with the tail.
-- **Hub availability.** The GUI is the bus hub; session↔session needs it
-  running. Acceptable since the editor is the point — otherwise the bus
-  moves into a small daemon (the daemon pattern already exists).
+- **Subscribe transport — RESOLVED.** Originally a `widget-bus.log` tail
+  (200ms poll, GUI-written). Now a real socket subscribe with
+  retained-replay + live streaming against the `jim_bus` daemon
+  (`jim_bus::client::BusHandle`), so there's no file-tail latency and no
+  GUI dependency.
+- **Hub availability — RESOLVED.** The hub used to be the GUI, so
+  session↔session needed the editor running. The bus now lives in the
+  standalone `jim_bus` daemon (the same daemon pattern as `jim_daemon`),
+  spawned on demand, persisted to disk — session↔session works with the
+  GUI closed.
 - **Trust.** Once `jim.action` can drive `dispatch_local`, any bus
   participant can command the editor. Locally that's the feature; keep a
   conscious "the bus is trusted within one user's machine" stance. (This
   matters more here because we run bypass-permissions — there's no
   per-action approval backstop, by design.)
 
-## Wire formats reused (so the bridge stays dylib-free)
+## Wire formats (so the bridge stays dylib-free)
 
-- **Publish:** `{"action":"widget_message","project":<name|"global"|null>,"topic":…,"payload":…,"retain":…,"sender":<id>}`
-  over `~/.jim/socket` (the `IpcRequest::WidgetMessage` variant).
-  `project:"global"` = the cross-project `None` channel; `sender` stamps
-  the real origin (defaults to `tbmsg`). The bridge publishes `agent.*`
-  with `project:"global"` and `sender:<session id>`.
-- **Subscribe:** NDJSON lines
-  `{"project":<id|null>,"topic":…,"sender":…,"retain":…,"payload":…}`
-  appended to `~/.jim/widget-bus.log`.
+The bridge / adapters talk to the `jim_bus` daemon via `jim_bus::client`
+(length-prefixed bincode frames — `crates/jim-bus/src/proto.rs`):
+
+- **Publish:** `Hello{Publisher}` then `Publish(BusMessage{ project:
+  Option<u64>, topic, payload_json, sender, retain })`. `project: None` is
+  the cross-project global channel the `agent.*` topics ride on; `sender`
+  stamps the real origin. Payloads ride as a JSON **string** (bincode
+  isn't self-describing, so it can't carry a `serde_json::Value`).
+- **Subscribe:** `Hello{Subscriber{since_seq}}` then read `BusFrame::Message
+  { seq, msg }` frames; the daemon brackets the retained replay with
+  `ReplayStart`/`ReplayEnd`, then streams live.
+- The legacy `widget_message` action on `~/.jim/socket` still works as a
+  thin GUI→daemon forwarder for backward compatibility.
 - **MCP:** newline-delimited JSON-RPC 2.0 on stdio. Channel capability is
   `capabilities.experimental["claude/channel"] = {}`; inbound events are
   `notifications/claude/channel` with `params {content, meta}`.

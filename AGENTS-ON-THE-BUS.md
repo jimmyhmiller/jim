@@ -7,18 +7,35 @@ This is the contract for writing one.
 
 ## The bus is the open API
 
-- **Publish** — one JSON line to `~/.jim/socket`:
-  `{"action":"widget_message","project":"global","topic":"<t>","payload":{…},"retain":<bool>,"sender":"<id>"}`
-- **Subscribe** — tail `~/.jim/widget-bus.log` (NDJSON; filter by `topic`).
-- Or just shell out: `jimctl msg emit --topic … --json …` and `jimctl msg tail`.
-- **Topics**: `agent.hello.<id>` (retained roster; null payload = tombstone),
-  `agent.inbox.<id>` (direct), `agent.all` (broadcast), `jim.action`
-  (payload is an `IpcRequest` → drives the editor: open files, spawn
-  widgets, …). Payload convention: `{ from, text, data? }`.
+The bus is hosted by a **standalone `jim_bus` daemon**, not the GUI — so
+it works whether or not the editor is open, exactly like the terminal
+works via `jim_daemon`. Any client (the GUI, `jimctl`, an adapter) that
+finds the bus down spawns it on demand (`<exe> bus-daemon`). The daemon
+owns the socket (`$HOME/.jim/bus.sock`), the persisted retained store,
+and the agent roster.
 
-Any process that can write a socket line and tail a file is already a
-first-class participant — **outbound + editor control work for everything
-today, no new code.** The only runtime-specific part is inbound *push*.
+- **Publish** — connect to the daemon socket, send a length-prefixed
+  bincode `Hello{Publisher}` then `Publish` frame (see
+  `crates/jim-bus/src/proto.rs`). In Rust, just call
+  `jim_bus::client::publish_oneshot(&BusMessage{…})`.
+- **Subscribe** — `Hello{Subscriber}` then read `BusFrame::Message`
+  frames; the daemon replays the retained store first (bracketed by
+  `ReplayStart`/`ReplayEnd`) then streams live. `jim_bus::client::BusHandle`
+  wraps this with auto-reconnect + resume.
+- Or just shell out: `jimctl msg emit --topic … --json …` and
+  `jimctl msg tail` — both talk to the daemon, GUI or no GUI.
+- **Topics**: `agent.hello.<id>` (retained roster; null payload = tombstone;
+  the daemon also sweeps dead pids / stale heartbeats), `agent.inbox.<id>`
+  (direct), `agent.all` (broadcast), `jim.action` (payload is an
+  `IpcRequest` → drives the editor: open files, spawn widgets, …). Payload
+  convention: `{ from, text, data? }`.
+
+Any process that can speak the socket protocol (or shell out to `jimctl
+msg`) is a first-class participant — **outbound + editor control work for
+everything today, no new code.** The only runtime-specific part is inbound
+*push*. The legacy `widget_message` action on the GUI's `~/.jim/socket`
+still works as a thin forwarder to the daemon, but new code should target
+the daemon directly.
 
 ### Addressing: point-to-point vs broadcast
 

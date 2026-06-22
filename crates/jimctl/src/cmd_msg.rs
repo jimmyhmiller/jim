@@ -18,7 +18,7 @@
 //!
 //! `--project` accepts a project name (`datalog-db`) or `active`.
 
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,11 +26,6 @@ use std::process::ExitCode;
 fn socket_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(Path::new(&home).join(".jim").join("socket"))
-}
-
-fn bus_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".jim").join("widget-bus.log"))
 }
 
 fn print_usage() {
@@ -108,42 +103,35 @@ fn cmd_emit(args: &[String]) -> ExitCode {
     };
     let retain = switches.iter().any(|s| s == "retain");
 
-    let req = serde_json::json!({
-        "action": "widget_message",
-        "project": get(&named, "project"),
-        "topic": topic,
-        "payload": payload,
-        "retain": retain,
-    });
+    // Resolve `--project NAME` to its numeric id; absent / "global" / "*"
+    // → the global channel. Project resolution still asks the GUI (it owns
+    // the project list), but is optional — most bus traffic is global and
+    // reaches the daemon whether or not the GUI is open.
+    let project: Option<u64> = match get(&named, "project") {
+        None | Some("global") | Some("*") => None,
+        Some(name) => match resolve_project_id(name) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("jimctl msg emit: {}", e);
+                return ExitCode::from(1);
+            }
+        },
+    };
 
-    let Some(sock) = socket_path() else {
-        eprintln!("jimctl msg: $HOME not set; can't locate socket");
-        return ExitCode::from(1);
+    let msg = jim_bus::proto::BusMessage {
+        project,
+        topic: topic.to_string(),
+        payload_json: payload.to_string(),
+        sender: "jimctl msg".to_string(),
+        retain,
     };
-    let mut stream = match UnixStream::connect(&sock) {
-        Ok(s) => s,
+    match jim_bus::client::publish_oneshot(&msg) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!(
-                "jimctl msg: connect {}: {} (is the terminal-bevy app running?)",
-                sock.display(),
-                e
-            );
-            return ExitCode::from(1);
+            eprintln!("jimctl msg: publish to jim-bus: {e}");
+            ExitCode::from(1)
         }
-    };
-    let body = match serde_json::to_vec(&req) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("jimctl msg: serialize: {}", e);
-            return ExitCode::from(1);
-        }
-    };
-    if let Err(e) = stream.write_all(&body) {
-        eprintln!("jimctl msg: write: {}", e);
-        return ExitCode::from(1);
     }
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    ExitCode::SUCCESS
 }
 
 fn cmd_tail(args: &[String]) -> ExitCode {
@@ -161,74 +149,38 @@ fn cmd_tail(args: &[String]) -> ExitCode {
         None => None,
     };
 
-    let Some(log) = bus_log_path() else {
-        eprintln!("jimctl msg: $HOME not set; can't locate bus log");
-        return ExitCode::from(1);
-    };
-
-    // Follow the log like `tail -f`: seek to the end, then poll for newly
-    // appended lines. If the file is truncated (app restart), reset.
+    // Subscribe to the bus daemon (spawning it if needed) and print each
+    // delivered message as a JSON line — same shape the old tail log had.
+    // The daemon replays the retained store first, then streams live.
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut pos: u64 = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    let handle = jim_bus::client::BusHandle::spawn();
     loop {
-        let mut f = match std::fs::File::open(&log) {
-            Ok(f) => f,
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                continue;
+        for item in handle.drain() {
+            if let jim_bus::client::Inbound::Message(msg) = item {
+                print_tail_msg(&mut out, &msg, filter_id);
             }
-        };
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        if len < pos {
-            // Truncated (restart) — start over from the top.
-            pos = 0;
         }
-        if len > pos {
-            if f.seek(SeekFrom::Start(pos)).is_err() {
-                pos = len;
-                continue;
-            }
-            let mut reader = BufReader::new(&mut f);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if line.ends_with('\n') {
-                            print_tail_line(&mut out, line.trim_end(), filter_id);
-                        } else {
-                            // Partial line: rewind so we re-read it whole.
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            // Where the next read should resume from.
-            pos = f.stream_position().unwrap_or(len);
-            let _ = out.flush();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let _ = out.flush();
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
-fn print_tail_line(out: &mut impl Write, line: &str, filter_id: Option<u64>) {
-    if line.is_empty() {
-        return;
-    }
+fn print_tail_msg(out: &mut impl Write, msg: &jim_bus::proto::BusMessage, filter_id: Option<u64>) {
     if let Some(want) = filter_id {
-        // Each line is `{"project":<id|null>,...}`; filter by project id.
-        let parsed: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let pid = parsed.get("project").and_then(|v| v.as_u64());
-        if pid != Some(want) {
+        if msg.project != Some(want) {
             return;
         }
     }
+    let payload: serde_json::Value =
+        serde_json::from_str(&msg.payload_json).unwrap_or(serde_json::Value::Null);
+    let line = serde_json::json!({
+        "project": msg.project,
+        "topic": msg.topic,
+        "sender": msg.sender,
+        "retain": msg.retain,
+        "payload": payload,
+    });
     let _ = writeln!(out, "{}", line);
 }
 

@@ -1,0 +1,162 @@
+// ui_sidebar.ft — a reusable, scrollable sidebar list for funct widgets.
+//
+// Independent scrolling without engine-level clipping: the list is
+// *virtually windowed* — only the items that fully fit are rendered, and the
+// wheel (routed via the host's `on_wheel(x, y, dy)`) pages the window. So the
+// sidebar scrolls on its own while the rest of the widget stays put, with no
+// clipping artifacts and fully clickable items.
+//
+// Usage from a host widget:
+//   import { sb_view, sb_wheel, sb_visible, sb_max_first } from "ui_sidebar"
+//   // state: sb_first (window start index)
+//   fn on_wheel(x, y, dy) {                       // host decides the region
+//       if x < SIDEBAR_W {
+//           state.sb_first = sb_wheel(state.sb_first, dy, len(items), H, ITEM_H)
+//           request_render()
+//       }
+//   }
+//   sb_view({ title, width, height, item_h, first, items, selected,
+//             id_prefix, reload_id })
+//     items    : [{ id, label, sub }]   (sub optional)
+//     selected : id of the highlighted item ("" = none)
+//     id_prefix: click ids are id_prefix + item.id; reload button = reload_id
+//
+// Pure module — every fn takes what it needs (funct fns don't see globals).
+
+// ---- palette (neutral slate; no warm tones) --------------------------------
+fn c_surface()  = "#161a21"
+fn c_border()   = "#262b35"
+fn c_divider()  = "#232833"
+fn c_title()    = "#e7eaf0"
+fn c_muted()    = "#8b93a1"
+fn c_item()     = "#d6dae2"
+fn c_sel_bg()   = "#243044"
+fn c_sel_text() = "#9fe0d0"
+fn c_hover()    = "#1d222b"
+fn c_track()    = "#1b1f27"
+fn c_thumb()    = "#39414e"
+
+fn header_h() = 30.0
+fn pad()      = 9.0
+
+fn ellipsize(s, n) = if len(s) > n { slice(s, 0, n - 1) + "…" } else { s }
+
+// ---- scroll math (exported) ------------------------------------------------
+export fn sb_visible(height, item_h) =
+    max(1, to_int(floor((height - header_h() - 2.0 * pad() - 8.0) / item_h)))
+
+export fn sb_max_first(n, height, item_h) = max(0, n - sb_visible(height, item_h))
+
+// Wheel → new window start. Steps proportionally to the delta (dy>0 =
+// toward the top), so a mouse notch moves a few rows and a trackpad glides.
+export fn sb_wheel(first, dy, n, height, item_h) {
+    let mag = max(1, to_int(floor(abs(dy) / 12.0)))
+    let step = if dy > 0.0 { 0 - mag } else { mag }
+    max(0, min(sb_max_first(n, height, item_h), first + step))
+}
+
+// ---- pieces ----------------------------------------------------------------
+fn item_el(it, prefix, selected, item_h) {
+    let is_sel = it.id == selected
+    let sub = unwrap_or(get(it, "sub"), "")
+    let mut lines = [
+        { kind: "text", value: ellipsize(it.label, 26), size: 12.0,
+          weight: if is_sel { "bold" } else { "normal" },
+          color: if is_sel { c_sel_text() } else { c_item() } },
+    ]
+    if sub != "" {
+        lines = push(lines, { kind: "text", value: sub, size: 10.0, color: c_muted() })
+    }
+    {
+        kind: "list-item", id: prefix + it.id, selected: is_sel, gap: 1.0,
+        style: {
+            radius: "7", width: "100%",
+            height: str(item_h - 4.0), min_height: str(item_h - 4.0),
+            padding: { top: 5.0, bottom: 5.0, left: 10.0, right: 10.0 },
+            background: if is_sel { c_sel_bg() } else { "#00000000" },
+            hover: { background: c_hover() },
+        },
+        children: [ { kind: "vstack", gap: 1.0, children: lines } ],
+    }
+}
+
+fn scrollbar(track_h, n, visible, first) {
+    if n <= visible {
+        return { kind: "canvas", style: { width: "6", height: str(track_h) }, children: [] }
+    }
+    let thumb_h = max(24.0, track_h * to_float(visible) / to_float(n))
+    let max_first = n - visible
+    let thumb_y = if max_first > 0 { (track_h - thumb_h) * to_float(first) / to_float(max_first) } else { 0.0 }
+    // Canvas items REQUIRE an `id` — without it the whole frame fails to
+    // deserialize ("missing field id") and the pane renders blank.
+    { kind: "canvas", style: { width: "6", height: str(track_h) }, children: [
+        { kind: "rect", id: "sb_track", x: 2.0, y: 0.0, w: 2.0, h: track_h, color: c_track(), anchor: "top-left" },
+        { kind: "rect", id: "sb_thumb", x: 1.0, y: thumb_y, w: 4.0, h: thumb_h, color: c_thumb(), anchor: "top-left" },
+    ]}
+}
+
+fn header_row(title, pos, reload_id) {
+    let mut right = [ { kind: "text", value: pos, size: 10.0, color: c_muted() } ]
+    if reload_id != "" {
+        right = push(right, { kind: "button", id: reload_id, label: "↻" })
+    }
+    { kind: "hstack", gap: 6.0, align: "center", children: [
+        // flex-grow frame absorbs the slack so the right group hugs the edge
+        // (Text has no style field; Spacer is fixed-size, not flex).
+        { kind: "frame", style: { flex_grow: 1.0 }, children: [
+            { kind: "text", value: title, weight: "bold", size: 12.0, color: c_title() },
+        ]},
+        { kind: "hstack", gap: 6.0, align: "center", children: right },
+    ]}
+}
+
+// ---- the sidebar (exported) ------------------------------------------------
+export fn sb_view(cfg) {
+    let n = len(cfg.items)
+    let item_h = cfg.item_h
+    let visible = sb_visible(cfg.height, item_h)
+    let first = max(0, min(sb_max_first(n, cfg.height, item_h), cfg.first))
+    let list_h = cfg.height - header_h() - 2.0 * pad() - 8.0
+
+    let reload_id = unwrap_or(get(cfg, "reload_id"), "")
+    let last = min(n, first + visible)
+    let pos = if n == 0 { "" } else { str(first + 1) + "–" + str(last) + " / " + str(n) }
+
+    let mut rows = []
+    let mut i = first
+    while i < n and i < first + visible {
+        rows = push(rows, item_el(cfg.items[i], cfg.id_prefix, cfg.selected, item_h))
+        i = i + 1
+    }
+    if n == 0 {
+        rows = push(rows, { kind: "text", value: "nothing yet", size: 11.0, color: c_muted() })
+    }
+
+    // `flat` = docked panel (fills its box, no rounded card / outline — just a
+    // surface fill; the host draws a divider). Otherwise a floating card.
+    let flat = unwrap_or(get(cfg, "flat"), false)
+    let pads = { top: pad(), bottom: pad(), left: pad(), right: pad() }
+    let frame_style = if flat {
+        { width: str(cfg.width), height: str(cfg.height),
+          background: c_surface(), padding: pads }
+    } else {
+        { width: str(cfg.width), height: str(cfg.height),
+          background: c_surface(), radius: "11",
+          border: { color: c_border(), width: 1.0 }, padding: pads }
+    }
+
+    {
+        kind: "frame", gap: 6.0,
+        style: frame_style,
+        children: [
+            header_row(cfg.title, pos, reload_id),
+            { kind: "divider" },
+            // align:start keeps the list pinned to the top — without it the
+            // row's cross-axis centers the (short) list vertically.
+            { kind: "hstack", gap: 4.0, align: "start", style: { flex_grow: 1.0 }, children: [
+                { kind: "vstack", gap: 3.0, style: { flex_grow: 1.0 }, children: rows },
+                scrollbar(list_h, n, visible, first),
+            ]},
+        ],
+    }
+}

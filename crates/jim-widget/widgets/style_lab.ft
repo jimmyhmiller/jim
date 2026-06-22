@@ -1,0 +1,758 @@
+// style_lab.ft — the Style Lab: generate theme candidates, judge them,
+// and let the feedback steer the next batch. (funct port of style_lab.rhai)
+//
+// Talks to the `style-muse` CLI (inference-bevy) over proc_spawn:
+//   next <count> <mode> [note]   → one JSON line of candidates
+//   feedback '<event-json>'      → records a verdict in feedback.jsonl
+//   adopt '<genome-json>' <name> → writes ~/.jim/styles/<name>/
+//
+// Each candidate ships a full `ui` style pack (every component painted in
+// its own palette, including hover plans), so cards and the per-candidate
+// "Expand" showcase render true to the genome regardless of the active
+// theme. "Try Live" adopts into the hot-reloading `lab` preset; "Keep"
+// saves a named preset (registry rescans on demand, no restart needed).
+import "host"
+
+// NOT YET registered for funct (the Rust bridge is being written
+// separately). Declared here so the call site compiles; faults loudly if
+// actually invoked until the host registers it. See missing_natives.
+extern fn set_active_style(name)
+
+fn init_state() = {
+    batch: [], verdicts: {}, toggles: {}, mode: "auto", note: "",
+    busy: false, status: "ready", auto_next: true, toast: "",
+    // proc handles are per-session worker ids — NEVER carry them across a
+    // script (re)load. A stale persisted handle once matched an unrelated
+    // proc exit and spammed "applied to the whole app" toasts.
+    batch_proc: -1, try_proc: -1, fb_count: 0, showcase: "", demo: {},
+}
+
+let state = atom(init_state())
+
+// Bare name: proc_spawn prepends the app's exe dir to PATH (target/release
+// in dev, Contents/MacOS in the bundle), so style-muse resolves next to the
+// running exe — no baked-in builder path that only exists on one machine.
+fn muse_bin() = "style-muse"
+
+// `type` is a funct keyword, so a record literal can't carry a bare `type:`
+// key. The worker renames `kind:` -> `type:` for the element discriminator,
+// but a button that ALSO has a `kind:` variant (ghost/outline) would then
+// collide. For those elements we inject the discriminator under the string
+// key "type" with assoc (which the worker leaves as the discriminator and
+// keeps the literal `kind` variant). Same trick for the glaze shader layers
+// whose own `type` key isn't an element discriminator.
+fn el(typename, rec) = assoc(rec, "type", typename)
+
+// funct fns don't see `state`, so handlers inline the fetch; this just
+// builds the argv.
+fn batch_args(mode, note) {
+    let mut args = ["next", "4", mode]
+    if note != "" { args = push(args, note) }
+    args
+}
+
+fn fresh_demo() = {
+    tog: true, chk: true, radio: "warm", tab: "two", slider: 62.0,
+    step: 3.0, sel: "m2", inp: "", dialog_open: false, show_toast: false
+}
+
+fn on_init() {
+    let mut s = @state
+    if len(s.demo) == 0 { s = { ..s, demo: fresh_demo() } }
+    // batches persisted before the ui-pack era can't render — refetch
+    if len(s.batch) > 0 and not has(s.batch[0], "ui") {
+        s = { ..s, batch: [], verdicts: {}, showcase: "" }
+    }
+    if len(s.batch) == 0 and not s.busy {
+        let proc = proc_spawn(muse_bin(), batch_args(s.mode, s.note))
+        s = { ..s, busy: true, status: "generating (" + s.mode + ")…", batch_proc: proc }
+    }
+    reset!(state, s)
+    request_render()
+}
+
+// ---------------------------------------------------------------- procs
+
+// Batch replies are recognized by SHAPE (a `candidates` key), not by
+// proc handle: a script reload re-runs top-level and resets the stored
+// handle, which used to orphan any in-flight fetch.
+fn on_proc_output(handle, line) {
+    let res = parse_json(line)
+    if res == () { return }
+    if has(res, "candidates") {
+        host_log("style_lab: batch arrived (" + str(len(res.candidates)) + " candidates)")
+        let mut s = @state
+        let mut status = "batch from " + res.source + " · " + str(res.feedback_count) + " verdicts recorded"
+        if has(res, "llm_error") and res.llm_error != () {
+            status = "fell back to random — " + res.llm_error
+        }
+        s = { ..s, batch: res.candidates, verdicts: {}, toggles: {}, showcase: "",
+              demo: fresh_demo(), busy: false, fb_count: res.feedback_count, status: status }
+        reset!(state, s)
+        request_render()
+        return
+    }
+    // adopt replies: activating the `lab` preset is keyed on the reply
+    // SHAPE too (handles reset on reload, see above)
+    if has(res, "ok") and has(res, "preset") {
+        host_log("style_lab: adopted preset " + res.preset)
+        if res.preset == "lab" {
+            set_active_style("lab")
+            reset!(state, { ..(@state), toast: "applied to the whole app (lab preset)" })
+            request_render()
+        }
+        return
+    }
+    // feedback replies: surface errors, stay quiet on success
+    if has(res, "error") {
+        reset!(state, { ..(@state), status: "" + res.error, toast: "" + res.error, busy: false })
+        request_render()
+    }
+}
+
+fn on_proc_exit(handle, code) {
+    // batch fetches answer with a `candidates` line before exiting; an
+    // exit while still busy means the fetch died (or was cancelled).
+    // Adopt completion is keyed on reply shape in on_proc_output — never
+    // on handles, which reset every script reload.
+    let s = @state
+    if handle == s.batch_proc and s.busy {
+        reset!(state, { ..s, busy: false,
+            status: "style-muse exited (" + str(code) + ") without a batch" })
+        request_render()
+    }
+}
+
+// --------------------------------------------------------------- clicks
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "new_batch" {
+        let mut s = @state
+        // clicking while busy cancels the in-flight fetch and starts a
+        // fresh one (a hung LLM call must never brick the button)
+        if s.busy and s.batch_proc >= 0 and proc_alive(s.batch_proc) {
+            proc_kill(s.batch_proc)
+        }
+        let proc = proc_spawn(muse_bin(), batch_args(s.mode, s.note))
+        s = { ..s, busy: true, status: "generating (" + s.mode + ")…", batch_proc: proc }
+        host_log("style_lab: new_batch click → proc handle " + str(proc))
+        if proc < 0 {
+            s = { ..s, busy: false, status: "failed to launch style-muse (see log)" }
+        }
+        reset!(state, s)
+        request_render()
+        return
+    }
+    if id == "back" {
+        reset!(state, { ..(@state), showcase: "" })
+        request_render()
+        return
+    }
+    if id == "toast_show" {
+        let s = @state
+        reset!(state, { ..s, demo: { ..s.demo, show_toast: true } })
+        request_render()
+        return
+    }
+    if id == "glaze_ui" {
+        // glaze_ui is a subprocess widget — spawn it as a pane via IPC. Bare
+        // name: the app spawns the command with the exe dir on PATH (it ships
+        // next to `jim` — target/release in dev, Contents/MacOS in the bundle),
+        // so it resolves without a machine-specific absolute path.
+        let req = "{\"action\":\"spawn_widget\",\"command\":\"glaze_ui\",\"title\":\"Glaze UI\",\"size\":[820,900]}"
+        proc_spawn("/bin/sh", ["-c", "printf '%s' '" + req + "' | nc -U \"$HOME/.jim/socket\""])
+        request_render()
+        return
+    }
+
+    let parts = split(id, ":")
+    if len(parts) < 2 { return }
+    let verb = parts[0]
+    let cid = parts[1]
+    if verb == "demo" or verb == "tog" { return }
+
+    // find the candidate
+    let mut cand = ()
+    for c in (@state).batch {
+        if c.id == cid { cand = c }
+    }
+    if cand == () { return }
+
+    if verb == "show" {
+        reset!(state, { ..(@state), showcase: cid, demo: fresh_demo() })
+        request_render()
+        return
+    }
+
+    if verb == "dlg" {
+        let s = @state
+        reset!(state, { ..s, demo: { ..s.demo, dialog_open: true } })
+        request_render()
+        return
+    }
+
+    // ensure a verdict record exists for this candidate
+    let mut s = @state
+    if not has(s.verdicts, cid) {
+        s = { ..s, verdicts: assoc(s.verdicts, cid, { overall: "", aspects: {} }) }
+        reset!(state, s)
+    }
+
+    if verb == "yes" or verb == "no" {
+        let v = if verb == "yes" { "like" } else { "dislike" }
+        let s = @state
+        let vd = get(s.verdicts, cid) |> unwrap_or({ overall: "", aspects: {} })
+        if vd.overall != v {
+            let new_vd = { ..vd, overall: v }
+            let mut s2 = { ..s, verdicts: assoc(s.verdicts, cid, new_vd), fb_count: s.fb_count + 1 }
+            send_feedback(cand, new_vd, s.note)
+            // every card judged → fetch the next round
+            if s2.auto_next and not s2.busy {
+                let mut judged = 0
+                for c in s2.batch {
+                    if has(s2.verdicts, c.id) {
+                        let cvd = get(s2.verdicts, c.id) |> unwrap_or({ overall: "" })
+                        if cvd.overall != "" { judged += 1 }
+                    }
+                }
+                if judged >= len(s2.batch) {
+                    let proc = proc_spawn(muse_bin(), batch_args(s2.mode, s2.note))
+                    s2 = { ..s2, busy: true, status: "generating (" + s2.mode + ")…", batch_proc: proc }
+                }
+            }
+            reset!(state, s2)
+        }
+        request_render()
+        return
+    }
+
+    if verb == "asp" and len(parts) >= 3 {
+        let aspect = parts[2]
+        let s = @state
+        let vd = get(s.verdicts, cid) |> unwrap_or({ overall: "", aspects: {} })
+        let cur = get(vd.aspects, aspect) |> unwrap_or("")
+        let nxt = if cur == "" { "like" } else { if cur == "like" { "dislike" } else { "" } }
+        let new_aspects = if nxt == "" {
+            dissoc(vd.aspects, aspect)
+        } else {
+            assoc(vd.aspects, aspect, nxt)
+        }
+        let new_vd = { ..vd, aspects: new_aspects }
+        send_feedback(cand, new_vd, s.note)
+        reset!(state, { ..s, verdicts: assoc(s.verdicts, cid, new_vd) })
+        request_render()
+        return
+    }
+
+    if verb == "try" {
+        proc_spawn(muse_bin(), ["adopt", cand.genes_json, "lab"])
+        reset!(state, { ..(@state), status: "trying \"" + cand.name + "\" live…" })
+        request_render()
+        return
+    }
+
+    if verb == "keep" {
+        proc_spawn(muse_bin(), ["adopt", cand.genes_json, cand.slug])
+        reset!(state, { ..(@state),
+            toast: "saved preset \"" + cand.slug + "\" — pick it via set_active_style / style picker" })
+        request_render()
+        return
+    }
+}
+
+fn send_feedback(cand, verdict, note) {
+    let ev = {
+        id: cand.id,
+        name: cand.name,
+        genes: cand.genes,
+        overall: verdict.overall,
+        aspects: verdict.aspects,
+        note: note,
+    }
+    proc_spawn(muse_bin(), ["feedback", to_json(ev)])
+}
+
+// ------------------------------------------------------- demo handlers
+
+fn on_tab_select(id, tab) {
+    let mut s = @state
+    if id == "mode" { s = { ..s, mode: tab } }
+    if id == "d_tab" { s = { ..s, demo: { ..s.demo, tab: tab } } }
+    reset!(state, s)
+    request_render()
+}
+
+fn on_toggle(id, checked) {
+    let mut s = @state
+    if id == "auto_next" {
+        s = { ..s, auto_next: checked }
+    } else { if id == "d_tog" {
+        s = { ..s, demo: { ..s.demo, tog: checked } }
+    } else { if id == "d_chk" {
+        s = { ..s, demo: { ..s.demo, chk: checked } }
+    } else {
+        let parts = split(id, ":")
+        if len(parts) == 2 and parts[0] == "tog" {
+            s = { ..s, toggles: assoc(s.toggles, parts[1], checked) }
+        }
+    }}}
+    reset!(state, s)
+    request_render()
+}
+
+fn on_radio_select(id, option) {
+    if id == "d_radio" {
+        let s = @state
+        reset!(state, { ..s, demo: { ..s.demo, radio: option } })
+        request_render()
+    }
+}
+
+fn on_slider_change(id, value) {
+    if id == "d_slider" {
+        let s = @state
+        reset!(state, { ..s, demo: { ..s.demo, slider: value } })
+        request_render()
+    }
+}
+
+fn on_select_change(id, value) {
+    if id == "d_sel" {
+        let s = @state
+        reset!(state, { ..s, demo: { ..s.demo, sel: value } })
+        request_render()
+    }
+}
+
+fn on_number_change(id, value) {
+    if id == "d_step" {
+        let s = @state
+        reset!(state, { ..s, demo: { ..s.demo, step: value } })
+        request_render()
+    }
+}
+
+fn on_input_change(id, value) {
+    let mut s = @state
+    if id == "note" { s = { ..s, note: value } }
+    if id == "d_inp" { s = { ..s, demo: { ..s.demo, inp: value } } }
+    reset!(state, s)
+}
+
+fn on_input_submit(id, value) {
+    if id == "note" {
+        let mut s = @state
+        s = { ..s, note: value }
+        if not s.busy {
+            let proc = proc_spawn(muse_bin(), batch_args(s.mode, value))
+            s = { ..s, busy: true, status: "generating (" + s.mode + ")…", batch_proc: proc }
+        }
+        reset!(state, s)
+        request_render()
+    }
+}
+
+fn on_dialog_close(id) {
+    let s = @state
+    reset!(state, { ..s, demo: { ..s.demo, dialog_open: false } })
+    request_render()
+}
+
+fn on_toast_dismiss(id) {
+    let s = @state
+    if id == "d_toast" {
+        reset!(state, { ..s, demo: { ..s.demo, show_toast: false } })
+    } else {
+        reset!(state, { ..s, toast: "" })
+    }
+    request_render()
+}
+
+// scriptable preset switching, e.g.
+//   {"action":"widget_message","topic":"style_lab.set_preset","payload":"velvet"}
+fn on_message(topic, payload, sender) {
+    if topic == "style_lab.set_preset" {
+        let mut name = "" + payload
+        if name == "none" { name = "" }
+        set_active_style(name)
+        let toast = if name == "" { "preset cleared" } else { "preset → " + name }
+        reset!(state, { ..(@state), toast: toast })
+        request_render()
+    }
+    // fetch a fresh batch (same path as the New batch button)
+    if topic == "style_lab.batch" {
+        let mut s = @state
+        if s.busy and s.batch_proc >= 0 and proc_alive(s.batch_proc) {
+            proc_kill(s.batch_proc)
+        }
+        let proc = proc_spawn(muse_bin(), batch_args(s.mode, s.note))
+        s = { ..s, busy: true, status: "generating (" + s.mode + ")…", batch_proc: proc }
+        host_log("style_lab: bus batch → proc handle " + str(proc))
+        reset!(state, s)
+        request_render()
+        return
+    }
+    // open the showcase for batch index N (payload), -1 → back to grid
+    if topic == "style_lab.show" and payload != () {
+        let s = @state
+        let idx = 0 + payload
+        if idx >= 0 and idx < len(s.batch) {
+            reset!(state, { ..s, showcase: s.batch[idx].id, demo: fresh_demo() })
+        } else {
+            reset!(state, { ..s, showcase: "" })
+        }
+        request_render()
+    }
+}
+
+// --------------------------------------------------------------- pieces
+
+fn gene_summary(g) {
+    g.mode + " · " + g.harmony + " · " + g.depth + " · r" + str(g.radius) + " · " + g.hover_style + " · " + g.effect
+}
+
+fn swatch_row(t) {
+    let cols = [t.bg, t.surface_1, t.surface_2, t.fg, t.accent,
+                t.status_success, t.warn, t.err]
+    let mut kids = []
+    for c in cols {
+        kids = push(kids, { kind: "swatch", color: c, size: 20.0 })
+    }
+    { kind: "hstack", gap: 4.0, children: kids }
+}
+
+// the compact card's component cluster, styled from the ui pack
+fn comp_cluster(cand, tog_on) {
+    let t = cand.tokens
+    let ui = cand.ui
+    { kind: "frame", gap: 8.0, pad: 10.0, style: ui.card, children: [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "button", id: "demo:" + cand.id + ":p", label: "Primary",
+               style: ui.button_primary },
+            el("button", { id: "demo:" + cand.id + ":o", label: "Outline", kind: "outline",
+               style: ui.button_outline }),
+            { kind: "badge", value: "badge", style: ui.badge },
+            { kind: "spacer", size: 2.0 },
+            { kind: "toggle", id: "tog:" + cand.id, label: "", checked: tog_on,
+               style: cand.ui.toggle },
+        ]},
+        { kind: "hstack", gap: 10.0, align: "center", children: [
+            { kind: "slider", id: "demo:" + cand.id + ":s", value: 62.0, min: 0.0, max: 100.0,
+               width: 130.0, style: ui.slider },
+            { kind: "bar", value: 0.7, max: 1.0, width: 90.0, height: 7.0, style: ui.bar },
+            { kind: "text", value: "Aa", size: 14.0, weight: "bold", color: t.fg },
+            { kind: "text", value: "fn main()", size: 12.0, color: t.syntax_keyword },
+            { kind: "text", value: "\"str\"", size: 12.0, color: t.syntax_string },
+            { kind: "text", value: "// note", size: 12.0, color: t.syntax_comment },
+        ]},
+    ]}
+}
+
+// animated effect strip (the genome's chrome shader, in miniature)
+fn fx_strip(cand) {
+    let t = cand.tokens
+    let p = cand.preview
+    let mut layers = [ el("fill", { color: t.bg }) ]
+    if p.fx != "" {
+        layers = push(layers, el("shader", { body: p.fx, overlay: true }))
+    } else { if p.gradient != () {
+        layers = push(layers, el("linear-gradient", { angle: 0.0, stops: [
+            { offset: 0.0, color: p.gradient[0] },
+            { offset: 1.0, color: p.gradient[1] },
+        ]}))
+    }}
+    let label = if p.fx != "" { cand.genes.effect } else { "static" }
+    { kind: "frame", pad: 0.0, style: {
+        height: "30", width: "100%", radius: "6",
+        glaze_layers: layers,
+    }, children: [
+        { kind: "text", value: " " + label, size: 10.0, color: t.fg_muted },
+    ]}
+}
+
+// feedback chips are styled with ACTIVE-theme token names (not the
+// candidate's), so they stay legible on every card
+fn aspect_chip(cid, aspect, v) {
+    let mut label = aspect
+    let mut bg = "surface_2"
+    if v == "like"    { label = "+ " + aspect; bg = "status_success" }
+    if v == "dislike" { label = "- " + aspect; bg = "err" }
+    el("button", { id: "asp:" + cid + ":" + aspect, label: label, kind: "ghost",
+       style: { background: bg, radius: "999",
+                 padding: { top: 2.0, right: 8.0, bottom: 2.0, left: 8.0 } } })
+}
+
+fn chips_row(cid, aspects) {
+    let mut chips = []
+    for a in ["colors", "shape", "depth", "motion", "hover", "effect"] {
+        let v = get(aspects, a) |> unwrap_or("")
+        chips = push(chips, aspect_chip(cid, a, v))
+    }
+    { kind: "hstack", gap: 6.0, align: "center", children: chips }
+}
+
+fn verdict_row(cid, overall, in_showcase) {
+    let yes_style = { radius: "999", padding: { top: 4.0, right: 14.0, bottom: 4.0, left: 14.0 },
+                       background: if overall == "like" { "status_success" } else { "surface_2" } }
+    let no_style  = { radius: "999", padding: { top: 4.0, right: 14.0, bottom: 4.0, left: 14.0 },
+                       background: if overall == "dislike" { "err" } else { "surface_2" } }
+    let mut kids = [
+        el("button", { id: "yes:" + cid, label: "yes", kind: "ghost", style: yes_style }),
+        el("button", { id: "no:" + cid, label: "no", kind: "ghost", style: no_style }),
+        { kind: "spacer", size: 2.0 },
+    ]
+    if not in_showcase {
+        kids = push(kids, el("button", { id: "show:" + cid, label: "Expand", kind: "ghost",
+                     style: { background: "surface_1", radius: "999",
+                               padding: { top: 4.0, right: 12.0, bottom: 4.0, left: 12.0 } } }))
+    }
+    kids = push(kids, el("button", { id: "try:" + cid, label: "Try live", kind: "outline" }))
+    kids = push(kids, el("button", { id: "keep:" + cid, label: "Keep", kind: "ghost" }))
+    { kind: "hstack", gap: 8.0, align: "center", children: kids }
+}
+
+fn card(cand, verdict, tog_on, card_w) {
+    let t = cand.tokens
+    let cid = cand.id
+    let mut overall = ""
+    let mut aspects = {}
+    if verdict != () { overall = verdict.overall; aspects = verdict.aspects }
+
+    // candidate-painted preview on top; feedback controls below in the
+    // ACTIVE theme so they're always readable
+    { kind: "vstack", gap: 6.0, style: { width: "" + str(card_w) }, children: [
+        { kind: "frame", gap: 8.0, pad: 12.0, style: {
+            background: t.bg,
+            radius: "10",
+            width: "100%",
+            border: { color: t.surface_2, width: 1.0 },
+            shadow: { color: "#00000055", blur: 14.0, offset_y: 4.0 },
+        }, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: cand.name, size: 14.0, weight: "bold", color: t.fg },
+                { kind: "spacer", size: 4.0 },
+                { kind: "text", value: gene_summary(cand.genes), size: 10.0, color: t.fg_muted },
+            ]},
+            swatch_row(t),
+            comp_cluster(cand, tog_on),
+            fx_strip(cand),
+        ]},
+        chips_row(cid, aspects),
+        verdict_row(cid, overall, false),
+    ]}
+}
+
+// ------------------------------------------------------------- showcase
+
+fn section(label, color) {
+    { kind: "text", value: label, size: 10.0, color: color }
+}
+
+// every widget element, painted from the candidate's ui pack
+fn showcase(cand, demo, verdict, w) {
+    let t = cand.tokens
+    let ui = cand.ui
+    let cid = cand.id
+    let g = cand.genes
+    let mut overall = ""
+    let mut aspects = {}
+    if verdict != () { overall = verdict.overall; aspects = verdict.aspects }
+    let muted = t.fg_muted
+
+    let left = { kind: "vstack", gap: 10.0, style: { width: "46%" }, children: [
+        section("buttons — hover them (" + g.hover_style + ", " + g.motion + ")", muted),
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "button", id: "demo:" + cid + ":p", label: "Primary", style: ui.button_primary },
+            { kind: "button", id: "demo:" + cid + ":se", label: "Secondary", style: ui.button_secondary },
+            el("button", { id: "demo:" + cid + ":o", label: "Outline", kind: "outline", style: ui.button_outline }),
+        ]},
+        section("toggle · checkbox · radio", muted),
+        { kind: "hstack", gap: 14.0, align: "center", children: [
+            { kind: "toggle", id: "d_tog", label: "Toggle", checked: demo.tog, style: ui.toggle },
+            { kind: "checkbox", id: "d_chk", label: "Check", checked: demo.chk, style: ui.checkbox },
+        ]},
+        { kind: "radio-group", id: "d_radio", selected: demo.radio, options: [
+            { id: "warm", label: "Warm" },
+            { id: "cool", label: "Cool" },
+            { id: "neutral", label: "Neutral" },
+        ], style: ui.radio },
+        section("slider · bar · stepper", muted),
+        { kind: "hstack", gap: 12.0, align: "center", children: [
+            { kind: "slider", id: "d_slider", value: demo.slider, min: 0.0, max: 100.0,
+               width: 150.0, style: ui.slider },
+            { kind: "bar", value: demo.slider, max: 100.0, width: 90.0, height: 7.0, style: ui.bar },
+        ]},
+        { kind: "stepper", id: "d_step", value: demo.step, min: 0.0, max: 10.0, step: 1.0,
+           style: ui.stepper },
+        section("badge · swatches · type", muted),
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "badge", value: "badge", style: ui.badge },
+            swatch_row(t),
+        ]},
+        { kind: "hstack", gap: 10.0, align: "center", children: [
+            { kind: "text", value: "Heading", size: 16.0, weight: "bold", color: t.fg },
+            { kind: "text", value: "body text", size: 12.0, color: t.fg },
+            { kind: "text", value: "muted", size: 12.0, color: t.fg_muted },
+            { kind: "text", value: "fn main()", size: 12.0, color: t.syntax_keyword },
+            { kind: "text", value: "\"string\"", size: 12.0, color: t.syntax_string },
+            { kind: "text", value: "// comment", size: 12.0, color: t.syntax_comment },
+        ]},
+    ]}
+
+    let right = { kind: "vstack", gap: 10.0, style: { flex_grow: 1.0 }, children: [
+        section("tabs · select · input", muted),
+        { kind: "tabs", id: "d_tab", selected: demo.tab, items: [
+            { id: "one", label: "Editor" },
+            { id: "two", label: "Terminal" },
+            { id: "three", label: "Issues" },
+        ], style: ui.tabs },
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "select", id: "d_sel", value: demo.sel, width: 150.0, options: [
+                { id: "m1", label: "Mono" },
+                { id: "m2", label: "Duotone" },
+                { id: "m3", label: "Complement" },
+            ], style: ui.select },
+            { kind: "input", id: "d_inp", value: demo.inp, width: 170.0,
+               placeholder: "type here…", style: ui.input },
+        ]},
+        section("table", muted),
+        { kind: "table", zebra: true, columns: [
+            { id: "tok", header: "token" },
+            { id: "val", header: "value", width: 90.0 },
+        ], rows: [
+            ["accent", t.accent],
+            ["surface", t.surface_2],
+            ["radius", "" + str(g.radius) + "px"],
+        ], style: ui.table },
+        section("overlays", muted),
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "popover", id: "d_pop", label: "Popover", width: 200.0, style: ui.popover,
+               content: { kind: "vstack", gap: 6.0, pad: 10.0, children: [
+                   { kind: "text", value: "Floating card", size: 12.0, color: t.fg },
+                   { kind: "button", id: "demo:" + cid + ":pop", label: "Action",
+                      style: ui.button_secondary },
+               ]} },
+            { kind: "button", id: "dlg:" + cid, label: "Dialog", style: ui.button_secondary },
+            { kind: "button", id: "toast_show", label: "Toast", style: ui.button_secondary },
+            { kind: "tooltip", label: "hover me", text: "a " + g.hover_style + " themed tooltip",
+               style: ui.tooltip },
+        ]},
+    ]}
+
+    let mut kids = [
+        { kind: "hstack", gap: 10.0, align: "center", children: [
+            el("button", { id: "back", label: "← batch", kind: "ghost",
+               style: { background: "surface_2", radius: "999",
+                         padding: { top: 3.0, right: 10.0, bottom: 3.0, left: 10.0 } } }),
+            { kind: "text", value: cand.name, size: 16.0, weight: "bold" },
+            { kind: "text", value: gene_summary(g), size: 11.0, color: "fg_muted" },
+        ]},
+        { kind: "frame", gap: 12.0, pad: 14.0, style: {
+            background: t.bg, radius: "10", width: "100%",
+            border: { color: t.surface_2, width: 1.0 },
+        }, children: [
+            { kind: "hstack", gap: 18.0, children: [ left, right ] },
+            fx_strip(cand),
+        ]},
+        chips_row(cid, aspects),
+        verdict_row(cid, overall, true),
+    ]
+
+    if demo.dialog_open {
+        kids = push(kids, { kind: "dialog", id: "d_dialog", open: true, title: cand.name,
+            width: 340.0, style: ui.dialog,
+            body: { kind: "vstack", gap: 10.0, children: [
+                { kind: "text", value: "A modal painted in this candidate's palette.",
+                   size: 12.0, color: t.fg },
+                { kind: "hstack", gap: 8.0, children: [
+                    { kind: "button", id: "demo:" + cid + ":ok", label: "Confirm",
+                       style: ui.button_primary },
+                    el("button", { id: "demo:" + cid + ":cxl", label: "Cancel",
+                       style: ui.button_outline, kind: "outline" }),
+                ]},
+            ]} })
+    }
+    if demo.show_toast {
+        kids = push(kids, { kind: "toast", id: "d_toast",
+                     text: cand.name + " — toast in candidate colors", style: ui.toast })
+    }
+
+    kids
+}
+
+// --------------------------------------------------------------- render
+
+fn render(w, h) {
+    let st = @state
+    let header = { kind: "hstack", gap: 10.0, align: "center", children: [
+        { kind: "text", value: "Style Lab", size: 16.0, weight: "bold" },
+        { kind: "spacer", size: 6.0 },
+        { kind: "tabs", id: "mode", selected: st.mode, items: [
+            { id: "auto", label: "Auto" },
+            { id: "random", label: "Random" },
+            { id: "llm", label: "DeepSeek" },
+        ]},
+        { kind: "toggle", id: "auto_next", label: "auto-next", checked: st.auto_next },
+        { kind: "button", id: "new_batch",
+           label: if st.busy { "Generating…" } else { "New batch" } },
+        el("button", { id: "glaze_ui", label: "Glaze UI", kind: "ghost",
+           style: { background: "surface_1", radius: "999",
+                     padding: { top: 3.0, right: 10.0, bottom: 3.0, left: 10.0 } } }),
+    ]}
+    let note_row = { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "input", id: "note", value: st.note, width: 420.0,
+           placeholder: "tell the muse something… (e.g. 'warmer, less neon, round corners')" },
+        { kind: "text", value: st.status, size: 10.0, color: "fg_muted" },
+    ]}
+
+    let mut children = [header, note_row]
+
+    // expanded single-candidate showcase
+    if st.showcase != "" {
+        let mut cand = ()
+        for c in st.batch {
+            if c.id == st.showcase { cand = c }
+        }
+        if cand != () {
+            let mut verdict = ()
+            if has(st.verdicts, cand.id) { verdict = get(st.verdicts, cand.id) |> unwrap_or(()) }
+            for k in showcase(cand, st.demo, verdict, w) { children = push(children, k) }
+            if st.toast != "" {
+                children = push(children, { kind: "toast", id: "toast", text: st.toast })
+            }
+            return { kind: "scroll", gap: 12.0, pad: 14.0, children: children }
+        }
+    }
+
+    let mut card_w = (w - 28.0 - 12.0) / 2.0
+    if card_w < 300.0 { card_w = w - 28.0 }
+
+    let mut i = 0
+    while i < len(st.batch) {
+        let mut kids = []
+        let mut j = i
+        while j < len(st.batch) and len(kids) < 2 {
+            let c = st.batch[j]
+            let mut verdict = ()
+            if has(st.verdicts, c.id) { verdict = get(st.verdicts, c.id) |> unwrap_or(()) }
+            let mut tog_on = true
+            if has(st.toggles, c.id) { tog_on = get(st.toggles, c.id) |> unwrap_or(true) }
+            kids = push(kids, card(c, verdict, tog_on, card_w))
+            j += 1
+        }
+        children = push(children, { kind: "hstack", gap: 12.0, children: kids })
+        i = j
+    }
+
+    if len(st.batch) == 0 and not st.busy {
+        children = push(children, { kind: "vstack", gap: 8.0, pad: 30.0, children: [
+            { kind: "text", value: "No candidates yet — hit New batch.", color: "fg_muted" },
+        ]})
+    }
+
+    if st.toast != "" {
+        children = push(children, { kind: "toast", id: "toast", text: st.toast })
+    }
+
+    { kind: "scroll", gap: 12.0, pad: 14.0, children: children }
+}

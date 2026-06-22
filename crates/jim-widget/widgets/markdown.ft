@@ -1,0 +1,476 @@
+// markdown.ft — render a Markdown document as widget Elements.
+//
+// Sources (any of):
+//   params.path  — a file to read (via `cat`, re-read on restart/reload)
+//   params.text  — literal Markdown to render
+//   params.in    — widget-bus topic; messages {text|md} or {path} re-render live
+//   the path box  — type a path and press Enter (or "Load") to open a file
+//
+// Spawned bare from the palette (no params) it shows a built-in welcome doc
+// that exercises every supported block.
+//
+// Supported blocks: ATX headings (#..######), paragraphs (wrap to pane width),
+// fenced code (``` / ~~~), blockquotes (>), unordered/ordered lists (with
+// nesting by indent), GitHub pipe tables, horizontal rules (--- *** ___).
+// Inline: **bold**/*italic*/`code` markers are stripped (the Element model has
+// no mixed-style runs inside a wrapped paragraph), [text](url) -> "text (url)",
+// ![alt](url) -> "🖼 alt". Single `_` is left alone so snake_case survives.
+//
+// The pane itself scrolls, so a long doc is just a tall vstack.
+import "host"
+import { col_text, col_muted, col_accent, col_panel } from "df"
+
+let state = atom(init_state())
+
+fn init_state() = { md: "", blocks: [], path: "", path_draft: "",
+                    proc: -1, cat: [], status: "" }
+
+// Current state as a complete record. Guards against a non-record (Unit)
+// persisted snapshot and back-fills any keys a stale snapshot is missing,
+// so field access and `{..s}` spreads can never fault.
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+// ---- params ----
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+fn in_topic()  = param("in", "")
+
+// ---- small string utils ----
+fn idx(s, needle)   = unwrap_or(index_of(s, needle), -1)
+fn is_digit(c)      = contains("0123456789", c)
+// (No \r stripping: funct has no \r escape, and `trim` already drops CR on
+// the trimmed checks. CRLF files keep a cosmetic trailing CR inside code
+// fences only — harmless.)
+
+fn last_index_of(s, ch) {
+    let cs = chars(s)
+    let mut i = len(cs) - 1
+    while i >= 0 {
+        if cs[i] == ch { return i }
+        i = i - 1
+    }
+    -1
+}
+
+fn lead_spaces(s) {
+    let cs = chars(s)
+    let mut i = 0
+    while i < len(cs) and cs[i] == " " { i = i + 1 }
+    i
+}
+
+fn count_hashes(s) {
+    let cs = chars(s)
+    let mut i = 0
+    while i < len(cs) and cs[i] == "#" { i = i + 1 }
+    i
+}
+
+fn expand(p) {
+    if starts_with(p, "~/") { host_env("HOME") + slice(p, 1, len(p)) } else { p }
+}
+
+// ---- block predicates ----
+fn is_ul(s) = starts_with(s, "- ") or starts_with(s, "* ") or starts_with(s, "+ ")
+
+// Leading "N." marker (the "N." part) or "" if the line isn't an ordered item.
+fn ol_marker(s) {
+    let cs = chars(s)
+    let mut i = 0
+    while i < len(cs) and is_digit(cs[i]) { i = i + 1 }
+    if i == 0 { return "" }
+    if i < len(cs) and cs[i] == "." { slice(s, 0, i) } else { "" }
+}
+
+fn is_hr(s) {
+    let t = replace(trim(s), " ", "")
+    if len(t) < 3 { return false }
+    let c0 = chars(t)[0]
+    if not (c0 == "-" or c0 == "*" or c0 == "_") { return false }
+    for c in chars(t) { if c != c0 { return false } }
+    true
+}
+
+// A pipe-table separator row: |---|:--:| etc.
+fn is_table_sep(line) {
+    let t = trim(line)
+    if not contains(t, "-") { return false }
+    if len(t) == 0 { return false }
+    for c in chars(t) { if not contains("|:- ", c) { return false } }
+    true
+}
+
+// Would `raw` start a new block (so a paragraph must stop before it)?
+fn starts_block(raw) {
+    let s = trim(raw)
+    if s == "" { return true }
+    if starts_with(s, "#") { return true }
+    if starts_with(s, "```") or starts_with(s, "~~~") { return true }
+    if starts_with(s, ">") { return true }
+    if is_hr(s) { return true }
+    if is_ul(s) or ol_marker(s) != "" { return true }
+    false
+}
+
+// ---- inline cleanup ----
+
+// Strip a paired emphasis marker (e.g. "**", "*", "`") when balanced; leave
+// the text untouched when the marker count is odd (unbalanced), so stray
+// operators like "5 * 3" survive.
+fn strip_pair(s, m) {
+    let parts = split(s, m)
+    if len(parts) % 2 == 0 { s } else { join(parts, "") }
+}
+
+// [text](url) -> "text (url)" ; ![alt](url) -> "🖼 alt".
+fn replace_links(s) {
+    let mut out = ""
+    let mut rest = s
+    while true {
+        let open = idx(rest, "](")
+        if open < 0 { out = out + rest; break }
+        let lb = last_index_of(slice(rest, 0, open), "[")
+        if lb < 0 {
+            out = out + slice(rest, 0, open + 2)
+            rest = slice(rest, open + 2, len(rest))
+            continue
+        }
+        let after = slice(rest, open + 2, len(rest))
+        let close = idx(after, ")")
+        if close < 0 { out = out + rest; break }
+        let text = slice(rest, lb + 1, open - (lb + 1))
+        let url = slice(after, 0, close)
+        let is_img = lb > 0 and chars(rest)[lb - 1] == "!"
+        let mut prefix = slice(rest, 0, lb)
+        if is_img {
+            prefix = slice(prefix, 0, len(prefix) - 1)
+            out = out + prefix + "🖼 " + text
+        } else {
+            out = out + prefix + text + " (" + url + ")"
+        }
+        rest = slice(after, close + 1, len(after))
+    }
+    out
+}
+
+fn clean_inline(s) = strip_pair(strip_pair(strip_pair(replace_links(s), "**"), "*"), "`")
+
+// ---- table cells ----
+fn table_cells(line) {
+    let mut t = trim(line)
+    if starts_with(t, "|") { t = slice(t, 1, len(t)) }
+    if ends_with(t, "|")   { t = slice(t, 0, len(t) - 1) }
+    map(split(t, "|"), (c) => clean_inline(trim(c)))
+}
+
+// ---- block builders ----
+fn heading(level, text) {
+    let sizes = [25.0, 21.0, 18.0, 16.0, 14.5, 13.0]
+    let sz = sizes[level - 1]
+    let head = { kind: "text", value: clean_inline(text), size: sz,
+                 weight: "bold", color: col_text() }
+    let kids = if level <= 2 { [head, { kind: "divider" }] } else { [head] }
+    let top = if level <= 2 { 10.0 } else { 6.0 }
+    { kind: "vstack", gap: 4.0,
+      style: { margin: { top: top, right: 0.0, bottom: 0.0, left: 0.0 } },
+      children: kids }
+}
+
+fn code_block(code) {
+    { kind: "frame",
+      style: { background: col_panel(), radius: "8",
+               padding: { top: 10.0, right: 12.0, bottom: 10.0, left: 12.0 } },
+      children: [ { kind: "text", value: code, family: "mono", size: 12.5,
+                    color: col_text() } ] }
+}
+
+fn quote_block(text) {
+    { kind: "hstack", gap: 10.0, align: "stretch", children: [
+        { kind: "frame", children: [],
+          style: { background: col_accent(), width: "3", radius: "2" } },
+        { kind: "vstack", gap: 8.0, children: parse_blocks(text),
+          style: { flex_grow: 1.0, flex_shrink: 1.0 } },
+    ] }
+}
+
+fn table_block(header, rows) {
+    { kind: "table", zebra: true,
+      columns: map(header, (h) => { header: h }),
+      rows: rows }
+}
+
+fn list_item(ind, bullet, content) {
+    let row = { kind: "hstack", gap: 6.0, align: "start",
+        style: { flex_grow: 1.0 }, children: [
+            { kind: "text", value: bullet, color: col_accent(), size: 14.0,
+              selectable: false },
+            { kind: "text", value: clean_inline(content), size: 14.0,
+              color: col_text(), style: { flex_grow: 1.0, flex_shrink: 1.0 } },
+        ] }
+    let pad = to_float(ind) * 8.0
+    if pad > 0.0 {
+        { kind: "hstack", gap: 0.0, align: "start",
+          children: [ { kind: "spacer", size: pad }, row ] }
+    } else { row }
+}
+
+// ---- the block parser: Markdown text -> list of Elements ----
+fn parse_blocks(src) {
+    let lines = split(src, "\n")
+    let n = len(lines)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let raw = lines[i]
+        let s = trim(raw)
+        if s == "" { i = i + 1; continue }
+
+        // fenced code
+        if starts_with(s, "```") or starts_with(s, "~~~") {
+            let fence = slice(s, 0, 3)
+            let mut code = []
+            let mut j = i + 1
+            while j < n {
+                let cl = lines[j]
+                if starts_with(trim(cl), fence) { break }
+                code = push(code, cl)
+                j = j + 1
+            }
+            out = push(out, code_block(join(code, "\n")))
+            i = j + 1
+            continue
+        }
+
+        // ATX heading (1..6 #, must be followed by a space or line end)
+        if starts_with(s, "#") {
+            let h = count_hashes(s)
+            if h >= 1 and h <= 6 and (h >= len(s) or chars(s)[h] == " ") {
+                out = push(out, heading(h, trim(slice(s, h, len(s)))))
+                i = i + 1
+                continue
+            }
+        }
+
+        // pipe table: this row has a pipe and the next is a separator row
+        if contains(raw, "|") and i + 1 < n and is_table_sep(lines[i + 1]) {
+            let header = table_cells(raw)
+            let mut rows = []
+            let mut j = i + 2
+            while j < n {
+                let rl = lines[j]
+                if trim(rl) == "" or not contains(rl, "|") { break }
+                rows = push(rows, table_cells(rl))
+                j = j + 1
+            }
+            out = push(out, table_block(header, rows))
+            i = j
+            continue
+        }
+
+        // horizontal rule
+        if is_hr(s) { out = push(out, { kind: "divider" }); i = i + 1; continue }
+
+        // blockquote
+        if starts_with(s, ">") {
+            let mut qs = []
+            let mut j = i
+            while j < n {
+                let ql = trim(lines[j])
+                if not starts_with(ql, ">") { break }
+                qs = push(qs, trim(slice(ql, 1, len(ql))))
+                j = j + 1
+            }
+            out = push(out, quote_block(join(qs, "\n")))
+            i = j
+            continue
+        }
+
+        // list (unordered or ordered), grouped until a blank line
+        if is_ul(s) or ol_marker(s) != "" {
+            let mut items = []
+            let mut j = i
+            while j < n {
+                let raw2 = lines[j]
+                let s2 = trim(raw2)
+                if s2 == "" { break }
+                let ind = lead_spaces(raw2)
+                if is_ul(s2) {
+                    items = push(items, list_item(ind, "•", slice(s2, 2, len(s2))))
+                } else {
+                    let m = ol_marker(s2)
+                    if m == "" { break }
+                    items = push(items, list_item(ind, m + ".",
+                        trim(slice(s2, len(m) + 1, len(s2)))))
+                }
+                j = j + 1
+            }
+            out = push(out, { kind: "vstack", gap: 4.0, children: items })
+            i = j
+            continue
+        }
+
+        // paragraph: accumulate until a blank line or a new block start
+        let mut para = [s]
+        let mut j = i + 1
+        while j < n {
+            if starts_block(lines[j]) { break }
+            para = push(para, trim(lines[j]))
+            j = j + 1
+        }
+        out = push(out, { kind: "text", value: clean_inline(join(para, " ")),
+                          size: 14.0, color: col_text() })
+        i = j
+    }
+    out
+}
+
+// ---- loading ----
+fn set_md(text, path) {
+    let s = cur_state()
+    reset!(state, { ..s, md: text, path: path, blocks: parse_blocks(text),
+                    proc: -1, cat: [], status: "ok · " + str(len(text)) + "b" })
+    request_render()
+}
+
+fn show_error(path, code) {
+    set_md("# Could not read file\n\n`" + path + "`\n\n`cat` exited with code " +
+           str(code) + ".", path)
+}
+
+fn load_path(p) {
+    if p == "" { return }
+    let s = cur_state()
+    let h = proc_spawn("cat", [expand(p)])
+    if h == -1 { show_error(p, -1); return }
+    reset!(state, { ..s, proc: h, cat: [], path: p, path_draft: p,
+                    status: "loading…" })
+    request_render()
+}
+
+// ---- handlers ----
+fn on_init() {}
+
+// Runs on every start (fresh / restart / hot-reload), AFTER state rehydrates.
+// params.path always (re)reads the file; otherwise keep an interactively
+// loaded doc, only falling back to text/welcome on a truly fresh spawn.
+fn on_start() {
+    let s = cur_state()
+    let p = param("path", "")
+    if p != "" { load_path(p); return }
+    if unwrap_or(get(s, "md"), "") != "" {
+        let cur = unwrap_or(get(s, "path"), "")
+        if cur != "" { load_path(cur) }   // re-read the file we last opened
+        return
+    }
+    let t = param("text", "")
+    if t != "" { set_md(t, "") } else { set_md(welcome(), "") }
+}
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    if handle == s.proc { reset!(state, { ..s, cat: push(s.cat, line) }) }
+}
+
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    if handle != s.proc { return }
+    let text = join(s.cat, "\n")
+    if code != 0 and text == "" { show_error(s.path, code) }
+    else { set_md(text, s.path) }
+}
+
+fn on_input_change(id, value) {
+    if id == "path" { let s = cur_state(); reset!(state, { ..s, path_draft: value }) }
+}
+
+fn on_input_submit(id, value) { if id == "path" { load_path(trim(value)) } }
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "load"   { load_path(trim(unwrap_or(get(s, "path_draft"), s.path))) }
+    if id == "reload" {
+        if s.path != "" { load_path(s.path) } else { set_md(s.md, "") }
+    }
+}
+
+fn on_message(topic, payload, sender) {
+    if sender == my_id() { return }
+    if in_topic() == "" or topic != in_topic() { return }
+    let p = unwrap_or(get(payload, "path"), "")
+    if p != "" { load_path(p); return }
+    let t = unwrap_or(get(payload, "text"), unwrap_or(get(payload, "md"), ""))
+    if t != "" { set_md(t, "") }
+}
+
+// ---- render ----
+fn toolbar(s) {
+    { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: "▤ markdown", size: 13.0, weight: "bold",
+          color: col_text(), selectable: false },
+        { kind: "input", id: "path", value: s.path,
+          placeholder: "path to .md … (Enter to load)",
+          style: { flex_grow: 1.0 } },
+        { kind: "button", id: "load",   label: "Load" },
+        { kind: "button", id: "reload", label: "↻" },
+        { kind: "text", value: s.status, size: 11.0, color: col_muted(),
+          selectable: false },
+    ] }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    { kind: "vstack", gap: 12.0, pad: 14.0, children: [
+        toolbar(s),
+        { kind: "divider" },
+        { kind: "vstack", gap: 10.0, children: s.blocks },
+    ] }
+}
+
+// ---- built-in welcome doc ----
+fn welcome() = join([
+    "# Markdown widget",
+    "",
+    "Renders **Markdown** as widget elements, written in *funct*. Type a path",
+    "in the box above and press Enter to open a `.md` file — the pane scrolls,",
+    "so long documents just keep going.",
+    "",
+    "## Features",
+    "",
+    "- Headings, paragraphs, and `inline code`",
+    "- **Bold** and *italic* (markers are stripped)",
+    "- Ordered and unordered lists",
+    "  - nested by indentation",
+    "- Block quotes, code fences, tables, and rules",
+    "",
+    "## A list, in order",
+    "",
+    "1. First load a file",
+    "2. Or pipe text in over the bus topic `params.in`",
+    "3. Then read",
+    "",
+    "## Code",
+    "",
+    "```",
+    "fn hello(name) = \"hi, \" + name",
+    "hello(\"world\")",
+    "```",
+    "",
+    "## Quote",
+    "",
+    "> The pane owns scrolling; the widget just emits a tall stack of blocks.",
+    "> — the design",
+    "",
+    "## Table",
+    "",
+    "| block   | example        |",
+    "| ------- | -------------- |",
+    "| heading | # Title        |",
+    "| list    | - item         |",
+    "| link    | [jim](https://example.com) |",
+    "",
+    "---",
+    "",
+    "Open something real: try `~/.jim/widgets/AUTHORING.md` or any project README.",
+], "\n")

@@ -1,0 +1,94 @@
+// controls_demo.ft — exercises every interactive element + handler
+// (funct port of controls_demo.rhai). Verify Toggle / Tabs / Input /
+// Button all route correctly through the funct worker.
+import "host"
+
+fn init_state() = {
+    n: 0, dark: false, tab: "one", q: "", query: "",
+    last: "(nothing yet)", submitted: "",
+}
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_click(x, y, shift, cmd, id) {
+    let mut s = @state
+    if id == "inc" { s = { ..s, n: s.n + 1 } }
+    if id == "dec" { s = { ..s, n: s.n - 1 } }
+    reset!(state, { ..s, last: "click: " + id })
+    request_render()
+}
+
+fn on_toggle(id, checked) {
+    reset!(state, { ..(@state), dark: checked, last: "toggle: " + id + " = " + str(checked) })
+    request_render()
+}
+
+fn on_tab_select(id, tab) {
+    reset!(state, { ..(@state), tab: tab, last: "tab-select: " + id + " -> " + tab })
+    request_render()
+}
+
+fn on_input_change(id, value) {
+    let mut s = @state
+    if id == "search" { s = { ..s, q: value } }
+    if id == "query"  { s = { ..s, query: value } }
+    reset!(state, { ..s, last: "input-change: " + id + " = '" + value + "'" })
+    request_render()
+}
+
+fn on_input_submit(id, value) {
+    reset!(state, { ..(@state),
+        submitted: id + ": " + value,
+        last: "input-submit: " + id + " = '" + value + "'" })
+    request_render()
+}
+
+fn on_input_focus(id, focused) {
+    reset!(state, { ..(@state), last: "input-focus: " + id + " = " + str(focused) })
+    request_render()
+}
+
+fn render(w, h) {
+    let s = @state
+    {
+        kind: "vstack", gap: 10.0, pad: 14.0, children: [
+            { kind: "text", value: "Controls demo", size: 15.0, color: "#cfd2d8" },
+
+            { kind: "hstack", gap: 6.0, align: "center", children: [
+                { kind: "button", id: "dec", label: "-" },
+                { kind: "text", value: "n = " + str(s.n) },
+                { kind: "button", id: "inc", label: "+" },
+            ]},
+
+            { kind: "toggle", id: "dark", label: "Dark mode", checked: s.dark },
+
+            { kind: "tabs", id: "view", selected: s.tab, items: [
+                { id: "one",   label: "One" },
+                { id: "two",   label: "Two" },
+                { id: "three", label: "Three" },
+            ]},
+
+            { kind: "input", id: "search", value: s.q, placeholder: "type + Enter…" },
+
+            { kind: "text", value: "Multi-line query (Cmd+Enter to submit):", size: 11.0, color: "#9098a4" },
+            { kind: "textarea", id: "query", value: s.query, rows: 5, placeholder: "SELECT …\nFROM …" },
+            { kind: "text", value: "submitted: '" + s.submitted + "'", size: 11.0, color: "#9098a4" },
+
+            { kind: "divider" },
+            { kind: "text", value: "Table:", size: 11.0, color: "#9098a4" },
+            { kind: "table", zebra: true, columns: [
+                { id: "n", header: "#", width: 36.0, align: "end" },
+                { id: "item", header: "item" },
+                { id: "qty", header: "qty", width: 60.0, align: "end" },
+            ], rows: [
+                ["1", "Ada Lovelace", "98"],
+                ["2", "Alan Turing", "91"],
+                ["3", "Grace Hopper", "87"],
+            ]},
+
+            { kind: "divider" },
+            { kind: "text", value: s.last, size: 11.0, color: "#7f8794" },
+        ]
+    }
+}

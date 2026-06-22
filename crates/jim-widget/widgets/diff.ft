@@ -1,0 +1,704 @@
+// diff.ft — a code diff / review widget.
+//
+// Renders a UNIFIED DIFF (the one format git diff, `gh pr diff`, GitHub `.diff`
+// downloads, and `diff -u` all share) with syntax highlighting, line numbers,
+// add/del tinting, a unified or side-by-side view, and inline review comments
+// persisted to ~/.jim/reviews/<id>.json.
+//
+// Sources (params.source, or the toolbar buttons):
+//   working  — `git -C <repo> diff`            (unstaged working tree)
+//   range    — `git -C <repo> diff <base> <head>`   (arg = "base head")
+//   pr       — `gh pr diff <n>` run in <repo>        (arg = PR number)
+//   file     — read a .diff/.patch file              (arg = path)
+//   pipe     — receive diff text on bus topic params.in  ({text} or {diff})
+//
+// params: { source, repo, arg, in, id, view }   (all optional)
+//
+// Syntax color comes from the host `highlight(code, lang)` fn (tree-sitter);
+// the pane scrolls, so a big diff is just a tall stack.
+import "host"
+import { col_text, col_muted, col_accent, col_panel } from "df"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    raw: "", files: [], source: "working", repo: "", arg: "",
+    view: "unified", status: "", proc: -1, cat: [], file_idx: 0,
+    comments: [], draft_key: "", draft_text: "", last_render_sy: 0.0,
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+// ---- params ----
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+fn in_topic()  = param("in", "")
+fn review_id() = param("id", "scratch")
+fn review_file() = "~/.jim/reviews/" + review_id() + ".json"
+
+// ---- small utils ----
+fn lpad(s, w) {
+    let mut out = s
+    while len(out) < w { out = " " + out }
+    out
+}
+fn lang_for(path) {
+    if ends_with(path, ".rs") { "rust" } else { "" }
+}
+// to_int only converts numbers, not strings; parse via parse_float (Result).
+fn parse_int(s) = to_int(unwrap_or(parse_float(s), 0.0))
+
+// Fixed row heights — every diff row is forced to these so the virtualizer's
+// math is exact (see window_rows). Comments/draft add estimated extra height.
+fn line_h() = 20.0
+fn hunk_h() = 20.0
+fn comment_h() = 46.0
+fn draft_h() = 124.0
+fn strip_diff_path(line) {
+    // "--- a/foo" / "+++ b/foo" / "--- /dev/null"
+    let p = trim(slice(line, 4, len(line)))
+    if starts_with(p, "a/") or starts_with(p, "b/") { slice(p, 2, len(p)) } else { p }
+}
+
+// ---- unified-diff parser → files[ {old,new,lines,adds,dels} ] ----
+// `lines` entries: { tag:"hunk"|"ctx"|"add"|"del", text, o, nn, runs }
+fn parse_diff(raw) {
+    let lines = split(raw, "\n")
+    let n = len(lines)
+    let mut files = []
+    let mut have = false
+    let mut f_old = ""
+    let mut f_new = ""
+    let mut f_lines = []
+    let mut adds = 0
+    let mut dels = 0
+    let mut o_no = 0
+    let mut n_no = 0
+    let mut in_hunk = false
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if starts_with(line, "diff --git") {
+            if have { files = push(files, finish_file(f_old, f_new, f_lines, adds, dels)) }
+            have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0; in_hunk = false
+            i = i + 1; continue
+        }
+        if starts_with(line, "--- ") and i + 1 < n and starts_with(lines[i + 1], "+++ ") {
+            if not have { have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0 }
+            f_old = strip_diff_path(line)
+            f_new = strip_diff_path(lines[i + 1])
+            in_hunk = false
+            i = i + 2; continue
+        }
+        if starts_with(line, "@@") {
+            if not have { have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0 }
+            let hh = parse_hunk_header(line)
+            o_no = hh.o
+            n_no = hh.n
+            f_lines = push(f_lines, { tag: "hunk", text: line, o: 0, nn: 0 })
+            in_hunk = true
+            i = i + 1; continue
+        }
+        if in_hunk and have {
+            let c0 = if len(line) > 0 { slice(line, 0, 1) } else { " " }
+            if c0 == "\\" { i = i + 1; continue }
+            let text = if len(line) > 0 { slice(line, 1, len(line)) } else { "" }
+            if c0 == "+" {
+                f_lines = push(f_lines, { tag: "add", text: text, o: 0, nn: n_no })
+                n_no = n_no + 1; adds = adds + 1
+            } else if c0 == "-" {
+                f_lines = push(f_lines, { tag: "del", text: text, o: o_no, nn: 0 })
+                o_no = o_no + 1; dels = dels + 1
+            } else {
+                f_lines = push(f_lines, { tag: "ctx", text: text, o: o_no, nn: n_no })
+                o_no = o_no + 1; n_no = n_no + 1
+            }
+            i = i + 1; continue
+        }
+        i = i + 1
+    }
+    if have { files = push(files, finish_file(f_old, f_new, f_lines, adds, dels)) }
+    files
+}
+
+// "@@ -o,c +n,c @@ section" → { o, n } (1-based start lines)
+fn parse_hunk_header(line) {
+    let mut o = 1
+    let mut n = 1
+    let parts = split(line, " ")
+    for p in parts {
+        if starts_with(p, "-") {
+            let body = slice(p, 1, len(p))
+            o = parse_int(first_num(body))
+        } else if starts_with(p, "+") {
+            let body = slice(p, 1, len(p))
+            n = parse_int(first_num(body))
+        }
+    }
+    { o: o, n: n }
+}
+fn first_num(s) {
+    let c = split(s, ",")
+    if len(c) > 0 { c[0] } else { s }
+}
+
+// Resolve syntax runs per display line via ONE highlight() call for each side
+// of the file (old / new blob), then map back to the interleaved lines.
+fn finish_file(old, new, flines, adds, dels) {
+    let lang = lang_for(if new != "" { new } else { old })
+    let mut old_seq = []
+    let mut new_seq = []
+    for l in flines {
+        if l.tag == "ctx" { old_seq = push(old_seq, l.text); new_seq = push(new_seq, l.text) }
+        else if l.tag == "add" { new_seq = push(new_seq, l.text) }
+        else if l.tag == "del" { old_seq = push(old_seq, l.text) }
+    }
+    let old_runs = highlight(join(old_seq, "\n"), lang)
+    let new_runs = highlight(join(new_seq, "\n"), lang)
+    let mut out = []
+    let mut oi = 0
+    let mut ni = 0
+    for l in flines {
+        if l.tag == "hunk" { out = push(out, l); continue }
+        let mut runs = []
+        if l.tag == "ctx" { runs = nth(new_runs, ni); ni = ni + 1; oi = oi + 1 }
+        else if l.tag == "add" { runs = nth(new_runs, ni); ni = ni + 1 }
+        else if l.tag == "del" { runs = nth(old_runs, oi); oi = oi + 1 }
+        out = push(out, { ..l, runs: runs })
+    }
+    { old: old, new: new, lines: out, adds: adds, dels: dels }
+}
+fn nth(xs, i) = if i >= 0 and i < len(xs) { xs[i] } else { [] }
+
+// ---- colors ----
+fn kind_color(k) {
+    if k == "keyword" { "#c78fe6" }
+    else if k == "string" { "#a6df99" }
+    else if k == "comment" { "#7b8494" }
+    else if k == "function" { "#8cc7ff" }
+    else if k == "type" { "#f0d18c" }
+    else if k == "constructor" { "#f0d18c" }
+    else if k == "constant" { "#f29e7a" }
+    else if k == "attribute" { "#d9b380" }
+    else if k == "operator" { "#b3bdcc" }
+    else if k == "punctuation" { "#b3bdcc" }
+    else if k == "property" { "#d9d2f2" }
+    else if k == "label" { "#f29e7a" }
+    else if k == "escape" { "#f0bf66" }
+    else { col_text() }
+}
+fn tint(tag) {
+    if tag == "add" { "#12301d" } else if tag == "del" { "#341a1d" } else { "" }
+}
+fn sign_color(tag) {
+    if tag == "add" { "#5fcf8a" } else if tag == "del" { "#e08a8a" } else { col_muted() }
+}
+
+// ---- comments (array of { key, text, ts }) ----
+fn line_key(file, l) {
+    let p = if file.new != "" { file.new } else { file.old }
+    if l.tag == "del" { p + ":-" + str(l.o) } else { p + ":" + str(l.nn) }
+}
+fn comments_for(comments, key) = filter(comments, (c) => c.key == key)
+
+fn load_comments() {
+    let r = read_file(review_file())
+    if r.ok and trim(r.text) != "" {
+        let arr = parse_json(r.text)
+        if typeof(arr) == "List" { reset!(state, { ..cur_state(), comments: arr }) }
+    }
+}
+fn save_comments(comments) { write_file(review_file(), to_json(comments)) }
+
+// ---- sources ----
+// Default the repo to the spawning project's root (host injects it as
+// params.project_root), so the diff shows the project's git changes
+// rather than wherever the GUI process happens to be running. The repo
+// input field still overrides it; "." is the last-resort fallback.
+fn project_root() = param("project_root", "")
+fn repo_arg(s) {
+    if s.repo != "" { s.repo }
+    else if project_root() != "" { project_root() }
+    else { "." }
+}
+
+fn source_argv(s) {
+    let repo = repo_arg(s)
+    let src = s.source
+    if src == "range" {
+        let parts = split(trim(s.arg), " ")
+        let base = if len(parts) > 0 and parts[0] != "" { parts[0] } else { "HEAD~1" }
+        let head = if len(parts) > 1 { parts[1] } else { "HEAD" }
+        ["git", "-C", repo, "diff", base, head]
+    } else if src == "pr" {
+        // gh has no -C; run it in the repo via a shell.
+        ["sh", "-c", "cd " + repo + " && gh pr diff " + trim(s.arg)]
+    } else {
+        ["git", "-C", repo, "diff"]
+    }
+}
+
+fn run_source() {
+    let s = cur_state()
+    let src = s.source
+    if src == "pipe" {
+        reset!(state, { ..s, status: "waiting on bus: " + in_topic() })
+        request_render()
+        return
+    }
+    if src == "file" {
+        let r = read_file(trim(s.arg))
+        if r.ok { set_diff(r.text) } else { set_status("read failed: " + s.arg) }
+        return
+    }
+    let argv = source_argv(s)
+    let h = proc_spawn(argv[0], slice(argv, 1, len(argv)))
+    if h == -1 { set_status("spawn failed"); return }
+    reset!(state, { ..s, proc: h, cat: [], status: "loading…" })
+    request_render()
+}
+
+fn set_status(msg) { reset!(state, { ..cur_state(), status: msg }); request_render() }
+
+fn set_diff(raw) {
+    let s = cur_state()
+    let files = parse_diff(raw)
+    let mut adds = 0
+    let mut dels = 0
+    for f in files { adds = adds + f.adds; dels = dels + f.dels }
+    let st = if len(files) == 0 { "no changes" } else {
+        str(len(files)) + " files  +" + str(adds) + " −" + str(dels)
+    }
+    reset!(state, { ..s, raw: raw, files: files, proc: -1, cat: [], status: st, file_idx: 0 })
+    request_render()
+}
+
+// ---- handlers ----
+fn on_init() {}
+
+fn on_start() {
+    let s = cur_state()
+    // params can preset the source/config on a fresh spawn.
+    reset!(state, { ..s,
+        source: param("source", s.source),
+        repo: param("repo", s.repo),
+        arg: param("arg", s.arg),
+        view: param("view", s.view) })
+    load_comments()
+    run_source()
+}
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    if handle == s.proc { reset!(state, { ..s, cat: push(s.cat, line) }) }
+}
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    if handle != s.proc { return }
+    set_diff(join(s.cat, "\n"))
+}
+
+fn on_message(topic, payload, sender) {
+    if sender == my_id() { return }
+    if in_topic() == "" or topic != in_topic() { return }
+    let t = unwrap_or(get(payload, "text"), unwrap_or(get(payload, "diff"), ""))
+    if t != "" { set_diff(t) }
+}
+
+fn on_input_change(id, value) {
+    let s = cur_state()
+    if id == "repo" { reset!(state, { ..s, repo: value }) }
+    else if id == "arg" { reset!(state, { ..s, arg: value }) }
+    else if id == "draft" { reset!(state, { ..s, draft_text: value }) }
+}
+fn on_input_submit(id, value) {
+    if id == "arg" { run_source() }
+    if id == "draft" { save_draft() }
+}
+fn on_select_change(id, value) {
+    if id == "file" { reset!(state, { ..cur_state(), file_idx: parse_int(value) }); request_render() }
+}
+// Opt into scroll-driven re-rendering, but COALESCE: only re-window when the
+// scroll has moved far enough that we're approaching the overscan edge.
+// Between re-renders the host just translates the already-rendered slice
+// (free), and the visibility clip hides whatever scrolls into the title bar —
+// so scrolling is smooth and the ~one re-render per ~third-of-a-screen is the
+// only place we pay the layout/spawn cost.
+fn on_scroll(y) {
+    let s = cur_state()
+    if abs(y - s.last_render_sy) > canvas_h * 0.3 { request_render() }
+}
+
+fn save_draft() {
+    let s = cur_state()
+    if s.draft_key == "" or trim(s.draft_text) == "" {
+        reset!(state, { ..s, draft_key: "", draft_text: "" }); request_render(); return
+    }
+    let c = { key: s.draft_key, text: trim(s.draft_text), ts: round(time()) }
+    let next = push(s.comments, c)
+    save_comments(next)
+    reset!(state, { ..s, comments: next, draft_key: "", draft_text: "" })
+    request_render()
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "load" { run_source(); return }
+    if id == "refresh" { run_source(); return }
+    if id == "view" {
+        reset!(state, { ..s, view: if s.view == "unified" { "split" } else { "unified" } })
+        request_render(); return
+    }
+    if id == "src_working" { reset!(state, { ..s, source: "working" }); run_source(); return }
+    if id == "src_range" { reset!(state, { ..s, source: "range" }); request_render(); return }
+    if id == "src_pr" { reset!(state, { ..s, source: "pr" }); request_render(); return }
+    if id == "src_file" { reset!(state, { ..s, source: "file" }); request_render(); return }
+    if starts_with(id, "file:") {
+        reset!(state, { ..s, file_idx: parse_int(slice(id, 5, len(id))) })
+        request_render(); return
+    }
+    if id == "prev_file" {
+        reset!(state, { ..s, file_idx: max(0, s.file_idx - 1) }); request_render(); return
+    }
+    if id == "next_file" {
+        reset!(state, { ..s, file_idx: min(len(s.files) - 1, s.file_idx + 1) }); request_render(); return
+    }
+    if id == "save_cmt" { save_draft(); return }
+    if id == "cancel_cmt" { reset!(state, { ..s, draft_key: "", draft_text: "" }); request_render(); return }
+    if starts_with(id, "cmt:") {
+        let key = slice(id, 4, len(id))
+        let nk = if s.draft_key == key { "" } else { key }
+        reset!(state, { ..s, draft_key: nk, draft_text: "" })
+        request_render(); return
+    }
+}
+
+// ---- rendering ----
+// gutter + sign use wrap:false so their min-content equals their full width.
+// That makes them NON-shrinkable in the row's flex: when a long code line
+// overflows, the row no longer squeezes the gutter/sign (which used to pull
+// the code cell leftward and mangle the indentation).
+fn gutter(l) {
+    let on = if l.o > 0 { lpad(str(l.o), 4) } else { "    " }
+    let nn = if l.nn > 0 { lpad(str(l.nn), 4) } else { "    " }
+    { kind: "text", value: on + " " + nn, family: "mono", size: 11.0,
+      color: col_muted(), selectable: false, wrap: false }
+}
+fn sign_el(l) {
+    let g = if l.tag == "add" { "+" } else if l.tag == "del" { "-" } else { " " }
+    { kind: "text", value: g, family: "mono", size: 12.5, color: sign_color(l.tag),
+      selectable: false, wrap: false }
+}
+fn code_cell(runs) {
+    let mut kids = []
+    if len(runs) == 0 {
+        kids = [ { kind: "text", value: " ", family: "mono", size: 12.5,
+                   color: col_text(), selectable: false, wrap: false } ]
+    } else {
+        for r in runs {
+            kids = push(kids, { kind: "text", value: r.text, family: "mono", size: 12.5,
+                                color: kind_color(r.kind), selectable: false, wrap: false })
+        }
+    }
+    // wrap:false on each run keeps every code line on ONE visual line (its
+    // min- and max-content width both equal the full line), so a long line
+    // can't be squeezed into a taller wrapped box that overflows the fixed
+    // 20px row and overlaps the next. Long lines extend right and clip at the
+    // pane edge. flex_shrink:0 belts-and-suspenders the same intent.
+    { kind: "hstack", gap: 0.0, align: "start",
+      style: { flex_shrink: 0.0 },
+      children: kids }
+}
+fn line_style(tag) {
+    let pad = { top: 1.0, bottom: 1.0, left: 6.0, right: 6.0 }
+    // Force a fixed row height so the virtualizer's offset math is exact.
+    // clip:true makes the row a clip boundary. The renderer truncates each
+    // (monospace) text run to this row's box width, so a long code line is
+    // physically cut at the green's right edge — contained, and resize-safe
+    // (every re-render re-truncates to the current width).
+    let base = { padding: pad, height: "20", min_height: "20", clip: true }
+    let t = tint(tag)
+    if t == "" { base } else { merge(base, { background: t }) }
+}
+
+fn comment_view(c) {
+    { kind: "frame", gap: 2.0,
+      style: { background: col_panel(), radius: "6",
+               margin: { top: 2.0, bottom: 2.0, left: 60.0, right: 8.0 },
+               padding: { top: 6.0, bottom: 6.0, left: 10.0, right: 10.0 } },
+      children: [
+        { kind: "text", value: c.text, size: 12.5, color: col_text() },
+        { kind: "text", value: "comment · t=" + str(c.ts), size: 10.0, color: col_muted(),
+          selectable: false },
+      ] }
+}
+fn draft_view(s) {
+    { kind: "vstack", gap: 4.0,
+      style: { margin: { top: 2.0, bottom: 4.0, left: 60.0, right: 8.0 } },
+      children: [
+        { kind: "textarea", id: "draft", value: s.draft_text, rows: 3, width: 520.0,
+          placeholder: "Comment… (⌘/Ctrl+Enter to save)" },
+        { kind: "hstack", gap: 6.0, children: [
+          { kind: "button", id: "save_cmt", label: "Save" },
+          { kind: "button", id: "cancel_cmt", label: "Cancel" },
+        ] },
+      ] }
+}
+
+fn uline(file, l, s) {
+    if l.tag == "hunk" {
+        { kind: "frame",
+          style: { background: col_panel(), height: "20", min_height: "20", clip: true,
+                   padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+          children: [ { kind: "text", value: l.text, family: "mono", size: 11.0,
+                        color: col_accent(), selectable: false, wrap: false } ] }
+    } else {
+        let key = line_key(file, l)
+        let row = { kind: "hstack", gap: 8.0, align: "start",
+                    children: [ gutter(l), sign_el(l), code_cell(l.runs) ] }
+        let li = { kind: "list-item", id: "cmt:" + key, selected: false, pad: 0.0,
+                   style: line_style(l.tag), children: [row] }
+        let cs = comments_for(s.comments, key)
+        let mut kids = [li]
+        for c in cs { kids = push(kids, comment_view(c)) }
+        if s.draft_key == key { kids = push(kids, draft_view(s)) }
+        if len(kids) == 1 { li } else { { kind: "vstack", gap: 0.0, children: kids } }
+    }
+}
+
+// ---- side-by-side ----
+fn flush_pairs(rows, dels, adds) {
+    let m = max(len(dels), len(adds))
+    let mut out = rows
+    let mut i = 0
+    while i < m {
+        let l = if i < len(dels) { dels[i] } else { () }
+        let r = if i < len(adds) { adds[i] } else { () }
+        out = push(out, { kind: "pair", left: l, right: r })
+        i = i + 1
+    }
+    out
+}
+fn split_rows(lines) {
+    let mut rows = []
+    let mut dels = []
+    let mut adds = []
+    for l in lines {
+        if l.tag == "hunk" {
+            rows = flush_pairs(rows, dels, adds); dels = []; adds = []
+            rows = push(rows, { kind: "hunk", h: l })
+        } else if l.tag == "ctx" {
+            rows = flush_pairs(rows, dels, adds); dels = []; adds = []
+            rows = push(rows, { kind: "pair", left: l, right: l })
+        } else if l.tag == "del" { dels = push(dels, l) }
+        else if l.tag == "add" { adds = push(adds, l) }
+    }
+    flush_pairs(rows, dels, adds)
+}
+fn side_cell(l) {
+    if typeof(l) != "Record" {
+        { kind: "frame", style: { flex_grow: 1.0, flex_shrink: 1.0,
+            min_width: "0", padding: { top: 1.0, bottom: 1.0, left: 6.0, right: 6.0 } },
+          children: [] }
+    } else {
+        { kind: "frame",
+          style: { flex_grow: 1.0, flex_shrink: 1.0, min_width: "0",
+            background: tint(l.tag),
+            padding: { top: 1.0, bottom: 1.0, left: 6.0, right: 6.0 } },
+          children: [ { kind: "hstack", gap: 8.0, align: "start",
+                        children: [ sign_el(l), code_cell(l.runs) ] } ] }
+    }
+}
+fn sline(row) {
+    if row.kind == "hunk" {
+        { kind: "frame", style: { background: col_panel(), height: "20", min_height: "20",
+            padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+          children: [ { kind: "text", value: row.h.text, family: "mono", size: 11.0,
+                        color: col_accent(), selectable: false, wrap: false } ] }
+    } else {
+        { kind: "hstack", gap: 1.0, align: "stretch",
+          style: { height: "20", min_height: "20" },
+          children: [ side_cell(row.left), side_cell(row.right) ] }
+    }
+}
+
+// VIRTUALIZER. Given each row's height, the scroll offset, and the viewport
+// height, return the visible [first,last) row range plus the spacer heights
+// that stand in for the off-screen rows above/below — so the host still sees
+// the full content height (correct scroll bounds) while we only ever build a
+// screenful of rows. This is what keeps a 5000-line diff from laying out
+// 25000 Taffy nodes.
+fn window_rows(heights, sy, vh) {
+    let n = len(heights)
+    let mut offs = []
+    let mut acc = 0.0
+    for hgt in heights { offs = push(offs, acc); acc = acc + hgt }
+    let total = acc
+    // Half a screen of overscan each side: enough that a coalesced re-render
+    // (fires at 0.3·vh of scroll) always stays ahead of the visible edge,
+    // without building a needless 3 screens of rows.
+    let over = if vh > 1.0 { vh * 0.5 } else { 100000.0 }
+    let top_edge = sy - over
+    let bot_edge = sy + vh + over
+    let mut first = 0
+    while first < n and offs[first] + heights[first] < top_edge { first = first + 1 }
+    let mut last = first
+    while last < n and offs[last] < bot_edge { last = last + 1 }
+    let top = if first < n { offs[first] } else { total }
+    let bottom = if last < n { total - offs[last] } else { 0.0 }
+    { first: first, last: last, top: top, bottom: bottom }
+}
+
+fn file_block(f, s, sy, vh) {
+    let head = { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: if f.new != "" { f.new } else { f.old }, weight: "bold",
+          size: 13.0, color: col_text() },
+        { kind: "badge", value: "+" + str(f.adds), color: "#1c4a30" },
+        { kind: "badge", value: "−" + str(f.dels), color: "#4a1f24" },
+    ] }
+    let split = s.view == "split"
+    let rows = if split { split_rows(f.lines) } else { f.lines }
+    // Per-row heights (must match the forced render heights for exact paging).
+    let mut heights = []
+    for r in rows {
+        if split {
+            heights = push(heights, if r.kind == "hunk" { hunk_h() } else { line_h() })
+        } else if r.tag == "hunk" {
+            heights = push(heights, hunk_h())
+        } else {
+            let key = line_key(f, r)
+            let cbump = to_float(len(comments_for(s.comments, key))) * comment_h()
+            let dbump = if s.draft_key == key { draft_h() } else { 0.0 }
+            heights = push(heights, line_h() + cbump + dbump)
+        }
+    }
+    let win = window_rows(heights, sy, vh)
+    let mut body = []
+    if win.top > 0.0 { body = push(body, { kind: "spacer", size: win.top }) }
+    let mut i = win.first
+    while i < win.last {
+        let r = rows[i]
+        body = push(body, if split { sline(r) } else { uline(f, r, s) })
+        i = i + 1
+    }
+    if win.bottom > 0.0 { body = push(body, { kind: "spacer", size: win.bottom }) }
+    { kind: "vstack", gap: 2.0,
+      style: { margin: { top: 4.0, bottom: 10.0, left: 0.0, right: 0.0 } },
+      children: [ head, { kind: "divider" }, { kind: "vstack", gap: 0.0, children: body } ] }
+}
+
+fn src_label(s) {
+    if s.source == "working" { "working tree" }
+    else if s.source == "range" { "range" }
+    else if s.source == "pr" { "PR" }
+    else if s.source == "file" { "file" }
+    else { "pipe" }
+}
+
+fn toolbar(s) {
+    let row1 = { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "text", value: "▤ diff", size: 13.0, weight: "bold", color: col_text(),
+          selectable: false },
+        { kind: "button", id: "src_working", label: "Working" },
+        { kind: "button", id: "src_range", label: "Range" },
+        { kind: "button", id: "src_pr", label: "PR" },
+        { kind: "button", id: "src_file", label: "File" },
+        { kind: "button", id: "view", label: if s.view == "unified" { "Split" } else { "Unified" } },
+        { kind: "button", id: "refresh", label: "↻" },
+        { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false },
+    ] }
+    let arg_ph = if s.source == "range" { "base head  (e.g. main HEAD)" }
+        else if s.source == "pr" { "PR number" }
+        else if s.source == "file" { "path to .diff" }
+        else { "(working tree — no arg)" }
+    let row2 = { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "text", value: src_label(s) + ":", size: 11.0, color: col_muted(),
+          selectable: false },
+        { kind: "input", id: "repo", value: s.repo,
+          placeholder: "repo path (" + repo_arg(s) + ")",
+          style: { flex_grow: 1.0 } },
+        { kind: "input", id: "arg", value: s.arg, placeholder: arg_ph,
+          style: { flex_grow: 2.0 } },
+        { kind: "button", id: "load", label: "Load" },
+    ] }
+    { kind: "vstack", gap: 6.0, children: [ row1, row2 ] }
+}
+
+// LEFT SIDEBAR — a clickable list of every changed file. Clicking a row
+// (id "file:<i>") switches file_idx (see on_click). Only the selected
+// file's lines are ever rendered into the diff body, so the entity count
+// stays bounded no matter how many files the diff touches. The sidebar
+// lives in the normal scroll flow (the host has one scroll offset per
+// pane), so it scrolls with the body on long files; scroll back to the
+// top to pick another.
+fn file_base(path) {
+    let parts = split(path, "/")
+    let n = len(parts)
+    if n > 0 { parts[n - 1] } else { path }
+}
+fn file_row_style(sel) {
+    let base = { padding: { top: 5.0, bottom: 5.0, left: 8.0, right: 8.0 },
+                 radius: "6", width: "100%" }
+    if sel { merge(base, { background: col_panel() }) } else { base }
+}
+fn file_row(i, f, sel) {
+    let path = if f.new != "" { f.new } else { f.old }
+    let name = { kind: "text", value: file_base(path), family: "mono", size: 12.0,
+                 weight: if sel { "bold" } else { "normal" },
+                 color: col_text(), selectable: false }
+    let stat = { kind: "hstack", gap: 6.0, children: [
+        { kind: "text", value: "+" + str(f.adds), family: "mono", size: 10.0,
+          color: "#5fcf8a", selectable: false },
+        { kind: "text", value: "−" + str(f.dels), family: "mono", size: 10.0,
+          color: "#e08a8a", selectable: false },
+    ] }
+    let inner = { kind: "vstack", gap: 1.0, children: [ name, stat ] }
+    { kind: "list-item", id: "file:" + str(i), selected: sel, pad: 0.0,
+      style: file_row_style(sel), children: [ inner ] }
+}
+fn files_sidebar(s, idx) {
+    let mut rows = [ { kind: "text",
+        value: "Changed files (" + str(len(s.files)) + ")",
+        size: 11.0, weight: "bold", color: col_muted(), selectable: false } ]
+    let mut i = 0
+    for f in s.files {
+        rows = push(rows, file_row(i, f, i == idx))
+        i = i + 1
+    }
+    { kind: "vstack", gap: 3.0,
+      style: { width: "260", min_width: "260", flex_shrink: 0.0,
+               padding: { top: 2.0, bottom: 2.0, left: 0.0, right: 6.0 } },
+      children: rows }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    // Remember the scroll offset we windowed at, so on_scroll knows when the
+    // view has drifted far enough to warrant another (coalesced) re-window.
+    reset!(state, { ..s, last_render_sy: scroll_y })
+    let mut kids = [ toolbar(s), { kind: "divider" } ]
+    if len(s.files) == 0 {
+        kids = push(kids, { kind: "text", value: "No diff loaded. Pick a source and Load.",
+                            color: col_muted() })
+    } else {
+        let idx = if s.file_idx >= len(s.files) or s.file_idx < 0 { 0 } else { s.file_idx }
+        // scroll_y is the host-injected scroll offset; h is the viewport
+        // height — together they drive the virtualizer.
+        // The body fills to the pane content edge (render() drops the right
+        // padding). The host's per-frame `enforce_pane_content_bounds` clips
+        // every text run at that same content edge — which is exactly where
+        // the row tint (= body width) ends. So long lines are cut right where
+        // the green/red stops, and because the host re-clips every frame it
+        // stays correct DURING a resize drag (no stale overhang).
+        let body = { kind: "vstack", gap: 0.0,
+            style: { flex_grow: 1.0, min_width: "0" },
+            children: [ file_block(s.files[idx], s, scroll_y, h) ] }
+        kids = push(kids, { kind: "hstack", gap: 14.0, align: "start",
+            children: [ files_sidebar(s, idx), body ] })
+    }
+    // Symmetric padding: the row clip truncates code to the row box, so we no
+    // longer need the body flush to the pane edge — a clean right gutter works.
+    { kind: "vstack", gap: 10.0, pad: 14.0, children: kids }
+}

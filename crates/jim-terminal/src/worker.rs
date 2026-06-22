@@ -505,12 +505,23 @@ fn worker_loop(
             let mut output_bytes: u64 = 0;
             let mut had_any = false;
             let vt_start = Instant::now();
+            // Whole socket-drain: blocking read + per-frame `term.decode` +
+            // the `term.vt_write` work below, all on the worker thread. Lands
+            // in the same trace ring as the main/render threads, so a slow
+            // frame's dump shows worker activity overlapping the main thread's
+            // parked wait (decode = `term.drain_socket` minus `term.vt_write`
+            // minus the feed/log handlers). Free when tracing is off.
+            let _drain = jim_pane::trace::span("term.drain_socket", "terminal.worker");
             let alive = client
                 .poll_frames(|m| {
                     had_any = true;
                     match m {
                         DaemonMessage::Output(bytes) => {
-                            terminal.vt_write(&bytes);
+                            {
+                                let _vt =
+                                    jim_pane::trace::span("term.vt_write", "terminal.worker");
+                                terminal.vt_write(&bytes);
+                            }
                             if !in_replay {
                                 // Log only LIVE output. Replayed history is
                                 // the daemon's authoritative buffer; the
@@ -666,6 +677,7 @@ fn worker_loop(
         if want_publish || replay_just_ended {
             let force = force_full_publish || replay_just_ended;
             let t = Instant::now();
+            let _pub = jim_pane::trace::span("term.publish", "terminal.worker");
             let (pc, pr, published) = publish_snapshot(
                 &mut terminal,
                 &mut render_state,

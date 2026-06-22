@@ -1,0 +1,435 @@
+// lsp_symbol.ft — one pulled-out symbol shown as its own source on the left,
+// with an auto-loaded navigation sidebar on the right:
+//   • Impls  — every impl block (inherent + trait) on this type, with methods
+//   • Used by — references to this symbol across the workspace
+//   • Definition
+// Each entry opens the relevant symbol in a new pane. The sidebar loads itself
+// as soon as the source resolves — no buttons.
+//
+// params: { file, name, kind, anchor_line, container? }
+import "host"
+import { col_text, col_muted, col_accent, col_panel } from "df"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    text: "", status: "resolving…", found: false,
+    anchor: 0, sel_char: 0, lines: [],
+    jobs: [],            // [{ h, kind }] — concurrent in-flight jimctl calls
+    impls: [], impls_label: "",
+    refs: [],  refs_label: "",
+    defs: [],  defs_label: "",
+    pending: (),
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+fn the_file() = param("file", "")
+fn the_name() = param("name", "")
+fn the_kind() = param("kind", "")
+fn the_container() = param("container", "")
+
+fn is_type_kind(k) {
+    k == "struct" or k == "enum" or k == "class" or k == "interface" or
+    k == "trait" or k == "union" or k == "type_parameter"
+}
+
+fn norm(s) {
+    let parts = split(trim(s), " ")
+    let n = len(parts)
+    if n > 0 { parts[n - 1] } else { s }
+}
+fn file_base(path) {
+    let parts = split(path, "/")
+    let n = len(parts)
+    if n > 0 { parts[n - 1] } else { path }
+}
+fn uri_to_path(uri) {
+    if starts_with(uri, "file://") { slice(uri, 7, len(uri)) } else { uri }
+}
+
+// ---- concurrent job tracking (handle -> kind) ----
+fn add_job(h, kind) {
+    if h != -1 { reset!(state, { ..cur_state(), jobs: push(cur_state().jobs, { h: h, kind: kind }) }) }
+}
+fn job_kind(s, handle) {
+    for j in s.jobs { if j.h == handle { return j.kind } }
+    ""
+}
+fn drop_job(handle) {
+    reset!(state, { ..cur_state(), jobs: filter(cur_state().jobs, (j) => j.h != handle) })
+}
+
+// ---- step 1: resolve this symbol's current range via documentSymbol ----
+fn resolve() {
+    let f = the_file()
+    if f == "" { reset!(state, { ..cur_state(), status: "no file given" }); request_render(); return }
+    let h = proc_spawn("jimctl", ["lsp", "symbols", f])
+    if h == -1 { reset!(state, { ..cur_state(), status: "spawn failed (jimctl not found?)" }); request_render(); return }
+    // Fresh resolve abandons any in-flight jobs and clears the panels.
+    reset!(state, { ..cur_state(), jobs: [{ h: h, kind: "symbols" }],
+                    impls: [], impls_label: "", refs: [], refs_label: "", defs: [], defs_label: "" })
+    request_render()
+}
+
+// ---- step 2: slice the source ----
+fn fetch_source(rng) {
+    let a = str(rng.start.line) + ":" + str(rng.start.character)
+    let b = str(rng.end.line) + ":" + str(rng.end.character)
+    let h = proc_spawn("jimctl", ["lsp", "source", the_file(), "--range", a + "-" + b])
+    add_job(h, "source")
+}
+
+// ---- step 3: auto-load the sidebar (concurrently) once source is in ----
+fn auto_load() {
+    let pos = str(cur_state().anchor) + ":" + str(cur_state().sel_char)
+    let f = the_file()
+    let hu = proc_spawn("jimctl", ["lsp", "references", f, "--pos", pos])
+    let hd = proc_spawn("jimctl", ["lsp", "definition", f, "--pos", pos])
+    reset!(state, { ..cur_state(), refs_label: "loading…", defs_label: "loading…" })
+    add_job(hu, "refs")
+    add_job(hd, "def")
+    if is_type_kind(the_kind()) {
+        // impls takes only a type NAME (no file), so pass --root explicitly —
+        // the file's path lets jimctl resolve the workspace.
+        let hi = proc_spawn("jimctl", ["lsp", "impls", the_name(), "--root", f])
+        reset!(state, { ..cur_state(), impls_label: "gathering…" })
+        add_job(hi, "impls")
+    }
+    request_render()
+}
+
+// ---- symbol resolution (kind,name,container) + nearest-line ----
+fn collect(nodes, kind, name, parent, acc) {
+    let mut out = acc
+    if typeof(nodes) != "List" { return out }
+    for n in nodes {
+        let kn = unwrap_or(get(n, "kind_name"), "")
+        let nm = unwrap_or(get(n, "name"), "")
+        if kn == kind and nm == name {
+            let st = unwrap_or(get(unwrap_or(get(n, "selection_range"), ()), "start"), ())
+            out = push(out, {
+                range: unwrap_or(get(n, "range"), ()),
+                sel_line: unwrap_or(get(st, "line"), 0),
+                sel_char: unwrap_or(get(st, "character"), 0),
+                container: norm(parent),
+            })
+        }
+        let kids = unwrap_or(get(n, "children"), [])
+        if typeof(kids) == "List" and len(kids) > 0 { out = collect(kids, kind, name, nm, out) }
+    }
+    out
+}
+fn best_match(cands, anchor, want) {
+    if len(cands) == 0 { return () }
+    let wn = norm(want)
+    let mut pool = []
+    if wn != "" { for c in cands { if c.container == wn { pool = push(pool, c) } } }
+    if len(pool) == 0 { pool = cands }
+    let mut best = pool[0]
+    let mut bestd = abs(to_float(best.sel_line) - to_float(anchor))
+    for c in pool {
+        let d = abs(to_float(c.sel_line) - to_float(anchor))
+        if d < bestd { best = c; bestd = d }
+    }
+    best
+}
+
+// Deepest symbol whose range contains `line` — for opening a reference/def.
+fn enclosing(nodes, line, parent, best) {
+    let mut b = best
+    if typeof(nodes) != "List" { return b }
+    for n in nodes {
+        let rng = unwrap_or(get(n, "range"), ())
+        let sl = unwrap_or(get(unwrap_or(get(rng, "start"), ()), "line"), -1)
+        let el = unwrap_or(get(unwrap_or(get(rng, "end"), ()), "line"), -1)
+        if line >= sl and line <= el {
+            let srs = unwrap_or(get(unwrap_or(get(n, "selection_range"), ()), "start"), ())
+            b = { name: unwrap_or(get(n, "name"), "?"),
+                  kind: unwrap_or(get(n, "kind_name"), "symbol"),
+                  line: unwrap_or(get(srs, "line"), sl),
+                  container: parent }
+            let kids = unwrap_or(get(n, "children"), [])
+            if typeof(kids) == "List" and len(kids) > 0 { b = enclosing(kids, line, unwrap_or(get(n, "name"), ""), b) }
+        }
+    }
+    b
+}
+
+fn parse_locations(v) {
+    let mut out = []
+    if typeof(v) == "List" { for loc in v { out = push(out, loc_to_ref(loc)) } }
+    else if typeof(v) == "Record" { out = push(out, loc_to_ref(v)) }
+    out
+}
+fn loc_to_ref(loc) {
+    let rng = unwrap_or(get(loc, "range"), ())
+    let st = unwrap_or(get(rng, "start"), ())
+    { file: uri_to_path(unwrap_or(get(loc, "uri"), "")), line: unwrap_or(get(st, "line"), 0) }
+}
+
+// Open the symbol enclosing a location (a reference / definition site).
+fn open_loc(r) {
+    let h = proc_spawn("jimctl", ["lsp", "symbols", r.file])
+    if h == -1 { return }
+    reset!(state, { ..cur_state(), pending: r })
+    add_job(h, "loc_open")
+}
+fn spawn_symbol_pane(file, m) {
+    let p = { file: file, name: m.name, kind: m.kind, anchor_line: m.line, container: m.container }
+    proc_spawn("jimctl", ["widget", "--kind", "script_widget", "--title", m.name,
+                          "--params", to_json(p), "lsp_symbol.ft"])
+}
+
+// ---- reply handling (one JSON line per child; dispatched by job kind) ----
+fn on_proc_output(handle, line) {
+    let kind = job_kind(cur_state(), handle)
+    if kind == "" { return }
+    drop_job(handle)
+    let v = parse_json(line)
+    if typeof(v) != "Record" { return }
+    let err = get(v, "error")
+    if typeof(err) == "Record" {
+        let msg = "lsp: " + unwrap_or(get(err, "message"), "error")
+        if kind == "symbols" or kind == "source" {
+            reset!(state, { ..cur_state(), status: msg, found: false })
+        } else if kind == "impls" { reset!(state, { ..cur_state(), impls_label: msg }) }
+        else if kind == "refs" { reset!(state, { ..cur_state(), refs_label: msg }) }
+        else if kind == "def" { reset!(state, { ..cur_state(), defs_label: msg }) }
+        request_render(); return
+    }
+    let res = unwrap_or(get(v, "result"), ())
+    if typeof(res) != "Record" { return }
+
+    if kind == "symbols" {
+        let cands = collect(unwrap_or(get(res, "symbols"), []), the_kind(), the_name(), "", [])
+        if len(cands) == 0 {
+            reset!(state, { ..cur_state(), found: false, text: "", lines: [],
+                            status: "✗ symbol no longer found in " + file_base(the_file()) })
+            request_render(); return
+        }
+        let m = best_match(cands, cur_state().anchor, the_container())
+        reset!(state, { ..cur_state(), anchor: m.sel_line, sel_char: m.sel_char })
+        fetch_source(m.range)
+    } else if kind == "source" {
+        let text = unwrap_or(get(res, "text"), "")
+        reset!(state, { ..cur_state(), found: true, text: text, lines: highlight(text, "rust"),
+                        status: the_kind() + "  ·  " + file_base(the_file()) })
+        request_render()
+        auto_load()
+    } else if kind == "refs" {
+        // Already enriched by the daemon: [{file, line, symbol, kind, container, sym_line}].
+        reset!(state, { ..cur_state(), refs: unwrap_or(get(res, "locations"), []), refs_label: "" })
+        request_render()
+    } else if kind == "def" {
+        reset!(state, { ..cur_state(), defs: unwrap_or(get(res, "definition"), []), defs_label: "" })
+        request_render()
+    } else if kind == "impls" {
+        reset!(state, { ..cur_state(), impls: unwrap_or(get(res, "impls"), []), impls_label: "" })
+        request_render()
+    }
+}
+
+// Open the symbol an enriched location points into (its enclosing fn/struct).
+fn open_enriched(r) {
+    let sym = unwrap_or(get(r, "symbol"), "")
+    if sym == "" { return }
+    spawn_symbol_pane(unwrap_or(get(r, "file"), ""), {
+        name: sym,
+        kind: unwrap_or(get(r, "kind"), "symbol"),
+        line: unwrap_or(get(r, "sym_line"), 0),
+        container: unwrap_or(get(r, "container"), "") })
+}
+
+fn on_message(topic, payload, sender) {
+    if topic != "lsp.changed" { return }
+    let f = unwrap_or(get(payload, "file"), "")
+    if f != "" and f == the_file() { resolve() }
+}
+
+fn on_init() {}
+fn on_start() {
+    let a = to_int(unwrap_or(parse_float(str(param("anchor_line", 0))), 0.0))
+    reset!(state, { ..init_state(), anchor: a })
+    resolve()
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "reload" { resolve(); return }
+    let s = cur_state()
+    if starts_with(id, "ref:") {
+        let i = to_int(unwrap_or(parse_float(slice(id, 4, len(id))), 0.0))
+        if i >= 0 and i < len(s.refs) { open_enriched(s.refs[i]) }
+        return
+    }
+    if starts_with(id, "dref:") {
+        let i = to_int(unwrap_or(parse_float(slice(id, 5, len(id))), 0.0))
+        if i >= 0 and i < len(s.defs) { open_enriched(s.defs[i]) }
+        return
+    }
+    if starts_with(id, "m:") {
+        let parts = split(slice(id, 2, len(id)), ":")
+        let i = to_int(unwrap_or(parse_float(parts[0]), 0.0))
+        let j = to_int(unwrap_or(parse_float(parts[1]), 0.0))
+        if i >= 0 and i < len(s.impls) {
+            let im = s.impls[i]
+            let ms = unwrap_or(get(im, "methods"), [])
+            if j >= 0 and j < len(ms) {
+                let m = ms[j]
+                spawn_symbol_pane(unwrap_or(get(im, "file"), ""), {
+                    name: unwrap_or(get(m, "name"), "?"),
+                    kind: unwrap_or(get(m, "kind_name"), "method"),
+                    line: unwrap_or(get(m, "sel_line"), 0),
+                    container: the_name() })
+            }
+        }
+        return
+    }
+}
+
+// ---- syntax colors ----
+fn kc(k) {
+    if k == "keyword" { "#c78fe6" } else if k == "string" { "#a6df99" }
+    else if k == "comment" { "#7b8494" } else if k == "function" { "#8cc7ff" }
+    else if k == "type" { "#f0d18c" } else if k == "constructor" { "#f0d18c" }
+    else if k == "constant" { "#f29e7a" } else if k == "attribute" { "#d9b380" }
+    else if k == "operator" { "#b3bdcc" } else if k == "punctuation" { "#b3bdcc" }
+    else if k == "property" { "#d9d2f2" } else if k == "label" { "#f29e7a" }
+    else if k == "escape" { "#f0bf66" } else { col_text() }
+}
+fn lpad(s, w) {
+    let mut out = s
+    while len(out) < w { out = " " + out }
+    out
+}
+fn code_line(i, runs, startline) {
+    let gut = { kind: "text", value: lpad(str(startline + i + 1), 4), family: "mono",
+                size: 11.0, color: col_muted(), selectable: false, wrap: false }
+    let mut kids = []
+    if typeof(runs) != "List" or len(runs) == 0 {
+        kids = [ { kind: "text", value: " ", family: "mono", size: 12.5, color: col_text(), selectable: false, wrap: false } ]
+    } else {
+        for r in runs {
+            kids = push(kids, { kind: "text", value: unwrap_or(get(r, "text"), ""), family: "mono", size: 12.5,
+                                color: kc(unwrap_or(get(r, "kind"), "")), selectable: false, wrap: false })
+        }
+    }
+    { kind: "hstack", gap: 8.0, align: "start", style: { height: "18", min_height: "18", clip: true },
+      children: [ gut, { kind: "hstack", gap: 0.0, align: "start", style: { flex_shrink: 0.0 }, children: kids } ] }
+}
+
+// ---- sidebar sections ----
+fn section_title(label, count_text) {
+    { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: label, size: 11.0, weight: "bold", color: col_accent(), selectable: false },
+        { kind: "spacer", style: { flex_grow: 1.0 } },
+        { kind: "text", value: count_text, size: 10.0, color: col_muted(), selectable: false, wrap: false },
+    ] }
+}
+fn panel(children) {
+    { kind: "vstack", gap: 4.0,
+      style: { background: col_panel(), radius: "6", padding: { top: 8.0, bottom: 8.0, left: 8.0, right: 8.0 } },
+      children: children }
+}
+fn loc_row(idprefix, i, r) {
+    let sym = unwrap_or(get(r, "symbol"), "")
+    let cont = unwrap_or(get(r, "container"), "")
+    let label = if sym == "" { "(file scope)" }
+        else if cont != "" { norm(cont) + "::" + sym }
+        else { sym }
+    let loc = file_base(unwrap_or(get(r, "file"), "")) + ":" + str(unwrap_or(get(r, "line"), 0) + 1)
+    { kind: "list-item", id: idprefix + str(i), selected: false, pad: 0.0,
+      style: { width: "100%", radius: "5", padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+      children: [ { kind: "hstack", gap: 6.0, align: "center", children: [
+          { kind: "text", value: label, family: "mono", size: 11.5, color: "#8cc7ff", selectable: false, wrap: false },
+          { kind: "spacer", style: { flex_grow: 1.0 } },
+          { kind: "text", value: loc, size: 9.5, color: col_muted(), selectable: false, wrap: false },
+      ] } ] }
+}
+
+fn impl_block_view(i, im) {
+    let tr = unwrap_or(get(im, "trait"), "")
+    let label = if tr != "" { "impl " + tr } else { "inherent" }
+    let head = { kind: "text", value: label, family: "mono", size: 11.0, weight: "bold",
+                 color: "#f0d18c", selectable: false, wrap: false }
+    let mut rows = [ head ]
+    let ms = unwrap_or(get(im, "methods"), [])
+    let mut j = 0
+    for m in ms {
+        rows = push(rows, { kind: "list-item", id: "m:" + str(i) + ":" + str(j), selected: false, pad: 0.0,
+            style: { width: "100%", radius: "5", padding: { top: 1.0, bottom: 1.0, left: 12.0, right: 6.0 } },
+            children: [ { kind: "text", value: unwrap_or(get(m, "name"), "?"), family: "mono", size: 11.5,
+                          color: "#8cc7ff", selectable: false, wrap: false } ] })
+        j = j + 1
+    }
+    { kind: "vstack", gap: 1.0, children: rows }
+}
+
+fn impls_section(s) {
+    let count = if s.impls_label == "gathering…" { "gathering…" } else { str(len(s.impls)) }
+    let mut kids = [ section_title("Impls", count) ]
+    if s.impls_label != "gathering…" and len(s.impls) == 0 {
+        kids = push(kids, { kind: "text", value: "none", size: 10.0, color: col_muted(), selectable: false })
+    } else {
+        let mut i = 0
+        for im in s.impls { kids = push(kids, impl_block_view(i, im)); i = i + 1 }
+    }
+    panel(kids)
+}
+fn refs_section(s) {
+    let count = if s.refs_label == "loading…" { "loading…" } else { str(len(s.refs)) }
+    let mut kids = [ section_title("Used by", count) ]
+    if s.refs_label != "loading…" {
+        if len(s.refs) == 0 { kids = push(kids, { kind: "text", value: "none", size: 10.0, color: col_muted(), selectable: false }) }
+        else {
+            let mut i = 0
+            for r in s.refs { if i < 60 { kids = push(kids, loc_row("ref:", i, r)) } i = i + 1 }
+            if len(s.refs) > 60 { kids = push(kids, { kind: "text", value: "…+" + str(len(s.refs) - 60), size: 10.0, color: col_muted(), selectable: false }) }
+        }
+    }
+    panel(kids)
+}
+fn def_section(s) {
+    let count = if s.defs_label == "loading…" { "loading…" } else { str(len(s.defs)) }
+    let mut kids = [ section_title("Definition", count) ]
+    if s.defs_label != "loading…" {
+        if len(s.defs) == 0 { kids = push(kids, { kind: "text", value: "none", size: 10.0, color: col_muted(), selectable: false }) }
+        else { let mut i = 0; for r in s.defs { kids = push(kids, loc_row("dref:", i, r)); i = i + 1 } }
+    }
+    panel(kids)
+}
+
+fn sidebar(s) {
+    let mut secs = []
+    if is_type_kind(the_kind()) { secs = push(secs, impls_section(s)) }
+    secs = push(secs, refs_section(s))
+    secs = push(secs, def_section(s))
+    { kind: "vstack", gap: 10.0, style: { width: "320", min_width: "320", flex_shrink: 0.0 }, children: secs }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let head = { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: the_name(), weight: "bold", size: 13.0, color: col_text(), selectable: false, wrap: false },
+        { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false },
+        { kind: "spacer", style: { flex_grow: 1.0 } },
+        { kind: "button", id: "reload", label: "↻" },
+    ] }
+    let mut body = []
+    if s.found and typeof(s.lines) == "List" and len(s.lines) > 0 {
+        let mut i = 0
+        for runs in s.lines { body = push(body, code_line(i, runs, s.anchor)); i = i + 1 }
+    } else {
+        body = [ { kind: "text", value: if s.found { "(empty)" } else { s.status }, color: col_muted() } ]
+    }
+    let source_col = { kind: "vstack", gap: 8.0, style: { flex_grow: 1.0, min_width: "0" }, children: [
+        head, { kind: "divider" }, { kind: "vstack", gap: 0.0, children: body } ] }
+    let cols = if s.found {
+        { kind: "hstack", gap: 14.0, align: "start", children: [ source_col, sidebar(s) ] }
+    } else { source_col }
+    { kind: "vstack", gap: 0.0, pad: 12.0, children: [ cols ] }
+}

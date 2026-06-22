@@ -1,0 +1,43 @@
+// trace_recorder.ft — control surface for the native flame-graph trace
+// recorder. The capture loop + bounded circular buffer live in Rust
+// (crate jim-flame); this widget is ONLY the UI. It drives the recorder
+// over the widget bus and shows the status the recorder publishes back:
+//
+//   click Record  → emit("trace.record")  → Rust toggles capture
+//   click Send    → emit("trace.send")    → Rust opens/links a flame pane
+//   Rust          → emit_retained("trace.status", {recording, frames, spans})
+import "host"
+
+fn init_state() = { recording: false, frames: 0, spans: 0 }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "record" { emit("trace.record", { action: "toggle" }) }
+    if id == "send" { emit("trace.send", {}) }
+}
+
+fn on_message(topic, payload, sender) {
+    if topic == "trace.status" {
+        let s = @state
+        reset!(state, { ..s, recording: payload.recording, frames: payload.frames, spans: payload.spans })
+        request_render()
+    }
+}
+
+fn render(w, h) {
+    let s = @state
+    let rec_label = if s.recording { "Stop" } else { "Record" }
+    let status = if s.recording { "● recording" } else { "idle" }
+    {
+        kind: "vstack", gap: 10.0, pad: 14.0, children: [
+            { kind: "text", value: "Trace Recorder", weight: "bold" },
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "button", id: "record", label: rec_label },
+                { kind: "button", id: "send", label: "Send to Flame" },
+            ]},
+            { kind: "text", value: status + " · " + str(s.frames) + " frames · " + str(s.spans) + " spans", size: 11.0, color: "#9098a4" },
+        ]
+    }
+}

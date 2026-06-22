@@ -10,9 +10,10 @@
 //! This plugin brackets the [`Render`] schedule's phase sets with span
 //! open/close systems that feed the SAME `jim_pane::trace` ring as the rest of
 //! the instrumentation. With `JIMTRACE` armed, a slow frame's dump now carries
-//! `render` (whole schedule), `render.prepare`, `render.queue`, and
-//! `render.passes` spans on the render thread — so "what in rendering is slow"
-//! is finally answerable from the trace instead of needing `sample`.
+//! `render` (whole schedule), `render.prepare`, `render.prepare.bindgroups`
+//! (the sprite bind-group / `write_buffer` GPU-upload sub-zone), `render.queue`,
+//! and `render.passes` spans on the render thread — so "what in rendering is
+//! slow" is finally answerable from the trace instead of needing `sample`.
 //!
 //! Cost when tracing is off: `trace::begin()` is a single relaxed atomic load
 //! (same as every other instrumented site), so these systems are ~free.
@@ -27,6 +28,7 @@ use jim_pane::trace;
 struct RenderTraceState {
     whole: Option<trace::Pending>,
     prepare: Option<trace::Pending>,
+    bindgroups: Option<trace::Pending>,
     queue: Option<trace::Pending>,
     passes: Option<trace::Pending>,
 }
@@ -52,6 +54,16 @@ impl Plugin for RenderTracePlugin {
                 // `create_buffer`/`write_buffer`/`prepare_*_bind_groups` cost.
                 open_prepare.before(RenderSystems::Prepare),
                 close_prepare.after(RenderSystems::PrepareBindGroups),
+                // Bind-group sub-zone, nested inside `render.prepare`. This is
+                // where `prepare_sprite_image_bind_groups` runs, which calls
+                // `Queue::write_buffer` → a fresh Metal `StagingBuffer` →
+                // `create_buffer` that blocks in the GPU driver/kernel on a
+                // large sprite/cell upload — the prime suspect for the periodic
+                // frame stall. Splitting it out lets a trace say whether the
+                // prepare cost is the bind-group/buffer upload vs the earlier
+                // resource prep (= `render.prepare` minus this).
+                open_bindgroups.before(RenderSystems::PrepareBindGroups),
+                close_bindgroups.after(RenderSystems::PrepareBindGroups),
                 // Queue zone (queue_sprites / phase building).
                 open_queue.before(RenderSystems::Queue),
                 close_queue.after(RenderSystems::Queue),
@@ -74,6 +86,12 @@ fn open_prepare(mut s: ResMut<RenderTraceState>) {
 }
 fn close_prepare(mut s: ResMut<RenderTraceState>) {
     trace::end(s.prepare.take(), "render.prepare", "render", 0);
+}
+fn open_bindgroups(mut s: ResMut<RenderTraceState>) {
+    s.bindgroups = trace::begin();
+}
+fn close_bindgroups(mut s: ResMut<RenderTraceState>) {
+    trace::end(s.bindgroups.take(), "render.prepare.bindgroups", "render", 0);
 }
 fn open_queue(mut s: ResMut<RenderTraceState>) {
     s.queue = trace::begin();

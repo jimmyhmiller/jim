@@ -1,0 +1,96 @@
+// clip_lab.ft — visual test bed for the clip / truncation renderer feature.
+//
+// Each "box" is a frame with a SOLID background and `clip: true`. The renderer
+// truncates the (monospace) text inside to the box's width, so the white text
+// must always end at or before the colored box's right edge. The "± width"
+// buttons resize the boxes live so you can watch truncation re-flow without
+// resizing the pane (the same code path a real resize drives). Case 5 has NO
+// clip — it's the baseline: text spills past the red box to the pane edge.
+import "host"
+
+let state = atom(init_state())
+fn init_state() = { width: 260.0 }
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn lorem() = "the quick brown fox jumps over the lazy dog 0123456789 ABCDEFGHIJ end"
+
+fn mono(s, color) =
+    { kind: "text", value: s, family: "mono", size: 13.0, color: color,
+      selectable: false, wrap: false }
+fn white(s) = mono(s, "#ffffff")
+fn label(s) =
+    { kind: "text", value: s, size: 11.0, color: "#9aa4b2", selectable: false }
+
+// A clipping box: solid bg + clip:true so its right edge is the truncation line.
+fn clip_box(bg, width_spec, kids) {
+    { kind: "frame",
+      style: { background: bg, clip: true, width: width_spec,
+               height: "22", min_height: "22",
+               padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+      children: kids }
+}
+// Same box but WITHOUT clip — baseline that overflows.
+fn open_box(bg, width_spec, kids) {
+    { kind: "frame",
+      style: { background: bg, width: width_spec,
+               height: "22", min_height: "22",
+               padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+      children: kids }
+}
+
+fn case(name, el) {
+    { kind: "vstack", gap: 2.0, style: { margin: { top: 5.0, bottom: 0.0 } },
+      children: [ label(name), el ] }
+}
+
+fn cases(s) {
+    let wpx = str(round(s.width))
+    let green = "#1f6f43"
+    [
+      case("1. short text in clip box — unchanged",
+           clip_box(green, "300", [ white("hello world") ])),
+      case("2. long line, " + wpx + "px box — truncated at the green edge",
+           clip_box(green, wpx, [ white(lorem()) ])),
+      case("3. multi-run colored line — every run cut at the box edge",
+           clip_box(green, wpx, [
+             { kind: "hstack", gap: 0.0, align: "start", children: [
+               mono("let ", "#c78fe6"),
+               mono("value", "#8cc7ff"),
+               mono(" = compute_a_long_expression(alpha, beta, gamma, delta);", "#a6df99"),
+             ] } ])),
+      case("4. nested clip — outer " + wpx + ", inner 120 (tighter wins)",
+           clip_box("#26324a", wpx, [ clip_box(green, "120", [ white(lorem()) ]) ])),
+      case("5. NO clip — baseline, text overflows the red box",
+           open_box("#6f2f2f", wpx, [ white(lorem()) ])),
+      case("6. width 100% — truncated at the pane content edge",
+           clip_box(green, "100%", [ white(lorem() + "  " + lorem()) ])),
+    ]
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let wpx = str(round(s.width))
+    let title = { kind: "text", value: "Clip / truncation lab", size: 15.0,
+                  weight: "bold", color: "#e8ecf2", selectable: false }
+    let controls = { kind: "hstack", gap: 8.0, align: "center", children: [
+        label("box width: " + wpx + "px"),
+        { kind: "button", id: "narrower", label: "− width" },
+        { kind: "button", id: "wider", label: "+ width" },
+    ] }
+    let mut kids = [ title, controls, { kind: "divider" } ]
+    for c in cases(s) { kids = push(kids, c) }
+    { kind: "vstack", gap: 6.0, pad: 14.0, children: kids }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "narrower" {
+        reset!(state, { ..s, width: max(40.0, s.width - 30.0) }); request_render()
+    }
+    if id == "wider" {
+        reset!(state, { ..s, width: min(900.0, s.width + 30.0) }); request_render()
+    }
+}

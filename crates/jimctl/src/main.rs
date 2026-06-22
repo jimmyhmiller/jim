@@ -28,6 +28,7 @@ mod cmd_msg;
 mod cmd_open;
 mod cmd_project;
 mod cmd_suggest;
+mod cmd_trace;
 mod cmd_widget;
 
 /// Args after the subcommand — argv with prog + subcommand stripped.
@@ -56,6 +57,19 @@ fn main() -> ExitCode {
         Some("lsp") => cmd_lsp::run(),
         Some("memory") => cmd_memory::run(),
         Some("inject") => cmd_inject::run(),
+        Some("trace") => cmd_trace::run(),
+        // Host the message-bus daemon. Spawned by self-exec from any
+        // client (GUI or CLI) that finds the bus down — see jim_bus.
+        Some(s) if s == jim_bus::DAEMON_ARG => {
+            jim_bus::daemon::daemonize_if_requested();
+            match jim_bus::run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("[jim-bus] fatal: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(other) => {
             eprintln!("jimctl: unknown command '{other}'\n");
             usage();
@@ -89,6 +103,7 @@ fn usage() {
          \tissue ...                      issue-tracker operations\n\
          \tlsp ...                        structural code queries via rust-analyzer (ensure/symbols/source/rpc)\n\
          \tmemory ...                     manage the DeepSeek planner's memory\n\
-         \tinject ...                     send keystrokes into a session"
+         \tinject ...                     send keystrokes into a session\n\
+         \ttrace [--arm|--disarm] [--ms N]  control the frame-trace recorder at runtime"
     );
 }

@@ -42,8 +42,11 @@ fn start_fetch() {
 }
 
 // Ephemeral timer (auto-refresh) is re-established every start — it's
-// runtime, not data. With no interval, nothing animates.
-fn on_init() { if interval_s() > 0.0 { set_animating(true) } }
+// runtime, not data. A poll interval is a SLOW periodic tick, not a
+// 60fps animation: `set_tick_interval` asks the host to call `on_frame`
+// every `interval` seconds from the reactive loop, so an idle poller
+// costs ~nothing instead of pinning the whole app at 60fps Continuous.
+fn on_init() { if interval_s() > 0.0 { set_tick_interval(interval_s()) } }
 
 // The initial GET is a side effect → on_start, which runs ONLY on a fresh
 // spawn (not on restart). On restart the body is already in state.
@@ -73,15 +76,14 @@ fn on_proc_exit(handle, code) {
     request_render()
 }
 
-// Only used when an auto-refresh interval is configured.
+// Only used when an auto-refresh interval is configured. The host now
+// drives the cadence (one tick per `interval` seconds via
+// `set_tick_interval`), so each `on_frame` is a refresh — no self-gating.
 fn on_frame(dt) {
     let iv = interval_s()
-    if iv <= 0.0 { set_animating(false); return }
+    if iv <= 0.0 { set_tick_interval(0.0); return }
     let s = @state
-    if not s.busy and time() >= s.next_at {
-        reset!(state, { ..s, next_at: time() + iv })
-        start_fetch()
-    }
+    if not s.busy { start_fetch() }
 }
 
 fn on_click(x, y, shift, cmd, id) { if id == "refresh" { start_fetch() } }

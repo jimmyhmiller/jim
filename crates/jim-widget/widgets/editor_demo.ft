@@ -1,0 +1,43 @@
+// editor_demo.ft — a live jim-editor embedded inside a funct widget.
+//
+// The `editor` element mounts a REAL editor (syntax highlight, caret,
+// selection, undo, scroll, keyboard). It persists across re-renders, so
+// the script can redraw chrome around it without losing editor state.
+//
+// `value:` seeds the buffer; edits arrive via `on_editor_change(id, value)`.
+// Storing the value back in state keeps the two in sync (the host won't
+// echo, exactly like `on_input_change`). Use `path:` instead of `value:`
+// to bind the editor to a file (Cmd/Ctrl+S saves it).
+import "host"
+
+fn init_state() = {
+    code: "fn main() {\n    println!(\"hello from a portal\");\n}\n",
+    edits: 0,
+    chars: 0,
+}
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_editor_change(id, value) {
+    let s = @state
+    if id == "main" {
+        reset!(state, { ..s, code: value, edits: s.edits + 1, chars: len(value) })
+        request_render()
+    }
+}
+
+fn render(w, h) {
+    let s = @state
+    let status = "edits: " + str(s.edits) + "   chars: " + str(s.chars)
+    return {
+        kind: "vstack", gap: 8.0, pad: 12.0, children: [
+            { kind: "text", value: "Live editor portal", size: 16.0, color: "#cfd2d8" },
+            { kind: "text", value: status, size: 12.0, color: "#9098a4" },
+            // The editor fills the remaining space. `flex_grow` + min height
+            // make it grow with the pane like any other leaf.
+            { kind: "editor", id: "main", value: s.code, lang: "rust",
+              style: { flex_grow: 1.0, width: "100%", height: "100%", min_height: "160" } },
+        ]
+    }
+}

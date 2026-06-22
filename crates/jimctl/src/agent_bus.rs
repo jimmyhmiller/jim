@@ -1,35 +1,22 @@
-//! Shared helpers for jimctl agent adapters to ride the jim widget message
-//! bus (see AGENTS-ON-THE-BUS.md). The Claude `cmd_channel` adapter predates
-//! this module and still carries its own copies; new adapters (`cmd_codex`,
-//! …) use these so the wire format lives in one place.
+//! Shared helpers for jimctl agent adapters to ride the jim message bus
+//! (see AGENTS-ON-THE-BUS.md).
 //!
-//! Wire format is duplicated from the GUI on purpose (same rationale as the
-//! other `cmd_*` modules): staying lib-free of `jim-app` keeps the CLI off
-//! the libghostty dylib / @rpath dance.
+//! As of the GUI-independent bus, this talks to the `jim_bus` daemon
+//! (spawning it on demand) rather than the GUI's `~/.jim/socket` + the
+//! tail log. Publishing is a one-shot connect; the roster is the daemon's
+//! retained replay; `follow_inbox` is a live subscription. The agent bus
+//! therefore works whether or not the editor GUI is open — exactly like
+//! the terminal works whether or not the GUI is open.
+//!
+//! The public API (signatures, the `Inbound` shape) is unchanged so the
+//! `cmd_*` adapters built on it keep compiling untouched.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Seek, SeekFrom, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
-fn home(rel: &str) -> Option<PathBuf> {
-    let mut p = PathBuf::from(std::env::var_os("HOME")?);
-    for seg in rel.split('/') {
-        p.push(seg);
-    }
-    Some(p)
-}
-
-pub fn socket_path() -> Option<PathBuf> {
-    home(".jim/socket")
-}
-
-pub fn bus_log_path() -> Option<PathBuf> {
-    home(".jim/widget-bus.log")
-}
+use jim_bus::client;
+use jim_bus::proto::BusMessage;
 
 pub fn current_cwd() -> String {
     std::env::current_dir()
@@ -47,25 +34,18 @@ pub fn default_label() -> String {
         .unwrap_or_else(|| "session".to_string())
 }
 
-/// Publish one message onto the bus via the `widget_message` IPC action on
-/// `~/.jim/socket`. `project:"global"` is the cross-project channel the
-/// `agent.*` topics ride on; `sender` carries the real origin.
+/// Publish one message onto the bus. Rides the GLOBAL channel (`project:
+/// None`) the `agent.*` topics live on; `sender` carries the real origin.
+/// Spawns the bus daemon if it isn't running.
 pub fn publish(topic: &str, payload: Value, retain: bool, sender: &str) -> Result<(), String> {
-    let sock = socket_path().ok_or_else(|| "HOME not set".to_string())?;
-    let mut stream = UnixStream::connect(&sock)
-        .map_err(|e| format!("connect {}: {} (is the jim app running?)", sock.display(), e))?;
-    let req = json!({
-        "action": "widget_message",
-        "project": "global",
-        "topic": topic,
-        "payload": payload,
-        "retain": retain,
-        "sender": sender,
-    });
-    let body = serde_json::to_vec(&req).map_err(|e| format!("serialize: {e}"))?;
-    stream.write_all(&body).map_err(|e| format!("write: {e}"))?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    Ok(())
+    let msg = BusMessage {
+        project: None,
+        topic: topic.to_string(),
+        payload_json: payload.to_string(),
+        sender: sender.to_string(),
+        retain,
+    };
+    client::publish_oneshot(&msg).map_err(|e| format!("publish to jim-bus: {e}"))
 }
 
 /// Announce presence as a retained `agent.hello.<id>` so the roster + viewer
@@ -88,7 +68,8 @@ pub fn tombstone(id: &str) {
 }
 
 /// Is a process still alive? Prunes ghost roster entries from hard-killed
-/// sessions that never tombstoned.
+/// sessions that never tombstoned. (The daemon sweeps too, but adapters
+/// still expose this for their own roster views.)
 pub fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -99,25 +80,22 @@ pub fn pid_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Latest retained `agent.hello.<id>` per session (tombstones dropped), read
-/// from the bus log. Truncated on app start, so it reflects the current run.
+/// Latest retained `agent.hello.<id>` per session, from the daemon's
+/// retained replay. Tombstoned/expired entries are already gone from the
+/// store, so what comes back is the current roster.
 pub fn read_roster() -> BTreeMap<String, Value> {
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
-    let Some(log) = bus_log_path() else {
+    let Ok(msgs) = client::fetch_retained() else {
         return out;
     };
-    let Ok(text) = std::fs::read_to_string(&log) else {
-        return out;
-    };
-    for line in text.lines() {
-        let Ok(m) = serde_json::from_str::<Value>(line) else {
+    for m in msgs {
+        if m.project.is_some() {
+            continue; // agent bus is the global (None) channel
+        }
+        let Some(sid) = m.topic.strip_prefix("agent.hello.") else {
             continue;
         };
-        let topic = m.get("topic").and_then(Value::as_str).unwrap_or("");
-        let Some(sid) = topic.strip_prefix("agent.hello.") else {
-            continue;
-        };
-        let payload = m.get("payload").cloned().unwrap_or(Value::Null);
+        let payload: Value = serde_json::from_str(&m.payload_json).unwrap_or(Value::Null);
         if payload.is_null() {
             out.remove(sid);
         } else {
@@ -127,8 +105,9 @@ pub fn read_roster() -> BTreeMap<String, Value> {
     out
 }
 
-/// Tombstone any roster entry whose announced pid is gone, so the roster and
-/// the viewer widget self-heal. Skips our own id.
+/// Tombstone any roster entry whose announced pid is gone. The daemon does
+/// this on its own timer; adapters can still nudge it (e.g. right after
+/// listing the roster) so their view self-heals immediately.
 pub fn sweep_dead_sessions(self_id: &str) {
     for (sid, info) in read_roster() {
         if sid == self_id {
@@ -160,7 +139,7 @@ pub fn resolve_topic(to: &str) -> Option<String> {
     None
 }
 
-/// One bus message addressed to us, already unwrapped to the agent payload
+/// One bus message addressed to us, unwrapped to the agent payload
 /// convention (`{from, text, data?}`).
 #[derive(Clone)]
 pub struct Inbound {
@@ -174,88 +153,66 @@ pub struct Inbound {
     pub payload: Value,
 }
 
-/// Parse one bus-log line into an [`Inbound`] iff it is addressed to
-/// `self_id` (its inbox or `agent.all`) and is not our own emit. This is the
-/// single decoder every adapter shares so the "addressed to me, by whom,
-/// saying what" rules live in one place.
-pub fn parse_inbound(line: &str, self_id: &str, inbox: &str) -> Option<Inbound> {
-    if line.is_empty() {
+/// Decode one delivered [`BusMessage`] into an [`Inbound`] iff it is
+/// addressed to `self_id` (its inbox or `agent.all`) and is not our own
+/// emit. The single decoder every adapter shares.
+pub fn inbound_from(msg: &BusMessage, self_id: &str, inbox: &str) -> Option<Inbound> {
+    if msg.topic != inbox && msg.topic != "agent.all" {
         return None;
     }
-    let m: Value = serde_json::from_str(line).ok()?;
-    let topic = m.get("topic").and_then(Value::as_str).unwrap_or("");
-    if topic != inbox && topic != "agent.all" {
-        return None;
-    }
-    let bus_sender = m.get("sender").and_then(Value::as_str).unwrap_or("");
-    let payload = m.get("payload").cloned().unwrap_or(Value::Null);
+    let payload: Value = serde_json::from_str(&msg.payload_json).unwrap_or(Value::Null);
     let from = payload
         .get("from")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .unwrap_or(bus_sender)
+        .unwrap_or(&msg.sender)
         .to_string();
     // Skip our own emits (either stamping path).
-    if from == self_id || bus_sender == self_id {
+    if from == self_id || msg.sender == self_id {
         return None;
     }
     let text = match payload.get("text").and_then(Value::as_str) {
         Some(t) => t.to_string(),
         None => serde_json::to_string(&payload).unwrap_or_default(),
     };
-    Some(Inbound { from, text, topic: topic.to_string(), payload })
+    Some(Inbound {
+        from,
+        text,
+        topic: msg.topic.clone(),
+        payload,
+    })
 }
 
-/// Follow the bus log from the current end, invoking `on_msg` for every
-/// message addressed to `self_id` (see [`parse_inbound`]). Polls every 200ms
-/// like `tail -f`, resets on truncation (app restart), and — when `sweep` is
-/// set — prunes dead roster peers every ~5s. Returns when `should_stop()`
-/// reports true. This is the inbox stream the adapters used to hand-roll.
+/// Follow the bus live, invoking `on_msg` for every message addressed to
+/// `self_id` (see [`inbound_from`]). Subscribes to the daemon (which
+/// reconnects + re-spawns automatically), so this survives GUI restarts.
+/// Returns when `should_stop()` reports true. `sweep` nudges the daemon to
+/// prune dead peers (it also prunes on its own timer).
 pub fn follow_inbox<F, S>(self_id: &str, sweep: bool, mut on_msg: F, should_stop: S)
 where
     F: FnMut(Inbound),
     S: Fn() -> bool,
 {
-    let Some(log) = bus_log_path() else {
-        eprintln!("agent_bus: HOME not set; cannot tail bus");
-        return;
-    };
     let inbox = format!("agent.inbox.{self_id}");
-    let mut pos: u64 = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+    let handle = client::BusHandle::spawn();
     let mut sweep_ctr: u32 = 0;
 
     while !should_stop() {
-        if let Ok(mut f) = std::fs::File::open(&log) {
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len < pos {
-                pos = 0; // truncated on app restart → start over
-            }
-            if len > pos && f.seek(SeekFrom::Start(pos)).is_ok() {
-                let mut reader = std::io::BufReader::new(&mut f);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) if line.ends_with('\n') => {
-                            if let Some(msg) = parse_inbound(line.trim_end(), self_id, &inbox) {
-                                on_msg(msg);
-                            }
-                        }
-                        // Partial line (mid-write) or read error: re-read next pass.
-                        _ => break,
-                    }
+        for item in handle.drain() {
+            if let client::Inbound::Message(msg) = item {
+                if let Some(inbound) = inbound_from(&msg, self_id, &inbox) {
+                    on_msg(inbound);
                 }
-                pos = f.stream_position().unwrap_or(len);
             }
         }
         if sweep {
             sweep_ctr += 1;
-            if sweep_ctr >= 25 {
+            if sweep_ctr >= 50 {
+                // ~5s at the 100ms cadence below
                 sweep_ctr = 0;
                 sweep_dead_sessions(self_id);
             }
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }

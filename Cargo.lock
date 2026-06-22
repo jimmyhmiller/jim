@@ -4113,6 +4113,7 @@ dependencies = [
  "editor_core",
  "funct",
  "image",
+ "jim_bus",
  "jim_daemon",
  "jim_editor",
  "jim_flame",
@@ -4134,6 +4135,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "whiteboard-core",
+]
+
+[[package]]
+name = "jim_bus"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4300,6 +4311,7 @@ dependencies = [
  "glaze",
  "hound",
  "image",
+ "jim_bus",
  "jim_editor",
  "jim_inference",
  "jim_pane",
@@ -4319,6 +4331,7 @@ dependencies = [
 name = "jimctl"
 version = "0.1.0"
 dependencies = [
+ "jim_bus",
  "jim_daemon",
  "jim_lsp",
  "libc",

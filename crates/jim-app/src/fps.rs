@@ -279,14 +279,39 @@ fn collect_profile(
 // spans out of the ring and write the full nested timeline to disk for later
 // inspection. Toggle with Cmd+Shift+G or arm at startup with `JIMTRACE=1`.
 
+/// Runtime-mutable slow-frame dump threshold, in active-ms, stored as the f32
+/// bit pattern in an atomic. Env vars are frozen at launch, so a process-global
+/// the IPC handler and the per-frame capture system share is what makes the
+/// threshold live-adjustable (`jimctl trace --ms N`) without a restart. Seeded
+/// lazily from `JIMTRACE_MS` (default 50) on first touch.
+static TRACE_THRESHOLD_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static TRACE_THRESHOLD_INIT: std::sync::Once = std::sync::Once::new();
+
+fn init_trace_threshold() {
+    TRACE_THRESHOLD_INIT.call_once(|| {
+        let ms = std::env::var("JIMTRACE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50.0_f32);
+        TRACE_THRESHOLD_BITS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
 /// App-work (First→Last) over this many ms triggers a dump. We threshold on
 /// ACTIVE time, not total frame time, so reactive-mode idle sleeps (long
-/// frame, no work) don't trip it. Override with `JIMTRACE_MS`.
-fn trace_threshold_ms() -> f32 {
-    std::env::var("JIMTRACE_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50.0)
+/// frame, no work) don't trip it. Seeded from `JIMTRACE_MS`; change at runtime
+/// with [`set_trace_threshold_ms`].
+pub fn trace_threshold_ms() -> f32 {
+    init_trace_threshold();
+    f32::from_bits(TRACE_THRESHOLD_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Set the slow-frame dump threshold (active ms) at runtime. Called from the
+/// IPC handler for `jimctl trace --ms`. Explicit sets win over the env seed.
+pub fn set_trace_threshold_ms(ms: f32) {
+    init_trace_threshold();
+    TRACE_THRESHOLD_BITS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Cap dumps per session so a sustained slow stretch can't carpet the disk.

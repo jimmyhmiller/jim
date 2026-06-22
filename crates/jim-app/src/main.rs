@@ -7,7 +7,21 @@ fn main() {
     // Dispatch before touching Bevy so the daemon process never loads
     // the GUI stack.
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("--daemon") {
+    let first = args.next();
+    // Self-exec bus-daemon mode: whoever needs the agent/widget message
+    // bus spawns `<exe> bus-daemon`. Like `--daemon`, dispatch before
+    // touching Bevy so the daemon never loads the GUI stack. It
+    // double-forks itself (daemonize_if_requested), so the spawner's
+    // wait() returns promptly.
+    if first.as_deref() == Some(jim_bus::DAEMON_ARG) {
+        jim_bus::daemon::daemonize_if_requested();
+        if let Err(e) = jim_bus::run() {
+            eprintln!("[jim-bus] fatal: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if first.as_deref() == Some("--daemon") {
         let session_id: u64 = args
             .next()
             .and_then(|s| s.parse().ok())

@@ -1,0 +1,16 @@
+// hello.ft — the first funct widget. Smoke test for the funct→Element
+// pipeline (record `kind:` → protocol `type:`, frame slots, render loop).
+import "host"
+
+fn on_init() {
+    host_log("hello.ft init on ${canvas_w}x${canvas_h}")
+    request_render()
+}
+
+fn render(w, h) = {
+    kind: "vstack", gap: 10.0, pad: 16.0, children: [
+        { kind: "text", value: "Hello from funct!", size: 18.0, color: "#cfd2d8" },
+        { kind: "text", value: "canvas ${w} x ${h}", size: 12.0, color: "#9098a4" },
+        { kind: "text", value: "rendered by the funct VM", size: 12.0, color: "#7f8794" },
+    ]
+}

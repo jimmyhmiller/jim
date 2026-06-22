@@ -1,0 +1,7 @@
+# App-generated: `setup_watcher` rewrites host.ft on every startup to match
+# the funct host interface (funct_widget::HOST_FT). Not user-edited source.
+host.ft
+
+# Machine-specific symlinks into the gc-rust project (PlayGround). These are
+# live-loaded by Jim on this machine but are not part of this repo.
+gcr_*.ft

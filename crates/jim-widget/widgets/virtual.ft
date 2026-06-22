@@ -1,0 +1,71 @@
+// virtual.ft — reusable list virtualization for funct widgets.
+//
+// Renders only the rows visible in the current scroll window (plus overscan),
+// standing in for the rest with two `spacer` elements so the host still sees
+// the full content height (correct scroll bounds) while only ~a screenful of
+// Bevy entities is ever built. Packages the windowing pattern diff.ft hand-
+// rolls, so a widget doesn't reinvent it.
+//
+// WHY THIS MATTERS: the host spawns one (or more) Bevy entity per Element
+// node. A 1500-row list = ~10k entities; scrolling dirties the content-root
+// transform, forcing Bevy to re-propagate transforms + visibility across all
+// of them (~50ms/frame). Virtualizing caps the resident entity count at ~a
+// screenful, so that per-frame cost collapses.
+//
+// Usage in a widget:
+//   import { virtual_list, should_rewindow } from "virtual"
+//
+//   fn on_scroll(y) {
+//       if should_rewindow(y, cur_state().last_sy, canvas_h) { request_render() }
+//   }
+//   fn render(w, h) {
+//       reset!(state, { ..cur_state(), last_sy: scroll_y })
+//       // rows[i] renders at exactly heights[i] px (force it with a fixed
+//       // style.height so the scroll math is exact); the wrapper is gap:0.
+//       virtual_list(rows, heights, scroll_y, h, (row, i) => row_view(row, i))
+//   }
+
+// Visible [first,last) window + the spacer heights that stand in for the rows
+// above/below it, given each row's height and the current scroll offset.
+fn window(heights, sy, vh) {
+    let n = len(heights)
+    let mut offs = []
+    let mut acc = 0.0
+    for hgt in heights { offs = push(offs, acc); acc = acc + hgt }
+    let total = acc
+    // Half a screen of overscan each side: enough that a coalesced re-render
+    // (fired at ~1/3 screen of scroll) always stays ahead of the visible edge,
+    // and small offset errors (e.g. a header bar above the list) are absorbed.
+    let over = if vh > 1.0 { vh * 0.5 } else { 100000.0 }
+    let top_edge = sy - over
+    let bot_edge = sy + vh + over
+    let mut first = 0
+    while first < n and offs[first] + heights[first] < top_edge { first = first + 1 }
+    let mut last = first
+    while last < n and offs[last] < bot_edge { last = last + 1 }
+    let top = if first < n { offs[first] } else { total }
+    let bottom = if last < n { total - offs[last] } else { 0.0 }
+    { first: first, last: last, top: top, bottom: bottom }
+}
+
+// Build the windowed vstack: top spacer, the visible rows, bottom spacer.
+// `render_fn(row, i)` returns the Element for one row.
+export fn virtual_list(rows, heights, scroll_y, viewport_h, render_fn) {
+    let win = window(heights, scroll_y, viewport_h)
+    let mut body = []
+    if win.top > 0.0 { body = push(body, { kind: "spacer", size: win.top }) }
+    let mut i = win.first
+    while i < win.last {
+        body = push(body, render_fn(rows[i], i))
+        i = i + 1
+    }
+    if win.bottom > 0.0 { body = push(body, { kind: "spacer", size: win.bottom }) }
+    { kind: "vstack", gap: 0.0, children: body }
+}
+
+// Coalesce scroll re-renders: only re-window once the view has drifted far
+// enough (~1/3 screen) that we're nearing the overscan edge. Between re-renders
+// the host just translates the already-built window (free).
+export fn should_rewindow(scroll_y, last_sy, viewport_h) {
+    abs(scroll_y - last_sy) > viewport_h * 0.3
+}

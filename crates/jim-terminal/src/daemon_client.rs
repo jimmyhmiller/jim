@@ -160,7 +160,17 @@ impl DaemonClient {
             }
         }
         loop {
-            match decode::<DaemonMessage>(&self.in_buf) {
+            // Time just the bincode deserialize of one `DaemonMessage` frame.
+            // A big `Output(Vec<u8>)` / scrollback snapshot allocates and
+            // decodes a large Vec here — under profiling this is the single
+            // biggest worker-thread cost and the upstream trigger for the
+            // sprite re-upload stall, so it gets its own span (nested under
+            // the worker's `term.drain_socket`). Free when tracing is off.
+            let decoded = {
+                let _decode = jim_pane::trace::span("term.decode", "terminal.worker");
+                decode::<DaemonMessage>(&self.in_buf)
+            };
+            match decoded {
                 Ok(Some((msg, consumed))) => {
                     self.in_buf.drain(..consumed);
                     f(msg);

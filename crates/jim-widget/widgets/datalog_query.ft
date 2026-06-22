@@ -1,0 +1,271 @@
+// datalog_query.ft — a real query console for datalog-db.
+// (funct port of datalog_query.rhai.)
+//
+// Type any datalog command into the box and Cmd/Ctrl+Enter (or Run):
+//   find ?n where ?u: User { name: ?n }
+//   list User limit 50      schema      status
+//   assert User { name: "Carol", email: "c@x.com", age: 22 }
+//   define Tag { label: string required }
+//   drop User       purge Product
+// Query results render as a Table; assert/define/drop/etc show their
+// status line. Quick chips run common reads without typing.
+//
+// Talks to the `datalog` CLI as a one-shot subprocess (proc_* API),
+// draining stdout in on_frame.
+//
+// Differences from datalog_query.rhai, by language design:
+//  - state is an atom; handlers copy it out (`let mut s = @state`) and
+//    write it back with reset!(state, ...) before returning
+//  - lists/records are immutable: push/assoc return new values
+//  - render items use `kind:` instead of rhai's `type:` (funct keyword)
+//  - index_of returns Option<Int>, not -1
+import "host"
+
+// ---- state ----
+fn init_state() = {
+    host: "127.0.0.1:5557",
+    proc: -1,
+    busy: false,
+    job: "",
+    out: [],
+    types: [],   // for quick chips
+    q: "",       // textarea buffer
+    ran: "",     // last command run
+    rkind: "",   // "table" | "text"
+    rcols: [],
+    rrows: [],
+    rtext: [],
+}
+let state = atom(init_state())
+
+// ============================ helpers ============================
+
+fn dl_path() {
+    let home = host_env("HOME")
+    if home == "" { "datalog" } else { home + "/.cargo/bin/datalog" }
+}
+
+fn spawn_args(host, args) {
+    let mut argv = ["--host", host]
+    for a in args { argv = push(argv, a) }
+    proc_spawn(dl_path(), argv)
+}
+
+fn drain(handle) {
+    let mut lines = []
+    while true { let l = proc_read(handle); if l == "" { break } lines = push(lines, l) }
+    let mut done = false
+    if not proc_alive(handle) {
+        while true { let l = proc_read(handle); if l == "" { break } lines = push(lines, l) }
+        done = true
+    }
+    { lines: lines, done: done }
+}
+
+fn split_ws(s) {
+    let mut out = []
+    for p in split(s, " ") { if p != "" { out = push(out, p) } }
+    out
+}
+
+// Map a typed command line to the CLI's one-shot argv, matching how the
+// `datalog` binary itself splits one-shot commands. A bare `find ...` is
+// treated as a `query`.
+fn to_argv(line) {
+    let s = trim(line)
+    if s == "" { return [] }
+    let kw = match index_of(s, " ") {
+        None => s,
+        Some(sp) => slice(s, 0, sp),
+    }
+    let rest = match index_of(s, " ") {
+        None => "",
+        Some(sp) => trim(slice(s, sp + 1, len(s))),
+    }
+    if kw == "status" or kw == "schema" { return [kw] }
+    if kw == "find" { return ["query", s] }
+    if kw == "query" or kw == "define" or kw == "assert" or kw == "retract" or kw == "json" {
+        let mut a = [kw]
+        if rest != "" { a = push(a, rest) }
+        return a
+    }
+    // list / backup / drop / purge / anything else → whitespace argv
+    split_ws(s)
+}
+
+fn parse_types(lines) {
+    let mut types = []
+    let mut section = ""
+    for line in lines {
+        if line == "Entity types:" { section = "types" }
+        else if line == "Enums:"   { section = "enums" }
+        else if len(line) >= 3 and starts_with(line, "  ") and not starts_with(line, "   ") {
+            let name = slice(line, 2, len(line))
+            if name != "" and name != "(none)" and section == "types" { types = push(types, name) }
+        }
+    }
+    types
+}
+
+// A `find`/`list` result is an ASCII table: header, a `---+---` rule,
+// rows, then a `(N rows)` footer. Detect by the rule on line 2.
+fn is_table(lines) {
+    len(lines) >= 2 and starts_with(lines[1], "-")
+}
+
+fn split_cells(line) {
+    let mut out = []
+    for c in split(line, " | ") { out = push(out, trim(c)) }
+    out
+}
+
+fn parse_table(lines) {
+    let cols = split_cells(lines[0])
+    let mut rows = []
+    let mut i = 2 // skip header + rule
+    while i < len(lines) {
+        let line = lines[i]
+        i += 1
+        if line == "" { continue }
+        if starts_with(line, "(") { break } // "(N rows)" footer
+        rows = push(rows, split_cells(line))
+    }
+    { cols: cols, rows: rows }
+}
+
+// =========================== handlers ============================
+
+fn on_init() {
+    let mut s = @state
+    let p = spawn_args(s.host, ["schema"])
+    s = { ..s, proc: p }
+    if s.proc != -1 { s = { ..s, busy: true, job: "schema", out: [] }; set_animating(true) }
+    reset!(state, s)
+    request_render()
+}
+
+fn on_frame(dt) {
+    let mut s = @state
+    if not s.busy { set_animating(false); return }
+    let res = drain(s.proc)
+    let mut out = s.out
+    for l in res.lines { out = push(out, l) }
+    s = { ..s, out: out }
+    if res.done {
+        let job = s.job
+        let job_out = s.out
+        s = { ..s, busy: false, proc: -1, job: "", out: [] }
+        set_animating(false)
+        if job == "schema" {
+            s = { ..s, types: parse_types(job_out) }
+        } else if job == "cmd" {
+            if is_table(job_out) {
+                let t = parse_table(job_out)
+                s = { ..s, rkind: "table", rcols: t.cols, rrows: t.rows, rtext: [] }
+            } else {
+                s = { ..s, rkind: "text", rtext: job_out, rcols: [], rrows: [] }
+            }
+        }
+    }
+    reset!(state, s)
+    request_render()
+}
+
+// Build the one-shot child for `line`. Pure helper (host fns only, no
+// `state`); returns the handle, or -1.
+fn launch(host, line) {
+    let argv = to_argv(line)
+    if len(argv) == 0 { return -1 }
+    spawn_args(host, argv)
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let mut s = @state
+    if id == "" or s.busy { return }
+    let mut line = ""
+    if id == "run" { line = s.q }
+    else if id == "q:schema" { line = "schema" }
+    else if id == "q:status" { line = "status" }
+    else if starts_with(id, "ql:") { line = "list " + slice(id, 3, len(id)) + " limit 100" }
+    else { return }
+
+    s = { ..s, q: line }
+    let h = launch(s.host, line)
+    if h != -1 {
+        s = { ..s, proc: h, busy: true, job: "cmd", out: [], ran: trim(line) }
+        set_animating(true)
+        host_log("[datalog_query] " + s.ran)
+    }
+    reset!(state, s)
+    request_render()
+}
+
+fn on_input_change(id, value) {
+    if id == "q" { reset!(state, { ..(@state), q: value }); request_render() }
+}
+
+fn on_input_submit(id, value) {     // Cmd/Ctrl+Enter in the textarea
+    let mut s = @state
+    if id != "q" or s.busy { return }
+    s = { ..s, q: value }
+    let h = launch(s.host, value)
+    if h != -1 {
+        s = { ..s, proc: h, busy: true, job: "cmd", out: [], ran: trim(value) }
+        set_animating(true)
+        host_log("[datalog_query] " + s.ran)
+    }
+    reset!(state, s)
+    request_render()
+}
+
+// ============================ render =============================
+
+fn render(w, h) {
+    let s = @state
+    let mut rows = []
+
+    rows = push(rows, { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: "datalog query", size: 15.0, color: "#e6e9f0", weight: "bold" },
+        { kind: "badge", value: s.host },
+    ]})
+
+    // command box
+    rows = push(rows, { kind: "textarea", id: "q", value: s.q, rows: 4,
+        placeholder: "find ?n, ?age where ?u: User { name: ?n, age: ?age }   (Cmd+Enter to run)\nlist User limit 50   .   assert/define/drop/purge also work" })
+
+    // action row + quick chips
+    let mut chips = [
+        { kind: "button", id: "run", label: if s.busy { "running..." } else { "Run" } },
+        { kind: "button", id: "q:schema", label: "schema" },
+        { kind: "button", id: "q:status", label: "status" },
+    ]
+    for t in s.types { chips = push(chips, { kind: "button", id: "ql:" + t, label: "list " + t }) }
+    rows = push(rows, { kind: "hstack", gap: 6.0, children: chips })
+
+    if s.ran != "" {
+        rows = push(rows, { kind: "text", value: "$ " + s.ran, size: 10.0, color: "#6f7686", family: "mono" })
+    }
+
+    // result
+    if s.rkind == "table" {
+        rows = push(rows, { kind: "divider" })
+        if len(s.rrows) == 0 {
+            rows = push(rows, { kind: "text", value: "(no rows)", size: 11.0, color: "#7f8794" })
+        } else {
+            let mut cols = []
+            for c in s.rcols { cols = push(cols, { header: c }) }
+            rows = push(rows, { kind: "table", zebra: true, columns: cols, rows: s.rrows })
+            rows = push(rows, { kind: "text", value: str(len(s.rrows)) + " row(s)", size: 10.0, color: "#7f8794" })
+        }
+    } else if s.rkind == "text" {
+        rows = push(rows, { kind: "divider" })
+        for line in s.rtext {
+            let col = if starts_with(line, "ERROR") { "#e08a8a" }
+                      else if starts_with(line, "OK") { "#86c08a" }
+                      else { "#cfd3dd" }
+            rows = push(rows, { kind: "text", value: line, size: 11.0, color: col, family: "mono" })
+        }
+    }
+
+    { kind: "vstack", pad: 10.0, gap: 6.0, children: rows }
+}

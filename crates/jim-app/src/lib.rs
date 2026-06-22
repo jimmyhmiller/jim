@@ -947,6 +947,30 @@ fn drain_ipc_open_requests(
                     retain,
                 });
             }
+            ipc::IpcRequest::TraceControl { arm, ms } => {
+                use std::io::Write as _;
+                if let Some(on) = arm {
+                    jim_pane::trace::set_enabled(on);
+                }
+                if let Some(ms) = ms {
+                    fps::set_trace_threshold_ms(ms);
+                }
+                let armed = jim_pane::trace::enabled();
+                let threshold_ms = fps::trace_threshold_ms();
+                crate::diagnostics::append_log(&format!(
+                    "[trace] ipc: capture {} (threshold {:.0}ms active)",
+                    if armed { "ARMED" } else { "off" },
+                    threshold_ms,
+                ));
+                let body = serde_json::json!({
+                    "armed": armed,
+                    "threshold_ms": threshold_ms,
+                });
+                if let Ok(bytes) = serde_json::to_vec(&body) {
+                    let _ = _stream.write_all(&bytes);
+                }
+                let _ = _stream.shutdown(std::net::Shutdown::Write);
+            }
         }
     }
 }

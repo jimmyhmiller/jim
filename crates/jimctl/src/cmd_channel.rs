@@ -2,29 +2,31 @@
 //! to jim's widget↔widget message bus. See `CHANNELS.md` for the full
 //! design. This implements **Phase 0 + Phase 1**:
 //!
-//!   - inbound (bus → Claude): tail `~/.jim/widget-bus.log`, forward
+//!   - inbound (bus → Claude): subscribe to the `jim_bus` daemon, forward
 //!     subscribed topics as `notifications/claude/channel`;
 //!   - outbound (Claude → bus) tools: `jim_send`, `jim_subscribe`,
 //!     `jim_unsubscribe`, `jim_identify`, `jim_roster`.
 //!
 //! Claude Code spawns this as a stdio subprocess and speaks newline-
-//! delimited JSON-RPC 2.0 to it. Wire formats for jim's socket/bus are
-//! duplicated here on purpose (same rationale as the other `cmd_*`
-//! modules): staying lib-free of `jim-app` keeps this CLI off the
-//! libghostty dylib / @rpath dance.
+//! delimited JSON-RPC 2.0 to it. The bus transport is the standalone
+//! `jim_bus` daemon (spawned on demand), so the bridge works whether or
+//! not the editor GUI is open — the agent bus is GUI-independent, just
+//! like the terminal.
 //!
 //! IMPORTANT: stdout is the JSON-RPC channel — only well-formed messages
 //! may go there. All diagnostics must use stderr (`eprintln!`).
 
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, BufRead, Seek, SeekFrom, Write};
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+use crate::agent_bus;
+use jim_bus::client;
+use jim_bus::proto::BusMessage;
 
 const SERVER_NAME: &str = "jim";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -52,16 +54,6 @@ struct State {
 
 type Shared = Arc<Mutex<State>>;
 type Out = Arc<Mutex<io::Stdout>>;
-
-fn socket_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".jim").join("socket"))
-}
-
-fn bus_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".jim").join("widget-bus.log"))
-}
 
 /// This session's bus address. Overridable for testing via `JIM_CHANNEL_ID`;
 /// otherwise derived from the process id so it's unique per live session.
@@ -165,26 +157,11 @@ fn respond_error(out: &Out, id: Value, code: i64, message: &str) {
     );
 }
 
-/// Publish one message onto the widget bus via the `widget_message` IPC
-/// action. `project: "global"` targets the cross-project channel that the
-/// `agent.*` topics live on; `sender` carries this session's id so
-/// `on_message` and reply-by-sender see the real origin (not `tbmsg`).
+/// Publish one message onto the agent bus (the GUI-independent `jim_bus`
+/// daemon, spawned on demand). `sender` carries this session's id so
+/// `on_message` and reply-by-sender see the real origin.
 fn publish(topic: &str, payload: Value, retain: bool, sender: &str) -> Result<(), String> {
-    let sock = socket_path().ok_or_else(|| "HOME not set".to_string())?;
-    let mut stream = UnixStream::connect(&sock)
-        .map_err(|e| format!("connect {}: {} (is the jim app running?)", sock.display(), e))?;
-    let req = json!({
-        "action": "widget_message",
-        "project": "global",
-        "topic": topic,
-        "payload": payload,
-        "retain": retain,
-        "sender": sender,
-    });
-    let body = serde_json::to_vec(&req).map_err(|e| format!("serialize: {e}"))?;
-    stream.write_all(&body).map_err(|e| format!("write: {e}"))?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    Ok(())
+    agent_bus::publish(topic, payload, retain, sender)
 }
 
 pub fn run() -> ExitCode {
@@ -613,107 +590,50 @@ fn sweep_dead_sessions(self_id: &str) {
     }
 }
 
-/// Scan the bus log for the latest retained `agent.hello.<id>` per session,
-/// dropping tombstones (null payload). Returns id → hello payload, ordered.
-/// The log is truncated on app start, so it reflects the current app run.
+/// Latest retained `agent.hello.<id>` per session, from the daemon's
+/// retained replay (tombstones already dropped). Delegates to the shared
+/// SDK, which talks to the GUI-independent `jim_bus` daemon.
 fn read_roster() -> BTreeMap<String, Value> {
-    let mut out: BTreeMap<String, Value> = BTreeMap::new();
-    let Some(log) = bus_log_path() else {
-        return out;
-    };
-    let Ok(text) = std::fs::read_to_string(&log) else {
-        return out;
-    };
-    for line in text.lines() {
-        let parsed: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let topic = parsed.get("topic").and_then(Value::as_str).unwrap_or("");
-        let Some(sid) = topic.strip_prefix("agent.hello.") else {
-            continue;
-        };
-        let payload = parsed.get("payload").cloned().unwrap_or(Value::Null);
-        if payload.is_null() {
-            out.remove(sid); // tombstone → session gone
-        } else {
-            out.insert(sid.to_string(), payload);
-        }
-    }
-    out
+    agent_bus::read_roster()
 }
 
-/// Tail the widget bus log and forward subscribed messages into Claude as
-/// channel notifications. Mirrors `jimctl msg tail`'s follow loop, but
-/// filters by the live subscription set and renders each line as a
-/// `notifications/claude/channel`.
+/// Subscribe to the bus daemon and forward subscribed messages into Claude
+/// as channel notifications. Filters by the live subscription set. The
+/// daemon (re)connects + re-spawns automatically, so the bridge survives a
+/// GUI restart. The retained replay on (re)connect is skipped — channels
+/// are about live events — by waiting for the first `ReplayEnd`.
 fn spawn_tail(out: Out, shared: Shared, id: String) {
     std::thread::spawn(move || {
-        let Some(log) = bus_log_path() else {
-            eprintln!("jimctl channel: HOME not set; cannot tail bus");
-            return;
-        };
-        // Start at end-of-file so we don't replay the whole backlog on
-        // connect — channels are about live events.
-        let mut pos: u64 = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
-        // Prune ghost roster entries roughly every ~5s (25 * 200ms).
+        let handle = client::BusHandle::spawn();
+        // Skip the retained backlog the daemon replays on connect; forward
+        // only what arrives live afterward.
+        let mut live = false;
         let mut sweep_ctr: u32 = 0;
-
         loop {
-            let mut f = match std::fs::File::open(&log) {
-                Ok(f) => f,
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(300));
-                    continue;
-                }
-            };
-            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            if len < pos {
-                pos = 0; // truncated on app restart → start over
-            }
-            if len > pos {
-                if f.seek(SeekFrom::Start(pos)).is_err() {
-                    pos = len;
-                    continue;
-                }
-                let mut reader = io::BufReader::new(&mut f);
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            if line.ends_with('\n') {
-                                handle_bus_line(&out, &shared, &id, line.trim_end());
-                            } else {
-                                break; // partial line; re-read whole next pass
-                            }
+            for item in handle.drain() {
+                match item {
+                    client::Inbound::ReplayEnd => live = true,
+                    client::Inbound::Message(msg) => {
+                        if live {
+                            handle_bus_msg(&out, &shared, &id, &msg);
                         }
-                        Err(_) => break,
                     }
                 }
-                pos = f.stream_position().unwrap_or(len);
             }
             sweep_ctr += 1;
-            if sweep_ctr >= 25 {
+            if sweep_ctr >= 50 {
+                // ~5s at the 100ms cadence below
                 sweep_ctr = 0;
                 sweep_dead_sessions(&id);
             }
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(100));
         }
     });
 }
 
-/// Decide whether a single bus-log line is for us and, if so, deliver it.
-fn handle_bus_line(out: &Out, shared: &Shared, self_id: &str, line: &str) {
-    if line.is_empty() {
-        return;
-    }
-    let parsed: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let topic = parsed.get("topic").and_then(Value::as_str).unwrap_or("");
+/// Decide whether a delivered bus message is for us and, if so, deliver it.
+fn handle_bus_msg(out: &Out, shared: &Shared, self_id: &str, msg: &BusMessage) {
+    let topic = msg.topic.as_str();
     let subscribed = shared
         .lock()
         .map(|s| s.subs.contains(topic))
@@ -721,11 +641,11 @@ fn handle_bus_line(out: &Out, shared: &Shared, self_id: &str, line: &str) {
     if !subscribed {
         return;
     }
-    let bus_sender = parsed.get("sender").and_then(Value::as_str).unwrap_or("");
+    let bus_sender = msg.sender.as_str();
     if bus_sender == self_id {
         return; // don't echo our own emits back to ourselves
     }
-    let payload = parsed.get("payload").cloned().unwrap_or(Value::Null);
+    let payload: Value = serde_json::from_str(&msg.payload_json).unwrap_or(Value::Null);
     // The real origin: prefer the payload's `from` (survives any path that
     // doesn't stamp a real bus sender), else the bus sender. This is what
     // Claude passes back as `to: "agent:<sender>"`.

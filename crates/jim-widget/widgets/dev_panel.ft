@@ -1,0 +1,163 @@
+// dev_panel.ft — style-bevy override panel (funct port of dev_panel.rhai).
+//
+// EVENT-DRIVEN. Top-level body runs once; the host then calls
+// on_click/render only when something actually happens. This widget never
+// animates, so on_frame is never called and Tick is never sent — idle cost
+// is zero.
+//
+// Host fns (style-bevy + worker control):
+//   state_set(key, value)     — write to the shared script state map
+//   set_animating(bool)       — opt into per-frame on_frame() ticks
+//   request_render()          — schedule render() after handler returns
+import "host"
+
+// style-bevy dev natives — not yet registered for the funct worker.
+extern fn state_set(key, value)
+extern fn dev_edit(seconds)
+extern fn dev_age(seconds)
+extern fn dev_time_scale(scale)
+
+fn init_state() = { dust_h: -1.0, edit_h: -1.0, age_d: -1.0, scale: -1.0 }
+let state = atom(init_state())
+
+fn on_init() { request_render() }
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "" { return }
+    host_log("dev_panel: clicked " + id)
+
+    let mut s = @state
+
+    if id == "dust_m1" {
+        let mut h = s.dust_h
+        if h < 0.0 { h = 0.0 }
+        h = h - 1.0
+        if h < 0.0 { h = 0.0 }
+        s = { ..s, dust_h: h }
+        state_set("dust_seconds_override", h * 3600.0)
+    }
+    if id == "dust_p1" {
+        let mut h = s.dust_h
+        if h < 0.0 { h = 0.0 }
+        h = h + 1.0
+        s = { ..s, dust_h: h }
+        state_set("dust_seconds_override", h * 3600.0)
+    }
+    if id == "dust_p6" {
+        let mut h = s.dust_h
+        if h < 0.0 { h = 0.0 }
+        h = h + 6.0
+        s = { ..s, dust_h: h }
+        state_set("dust_seconds_override", h * 3600.0)
+    }
+    if id == "dust_24" {
+        s = { ..s, dust_h: 24.0 }
+        state_set("dust_seconds_override", 86400.0)
+    }
+    if id == "dust_clr" {
+        s = { ..s, dust_h: -1.0 }
+        state_set("dust_seconds_override", -1.0)
+    }
+
+    if id == "edit_p1" {
+        let mut h = s.edit_h
+        if h < 0.0 { h = 0.0 }
+        h = h + 1.0
+        s = { ..s, edit_h: h }
+        dev_edit(to_int(h * 3600.0))
+    }
+    if id == "edit_clr" {
+        s = { ..s, edit_h: -1.0 }
+        dev_edit(-1)
+    }
+
+    if id == "age_p1d" {
+        let mut d = s.age_d
+        if d < 0.0 { d = 0.0 }
+        d = d + 1.0
+        s = { ..s, age_d: d }
+        dev_age(to_int(d * 86400.0))
+    }
+    if id == "age_p30d" {
+        let mut d = s.age_d
+        if d < 0.0 { d = 0.0 }
+        d = d + 30.0
+        s = { ..s, age_d: d }
+        dev_age(to_int(d * 86400.0))
+    }
+    if id == "age_clr" {
+        s = { ..s, age_d: -1.0 }
+        dev_age(-1)
+    }
+
+    if id == "scale_0_25" { s = { ..s, scale: 0.25 }; dev_time_scale(0.25) }
+    if id == "scale_1"    { s = { ..s, scale: 1.0 };  dev_time_scale(1.0) }
+    if id == "scale_4"    { s = { ..s, scale: 4.0 };  dev_time_scale(4.0) }
+    if id == "scale_16"   { s = { ..s, scale: 16.0 }; dev_time_scale(16.0) }
+    if id == "scale_clr"  { s = { ..s, scale: -1.0 }; dev_time_scale(-1) }
+
+    if id == "clear_all" {
+        s = { ..s, dust_h: -1.0, edit_h: -1.0, age_d: -1.0, scale: -1.0 }
+        state_set("dust_seconds_override", -1.0)
+    }
+    if id == "windex" {
+        // dust.rhai watches state.windex_request_t — every new value
+        // triggers a fresh animation.
+        state_set("windex_request_t", time())
+    }
+
+    reset!(state, s)
+    request_render()
+}
+
+fn render(canvas_w, canvas_h) {
+    let s = @state
+
+    let mut dust_str = "dust:   (live)"
+    if s.dust_h >= 0.0 { dust_str = "dust:   " + str(to_int(s.dust_h)) + "h" }
+    let mut edit_str = "edit:   (live)"
+    if s.edit_h >= 0.0 { edit_str = "edit:   " + str(to_int(s.edit_h)) + "h" }
+    let mut age_str = "age:    (live)"
+    if s.age_d >= 0.0 { age_str = "age:    " + str(to_int(s.age_d)) + "d" }
+    let mut scale_str = "time:   (1x)"
+    if s.scale >= 0.0 { scale_str = "time:   " + str(s.scale) + "x" }
+
+    {
+        kind: "vstack",
+        pad: 8.0,
+        gap: 4.0,
+        children: [
+            { kind: "text", value: "Style dev panel", size: 14.0, color: "#cfd2d8" },
+            { kind: "text", value: dust_str, size: 11.0, color: "#9098a4" },
+            { kind: "hstack", gap: 4.0, align: "center", children: [
+                { kind: "button", id: "dust_m1",  label: "-1h" },
+                { kind: "button", id: "dust_p1",  label: "+1h" },
+                { kind: "button", id: "dust_p6",  label: "+6h" },
+                { kind: "button", id: "dust_24",  label: "24h" },
+                { kind: "button", id: "dust_clr", label: "clr" },
+            ]},
+            { kind: "text", value: edit_str, size: 11.0, color: "#9098a4" },
+            { kind: "hstack", gap: 4.0, align: "center", children: [
+                { kind: "button", id: "edit_p1",  label: "+1h" },
+                { kind: "button", id: "edit_clr", label: "clr" },
+            ]},
+            { kind: "text", value: age_str, size: 11.0, color: "#9098a4" },
+            { kind: "hstack", gap: 4.0, align: "center", children: [
+                { kind: "button", id: "age_p1d",  label: "+1d" },
+                { kind: "button", id: "age_p30d", label: "+30d" },
+                { kind: "button", id: "age_clr",  label: "clr" },
+            ]},
+            { kind: "text", value: scale_str, size: 11.0, color: "#9098a4" },
+            { kind: "hstack", gap: 4.0, align: "center", children: [
+                { kind: "button", id: "scale_0_25", label: "0.25" },
+                { kind: "button", id: "scale_1",    label: "1x" },
+                { kind: "button", id: "scale_4",    label: "4x" },
+                { kind: "button", id: "scale_16",   label: "16x" },
+                { kind: "button", id: "scale_clr",  label: "clr" },
+            ]},
+            { kind: "divider" },
+            { kind: "button", id: "windex", label: "Windex — wipe all dust" },
+            { kind: "button", id: "clear_all", label: "Clear all overrides" },
+        ],
+    }
+}

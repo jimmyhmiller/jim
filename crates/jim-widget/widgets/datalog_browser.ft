@@ -1,0 +1,362 @@
+// datalog_browser.ft — explore a running datalog-db service.
+// (funct port of datalog_browser.rhai)
+//
+// EVENT-DRIVEN. Talks to the `datalog` CLI as a one-shot subprocess
+// (the same proc_* API the chess widget uses for Stockfish): spawn
+// `datalog --host <h> <cmd...>`, drain stdout line-by-line in on_frame
+// until the child exits, then act on the captured text.
+//
+// What it does:
+//   - lists every entity type + enum (parsed from `schema`)
+//   - click a type to see its fields and browse its rows (`list`)
+//   - soft-drop (reversible) or hard-purge (destructive, confirmed) a type
+import "host"
+
+// ---- one-time state init ----
+fn init_state() = {
+    host: "127.0.0.1:5557",
+    proc: -1,
+    busy: false,
+    job: "",
+    out: [],
+    schema: [],
+    types: [],
+    enums: [],
+    selected: "",
+    rcols: [],   // browsed-rows table columns
+    rrows: [],   // browsed-rows table rows
+    rows_for: "",
+    msg: "",
+    confirm: "",
+    loaded: false,
+}
+let state = atom(init_state())
+
+// ============================ helpers ============================
+// (pure — no `state` access; host fns are allowed)
+
+fn dl_path() {
+    let home = host_env("HOME")
+    if home == "" { "datalog" } else { home + "/.cargo/bin/datalog" }
+}
+
+fn build_argv(host, args) {
+    let mut argv = ["--host", host]
+    for a in args { argv = push(argv, a) }
+    argv
+}
+
+// Spawn `datalog --host <host> <args...>`. Returns the child handle, or
+// -1 on failure. Caller stores it into state.
+fn spawn_job(host, args) {
+    proc_spawn(dl_path(), build_argv(host, args))
+}
+
+// Drain all stdout lines currently available from `handle`. Returns
+// { lines: [...new lines...], done: <process exited & fully drained> }.
+fn drain(handle) {
+    let mut lines = []
+    while true { let l = proc_read(handle); if l == "" { break } lines = push(lines, l) }
+    let mut done = false
+    if not proc_alive(handle) {
+        // EOF: the reader thread queues every line before flipping
+        // alive=false, so one more drain captures the tail.
+        while true { let l = proc_read(handle); if l == "" { break } lines = push(lines, l) }
+        done = true
+    }
+    { lines: lines, done: done }
+}
+
+// A schema name line is indented exactly two spaces ("  User"); field
+// lines are indented four ("    name: ...").
+fn is_name_line(line) {
+    len(line) >= 3 and starts_with(line, "  ") and not starts_with(line, "   ")
+}
+
+fn parse_schema(lines) {
+    let mut types = []
+    let mut enums = []
+    let mut section = ""
+    for line in lines {
+        if line == "Entity types:" { section = "types" }
+        else if line == "Enums:" { section = "enums" }
+        else if is_name_line(line) {
+            let name = slice(line, 2, len(line) - 2)
+            if name != "" and name != "(none)" {
+                if section == "types" { types = push(types, name) }
+                else if section == "enums" { enums = push(enums, name) }
+            }
+        }
+    }
+    { types: types, enums: enums }
+}
+
+// Field/variant lines that belong to `type` in the schema dump.
+fn fields_of(lines, ty) {
+    let target = "  " + ty
+    let mut out = []
+    let mut in_block = false
+    for line in lines {
+        if line == target { in_block = true }
+        else if in_block {
+            if starts_with(line, "    ") { out = push(out, slice(line, 4, len(line) - 4)) }
+            else { break }
+        }
+    }
+    out
+}
+
+fn last_line(arr) {
+    if len(arr) == 0 { "" } else { unwrap_or(get(arr, len(arr) - 1), "") }
+}
+
+// funct strings are immutable; trim returns a copy.
+fn trimmed(s) { trim(s) }
+
+// `list` output is an ASCII table: header, a `---+---` rule, rows, then
+// a `(N rows)` footer. Detect by the rule on line 2; parse cells on " | ".
+fn is_table(lines) {
+    len(lines) >= 2 and starts_with(unwrap_or(get(lines, 1), ""), "-")
+}
+
+fn split_cells(line) {
+    let mut out = []
+    for c in split(line, " | ") { out = push(out, trimmed(c)) }
+    out
+}
+
+fn parse_table(lines) {
+    let cols = split_cells(unwrap_or(get(lines, 0), ""))
+    let mut rows = []
+    let mut i = 2
+    while i < len(lines) {
+        let line = unwrap_or(get(lines, i), "")
+        i = i + 1
+        if line == "" { continue }
+        if starts_with(line, "(") { break }
+        rows = push(rows, split_cells(line))
+    }
+    { cols: cols, rows: rows }
+}
+
+// Split a field line "name: string required" into ["name", "string required"].
+fn field_pair(fieldline) {
+    let i = unwrap_or(index_of(fieldline, ":"), -1)
+    if i < 0 { [fieldline, ""] }
+    else { [trimmed(slice(fieldline, 0, i)), trimmed(slice(fieldline, i + 1, len(fieldline) - (i + 1)))] }
+}
+
+// =========================== handlers ============================
+
+fn on_init() {
+    // Kick the first schema load.
+    let s = @state
+    let p = spawn_job(s.host, ["schema"])
+    if p != -1 {
+        reset!(state, { ..s, proc: p, busy: true, job: "schema", out: [] })
+        set_animating(true)
+    } else {
+        reset!(state, { ..s, proc: p })
+    }
+    request_render()
+}
+
+fn on_frame(dt) {
+    let s = @state
+    if not s.busy { set_animating(false); return }
+    let res = drain(s.proc)
+    let mut out = s.out
+    for l in res.lines { out = push(out, l) }
+    if not res.done {
+        reset!(state, { ..s, out: out })
+        request_render()
+        return
+    }
+
+    // res.done — process exited and fully drained.
+    let job = s.job
+    set_animating(false)
+
+    if job == "schema" {
+        let parsed = parse_schema(out)
+        reset!(state, { ..s,
+            busy: false, proc: -1, job: "", out: [],
+            schema: out, types: parsed.types, enums: parsed.enums, loaded: true })
+        host_log("[datalog_browser] schema: " + str(len(parsed.types)) +
+                 " types, " + str(len(parsed.enums)) + " enums")
+    } else if job == "list" {
+        let mut s2 = { ..s, busy: false, proc: -1, job: "", out: [] }
+        if is_table(out) {
+            let t = parse_table(out)
+            s2 = { ..s2, rcols: t.cols, rrows: t.rows }
+        } else {
+            s2 = { ..s2, rcols: [], rrows: [] }
+        }
+        s2 = { ..s2, rows_for: s2.selected }
+        reset!(state, s2)
+    } else if job == "drop" or job == "purge" {
+        let mut s2 = { ..s, busy: false, proc: -1, job: "", out: [],
+            msg: last_line(out), selected: "", rcols: [], rrows: [], rows_for: "" }
+        // Re-pull the schema so the dropped type disappears.
+        let p = spawn_job(s2.host, ["schema"])
+        if p != -1 {
+            s2 = { ..s2, proc: p, busy: true, job: "schema", out: [] }
+            set_animating(true)
+        }
+        reset!(state, s2)
+    } else {
+        reset!(state, { ..s, busy: false, proc: -1, job: "", out: [] })
+    }
+    request_render()
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "" { return }
+    let s = @state
+
+    if id == "refresh" {
+        let mut s2 = { ..s, confirm: "", msg: "" }
+        if not s2.busy {
+            let p = spawn_job(s2.host, ["schema"])
+            if p != -1 { s2 = { ..s2, proc: p, busy: true, job: "schema", out: [] }; set_animating(true) }
+        }
+        reset!(state, s2)
+        request_render()
+        return
+    }
+
+    if starts_with(id, "t:") {
+        reset!(state, { ..s,
+            selected: slice(id, 2, len(id) - 2),
+            confirm: "", msg: "", rcols: [], rrows: [], rows_for: "" })
+        request_render()
+        return
+    }
+
+    if s.busy { return } // one command at a time
+
+    if id == "browse" {
+        let mut s2 = s
+        if s2.selected != "" {
+            let p = spawn_job(s2.host, ["list", s2.selected, "limit", "100"])
+            if p != -1 { s2 = { ..s2, proc: p, busy: true, job: "list", out: [] }; set_animating(true) }
+        }
+        reset!(state, s2)
+        request_render()
+        return
+    }
+
+    if id == "drop" { // soft drop — reversible, no confirm
+        let mut s2 = s
+        if s2.selected != "" {
+            let p = spawn_job(s2.host, ["drop", s2.selected])
+            if p != -1 { s2 = { ..s2, proc: p, busy: true, job: "drop", out: [] }; set_animating(true) }
+        }
+        reset!(state, s2)
+        request_render()
+        return
+    }
+
+    if id == "purge" { reset!(state, { ..s, confirm: "purge:" + s.selected }); request_render(); return }
+    if id == "cancel" { reset!(state, { ..s, confirm: "" }); request_render(); return }
+    if id == "confirm" {
+        let c = s.confirm
+        let mut s2 = { ..s, confirm: "" }
+        if starts_with(c, "purge:") {
+            let t = slice(c, 6, len(c) - 6)
+            let p = spawn_job(s2.host, ["purge", t])
+            if p != -1 { s2 = { ..s2, proc: p, busy: true, job: "purge", out: [] }; set_animating(true) }
+        }
+        reset!(state, s2)
+        request_render()
+        return
+    }
+}
+
+// ============================ render =============================
+
+fn render(w, h) {
+    let s = @state
+    let mut rows = []
+
+    // --- header ---
+    let title = [
+        { kind: "text", value: "datalog", size: 15.0, color: "#e6e9f0", weight: "bold" },
+        { kind: "badge", value: s.host },
+        { kind: "button", id: "refresh", label: "refresh" },
+    ]
+    rows = push(rows, { kind: "hstack", gap: 8.0, align: "center", children: title })
+
+    let status = if s.busy { "running " + s.job + "..." }
+                 else if not s.loaded { "connecting..." }
+                 else { str(len(s.types)) + " types, " + str(len(s.enums)) + " enums" }
+    rows = push(rows, { kind: "text", value: status, size: 11.0, color: "#8b90a0" })
+    if s.msg != "" {
+        rows = push(rows, { kind: "text", value: s.msg, size: 11.0, color: "#c8b06a" })
+    }
+    rows = push(rows, { kind: "divider" })
+
+    // --- type list ---
+    rows = push(rows, { kind: "text", value: "Types", size: 12.0, color: "#9aa0b0" })
+    if len(s.types) == 0 and s.loaded {
+        rows = push(rows, { kind: "text", value: "(none)", size: 11.0, color: "#6b7080" })
+    }
+    for t in s.types {
+        let mark = if s.selected == t { "> " } else { "  " }
+        rows = push(rows, { kind: "button", id: "t:" + t, label: mark + t })
+    }
+
+    if len(s.enums) > 0 {
+        rows = push(rows, { kind: "text", value: "Enums", size: 12.0, color: "#9aa0b0" })
+        let mut pills = []
+        for e in s.enums { pills = push(pills, { kind: "badge", value: e }) }
+        rows = push(rows, { kind: "hstack", gap: 4.0, children: pills })
+    }
+
+    // --- selected type detail ---
+    if s.selected != "" {
+        rows = push(rows, { kind: "divider" })
+        rows = push(rows, { kind: "text", value: s.selected, size: 13.0, color: "#e6e9f0", weight: "bold" })
+
+        // fields as a 2-col table
+        let mut frows = []
+        for f in fields_of(s.schema, s.selected) {
+            let p = field_pair(f)
+            frows = push(frows, [p[0], p[1]])
+        }
+        if len(frows) > 0 {
+            rows = push(rows, { kind: "table", columns: [
+                { header: "field", width: 120.0 },
+                { header: "type" },
+            ], rows: frows })
+        }
+
+        let actions = [
+            { kind: "button", id: "browse", label: "browse rows" },
+            { kind: "button", id: "drop", label: "soft drop" },
+            { kind: "button", id: "purge", label: "purge" },
+        ]
+        rows = push(rows, { kind: "hstack", gap: 6.0, children: actions })
+
+        if s.confirm == "purge:" + s.selected {
+            rows = push(rows, { kind: "text",
+                value: "Hard-purge '" + s.selected + "'? Deletes all its datoms. Irreversible.",
+                size: 11.0, color: "#e08a8a" })
+            rows = push(rows, { kind: "hstack", gap: 6.0, children: [
+                { kind: "button", id: "confirm", label: "yes, purge" },
+                { kind: "button", id: "cancel", label: "cancel" },
+            ]})
+        }
+
+        // browsed rows as a table
+        if s.rows_for == s.selected and len(s.rrows) > 0 {
+            rows = push(rows, { kind: "divider" })
+            let mut cols = []
+            for c in s.rcols { cols = push(cols, { header: c }) }
+            rows = push(rows, { kind: "table", zebra: true, columns: cols, rows: s.rrows })
+            rows = push(rows, { kind: "text", value: str(len(s.rrows)) + " row(s)", size: 10.0, color: "#7f8794" })
+        }
+    }
+
+    { kind: "vstack", pad: 10.0, gap: 4.0, children: rows }
+}

@@ -56,6 +56,16 @@ dirs use hyphens (`crates/jim-app`).
   `jim-daemon`); holds live shell state across GUI restarts. **Never
   kill these.** Runtime socket dir `/tmp/.terminal-bevy-<uid>` is
   FROZEN (legacy path; live daemons key on it).
+- `crates/jim-bus` — the standalone widget↔widget / agent (`agent.*`)
+  message-bus daemon. Same idea as `jim-daemon` but for messaging: it
+  owns `~/.jim/bus.sock`, the persisted retained store
+  (`~/.jim/bus-retained.json`) + agent roster, and the dead-peer sweep,
+  so the bus survives a GUI restart. Dylib-free; both `jim` and `jimctl`
+  host it by self-exec (`<exe> bus-daemon`) and connect as clients via
+  `jim_bus::client`. The GUI is just another client now (subscribes to
+  deliver to widgets, publishes their emits); the old `widget_message`
+  action on `~/.jim/socket` is a thin GUI→daemon forwarder. See
+  CHANNELS.md / AGENTS-ON-THE-BUS.md.
 - `crates/jim-style`, `crates/glaze` — per-project styling + the Glaze
   shader/style language. `crates/jim-diff`/`diff-core` — diff pane +
   model. `crates/jim-inference` — classifier prompts + `style-muse`.

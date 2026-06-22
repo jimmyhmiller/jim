@@ -1,0 +1,26 @@
+[package]
+name = "jim_bus"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# The headless half of the widget↔widget / agent message bus. Deliberately
+# dylib-free (no libghostty / Bevy): both the GUI (`jim_app`) and the
+# `jimctl` CLI depend on it for the protocol + client, and either can host
+# the daemon by self-exec (`<exe> bus-daemon`) — exactly like jim_daemon
+# hosts the terminal daemon. This is what makes the bus survive a GUI
+# restart: the retained store + roster live in the daemon, not the GUI.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+libc = "0.2"
+
+[lib]
+name = "jim_bus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jim-bus"
+path = "src/bin/jim-bus.rs"

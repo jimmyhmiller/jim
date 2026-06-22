@@ -1,0 +1,43 @@
+// bus_pong.ft — widget↔widget bus demo, "B" side (funct port of bus_pong.rhai).
+//
+// Pairs with bus_ping.ft. Receives "ping" and replies "pong" with n+1.
+// Also shows the retained "conn.state" it picks up on init even if it
+// spawned AFTER A published it — proof of MQTT-style retain.
+import "host"
+
+fn init_state() = { pings: 0, conn: "(unknown)" }
+let state = atom(init_state())
+
+fn on_init() {
+    reset!(state, init_state())
+    request_render()
+}
+
+fn on_message(topic, payload, sender) {
+    if sender == my_id() { return }
+    if topic == "ping" {
+        let s = @state
+        reset!(state, { ..s, pings: s.pings + 1 })
+        host_log("[bus_pong] got ping n=" + str(payload.n) + " from " + sender)
+        emit("pong", { n: payload.n + 1 })
+        request_render()
+    } else if topic == "conn.state" {
+        // Retained value redelivered on init even though A sent it first.
+        let status = if payload.ok { " (ok)" } else { " (down)" }
+        let s = @state
+        reset!(state, { ..s, conn: payload.host + status })
+        host_log("[bus_pong] retained conn.state on init: " + (@state).conn + " (from " + sender + ")")
+        request_render()
+    }
+}
+
+fn render(w, h) {
+    let s = @state
+    {
+        kind: "vstack", gap: 10.0, pad: 14.0, children: [
+            { kind: "text", value: "Bus demo · B (pong)", weight: "bold" },
+            { kind: "text", value: "pings seen: " + str(s.pings) },
+            { kind: "text", value: "conn (retained): " + s.conn },
+        ]
+    }
+}

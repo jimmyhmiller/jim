@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 glaze = { path = "../glaze" }
 jim_pane = { path = "../jim-pane" }
+jim_bus = { path = "../jim-bus" }
 jim_style = { path = "../jim-style" }
 jim_editor = { path = "../jim-editor" }
 claude-bus-bevy = { path = "../claude-bus-bevy" }
