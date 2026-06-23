@@ -30,6 +30,21 @@ const COLS: usize = 3;
 /// Vertical space reserved for a section label ("Stroke", "Fill", …).
 const LABEL_H: f32 = 16.0;
 
+/// Local-z lift applied to ALL toolbar content — the `Mesh2d` shapes (icons,
+/// cells, swatches, width samples) AND the `Text2d` (section labels + button
+/// glyphs) — so it sits clear of the pane's chrome quads: `bg` (pane-local z 0)
+/// and the full-pane `title_cover` (pane-local z 0.25). The content meshes are
+/// opaque (see [`spawn_mesh`]) and depth-test against the chrome; without the
+/// lift the `title_cover` (drawn closer) depth-occludes them. It MUST be applied
+/// uniformly: the cells are opaque and write depth, so any text left at its old
+/// low z would be occluded by its own cell (that's what hid the Fill style /
+/// Sloppiness / Opacity / Stroke style / Layers / Actions glyphs). The
+/// per-element offsets (cell 0.01, icon/swatch 0.02, text 0.03) ride on top of
+/// this lift to keep the within-button stacking. 5.0 clears the chrome with
+/// margin and stays well inside the 2D camera's ±1000 depth range even with the
+/// pane pinned at world z ≈ 850.
+const CONTENT_Z_LIFT: f32 = 5.0;
+
 /// Background/fill palette (Excalidraw-style): "no fill" plus four light tints.
 /// First entry is transparent (rendered as an outlined empty swatch).
 fn bg_palette() -> [WbColor; 5] {
@@ -118,6 +133,23 @@ pub struct ToolbarPane {
 /// Marks a spawned toolbar UI entity so it can be cleared on rebuild.
 #[derive(Component)]
 struct ToolbarUi;
+
+/// Cache of the toolbar's icon/cell/swatch mesh handles, in deterministic
+/// spawn order.
+///
+/// The toolbar rebuilds its UI (despawn-all + respawn-all) on every tool-state
+/// change — including a click on the already-active tool, which still marks
+/// `WbToolState` changed. Calling `meshes.add()` for fresh `Mesh` assets on each
+/// rebuild means dropping the old assets and adding new ones in the same frame;
+/// in Bevy 0.19 that churn leaves the new `Mesh2d` entities un-rendered (the
+/// asset isn't prepared in time), so every icon/swatch/cell vanishes after the
+/// first click while `Text2d` labels survive. The geometry is fully STATIC (the
+/// button grid, icons, swatch insets, and width samples never change — only the
+/// material colors do), so we build each mesh once, cache its handle, and reuse
+/// it across rebuilds. Mirrors jim-widget's button-mesh path, which reuses a
+/// shared mesh handle and only churns materials.
+#[derive(Resource, Default)]
+struct ToolbarMeshCache(Vec<Handle<Mesh>>);
 
 pub(crate) fn register(registry: &mut PaneRegistry) {
     registry.register(PaneKindSpec {
@@ -378,23 +410,58 @@ fn spawn_mesh(
     color: Color,
     z: f32,
     content_root: Entity,
+    cache: &mut ToolbarMeshCache,
+    cursor: &mut usize,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<ColorMaterial>,
     commands: &mut Commands,
 ) {
-    let mesh_h = meshes.add(mesh);
+    // Reuse the cached handle for this slot (geometry is static across
+    // rebuilds); only add a fresh `Mesh` asset the first time we see the slot.
+    // This avoids dropping+adding `Mesh` assets every rebuild — the churn that
+    // leaves respawned `Mesh2d` un-rendered in Bevy 0.19. See [`ToolbarMeshCache`].
+    let idx = *cursor;
+    *cursor += 1;
+    let mesh_h = match cache.0.get(idx) {
+        Some(h) => h.clone(),
+        None => {
+            let h = meshes.add(mesh);
+            cache.0.push(h.clone());
+            h
+        }
+    };
+    // OPAQUE, not Blend: in Bevy 0.19 a blend-mode `ColorMaterial` `Mesh2d`
+    // does NOT render through a per-pane camera (it never shows up in the
+    // pane camera's transparent pass), while an opaque one does — this is the
+    // actual cause of the toolbar's icons/cells/swatches vanishing while the
+    // `Text2d` labels (a different pipeline) stayed. The toolbar's shapes are
+    // solid colors, so opaque is correct anyway.
     let mat_h = materials.add(ColorMaterial {
         color,
-        alpha_mode: AlphaMode2d::Blend,
+        alpha_mode: AlphaMode2d::Opaque,
         ..default()
     });
-    commands.spawn((
-        Mesh2d(mesh_h),
-        MeshMaterial2d(mat_h),
-        Transform::from_xyz(0.0, 0.0, z),
-        ToolbarUi,
-        ChildOf(content_root),
-    ));
+    // Spawn the entity first, then insert `Mesh2d`/`MeshMaterial2d` via a
+    // deferred world insert (mirrors jim-widget's button-mesh path): in Bevy
+    // 0.19 bundle-spawning `Mesh2d` alongside `ChildOf` can skip the `Mesh2d`
+    // visibility-class required-component hook. `CONTENT_Z_LIFT` keeps the
+    // opaque content above the pane's chrome depth (see the const docs).
+    // `NoFrustumCulling` is defensive: the pane floats at world z ≈ 850
+    // (`pin_toolbar_z`) and these UI meshes must never be frustum-culled.
+    let entity = commands
+        .spawn((
+            Transform::from_xyz(0.0, 0.0, z + CONTENT_Z_LIFT),
+            Visibility::Inherited,
+            bevy::camera::visibility::NoFrustumCulling,
+            ToolbarUi,
+            ChildOf(content_root),
+        ))
+        .id();
+    commands.queue(move |world: &mut World| {
+        if let Ok(mut ec) = world.get_entity_mut(entity) {
+            ec.insert((Mesh2d(mesh_h), MeshMaterial2d(mat_h)));
+        }
+    });
 }
 
 /// Spawn a glyph/short label centered in a button cell.
@@ -416,7 +483,7 @@ fn glyph(
         TextColor(color),
         Anchor::CENTER,
         PaneContentNoClip,
-        Transform::from_xyz(b.x + b.w * 0.5, -(b.y + b.h * 0.5), 0.03),
+        Transform::from_xyz(b.x + b.w * 0.5, -(b.y + b.h * 0.5), 0.03 + CONTENT_Z_LIFT),
         ToolbarUi,
         ChildOf(content_root),
     ));
@@ -429,6 +496,7 @@ fn build_ui(
     theme: &ButtonTheme,
     font: &Handle<Font>,
     existing: &Query<(Entity, &ChildOf), With<ToolbarUi>>,
+    cache: &mut ToolbarMeshCache,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<ColorMaterial>,
     commands: &mut Commands,
@@ -438,6 +506,9 @@ fn build_ui(
             continue;
         }
         let content_root = chrome.content_root;
+        // The cached mesh handles are consumed in a fixed order per build; the
+        // layout is identical for every toolbar, so reset the cursor per pane.
+        let mut cursor = 0usize;
         for (e, parent) in existing.iter() {
             if parent.0 == content_root {
                 commands.entity(e).despawn();
@@ -456,7 +527,7 @@ fn build_ui(
                 TextColor(theme.label),
                 Anchor::CENTER_LEFT,
                 PaneContentNoClip,
-                Transform::from_xyz(l.x, -(l.y + LABEL_H * 0.5), 0.03),
+                Transform::from_xyz(l.x, -(l.y + LABEL_H * 0.5), 0.03 + CONTENT_Z_LIFT),
                 ToolbarUi,
                 ChildOf(content_root),
             ));
@@ -467,14 +538,14 @@ fn build_ui(
             // Button cell.
             let bg = if active { theme.cell_active } else { theme.cell };
             if let Some(m) = buttons::rounded_rect_mesh(b.x, b.y, b.w, b.h, 5.0) {
-                spawn_mesh(m, bg, 0.01, content_root, meshes, materials, commands);
+                spawn_mesh(m, bg, 0.01, content_root, cache, &mut cursor, meshes, materials, commands);
             }
             // Content.
             match b.action {
                 Action::Tool(t) => {
                     if let Some(icon) = buttons::tool_icon(t) {
                         for m in buttons::icon_meshes(icon, b.x, b.y, b.w, b.h, 2.2) {
-                            spawn_mesh(m, theme.label, 0.02, content_root, meshes, materials, commands);
+                            spawn_mesh(m, theme.label, 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
                         }
                     }
                 }
@@ -487,7 +558,7 @@ fn build_ui(
                         b.h - 2.0 * inset,
                         4.0,
                     ) {
-                        spawn_mesh(m, buttons::wb_to_color(c), 0.02, content_root, meshes, materials, commands);
+                        spawn_mesh(m, buttons::wb_to_color(c), 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
                     }
                 }
                 Action::Background(c) => {
@@ -502,14 +573,14 @@ fn build_ui(
                         // "No fill" — an outlined empty swatch (border ring over
                         // the cell bg) so it reads as transparent, not a color.
                         if let Some(m) = buttons::rounded_rect_mesh(sx, sy, sw, sh, 4.0) {
-                            spawn_mesh(m, theme.label.with_alpha(0.5), 0.02, content_root, meshes, materials, commands);
+                            spawn_mesh(m, theme.label.with_alpha(0.5), 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
                         }
                         let r = 1.5;
                         if let Some(m) = buttons::rounded_rect_mesh(sx + r, sy + r, sw - 2.0 * r, sh - 2.0 * r, 3.0) {
-                            spawn_mesh(m, bg, 0.03, content_root, meshes, materials, commands);
+                            spawn_mesh(m, bg, 0.03, content_root, cache, &mut cursor, meshes, materials, commands);
                         }
                     } else if let Some(m) = buttons::rounded_rect_mesh(sx, sy, sw, sh, 4.0) {
-                        spawn_mesh(m, buttons::wb_to_color(c), 0.02, content_root, meshes, materials, commands);
+                        spawn_mesh(m, buttons::wb_to_color(c), 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
                     }
                 }
                 Action::Fill(f) => {
@@ -524,7 +595,7 @@ fn build_ui(
                 }
                 Action::Width(w) => {
                     if let Some(m) = buttons::width_sample_mesh(b.x, b.y, b.w, b.h, w as f32) {
-                        spawn_mesh(m, theme.label, 0.02, content_root, meshes, materials, commands);
+                        spawn_mesh(m, theme.label, 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
                     }
                 }
                 Action::StrokeStyle(s) => {
@@ -561,7 +632,7 @@ fn build_ui(
                 Action::Delete => glyph(b, "Del", font, theme.label, content_root, commands),
                 Action::Clear => {
                     for m in buttons::icon_meshes(buttons::Icon::Trash, b.x, b.y, b.h, b.h, 2.0) {
-                        spawn_mesh(m, theme.label, 0.02, content_root, meshes, materials, commands);
+                        spawn_mesh(m, theme.label, 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
                     }
                     commands.spawn((
                         Text2d::new("Clear"),
@@ -573,7 +644,7 @@ fn build_ui(
                         TextColor(theme.label),
                         Anchor::CENTER_LEFT,
                         PaneContentNoClip,
-                        Transform::from_xyz(b.x + b.h + 2.0, -(b.y + b.h * 0.5), 0.03),
+                        Transform::from_xyz(b.x + b.h + 2.0, -(b.y + b.h * 0.5), 0.03 + CONTENT_Z_LIFT),
                         ToolbarUi,
                         ChildOf(content_root),
                     ));
@@ -594,13 +665,11 @@ fn toolbar_build_system(
     text_style: Option<Res<ChromeTextStyle>>,
     font: Option<Res<PaneFont>>,
     existing: Query<(Entity, &ChildOf), With<ToolbarUi>>,
+    mut cache: ResMut<ToolbarMeshCache>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut commands: Commands,
 ) {
-    let Some(font) = font else {
-        return;
-    };
     let theme = ButtonTheme::from_theme(chrome.as_deref(), text_style.as_deref());
 
     // Heal the stroke color if it isn't one of the current palette swatches —
@@ -608,9 +677,21 @@ fn toolbar_build_system(
     // switch. Setting it here also moves the active-swatch highlight onto the
     // foreground ink. Done before reading `is_changed` semantics so the write
     // triggers exactly one rebuild.
+    //
+    // This runs BEFORE the `font` guard below: the heal needs only the theme
+    // (which has fallbacks), not the font. If it sat after the guard, then on a
+    // fresh launch — before `PaneFont` finishes loading — the default near-black
+    // pen would never get healed, and `background_input` (which stamps new
+    // canvas strokes with this color and does NOT wait on the font) would draw
+    // the first few strokes with invisible ink until the font landed. That was
+    // the "first several canvas draws come out with no ink" bug.
     if !theme.palette.iter().any(|c| *c == ts.stroke_color) {
         ts.stroke_color = theme.palette[0];
     }
+
+    let Some(font) = font else {
+        return;
+    };
 
     // Rebuild when tool state or theme changes (to refresh highlights/colors),
     // or on first spawn.
@@ -627,6 +708,7 @@ fn toolbar_build_system(
         &theme,
         &font.0,
         &existing,
+        &mut cache,
         &mut meshes,
         &mut materials,
         &mut commands,
@@ -703,13 +785,22 @@ fn toolbar_click(
     }
 }
 
-/// Canvas-draw mode is "on" exactly while at least one floating canvas toolbar
-/// exists. The background drawing surface (in jim-app) reads this.
+/// Canvas-draw mode is "on" exactly while a *visible* Draw Tools toolbar exists.
+/// The background drawing surface (in jim-app) reads this.
+///
+/// We gate on visibility, not mere existence: a toolbar is project-scoped (its
+/// host pane carries a `PaneProject`), and jim-app's `sync_visibility` hides
+/// panes that don't belong to the active project. Counting hidden toolbars too
+/// would keep canvas-draw mode — and the globally-shared selected tool — active
+/// on EVERY project, so on a project with no Draw Tools open, clicks on the
+/// canvas would draw instead of selecting/dragging ("tools selected when none
+/// should be"). `InheritedVisibility` is the computed result of that hide, so a
+/// toolbar only counts while it's actually on screen.
 fn track_canvas_active(
-    toolbars: Query<(), With<ToolbarPane>>,
+    toolbars: Query<&InheritedVisibility, With<ToolbarPane>>,
     mut active: ResMut<CanvasDrawActive>,
 ) {
-    let now = toolbars.iter().next().is_some();
+    let now = toolbars.iter().any(|vis| vis.get());
     if active.0 != now {
         active.0 = now;
     }
@@ -739,13 +830,25 @@ fn pin_toolbar_z(mut panes: Query<(Entity, &mut PaneRect, Has<ToolbarPane>), Wit
 }
 
 pub(crate) fn build(app: &mut App) {
+    app.init_resource::<ToolbarMeshCache>();
     // `toolbar_click` reads `PaneContentPressed`, which `handle_pane_mouse`
     // (inside `PaneViewportReaders`) writes. Order it AFTER so it reads the
     // same frame's press instead of racing the writer — without this the
     // toolbar click is flaky ("can't click the Select tool").
+    //
+    // `toolbar_build_system` despawns + respawns the toolbar's content entities
+    // on each tool-state change. Build in `Update` (after `toolbar_click`, so it
+    // sees the same-frame tool change): the content then exists before jim-pane's
+    // PostUpdate `propagate_render_layers` / `reconcile_pane_content_layers`,
+    // which stamp it with the pane's `RenderLayers` before `CheckVisibility` in
+    // the same frame.
     app.add_systems(
         Update,
-        (toolbar_click.after(PaneViewportReaders), track_canvas_active),
+        (
+            toolbar_click.after(PaneViewportReaders),
+            toolbar_build_system.after(toolbar_click),
+            track_canvas_active,
+        ),
     );
-    app.add_systems(PostUpdate, (toolbar_build_system, pin_toolbar_z));
+    app.add_systems(PostUpdate, pin_toolbar_z);
 }

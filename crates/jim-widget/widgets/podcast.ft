@@ -33,7 +33,7 @@ fn init_state() = {
     recordings: [], sb_first: 0,
     sel_name: "",
     words: [], gaps_cut: [], regions: [],
-    peaks: [], dur_ms: 0.0,
+    peaks: [], sumsq: [], dur_ms: 0.0,   // sumsq = prefix sum of peaks² (len peaks+1), for O(1) per-column RMS at any zoom
     sel_kind: "none", sa: -1, sb: -1, ra: -1.0, rb: -1.0,   // word idx + region ms
     drag_target: "", dragging: false, wave_press: 0.0, wave_press_x: 0.0,
     time_overrides: [],   // [{i, t0, t1}] manual word-timing corrections
@@ -184,7 +184,7 @@ fn select(name) {
     let peaks = if pc.ok { unwrap_or(get(parse_json(pc.text), "peaks"), []) } else { [] }
     let dur = to_float(len(peaks)) * bucket_ms()
     let ns = { ..s, sel_name: name, words: edl.words, gaps_cut: edl.gaps, regions: edl.regions, time_overrides: edl.times,
-               peaks: peaks, dur_ms: dur, scroll: 0.0, wscroll: 0.0, cur_ms: 0.0,
+               peaks: peaks, sumsq: prefix_sumsq(peaks), dur_ms: dur, scroll: 0.0, wscroll: 0.0, cur_ms: 0.0,
                sel_kind: "none", sa: -1, sb: -1, ra: -1.0, rb: -1.0, edit_dirty: true,
                status: if cw.ok { str(len(edl.words)) + " words" } else { "transcribing…" } }
     reset!(state, recache({ ..ns, wzoom: if dur > 0.0 { fit_zoom(ns) } else { 60.0 } }))
@@ -224,7 +224,13 @@ fn extract_peaks(name) {
     reset!(state, { ..s, pk_proc: h })
 }
 fn parse_peaks(text) {
-    let mut out = []
+    // ffmpeg reports Peak_level in dBFS (log scale). Mapping dB linearly
+    // ((v+60)/60) crushed all the dynamics into the top of the range — normal
+    // speech peaks at ~-3..-10 dB, which mapped to ~0.85..0.95, so EVERY bucket
+    // was near-full-height and the waveform was a solid block. Convert to
+    // LINEAR amplitude (10^(dB/20)) like GarageBand, then normalize to the
+    // loudest peak so the strip is used without losing the quiet/loud contrast.
+    let mut amps = []
     for line in split(text, "\n") {
         if contains(line, "Peak_level=") {
             let v = match index_of(line, "Peak_level=") {
@@ -232,9 +238,14 @@ fn parse_peaks(text) {
                              if contains(vs, "inf") { -120.0 } else { match parse_float(vs) { Ok(x) => x, Err(_) => -120.0 } } },
                 None => -120.0,
             }
-            out = push(out, max(0.0, min(1.0, (v + 60.0) / 60.0)))
+            // 10^(dB/20) = exp(dB * ln(10)/20); ln(10)/20 = 0.1151292546
+            amps = push(amps, exp(v * 0.1151292546))
         }
     }
+    let mut mx = 0.0001
+    for a in amps { if a > mx { mx = a } }
+    let mut out = []
+    for a in amps { out = push(out, max(0.0, min(1.0, a / mx))) }
     out
 }
 
@@ -571,36 +582,72 @@ fn first_visible(placed, y_top) {
 }
 
 // ---- caches: scrolling reads these; only load/resize/zoom/pan rebuild ----
-// Waveform bars precomputed as max-peak-per-pixel-column for the current
+// Waveform bars precomputed as a per-pixel-column energy envelope for the current
 // zoom/scroll, so a transcript scroll doesn't rescan tens of thousands of
-// buckets every frame.
+// buckets every frame. See build_cols for the energy/normalize rationale.
+//
+// EXACT, not SUBSAMPLED: each pixel column aggregates EVERY bucket it covers, via
+// a prefix-sum-of-squares (`s.sumsq`, built once per load in `prefix_sumsq`). The
+// old code STRIDE-skipped buckets when zoomed out to bound the scan — but that
+// aliased: whether a column looked loud or quiet depended on which buckets the
+// stride happened to hit, so a single loud bucket in an otherwise-quiet stretch
+// spiked a column to full height, and as you zoomed the stride realigned and the
+// spikes washed the contour into a flat block. With a prefix sum the energy over
+// [b0,b1) is (ss[b1]-ss[b0])/(b1-b0) in O(1) per column, so the envelope is exact
+// at every zoom and the build stays O(visible pixels) — cheap on pan/zoom
+// regardless of file length.
 fn build_cols(s) {
-    let mut out = []
+    let mut raw = []
     let n = len(s.peaks)
-    if n == 0 or s.dur_ms <= 0.0 { return out }
+    if n == 0 or s.dur_ms <= 0.0 { return raw }
+    let ss = unwrap_or(get(s, "sumsq"), [])
+    if len(ss) != n + 1 { return raw }   // prefix sum not built yet for these peaks
     let right = 12.0 + (s.w - sbw() - 1.0 - 24.0)
-    // px per bucket; when many buckets map to a pixel (zoomed out), STEP so we
-    // scan ~2 buckets/pixel instead of all 100k+ — keeps pan/zoom cheap.
-    let ppb = wppm(s) * bucket_ms()
-    let step = if ppb >= 0.5 { 1 } else { max(1, to_int(floor(1.0 / (2.0 * max(ppb, 0.00001))))) }
-    let mut bi = max(0, to_int(floor(s.wscroll / bucket_ms())))
-    let mut prev_col = -1
-    let mut colmax = 0.0
-    while bi < n {
-        let bx = wx(s, to_float(bi) * bucket_ms())
-        if bx > right { bi = n }
-        else {
-            if bx >= 12.0 {
-                let col = to_int(floor(bx))
-                if col != prev_col and prev_col >= 0 { out = push(out, { x: to_float(prev_col), v: colmax }); colmax = 0.0 }
-                if s.peaks[bi] > colmax { colmax = s.peaks[bi] }
-                prev_col = col
-            }
-            bi = bi + step
+    // Pass 1: per-column ENERGY = mean of peak² over every bucket the column
+    // covers (exact via the prefix sum). Energy, NOT RMS: this audio is
+    // loudness-compressed (peaks cluster ~0.5), so an RMS envelope is a near-flat
+    // band that reads as a featureless blob when zoomed out. Squaring (energy)
+    // spreads that midrange — quiet dips drop away, loud passages stand up —
+    // restoring readable contour. Track the loudest column to normalize against.
+    let mut col = 12
+    let mut emax = 0.0000001
+    while to_float(col) <= right {
+        let b0 = max(0, to_int(floor(wms(s, to_float(col)) / bucket_ms())))
+        let b1 = min(n, to_int(ceil(wms(s, to_float(col) + 1.0) / bucket_ms())))
+        if b1 > b0 {
+            let e = (ss[b1] - ss[b0]) / to_float(b1 - b0)
+            if e > emax { emax = e }
+            raw = push(raw, { x: to_float(col), v: e })
         }
+        col = col + 1
     }
-    if prev_col >= 0 { out = push(out, { x: to_float(prev_col), v: colmax }) }
+    // Pass 2: normalize to the loudest VISIBLE column so the strip is fully used
+    // at every zoom — the loudest moment reaches full height, everything else its
+    // honest fraction. Combined with energy this gives even contrast at fit zoom
+    // (the old blob) and fine detail when zoomed in.
+    let mut out = []
+    let mut i = 0
+    while i < len(raw) {
+        out = push(out, { x: raw[i].x, v: min(1.0, raw[i].v / emax) })
+        i = i + 1
+    }
     out
+}
+// Prefix sum of squares: ss[k] = Σ peaks[0..k]². Built once whenever peaks
+// change (load / extract), so `build_cols` can range-query any column's RMS in
+// O(1). Length is len(peaks)+1 (ss[0] = 0).
+fn prefix_sumsq(peaks) {
+    let n = len(peaks)
+    let mut ss = [0.0]
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        let p = peaks[i]
+        acc = acc + p * p
+        ss = push(ss, acc)
+        i = i + 1
+    }
+    ss
 }
 fn relayout_state(s) {
     let p = layout(s.words, s.gaps_cut, s.w - sbw() - 1.0)
@@ -622,7 +669,17 @@ fn word_idx_at(words, ms) {
     }
     best
 }
-fn recols_state(s) { { ..s, wave_cols: build_cols(s) } }
+// Ensure the prefix-sum-of-squares matches the current peaks before rebuilding
+// the column cache. `get` (not `s.sumsq`) so a state restored from a persisted
+// snapshot that predates the `sumsq` field — hot reload / restart of an already-
+// open pane — heals instead of faulting on the missing field. The O(n) rebuild
+// only fires when stale (load / extract / first build after reload); zoom/pan
+// find it matching and skip straight to the O(visible-pixels) build_cols.
+fn recols_state(s) {
+    let cur = unwrap_or(get(s, "sumsq"), [])
+    let s2 = if len(cur) == len(s.peaks) + 1 { s } else { { ..s, sumsq: prefix_sumsq(s.peaks) } }
+    { ..s2, wave_cols: build_cols(s2) }
+}
 fn recache(s) { let r = recols_state(relayout_state(s)) { ..r, clips: edl_clips(r) } }
 // Keep the playing word in view: recenter only when it drifts out of the band.
 fn follow_scroll(s, curi) {
@@ -804,7 +861,7 @@ fn on_proc_exit(handle, code) {
         let peaks = if pt.ok { parse_peaks(pt.text) } else { [] }
         write_file(peaks_path(s.sel_name), to_json({ bucket_ms: bucket_ms(), peaks: peaks }))
         let dur = to_float(len(peaks)) * bucket_ms()
-        let ns = { ..s, pk_proc: -1, peaks: peaks, dur_ms: dur }
+        let ns = { ..s, pk_proc: -1, peaks: peaks, sumsq: prefix_sumsq(peaks), dur_ms: dur }
         reset!(state, recols_state({ ..ns, wzoom: if dur > 0.0 and s.wscroll == 0.0 { fit_zoom(ns) } else { ns.wzoom } }))
         request_render()
         return
@@ -987,7 +1044,7 @@ fn render(w, h) {
         for rg in removed_spans(clips, s.dur_ms) {
             let x0 = max(12.0, wx(s, rg.from))
             let x1 = min(right, wx(s, rg.to))
-            if x1 > x0 { items = push(items, { kind: "rect", id: "rm" + str(round(rg.from)), x: x0, y: wtop, w: x1 - x0, h: wave_h(), color: "#2a1518", anchor: "top-left" }) }
+            if x1 > x0 { items = push(items, { kind: "rect", id: "rm" + str(round(rg.from)), x: x0, y: wtop, w: x1 - x0, h: wave_h(), color: "#2a1518", anchor: "top-left", z: 0.02 }) }
         }
         // selection shading: words → their time span; region → the region
         let mut selA = -1.0
@@ -997,15 +1054,21 @@ fn render(w, h) {
         if selA >= 0.0 {
             let x0 = max(12.0, wx(s, selA))
             let x1 = min(right, wx(s, selB))
-            if x1 >= x0 { items = push(items, { kind: "rect", id: "wsel", x: x0, y: wtop, w: max(2.0, x1 - x0), h: wave_h(), color: "#1d3a5a", anchor: "top-left" }) }
+            if x1 >= x0 { items = push(items, { kind: "rect", id: "wsel", x: x0, y: wtop, w: max(2.0, x1 - x0), h: wave_h(), color: "#1d3a5a", anchor: "top-left", z: 0.03 }) }
         }
-        // peak bars from the cached column maxes (cheap to emit each frame)
+        // peak bars from the cached column maxes. EXPLICIT z (0.05) lifts them
+        // above the strip background / removed-span / selection shading. This
+        // matters because nested-canvas content sits at world z ~270+, where
+        // the renderer's tiny per-item order-z step (0.009/N ≈ 1e-5) falls
+        // BELOW f32 precision (ULP ~3e-5) and collapses — so without explicit,
+        // f32-survivable z gaps the bars and the opaque overlays share a depth
+        // and z-fight, flickering the waveform on every zoom/redraw.
         for c in s.wave_cols {
-            items = push(items, { kind: "rect", id: "wv" + str(c.x), x: c.x, y: mid, w: 1.0, h: max(1.0, c.v * halfH) * 2.0, color: "#3f7fae", anchor: "center" })
+            items = push(items, { kind: "rect", id: "wv" + str(c.x), x: c.x, y: mid, w: 1.0, h: max(1.0, c.v * halfH) * 2.0, color: "#3f7fae", anchor: "center", z: 0.05 })
         }
         // playhead
         let phx = wx(s, s.cur_ms)
-        if phx >= 12.0 and phx <= right { items = push(items, { kind: "rect", id: "wph", x: phx, y: wtop, w: 1.5, h: wave_h(), color: "#e8d99f", anchor: "top-left" }) }
+        if phx >= 12.0 and phx <= right { items = push(items, { kind: "rect", id: "wph", x: phx, y: wtop, w: 1.5, h: wave_h(), color: "#e8d99f", anchor: "top-left", z: 0.07 }) }
     } else if s.dur_ms <= 0.0 and s.sel_name != "" {
         items = push(items, { kind: "text", id: "wpk", x: 16.0, y: (wtop + wbot) / 2.0, value: "reading waveform…", size: 12.0, color: "#5a6472" })
     }

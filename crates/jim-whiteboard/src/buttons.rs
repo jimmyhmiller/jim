@@ -264,17 +264,24 @@ fn rounded_rect_points(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Vec<(f32,
     let top = -y;
     let bot = -(y + h);
     let seg = 4;
-    // (center_x, center_y, start_angle) for each corner, sweeping +90°.
+    use std::f32::consts::{FRAC_PI_2, PI};
+    // Each corner's arc center plus the angle it STARTS at; every arc sweeps 90°
+    // clockwise (`a = start - t·90°`). The start angles must put each arc in its
+    // own quadrant so consecutive arcs are joined by the rect's straight edges —
+    // e.g. the top-right arc runs from the top edge (90°) to the right edge (0°),
+    // so its next neighbour (bottom-right, starting at 0°) continues straight
+    // down the right edge. Getting these 90° off (the old bug) folds the outline
+    // into a 4-pointed star, which only became visible once the meshes rendered.
     let corners = [
-        (rt - r, top - r, 0.0_f32),                              // top-right
-        (rt - r, bot + r, std::f32::consts::FRAC_PI_2 * 3.0),    // bottom-right
-        (l + r, bot + r, std::f32::consts::PI),                  // bottom-left
-        (l + r, top - r, std::f32::consts::FRAC_PI_2),           // top-left
+        (rt - r, top - r, FRAC_PI_2),       // top-right:    90° → 0°
+        (rt - r, bot + r, 0.0_f32),         // bottom-right:  0° → -90°
+        (l + r, bot + r, FRAC_PI_2 * 3.0),  // bottom-left: 270° → 180°
+        (l + r, top - r, PI),               // top-left:    180° → 90°
     ];
     let mut pts = Vec::new();
     for (cx, cy, start) in corners {
         for i in 0..=seg {
-            let a = start - i as f32 / seg as f32 * std::f32::consts::FRAC_PI_2;
+            let a = start - i as f32 / seg as f32 * FRAC_PI_2;
             pts.push((cx + r * a.cos(), cy + r * a.sin()));
         }
     }

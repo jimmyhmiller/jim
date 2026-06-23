@@ -2046,7 +2046,15 @@ fn diff_render(
             raw_id.to_string()
         };
         seen.insert(id.clone());
-        let existing = sprite_entities.get(&id).copied();
+        // Bevy 0.19 regression: a REUSED entity does not re-render its updated
+        // Sprite/Transform under a per-pane camera, so a bar that changes height
+        // on zoom keeps its old size and the strip fills to a solid block. Work
+        // around it by despawning any existing entity for this id and respawning
+        // a fresh one below — fresh entities render at their correct size.
+        if let Some(e) = sprite_entities.remove(&id) {
+            commands.entity(e).try_despawn();
+        }
+        let existing: Option<Entity> = None;
         match item {
             CanvasItem::Sprite {
                 x,
