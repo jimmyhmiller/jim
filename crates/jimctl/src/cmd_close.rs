@@ -5,15 +5,17 @@
 //! button. Handy for cleaning up panes spawned via `widget`/`open`.
 //!
 //! Usage:
-//!   jimctl close --project P [--kind K] [--title T ...]
+//!   jimctl close --project P (--kind K | --title T ... | --all)
 //!
 //!   --project P   project name (or `active`). Required.
 //!   --kind K      only close panes of this kind (e.g. `script_widget`,
 //!                 `widget`, `editor`).
 //!   --title T     only close panes with this exact title; repeatable to
 //!                 close several. Lets you remove ONE pane (e.g. a
-//!                 duplicate) instead of all of a kind. Omit all filters
-//!                 to close EVERY pane in P.
+//!                 duplicate) instead of all of a kind.
+//!   --all         close EVERY pane in the project. Required to run with no
+//!                 `--kind`/`--title` filter, so an unfiltered "close
+//!                 everything" can only happen on purpose, never by accident.
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -30,6 +32,7 @@ pub fn run() -> ExitCode {
     let mut project: Option<String> = None;
     let mut kind: Option<String> = None;
     let mut titles: Vec<String> = Vec::new();
+    let mut all = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -47,13 +50,16 @@ pub fn run() -> ExitCode {
                 }
                 i += 1;
             }
+            "--all" => {
+                all = true;
+            }
             "-h" | "--help" => {
-                eprintln!("usage: jimctl close --project P [--kind K] [--title T ...]");
+                eprintln!("usage: jimctl close --project P (--kind K | --title T ... | --all)");
                 return ExitCode::SUCCESS;
             }
             other => {
                 eprintln!("jimctl close: unexpected arg `{}`", other);
-                eprintln!("usage: jimctl close --project P [--kind K] [--title T ...]");
+                eprintln!("usage: jimctl close --project P (--kind K | --title T ... | --all)");
                 return ExitCode::from(2);
             }
         }
@@ -61,6 +67,16 @@ pub fn run() -> ExitCode {
     }
     if project.is_none() {
         eprintln!("jimctl close: --project is required");
+        return ExitCode::from(2);
+    }
+    // Guard the footgun: closing EVERY pane in a project must be explicit.
+    // Without a `--kind`/`--title` filter, demand `--all` so an unfiltered
+    // mass-close can never happen by accident.
+    if kind.is_none() && titles.is_empty() && !all {
+        eprintln!(
+            "jimctl close: refusing to close ALL panes without a filter.\n  \
+             pass --kind K or --title T to target panes, or --all to close every pane in the project."
+        );
         return ExitCode::from(2);
     }
 

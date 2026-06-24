@@ -670,7 +670,15 @@ impl ScriptWidget {
 #[derive(Resource)]
 struct ScriptWatcher {
     rx: Mutex<Receiver<PathBuf>>,
-    _watcher: RecommendedWatcher,
+    /// The live watcher. Kept behind a `Mutex` (not just `_`-held) so we
+    /// can add directories to it at runtime: a widget can be loaded from
+    /// ANYWHERE (a symlinked-out file, a dir we didn't know about at
+    /// startup), and we watch wherever it actually lives — see
+    /// [`watch_widget_dirs`].
+    watcher: Mutex<RecommendedWatcher>,
+    /// Canonical directories we've already asked the watcher to watch.
+    /// Dedupes the per-frame `watch_widget_dirs` sweep.
+    watched: Mutex<HashSet<PathBuf>>,
 }
 
 /// Per-frame wall-clock budget for applying funct-pane frames on the MAIN
@@ -714,6 +722,7 @@ impl Plugin for ScriptWidgetPlugin {
             .add_systems(
                 Update,
                 (
+                    watch_widget_dirs,
                     poll_watcher,
                     apply_reloads,
                     forward_clicks_to_workers,
@@ -850,8 +859,18 @@ fn setup_watcher(world: &mut World) {
         ) {
             return;
         }
+        let mut sent = false;
         for path in ev.paths {
             let _ = tx.send(path);
+            sent = true;
+        }
+        // Wake the reactive main loop so `poll_watcher` drains this event
+        // now instead of on the next input / reactive timeout. While the
+        // user edits a widget their editor is focused and Jim is NOT, so
+        // its reactive wait is up to 60s — without this nudge a save looks
+        // like it never hot reloads. Same hook the worker threads use.
+        if sent {
+            crate::request_main_loop_wakeup();
         }
     }) {
         Ok(w) => w,
@@ -861,14 +880,64 @@ fn setup_watcher(world: &mut World) {
         }
     };
     let mut watcher = watcher;
-    if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-        warn!("script_widget: failed to watch {}: {}", dir.display(), e);
+    // Watch the canonical base dir (the symlink target), since FSEvents
+    // reports canonical paths. Per-widget dirs are added later by
+    // `watch_widget_dirs` as widgets actually load.
+    let base = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let mut watched = HashSet::new();
+    if let Err(e) = watcher.watch(&base, RecursiveMode::NonRecursive) {
+        warn!("script_widget: failed to watch {}: {}", base.display(), e);
         return;
     }
+    watched.insert(base);
     world.insert_resource(ScriptWatcher {
         rx: Mutex::new(rx),
-        _watcher: watcher,
+        watcher: Mutex::new(watcher),
+        watched: Mutex::new(watched),
     });
+}
+
+/// Ensure every loaded widget's real directory is watched. A widget's
+/// `script_path` is canonical (symlink-resolved at spawn), so this picks
+/// up widgets that live OUTSIDE `~/.jim/widgets` — symlinked-out panes
+/// like `gcr_*.ft`, which would otherwise never hot reload because the
+/// startup watcher only knew about the base dir.
+fn watch_widget_dirs(watcher: Option<Res<ScriptWatcher>>, widgets: Query<&ScriptWidget>) {
+    let _t_prof = jim_pane::prof::sys_span("watch_widget_dirs");
+    let Some(watcher) = watcher else { return };
+    for w in &widgets {
+        let Some(dir) = w.script_path.parent().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        {
+            let watched = watcher.watched.lock().expect("funct watched set poisoned");
+            if watched.contains(&dir) {
+                continue;
+            }
+        }
+        let Ok(mut wch) = watcher.watcher.lock() else {
+            continue;
+        };
+        match wch.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => {
+                watcher
+                    .watched
+                    .lock()
+                    .expect("funct watched set poisoned")
+                    .insert(dir);
+            }
+            Err(e) => {
+                // Record it anyway so we don't retry the failing watch
+                // every frame; the worst case is no hot reload for that dir.
+                warn!("script_widget: failed to watch {}: {}", dir.display(), e);
+                watcher
+                    .watched
+                    .lock()
+                    .expect("funct watched set poisoned")
+                    .insert(dir);
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -904,9 +973,17 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
         t.0 = cfg.script.trim_end_matches(".ft").to_string();
     }
 
-    let script_path = widgets_dir()
+    // Resolve to the file's REAL location. `~/.jim/widgets` is itself a
+    // symlink (into the repo), and individual widgets can be symlinks out
+    // to other repos (e.g. the `gcr_*.ft` panes). The file watcher's
+    // FSEvents backend reports canonical (symlink-resolved) paths, so we
+    // store the canonical path here — otherwise reload events never match
+    // this widget's `script_path` and hot reload silently no-ops. Falls
+    // back to the joined path if the file doesn't exist yet.
+    let joined = widgets_dir()
         .map(|d| d.join(&cfg.script))
         .unwrap_or_else(|| PathBuf::from(&cfg.script));
+    let script_path = std::fs::canonicalize(&joined).unwrap_or(joined);
 
     // Read the script text and hand it to the worker, which parses it on
     // its own thread (engine-specific: funct compiles, funct evals). A read
@@ -1027,7 +1104,14 @@ fn poll_watcher(watcher: Option<Res<ScriptWatcher>>, mut widgets: Query<&mut Scr
     if paths.is_empty() {
         return;
     }
-    let unique: HashSet<PathBuf> = paths.into_iter().collect();
+    // Canonicalize so events match the canonical `script_path`s we store.
+    // FSEvents already reports canonical paths, but normalizing both sides
+    // makes the match robust regardless of backend. Fall back to the raw
+    // path if the file vanished (e.g. mid-rename on an atomic save).
+    let unique: HashSet<PathBuf> = paths
+        .into_iter()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect();
     // A changed file that ISN'T some widget's own script is a shared
     // *library module* (e.g. `df.ft`, imported by every chart). Editing it
     // must hot-swap into every widget that imported it — otherwise charts
@@ -1495,6 +1579,17 @@ fn forward_inputs_to_workers(
                 canvas_w: content_size.x,
                 canvas_h: content_size.y,
             });
+            // Re-layout the latest frame at the new size on THIS frame, host-
+            // side. The worker re-renders too, but a size-independent widget
+            // (its `render` ignores w/h — e.g. the LSP symbol pane, whose flex
+            // tree reflows purely via Taffy) produces a byte-identical tree,
+            // which the worker drops as an unchanged frame (`frame_hash`). So
+            // without this nudge the content never reflows to the new size
+            // until some *unrelated* event happens to bump `frame_gen` — the
+            // "resize lag" where a pane keeps its old layout for a while.
+            // `apply_latest_frames` runs next in the chain and lays the cached
+            // frame out at the freshly measured `content_size`.
+            w.force_render = true;
         }
         w.last_size = content_size;
 

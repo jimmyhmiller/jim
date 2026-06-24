@@ -33,6 +33,13 @@ bevy = { version = "0.19", default-features = false, features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = "0.2"
+# File-drop routing: query the live pointer position from AppKit at drop
+# time, because winit emits no cursor updates during a native drag (so
+# `Window::cursor_position()` is stale and routes to the wrong pane).
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSResponder"] }
+# Matching the version Bevy's `RawHandleWrapper::get_window_handle` returns,
+# so we can pattern-match the AppKit handle out of it.
+raw-window-handle = "0.6"
 core-text = "21"
 core-foundation = "0.10"
 

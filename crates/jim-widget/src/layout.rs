@@ -730,6 +730,11 @@ fn apply_style_overrides(s: &mut taffy::Style, style: Option<&PStyle>) {
     if let Some(a) = style.align_self {
         s.align_self = Some(align_to_taffy(a));
     }
+    // Soft-wrap children onto multiple rows/lines (e.g. a row of colored code
+    // runs becoming a wrapped code line) instead of overflowing the main axis.
+    if style.flex_wrap == Some(true) {
+        s.flex_wrap = taffy::style::FlexWrap::Wrap;
+    }
     // `clip: true` makes this a horizontal clip boundary. Telling Taffy the
     // box clips on the x-axis means overflowing children no longer inflate
     // its content size, so the box stays at its laid-out (e.g. stretched)

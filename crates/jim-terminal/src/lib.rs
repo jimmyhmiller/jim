@@ -897,26 +897,46 @@ fn handle_keyboard(
 fn handle_file_drop(
     mut drops: MessageReader<bevy::window::FileDragAndDrop>,
     windows: Query<&Window>,
+    // The window's raw AppKit handle, used to query the live pointer from
+    // AppKit at drop time. Lives on the window entity as an ECS component
+    // (unlike `WinitWindows`, which is a main-thread-local, not a resource).
+    #[cfg(target_os = "macos")] window_handles: Query<&bevy::window::RawHandleWrapper>,
+    // Forces this system onto the main thread so the AppKit calls below are
+    // sound (NSView/NSWindow are main-thread-only).
+    #[cfg(target_os = "macos")] _main_thread: bevy::ecs::system::NonSendMarker,
     viewport: Res<jim_pane::PaneViewport>,
     store: Res<TerminalStore>,
     panes: Query<(Entity, &PaneRect, &PaneKindMarker, Option<&Visibility>), With<PaneTag>>,
     mut focused: ResMut<FocusedPane>,
 ) {
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let cursor = window.cursor_position();
-
     for ev in drops.read() {
-        let bevy::window::FileDragAndDrop::DroppedFile { path_buf, .. } = ev else {
+        let bevy::window::FileDragAndDrop::DroppedFile { window, path_buf } = ev else {
             continue;
         };
-        let Some(pt) = cursor else {
-            // Drop arrived without a cursor sample (window not focused
-            // yet, or pointer left between drop start + finish). Without
-            // a cursor we can't pick a pane — skip rather than guess.
+        // winit emits no `CursorMoved` during a native macOS file drag, so
+        // `Window::cursor_position()` is frozen wherever the pointer last
+        // was BEFORE the drag — with several terminals open it routes the
+        // path to the wrong pane. Ask AppKit for the live pointer position
+        // at drop time instead; fall back to Bevy's stale value only if the
+        // native lookup fails (e.g. non-macOS).
+        #[cfg(target_os = "macos")]
+        let mut pt = window_handles
+            .get(*window)
+            .ok()
+            .and_then(pointer_pos_from_handle);
+        #[cfg(not(target_os = "macos"))]
+        let mut pt: Option<Vec2> = None;
+        let native_ok = pt.is_some();
+        if pt.is_none() {
+            pt = windows.get(*window).ok().and_then(|w| w.cursor_position());
+        }
+        eprintln!("[file-drop] dbg: native_ok={native_ok} pt={pt:?}");
+        let Some(pt) = pt else {
+            // No live pointer and no cursor sample (window not focused yet,
+            // or pointer left between drop start + finish). Without a
+            // position we can't pick a pane — skip rather than guess.
             eprintln!(
-                "[file-drop] no cursor position — ignoring drop of {}",
+                "[file-drop] no pointer position — ignoring drop of {}",
                 path_buf.display()
             );
             continue;
@@ -928,7 +948,14 @@ fn handle_file_drop(
             })
             .map(|(e, r, _, _)| (e, *r))
             .collect();
-        let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &visible)
+        let canvas_pt = viewport.window_to_canvas(pt);
+        eprintln!(
+            "[file-drop] dbg: pt=({:.1},{:.1}) canvas=({:.1},{:.1}) vp(origin=({:.1},{:.1}) pan=({:.1},{:.1}) zoom={:.3}) panes={:?}",
+            pt.x, pt.y, canvas_pt.x, canvas_pt.y,
+            viewport.origin.x, viewport.origin.y, viewport.pan.x, viewport.pan.y, viewport.zoom,
+            visible.iter().map(|(e, r)| (*e, r.pos.x, r.pos.y, r.size.x, r.size.y, r.z)).collect::<Vec<_>>()
+        );
+        let Some(target) = jim_pane::topmost_pane_at(canvas_pt, &visible)
         else {
             eprintln!(
                 "[file-drop] no terminal under cursor — ignoring drop of {}",
@@ -952,6 +979,33 @@ fn handle_file_drop(
         data.worker.send(WorkerMsg::ScrollToBottom);
         focused.0 = Some(target);
     }
+}
+
+/// The live pointer position in Bevy window-logical coordinates (top-left
+/// origin, logical points) — the same space as `Window::cursor_position()`.
+///
+/// We mirror winit's own cursor math: take the pointer in the NSWindow's
+/// base coordinate system (`mouseLocationOutsideOfEventStream`, which is
+/// current regardless of the event stream, so it's valid mid-drag) and run
+/// it through the content view's `convertPoint:fromView:nil`. winit's view
+/// overrides `isFlipped -> true`, so the result already has a top-left
+/// origin in logical points — no Y-flip or scale-factor correction needed.
+#[cfg(target_os = "macos")]
+fn pointer_pos_from_handle(raw: &bevy::window::RawHandleWrapper) -> Option<Vec2> {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::RawWindowHandle;
+
+    let RawWindowHandle::AppKit(h) = raw.get_window_handle() else {
+        return None;
+    };
+    // SAFETY: AppKit hands back a live NSView pointer for this window, and
+    // the calling system is pinned to the main thread (`NonSendMarker`),
+    // where these AppKit UI calls are required to happen.
+    let view: &NSView = unsafe { &*(h.ns_view.as_ptr() as *const NSView) };
+    let ns_window = view.window()?;
+    let win_pt = unsafe { ns_window.mouseLocationOutsideOfEventStream() };
+    let view_pt = view.convertPoint_fromView(win_pt, None);
+    Some(Vec2::new(view_pt.x as f32, view_pt.y as f32))
 }
 
 /// POSIX-safe shell quoting: wrap in single quotes; embed any literal

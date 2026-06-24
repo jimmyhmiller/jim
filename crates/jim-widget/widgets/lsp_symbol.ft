@@ -17,9 +17,11 @@ fn init_state() = {
     anchor: 0, sel_char: 0, lines: [],
     jobs: [],            // [{ h, kind }] — concurrent in-flight jimctl calls
     impls: [], impls_label: "",
-    refs: [],  refs_label: "",
+    refs: [],  refs_label: "", refs_total: 0,
     defs: [],  defs_label: "",
     pending: (),
+    sidebar_hidden: false,
+    wrap: false,        // soft-wrap long source lines (issue #33)
 }
 
 fn cur_state() {
@@ -77,8 +79,12 @@ fn resolve() {
 }
 
 // ---- step 2: slice the source ----
+// Start the slice at column 0 of the first line so it keeps its leading
+// indentation like every other line — otherwise rust-analyzer's range starts
+// at the symbol's indent column and the first line renders flush-left while the
+// rest stay indented (issue #30).
 fn fetch_source(rng) {
-    let a = str(rng.start.line) + ":" + str(rng.start.character)
+    let a = str(rng.start.line) + ":0"
     let b = str(rng.end.line) + ":" + str(rng.end.character)
     let h = proc_spawn("jimctl", ["lsp", "source", the_file(), "--range", a + "-" + b])
     add_job(h, "source")
@@ -160,6 +166,43 @@ fn enclosing(nodes, line, parent, best) {
     b
 }
 
+fn contains_str(xs, v) {
+    for x in xs { if x == v { return true } }
+    false
+}
+
+// A reference's identity for dedup: the enclosing function/symbol it sits in
+// (container::symbol), so many call sites inside one fn collapse to one row.
+// File-scope references (no symbol) fall back to the file path.
+fn ref_key(r) {
+    let sym = unwrap_or(get(r, "symbol"), "")
+    let cont = unwrap_or(get(r, "container"), "")
+    if sym == "" { "file:" + unwrap_or(get(r, "file"), "") } else { norm(cont) + "::" + sym }
+}
+
+// Deduplicate enriched references by enclosing function (issue #29). Keeps the
+// first occurrence as the representative row and tags it with `count` = how many
+// raw uses collapsed into it.
+fn dedup_refs(raw) {
+    if typeof(raw) != "List" { return [] }
+    let mut keys = []
+    let mut reps = []
+    for r in raw {
+        let k = ref_key(r)
+        if not contains_str(keys, k) { keys = push(keys, k); reps = push(reps, r) }
+    }
+    let mut out = []
+    let mut i = 0
+    for rep in reps {
+        let k = keys[i]
+        let mut c = 0
+        for r in raw { if ref_key(r) == k { c = c + 1 } }
+        out = push(out, { ..rep, count: c })
+        i = i + 1
+    }
+    out
+}
+
 fn parse_locations(v) {
     let mut out = []
     if typeof(v) == "List" { for loc in v { out = push(out, loc_to_ref(loc)) } }
@@ -223,7 +266,10 @@ fn on_proc_output(handle, line) {
         auto_load()
     } else if kind == "refs" {
         // Already enriched by the daemon: [{file, line, symbol, kind, container, sym_line}].
-        reset!(state, { ..cur_state(), refs: unwrap_or(get(res, "locations"), []), refs_label: "" })
+        // Collapse multiple uses inside one function to a single row (issue #29).
+        let raw = unwrap_or(get(res, "locations"), [])
+        let total = if typeof(raw) == "List" { len(raw) } else { 0 }
+        reset!(state, { ..cur_state(), refs: dedup_refs(raw), refs_total: total, refs_label: "" })
         request_render()
     } else if kind == "def" {
         reset!(state, { ..cur_state(), defs: unwrap_or(get(res, "definition"), []), defs_label: "" })
@@ -260,6 +306,14 @@ fn on_start() {
 
 fn on_click(x, y, shift, cmd, id) {
     if id == "reload" { resolve(); return }
+    if id == "togglebar" {
+        reset!(state, { ..cur_state(), sidebar_hidden: not cur_state().sidebar_hidden })
+        request_render(); return
+    }
+    if id == "togglewrap" {
+        reset!(state, { ..cur_state(), wrap: not cur_state().wrap })
+        request_render(); return
+    }
     let s = cur_state()
     if starts_with(id, "ref:") {
         let i = to_int(unwrap_or(parse_float(slice(id, 4, len(id))), 0.0))
@@ -306,7 +360,7 @@ fn lpad(s, w) {
     while len(out) < w { out = " " + out }
     out
 }
-fn code_line(i, runs, startline) {
+fn code_line(i, runs, startline, wrap) {
     let gut = { kind: "text", value: lpad(str(startline + i + 1), 4), family: "mono",
                 size: 11.0, color: col_muted(), selectable: false, wrap: false }
     let mut kids = []
@@ -315,11 +369,20 @@ fn code_line(i, runs, startline) {
     } else {
         for r in runs {
             kids = push(kids, { kind: "text", value: unwrap_or(get(r, "text"), ""), family: "mono", size: 12.5,
-                                color: kc(unwrap_or(get(r, "kind"), "")), selectable: false, wrap: false })
+                                color: kc(unwrap_or(get(r, "kind"), "")), selectable: false, wrap: wrap })
         }
     }
-    { kind: "hstack", gap: 8.0, align: "start", style: { height: "18", min_height: "18", clip: true },
-      children: [ gut, { kind: "hstack", gap: 0.0, align: "start", style: { flex_shrink: 0.0 }, children: kids } ] }
+    if wrap {
+        // Soft-wrap mode: let the row of colored runs flow onto multiple lines
+        // (flex_wrap) and grow vertically; gutter sits at the top. No clip/fixed
+        // height so the wrapped block claims its real height.
+        let runs_box = { kind: "hstack", gap: 0.0, align: "start",
+                         style: { flex_grow: 1.0, min_width: "0", flex_wrap: true }, children: kids }
+        { kind: "hstack", gap: 8.0, align: "start", style: { width: "100%" }, children: [ gut, runs_box ] }
+    } else {
+        { kind: "hstack", gap: 8.0, align: "start", style: { height: "18", min_height: "18", clip: true },
+          children: [ gut, { kind: "hstack", gap: 0.0, align: "start", style: { flex_shrink: 0.0 }, children: kids } ] }
+    }
 }
 
 // ---- sidebar sections ----
@@ -342,12 +405,26 @@ fn loc_row(idprefix, i, r) {
         else if cont != "" { norm(cont) + "::" + sym }
         else { sym }
     let loc = file_base(unwrap_or(get(r, "file"), "")) + ":" + str(unwrap_or(get(r, "line"), 0) + 1)
+    let cnt = unwrap_or(get(r, "count"), 1)
+    // Label grows to fill and clips at its own right edge (issue #27/#28) so a
+    // long `Type::method` truncates instead of shoving the location off-screen.
+    let label_box = { kind: "hstack", gap: 0.0, align: "center",
+        style: { flex_grow: 1.0, min_width: "0", clip: true },
+        children: [ { kind: "text", value: label, family: "mono", size: 11.5,
+                      color: "#8cc7ff", selectable: false, wrap: false } ] }
+    let mut right = []
+    if cnt > 1 {
+        right = push(right, { kind: "text", value: "×" + str(cnt), size: 9.5,
+                              color: col_accent(), selectable: false, wrap: false })
+    }
+    right = push(right, { kind: "text", value: loc, size: 9.5, color: col_muted(),
+                          selectable: false, wrap: false })
     { kind: "list-item", id: idprefix + str(i), selected: false, pad: 0.0,
-      style: { width: "100%", radius: "5", padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
-      children: [ { kind: "hstack", gap: 6.0, align: "center", children: [
-          { kind: "text", value: label, family: "mono", size: 11.5, color: "#8cc7ff", selectable: false, wrap: false },
-          { kind: "spacer", style: { flex_grow: 1.0 } },
-          { kind: "text", value: loc, size: 9.5, color: col_muted(), selectable: false, wrap: false },
+      style: { width: "100%", radius: "5", clip: true,
+               padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+      children: [ { kind: "hstack", gap: 6.0, align: "center", style: { width: "100%" }, children: [
+          label_box,
+          { kind: "hstack", gap: 6.0, align: "center", style: { flex_shrink: 0.0 }, children: right },
       ] } ] }
 }
 
@@ -381,7 +458,10 @@ fn impls_section(s) {
     panel(kids)
 }
 fn refs_section(s) {
-    let count = if s.refs_label == "loading…" { "loading…" } else { str(len(s.refs)) }
+    // Show "N fns" (deduped rows) and, when uses collapsed, the raw use total.
+    let count = if s.refs_label == "loading…" { "loading…" }
+        else if s.refs_total > len(s.refs) { str(len(s.refs)) + " fns · " + str(s.refs_total) + " uses" }
+        else { str(len(s.refs)) }
     let mut kids = [ section_title("Used by", count) ]
     if s.refs_label != "loading…" {
         if len(s.refs) == 0 { kids = push(kids, { kind: "text", value: "none", size: 10.0, color: col_muted(), selectable: false }) }
@@ -413,22 +493,33 @@ fn sidebar(s) {
 
 fn render(w, h) {
     let s = cur_state()
-    let head = { kind: "hstack", gap: 8.0, align: "center", children: [
+    let mut head_kids = [
         { kind: "text", value: the_name(), weight: "bold", size: 13.0, color: col_text(), selectable: false, wrap: false },
         { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false },
         { kind: "spacer", style: { flex_grow: 1.0 } },
-        { kind: "button", id: "reload", label: "↻" },
-    ] }
+    ]
+    // Soft-wrap toggle for the source (issue #33).
+    if s.found {
+        head_kids = push(head_kids, { kind: "button", id: "togglewrap",
+            label: if s.wrap { "↵ wrap on" } else { "↵ wrap" } })
+    }
+    // Sidebar show/hide toggle (issue #32) — only meaningful once a sidebar exists.
+    if s.found {
+        head_kids = push(head_kids, { kind: "button", id: "togglebar",
+            label: if s.sidebar_hidden { "◧ panel" } else { "◨ hide" } })
+    }
+    head_kids = push(head_kids, { kind: "button", id: "reload", label: "↻" })
+    let head = { kind: "hstack", gap: 8.0, align: "center", children: head_kids }
     let mut body = []
     if s.found and typeof(s.lines) == "List" and len(s.lines) > 0 {
         let mut i = 0
-        for runs in s.lines { body = push(body, code_line(i, runs, s.anchor)); i = i + 1 }
+        for runs in s.lines { body = push(body, code_line(i, runs, s.anchor, s.wrap)); i = i + 1 }
     } else {
         body = [ { kind: "text", value: if s.found { "(empty)" } else { s.status }, color: col_muted() } ]
     }
     let source_col = { kind: "vstack", gap: 8.0, style: { flex_grow: 1.0, min_width: "0" }, children: [
         head, { kind: "divider" }, { kind: "vstack", gap: 0.0, children: body } ] }
-    let cols = if s.found {
+    let cols = if s.found and not s.sidebar_hidden {
         { kind: "hstack", gap: 14.0, align: "start", children: [ source_col, sidebar(s) ] }
     } else { source_col }
     { kind: "vstack", gap: 0.0, pad: 12.0, children: [ cols ] }

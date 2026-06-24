@@ -201,6 +201,11 @@ pub struct Style {
     /// responsive layout, independent of the Element variant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flex_direction: Option<String>,
+    /// When true, this container wraps its children onto multiple lines/rows
+    /// instead of overflowing the main axis (Taffy `FlexWrap::Wrap`). Lets a
+    /// row of syntax-colored text runs wrap as a soft-wrapped code line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flex_wrap: Option<bool>,
 
     /// Ordered paint plan produced by Glaze. When non-empty, these layers
     /// replace the scalar `background` / `border` / `shadow` / `shader`

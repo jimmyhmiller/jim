@@ -1,0 +1,89 @@
+// claude-usage.ft
+import "host"
+import { col_text, col_muted, col_accent } from "df"
+
+fn init_state() = { pct: -1, status: "idle", busy: false, proc: -1, lines: [] }
+let state = atom(init_state())
+
+fn start_fetch() {
+    let s = @state
+    if s.busy { return }
+    let h = proc_spawn("/Users/jimmyhmiller/.local/bin/claude", ["-p", "/usage"])
+    host_log("spawn returned " + str(h))
+    if h == -1 {
+        reset!(state, { ..s, status: "spawn failed" })
+    } else {
+        reset!(state, { ..s, proc: h, busy: true, lines: [], status: "fetching…" })
+    }
+    request_render()
+}
+
+fn on_start() { start_fetch() }
+
+fn on_proc_output(handle, line) {
+    let s = @state
+    if handle == s.proc {
+        reset!(state, { ..s, lines: push(s.lines, line) })
+    }
+}
+
+fn on_proc_exit(handle, code) {
+    let s = @state
+    if handle != s.proc { return }
+
+    host_log("proc exited with code " + str(code) + " lines=" + str(len(s.lines)))
+
+    // Grab the "Current week (all models): N% used …" line specifically.
+    // The output has several "…: N% used" lines plus unrelated lines that
+    // also contain ": " and "%" (e.g. "Top MCP servers: … 8%"), so we must
+    // match the week line, not just take the last percent we happen to see.
+    let mut pct = -1
+    for line in s.lines {
+        if contains(line, "Current week (all models)") {
+            let parts = split(line, ": ")
+            if len(parts) >= 2 {
+                let pct_parts = split(trim(parts[1]), "%")
+                if len(pct_parts) >= 1 {
+                    pct = unwrap_or(parse_int(trim(pct_parts[0])), -1)
+                }
+            }
+        }
+    }
+
+    host_log("parsed pct=" + str(pct))
+    reset!(state, { ..s, busy: false, proc: -1, lines: [], pct: pct, status: "ok" })
+    request_render()
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "refresh" { start_fetch() }
+}
+
+fn pct_color(pct) {
+    if pct >= 80 { "#e08a8a" }
+    else if pct >= 50 { "#e0b066" }
+    else { col_accent() }
+}
+
+fn render(w, h) {
+    let s = @state
+    let pct_text = if s.pct >= 0 { str(s.pct) + "%" } else { "…" }
+
+    {
+        kind: "vstack", gap: 8.0, pad: 12.0, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "text", value: "claude usage", size: 14.0,
+                  weight: "bold", color: col_text() },
+                { kind: "button", id: "refresh", label: "↻" },
+            ]},
+            { kind: "hstack", gap: 6.0, align: "end", children: [
+                { kind: "text", value: pct_text, size: 28.0,
+                  weight: "bold", color: pct_color(s.pct) },
+                { kind: "text", value: "used this week", size: 13.0,
+                  color: col_muted() },
+            ]},
+            { kind: "text", value: s.status, size: 10.0, color: col_muted() },
+        ]
+    }
+}
+// wake-test
