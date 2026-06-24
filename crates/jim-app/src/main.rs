@@ -42,7 +42,7 @@ fn main() {
     // Make a Finder/Dock/LaunchServices launch behave EXACTLY like a
     // terminal launch. A GUI launch inherits launchd's minimal
     // environment — none of the vars the user exports from their shell
-    // rc files (`DEEPSEEK_KEY`, `JIMMY_API_KEY`, a real `PATH`, …) are
+    // rc files (`DEEPSEEK_API_KEY`, `JIMMY_API_KEY`, a real `PATH`, …) are
     // present, so e.g. the Actions agent's `LlmConfig::from_env` finds
     // no key. Resolve the login+interactive shell env once here, before
     // any thread spawns (the only point where `set_var` is sound), so
@@ -77,6 +77,25 @@ fn main() {
             position: init_position,
             ..default()
         }),
+        // Survive closing the laptop lid / display sleep. On macOS that
+        // removes the monitor; bevy_winit then despawns the `Monitor`
+        // entity, and because `Monitor` is the `linked_spawn` target of the
+        // window's `OnMonitor` relationship, the despawn CASCADES and takes
+        // the primary window with it (confirmed by backtrace). With the
+        // default `ExitCondition::OnAllClosed`, the now-windowless app sees
+        // zero windows and sends `AppExit`, quitting cleanly (status 0, no
+        // crash) on every sleep.
+        //
+        // We can't reliably stop the cascade from the relationship side, so
+        // instead we (1) never auto-exit and (2) respawn the primary window
+        // the moment it's lost — see
+        // `window_geometry::respawn_primary_window_on_loss`. `DontExit` also
+        // means the window's red close button no longer quits the app; quit
+        // via Cmd-Q (a separate NSApp path), which still works.
+        exit_condition: bevy::window::ExitCondition::DontExit,
+        // Don't despawn the window on a close *request* either, so the red
+        // button is inert rather than triggering a despawn→respawn flicker.
+        close_when_requested: false,
         ..default()
     }));
     // Stash the saved geometry so `fit_window_to_monitor` can re-apply it

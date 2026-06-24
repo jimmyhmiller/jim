@@ -6,9 +6,11 @@
 //!   cargo run -p jim_inference --bin infer-classify-cwd -- editor-idea /Users/me/code/editor-idea
 //!
 //! Honours the same env vars as the in-process classifier:
-//!   LLM_BASE_URL  (default https://api.deepseek.com/v1)
-//!   LLM_API_KEY   (fallback DEEPSEEK_KEY, OPENAI_API_KEY)
-//!   LLM_MODEL     (default deepseek-chat)
+//!   LLM_BASE_URL         (default https://api.deepseek.com/v1)
+//!   LLM_API_KEY          (fallback DEEPSEEK_API_KEY, DEEPSEEK_KEY,
+//!                         OPENAI_API_KEY)
+//!   LLM_MODEL            (default deepseek-chat)
+//!   LLM_RESPONSE_FORMAT  (default json_object; json_schema, none)
 
 use jim_inference::{classifiers, llm::LlmConfig};
 

@@ -204,6 +204,51 @@ pub fn save_on_change(
     state.last_write_at = Some(now);
 }
 
+/// Respawn the primary window the instant it's despawned, so closing the
+/// laptop lid / sleeping the display doesn't leave the app windowless.
+///
+/// On macOS, sleeping the display removes the monitor; bevy_winit despawns
+/// the `Monitor` entity, and because `Monitor` is the `linked_spawn`
+/// target of the window's `OnMonitor` relationship, that despawn cascades
+/// and takes the primary window down with it (confirmed by backtrace).
+/// Paired with `ExitCondition::DontExit` (set in `main.rs`) the app no
+/// longer quits when that happens — but it would be left with no window.
+///
+/// This observer fires synchronously, *before* the entity is fully gone,
+/// the moment a `PrimaryWindow` loses its `Window` component, and queues a
+/// fresh primary window in the same command flush. So the `Window` entity
+/// is recreated before the next schedule run — no system ever observes
+/// zero windows (avoids `single()` panics) — and bevy_winit creates the OS
+/// window again as soon as a display is back. The new window carries no
+/// `OnMonitor` yet, so the in-flight monitor-despawn cascade can't reach
+/// it. Cameras render to `WindowRef::Primary`, so they re-bind to it
+/// automatically. Size/position are restored from the last saved geometry.
+pub fn respawn_primary_window_on_loss(
+    removed: On<Remove, Window>,
+    mut commands: Commands,
+    primaries: Query<(), With<PrimaryWindow>>,
+) {
+    // Only react to the *primary* window going away.
+    if !primaries.contains(removed.event().entity) {
+        return;
+    }
+    let saved = load();
+    let (w, h) = saved.map(|g| (g.w, g.h)).unwrap_or((1200, 760));
+    let position = saved
+        .map(|g| WindowPosition::At(IVec2::new(g.x, g.y)))
+        .unwrap_or_default();
+    commands.spawn((
+        Window {
+            title: "Jim".into(),
+            resolution: (w, h).into(),
+            position,
+            ..default()
+        },
+        PrimaryWindow,
+    ));
+    crate::diagnostics::append_log("[window] primary window lost (display sleep?) — respawned");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

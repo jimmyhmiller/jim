@@ -87,6 +87,7 @@ pub struct DiagnosticsPlugin;
 impl Plugin for DiagnosticsPlugin {
     fn build(&self, app: &mut App) {
         spawn_footprint_heartbeat();
+        install_panic_breadcrumb();
         append_log("[mem] ---- diagnostics started ----");
         app.init_resource::<MemReadout>()
             .init_resource::<ContinuousWatch>()
@@ -653,4 +654,16 @@ pub(crate) fn append_log(line: &str) {
         }
     }
     eprint!("{}", full);
+}
+
+/// Route any unwinding panic into the diagnostics log before the default
+/// hook runs. On a Dock launch stderr goes nowhere, so a panic on the main
+/// loop or a background thread would otherwise leave no trace. Chains the
+/// previous hook so normal panic output (and any abort) is unchanged.
+fn install_panic_breadcrumb() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        append_log(&format!("[panic] {info}"));
+        prev(info);
+    }));
 }

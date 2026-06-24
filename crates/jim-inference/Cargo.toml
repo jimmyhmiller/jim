@@ -19,7 +19,7 @@ name = "jim_inference"
 path = "src/lib.rs"
 
 # Smoke-test binary for the LLM call alone (no Bevy). Reads
-# LLM_API_KEY (or DEEPSEEK_KEY) and prints the classifier output for
+# LLM_API_KEY (or DEEPSEEK_API_KEY) and prints the classifier output for
 # one (project_name, cwd) pair from argv. Useful for verifying the
 # endpoint + key without restarting the editor.
 [[bin]]

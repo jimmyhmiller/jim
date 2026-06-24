@@ -20,7 +20,8 @@ use serde_json::Value;
 
 use jim_terminal::worker::WorkerMsg;
 use jim_terminal::{
-    BellPulse, TerminalSession, TerminalStore, LINE_HEIGHT, PANE_KIND,
+    pt_to_cell, BellPulse, MonoMetrics, TerminalSession, TerminalStore, LINE_HEIGHT,
+    PANE_KIND,
 };
 
 pub mod actions;
@@ -418,6 +419,12 @@ impl Plugin for AppShellPlugin {
                     window_geometry::save_on_change,
                 ),
             )
+            // Survive lid-close / display-sleep: when the monitor goes away
+            // the primary window is despawned by a `linked_spawn` cascade;
+            // paired with `ExitCondition::DontExit` (main.rs) we respawn it
+            // immediately so the app stays alive and visible on wake.
+            // See `window_geometry::respawn_primary_window_on_loss`.
+            .add_observer(window_geometry::respawn_primary_window_on_loss)
             .add_systems(PostStartup, release_os_focus)
             // Single keyboard-ownership authority, before every Update
             // consumer reads it.
@@ -1091,6 +1098,7 @@ fn handle_scroll(
     viewport: Res<jim_pane::PaneViewport>,
     projects: Res<Projects>,
     store: Res<TerminalStore>,
+    metrics: Res<MonoMetrics>,
     keys: Res<ButtonInput<KeyCode>>,
     all_panes: Query<(Entity, &PaneRect, Option<&Visibility>), With<PaneTag>>,
     terminals: Query<
@@ -1165,11 +1173,26 @@ fn handle_scroll(
         return;
     };
 
-    // Bevy: wheel.y > 0 = scroll-up gesture = reveal older content.
-    // libghostty: ScrollViewport::Delta is positive toward the active
-    // area, negative back into history. So mirror the sign.
-    let scroll_delta = -whole_lines;
-    data.worker.send(WorkerMsg::ScrollDelta(scroll_delta));
+    // Cell under the cursor (viewport-relative, 0-based) so the worker
+    // can fill in a mouse report when the child enabled mouse tracking.
+    // Clamp the lower bound here; the worker clamps the upper bound
+    // against the live grid size.
+    let (col, row) = match all_rects.iter().find(|(e, _)| *e == target) {
+        Some((_, rect)) => {
+            let (c, r) = pt_to_cell(viewport.window_to_canvas(pt), rect, metrics.cell_width);
+            (c.max(0) as u16, r.max(0) as u16)
+        }
+        None => (0, 0),
+    };
+
+    // Bevy: wheel.y > 0 = scroll-up gesture = reveal older content. The
+    // worker decides whether that becomes a mouse report, an arrow key,
+    // or a local scrollback move based on the VT's current modes.
+    data.worker.send(WorkerMsg::Wheel {
+        lines: whole_lines,
+        col,
+        row,
+    });
 }
 
 // ---------- Rendering ----------

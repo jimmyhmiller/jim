@@ -172,10 +172,18 @@ pub enum WorkerMsg {
         cell_w_px: u32,
         cell_h_px: u32,
     },
-    /// Scroll the viewport by `delta` lines. Negative = back into
-    /// scrollback history; positive = forward toward the active area.
-    /// `None` is interpreted as "snap to the bottom (active area)".
-    ScrollDelta(isize),
+    /// A mouse-wheel gesture over the terminal. `lines` follows Bevy's
+    /// convention: positive = scroll-up gesture (reveal older content),
+    /// negative = scroll-down. `col`/`row` are the 0-based viewport cell
+    /// under the cursor (for mouse reporting). The worker decides what to
+    /// do based on the VT's current modes:
+    ///   - mouse tracking active → forward wheel events to the child as
+    ///     SGR (1006) or legacy X10 mouse sequences;
+    ///   - alternate screen, no tracking → translate to Up/Down arrow
+    ///     keys (xterm alternate-scroll), honoring application-cursor
+    ///     mode (DECCKM);
+    ///   - otherwise → scroll libghostty's local scrollback viewport.
+    Wheel { lines: isize, col: u16, row: u16 },
     ScrollToBottom,
     /// Extract the text of a selection that may span scrollback the
     /// visible snapshot doesn't hold. `start`/`end` are normalised
@@ -341,6 +349,44 @@ const SCROLLBACK_LOG_KEEP: u64 = 12 * 1024 * 1024;
 /// Check the log size every N bytes appended (cheap counter test in
 /// the hot path; the actual fs metadata call only runs at boundaries).
 const SCROLLBACK_ROTATE_CHECK_EVERY: u64 = 256 * 1024;
+
+/// Encode one mouse-wheel event at the 0-based viewport cell
+/// `(col, row)`. `up` is the scroll-up gesture (wheel button 64; down is
+/// 65). Emits an SGR (1006) sequence when `sgr`, otherwise the legacy
+/// X10 form. Appended to `out` so a multi-line gesture batches into one
+/// write.
+fn encode_wheel(out: &mut Vec<u8>, up: bool, col: u16, row: u16, sgr: bool) {
+    let btn: u16 = if up { 64 } else { 65 };
+    if sgr {
+        // ESC [ < btn ; col+1 ; row+1 M  (press; wheel sends no release)
+        out.extend_from_slice(b"\x1b[<");
+        out.extend_from_slice(btn.to_string().as_bytes());
+        out.push(b';');
+        out.extend_from_slice((col + 1).to_string().as_bytes());
+        out.push(b';');
+        out.extend_from_slice((row + 1).to_string().as_bytes());
+        out.push(b'M');
+    } else {
+        // Legacy X10: ESC [ M  (btn+32)  (col+1+32)  (row+1+32). Coords
+        // past 223 can't be represented in one byte; clamp them.
+        out.extend_from_slice(b"\x1b[M");
+        out.push((btn + 32).min(255) as u8);
+        out.push((col as u32 + 1 + 32).min(255) as u8);
+        out.push((row as u32 + 1 + 32).min(255) as u8);
+    }
+}
+
+/// The arrow-key sequence a wheel notch maps to in the alternate screen
+/// (xterm alternate-scroll). `app_cursor` selects DECCKM application-mode
+/// (`ESC O A`) over the normal form (`ESC [ A`).
+fn arrow_seq(up: bool, app_cursor: bool) -> &'static [u8] {
+    match (up, app_cursor) {
+        (true, false) => b"\x1b[A",
+        (false, false) => b"\x1b[B",
+        (true, true) => b"\x1bOA",
+        (false, true) => b"\x1bOB",
+    }
+}
 
 fn worker_loop(
     mut client: DaemonClient,
@@ -641,10 +687,59 @@ fn worker_loop(
                     client.send(&ClientMessage::Resize { cols, rows });
                     did_anything = true;
                 }
-                Ok(WorkerMsg::ScrollDelta(delta)) => {
-                    terminal.scroll_viewport(ScrollViewport::Delta(delta));
-                    did_anything = true;
-                    force_full_publish = true;
+                Ok(WorkerMsg::Wheel { lines, col, row }) => {
+                    if lines != 0 {
+                        let count = lines.unsigned_abs();
+                        let up = lines > 0;
+                        let mouse_tracking =
+                            terminal.is_mouse_tracking().unwrap_or(false);
+                        let alt_screen = terminal
+                            .mode(Mode::ALT_SCREEN_SAVE)
+                            .unwrap_or(false)
+                            || terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
+                            || terminal
+                                .mode(Mode::ALT_SCREEN_LEGACY)
+                                .unwrap_or(false);
+                        if mouse_tracking {
+                            // Forward the wheel to the child. Clamp the
+                            // cell to the grid so the report is in-bounds.
+                            let max_c =
+                                terminal.cols().unwrap_or(1).saturating_sub(1);
+                            let max_r =
+                                terminal.rows().unwrap_or(1).saturating_sub(1);
+                            let c = col.min(max_c);
+                            let r = row.min(max_r);
+                            let sgr = terminal.mode(Mode::SGR_MOUSE).unwrap_or(false);
+                            let mut bytes = Vec::new();
+                            for _ in 0..count {
+                                encode_wheel(&mut bytes, up, c, r, sgr);
+                            }
+                            client.send(&ClientMessage::Input(bytes));
+                            did_anything = true;
+                        } else if alt_screen {
+                            // No scrollback in the alt screen; translate to
+                            // arrow keys the way xterm's alternateScroll does.
+                            let app_cursor =
+                                terminal.mode(Mode::DECCKM).unwrap_or(false);
+                            let seq = arrow_seq(up, app_cursor);
+                            let mut bytes =
+                                Vec::with_capacity(seq.len() * count as usize);
+                            for _ in 0..count {
+                                bytes.extend_from_slice(seq);
+                            }
+                            client.send(&ClientMessage::Input(bytes));
+                            did_anything = true;
+                        } else {
+                            // Normal scrollback. libghostty's Delta is
+                            // positive toward the active area, negative back
+                            // into history — so an up gesture goes negative.
+                            let delta =
+                                if up { -(count as isize) } else { count as isize };
+                            terminal.scroll_viewport(ScrollViewport::Delta(delta));
+                            did_anything = true;
+                            force_full_publish = true;
+                        }
+                    }
                 }
                 Ok(WorkerMsg::ScrollToBottom) => {
                     terminal.scroll_viewport(ScrollViewport::Bottom);

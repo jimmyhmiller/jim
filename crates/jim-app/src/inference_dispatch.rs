@@ -55,7 +55,7 @@ impl Plugin for InferenceDispatchPlugin {
             Err(e) => {
                 warn!(
                     "[inference-dispatch] classifier disabled ({}); \
-                     set LLM_API_KEY or DEEPSEEK_KEY to enable",
+                     set LLM_API_KEY or DEEPSEEK_API_KEY to enable",
                     e
                 );
                 None
