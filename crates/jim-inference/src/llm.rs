@@ -292,9 +292,10 @@ impl Msg {
 
 /// Multi-turn chat completion. Unlike [`complete_json`] (system+user only)
 /// this carries a full message history — the primitive an agent loop calls
-/// each step. Still `response_format = json_object`, so the assistant's
-/// reply is expected to be a single JSON object; we return it raw for the
-/// caller to parse (an agent turn is small and bespoke). Blocking HTTP —
+/// each step. Uses the configured `response_format` (see
+/// [`ResponseFormatMode`]), so the assistant's reply is expected to be a
+/// single JSON object; we return it raw for the caller to parse (an agent
+/// turn is small and bespoke). Blocking HTTP —
 /// call from a worker thread, never a Bevy system.
 pub fn chat_json(cfg: &LlmConfig, messages: &[Msg], temperature: f32) -> Result<String, LlmError> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));

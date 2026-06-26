@@ -425,6 +425,10 @@ impl Plugin for AppShellPlugin {
             // immediately so the app stays alive and visible on wake.
             // See `window_geometry::respawn_primary_window_on_loss`.
             .add_observer(window_geometry::respawn_primary_window_on_loss)
+            // …but a deliberate close request (red button / Cmd-W) should
+            // still quit. That request never fires on the lid-close cascade,
+            // so honoring it here doesn't undo the survival behavior above.
+            .add_systems(Update, window_geometry::quit_on_close_request)
             .add_systems(PostStartup, release_os_focus)
             // Single keyboard-ownership authority, before every Update
             // consumer reads it.

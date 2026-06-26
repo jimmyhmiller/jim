@@ -12,7 +12,9 @@
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
-use bevy::window::{Monitor, PrimaryMonitor, PrimaryWindow, WindowMoved, WindowResized};
+use bevy::window::{
+    Monitor, PrimaryMonitor, PrimaryWindow, WindowCloseRequested, WindowMoved, WindowResized,
+};
 use serde::{Deserialize, Serialize};
 
 const FILE_NAME: &str = "window.json";
@@ -247,6 +249,43 @@ pub fn respawn_primary_window_on_loss(
         PrimaryWindow,
     ));
     crate::diagnostics::append_log("[window] primary window lost (display sleep?) — respawned");
+}
+
+/// Make the window's red close button (and Cmd-W / Window→Close) actually
+/// quit the app — while a display sleep / lid close still does not.
+///
+/// `main.rs` sets `close_when_requested: false` + `ExitCondition::DontExit`
+/// so the lid-close monitor-despawn cascade can't take the app down (see
+/// [`respawn_primary_window_on_loss`]). The side effect was that an explicit
+/// user close request became inert — the red button did nothing.
+///
+/// The two cases are cleanly separable by the signal each produces:
+/// - **Red button / Cmd-W**: winit emits [`WindowCloseRequested`] for the
+///   primary window. That's a genuine "the user wants to quit" request.
+/// - **Display sleep / lid close**: the monitor is removed and the `Window`
+///   is despawned through the `OnMonitor` `linked_spawn` relationship. That
+///   path emits **no** `WindowCloseRequested` at all — the old sleep-quit
+///   came from `ExitCondition::OnAllClosed` auto-generating `AppExit` once
+///   zero windows remained, which is exactly what `DontExit` now prevents.
+///
+/// So honoring a `WindowCloseRequested` for the primary window here restores
+/// the close button without resurrecting the sleep-quit bug. We send
+/// [`AppExit`] directly, which exits regardless of `ExitCondition::DontExit`
+/// (that condition only governs the *automatic* exit-on-window-loss path,
+/// not an explicit `AppExit`).
+pub fn quit_on_close_request(
+    mut requested: MessageReader<WindowCloseRequested>,
+    primaries: Query<(), With<PrimaryWindow>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    // Only the primary window's close button quits; a stray close request
+    // for any other (transient) window must not take the whole app down.
+    if requested
+        .read()
+        .any(|ev| primaries.contains(ev.window))
+    {
+        exit.write(AppExit::Success);
+    }
 }
 
 #[cfg(test)]

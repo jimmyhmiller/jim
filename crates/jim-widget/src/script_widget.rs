@@ -823,6 +823,8 @@ fn setup_watcher(world: &mut World) {
         ("style_picker.ft", include_str!("../widgets/style_picker.ft")),
         ("theme_editor.ft", include_str!("../widgets/theme_editor.ft")),
         ("chess.ft", include_str!("../widgets/chess.ft")),
+        ("dev_panel.ft", include_str!("../widgets/dev_panel.ft")),
+        ("style_lab.ft", include_str!("../widgets/style_lab.ft")),
     ] {
         let p = dir.join(name);
         if !p.exists() {
