@@ -14,7 +14,7 @@ use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
 use jim_pane::{
-    PaneKindMarker, PanePlugin, PaneRect, PaneTag,
+    AnimatedChromePane, ChromeAnimates, PaneKindMarker, PanePlugin, PaneRect, PaneTag,
 };
 use serde_json::Value;
 
@@ -1796,6 +1796,8 @@ fn maintain_winit_mode_for_animation(
     mut settings: ResMut<bevy::winit::WinitSettings>,
     time: Res<Time>,
     mut pin_watch: ResMut<diagnostics::ContinuousWatch>,
+    animated_panes: Query<(), With<AnimatedChromePane>>,
+    mut chrome_animates: ResMut<ChromeAnimates>,
 ) {
     let preset_animates = preset.0.as_deref().map_or(false, |name| {
         registry
@@ -1804,6 +1806,15 @@ fn maintain_winit_mode_for_animation(
             .find(|p| p.name == name)
             .map_or(false, |p| p.chrome_animates)
     });
+    // Tell `push_chrome_time` whether any on-screen chrome shader reads
+    // `params.time`: the global active preset, or any per-pane override
+    // (cube overview). When false it skips dirtying every chrome material
+    // each frame — the dominant idle GPU/CPU cost. Compare-before-write so
+    // we don't mark the resource `Changed` every frame.
+    let any_chrome_animates = preset_animates || !animated_panes.is_empty();
+    if chrome_animates.0 != any_chrome_animates {
+        chrome_animates.0 = any_chrome_animates;
+    }
     // A funct widget that opted into animation via `set_animating(true)`
     // (e.g. the datalog IDE results pane draining a `datalog` subprocess in
     // `on_frame`, or chess polling Stockfish) also needs every frame. Without

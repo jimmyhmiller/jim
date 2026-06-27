@@ -26,6 +26,7 @@ impl Plugin for ChromeMaterialPlugin {
         app.init_resource::<ChromeStyle>()
             .init_resource::<ChromeTextStyle>()
             .init_resource::<ActiveChromeShader>()
+            .init_resource::<ChromeAnimates>()
             .add_systems(Startup, init_default_chrome_shader)
             .add_plugins(Material2dPlugin::<PaneChromeMaterial>::default())
             .add_plugins(Material2dPlugin::<PaneShadowMaterial>::default());
@@ -39,6 +40,26 @@ impl Plugin for ChromeMaterialPlugin {
 /// material the same frame.
 #[derive(Resource, Default, Clone)]
 pub struct ActiveChromeShader(pub Handle<Shader>);
+
+/// Whether any on-screen chrome shader actually animates (reads
+/// `params.time`). When false, `push_chrome_time` skips its per-frame
+/// `materials.iter_mut()` entirely — that `iter_mut` marks every pane's
+/// chrome material `Changed`, forcing the render world to recreate and
+/// re-upload every chrome bind-group buffer to the GPU on every rendered
+/// frame. For a static theme (the default embedded shader never reads
+/// `time`) that GPU upload is pure waste and was the dominant idle CPU
+/// cost. A higher-level crate sets this true when the active global
+/// preset animates or any per-pane [`AnimatedChromePane`] is present.
+#[derive(Resource, Default, Clone)]
+pub struct ChromeAnimates(pub bool);
+
+/// Marker stamped on a pane whose per-pane chrome shader override
+/// animates (its project's preset ships an animating `chrome.wgsl`).
+/// Lets the mode-maintainer keep `ChromeAnimates` true even when the
+/// *global* active preset is static — e.g. in the cube overview where
+/// panes from several projects/presets are on screen at once.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct AnimatedChromePane;
 
 /// Theme-driven colors for the chrome text/sprite children that the
 /// SDF material doesn't cover: title text, the close button, the

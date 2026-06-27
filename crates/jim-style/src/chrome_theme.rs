@@ -12,7 +12,8 @@
 
 use bevy::prelude::*;
 use jim_pane::{
-    ChromeStyle, ChromeTextStyle, PaneChromeShader, PaneChromeStyle, PaneProject, PaneTag,
+    AnimatedChromePane, ChromeStyle, ChromeTextStyle, PaneChromeShader, PaneChromeStyle,
+    PaneProject, PaneTag,
 };
 
 use crate::presets::StylePresetRegistry;
@@ -90,28 +91,34 @@ fn stamp(
 ) {
     match ctx.themes.get(project_id) {
         Some(theme) => {
-            // The project's preset chrome shader (or the embedded default).
-            let url = ctx
+            // The project's preset chrome shader (or the embedded default),
+            // and whether that shader animates (reads `params.time`).
+            let preset = ctx
                 .style_state
                 .preset_of(project_id)
-                .and_then(|name| {
-                    ctx.registry
-                        .presets
-                        .iter()
-                        .find(|p| p.name == name)
-                        .and_then(|p| p.chrome_shader.clone())
-                })
+                .and_then(|name| ctx.registry.presets.iter().find(|p| p.name == name));
+            let url = preset
+                .and_then(|p| p.chrome_shader.clone())
                 .unwrap_or_else(|| DEFAULT_CHROME_SHADER.to_string());
+            let animates = preset.is_some_and(|p| p.chrome_animates);
             commands.entity(entity).insert((
                 PaneChromeStyle(build_chrome_style(theme)),
                 PaneChromeShader(ctx.asset_server.load::<bevy::shader::Shader>(url)),
             ));
+            // Keep the per-pane animation marker in sync so the
+            // mode-maintainer can tell `push_chrome_time` to run.
+            if animates {
+                commands.entity(entity).insert(AnimatedChromePane);
+            } else {
+                commands.entity(entity).remove::<AnimatedChromePane>();
+            }
         }
         None if has_override => {
             commands
                 .entity(entity)
                 .remove::<PaneChromeStyle>()
-                .remove::<PaneChromeShader>();
+                .remove::<PaneChromeShader>()
+                .remove::<AnimatedChromePane>();
         }
         None => {}
     }

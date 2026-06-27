@@ -73,8 +73,9 @@ pub use camera::{
     pane_camera_setup_for, PaneCameraOf, PaneCameraSetup, PaneCanvasRegion,
 };
 pub use chrome_material::{
-    ActiveChromeShader, ChromeMaterialPlugin, ChromeParams, ChromeStyle, ChromeTextStyle,
-    PaneChromeMaterial, PaneChromeShader, PaneChromeStyle, PaneShadowMaterial, ShadowParams,
+    ActiveChromeShader, AnimatedChromePane, ChromeAnimates, ChromeMaterialPlugin, ChromeParams,
+    ChromeStyle, ChromeTextStyle, PaneChromeMaterial, PaneChromeShader, PaneChromeStyle,
+    PaneShadowMaterial, ShadowParams,
 };
 pub use dock::{
     create_dock, create_dock_template, create_template_skeleton, dock_co_members, Dock, DockMember,
@@ -1028,8 +1029,17 @@ fn reset_input_consumed(mut consumed: ResMut<InputConsumed>) {
 /// detects "uniform actually differs" before re-uploading to GPU.
 fn push_chrome_time(
     time: Res<Time>,
+    animates: Res<chrome_material::ChromeAnimates>,
     mut materials: ResMut<Assets<PaneChromeMaterial>>,
 ) {
+    // No on-screen chrome shader reads `params.time`, so skip the whole
+    // pass. The `iter_mut()` below marks every chrome material `Changed`,
+    // which forces the render world to recreate + re-upload every pane's
+    // chrome bind-group buffer to the GPU every rendered frame — the
+    // dominant idle-CPU cost for a static theme. See `ChromeAnimates`.
+    if !animates.0 {
+        return;
+    }
     let _prof = prof::sys_span("chrome_time");
     let t = time.elapsed_secs();
     for (_id, mat) in materials.iter_mut() {
