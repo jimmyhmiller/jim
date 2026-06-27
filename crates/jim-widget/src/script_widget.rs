@@ -473,6 +473,10 @@ pub struct ScriptWidget {
     /// Sprite id → entity. Lets us diff frames instead of
     /// despawn+respawn.
     pub sprite_entities: HashMap<String, Entity>,
+    /// Top-level Canvas counterpart to [`Self::canvas_region_prev`]: the
+    /// items rendered last frame, keyed by id, so `diff_render` can skip
+    /// unchanged ones (no flicker, no churn).
+    pub sprite_prev: HashMap<String, CanvasItem>,
     /// One per nested `Element::Canvas` region (indexed by the region's
     /// order in the flow walk): item id → entity. Lets nested canvas
     /// regions diff like the top-level Canvas path instead of
@@ -482,6 +486,15 @@ pub struct ScriptWidget {
     /// user zoomed/panned. The per-frame flow teardown skips entities
     /// tracked here.
     pub canvas_region_entities: Vec<HashMap<String, Entity>>,
+    /// Per-region cache of the canvas items rendered LAST frame, keyed by id.
+    /// Lets `diff_render` recognise an item that is byte-identical to last
+    /// frame and leave its entity completely untouched — no despawn, no
+    /// respawn, no component re-insert. That is what stops button/label text
+    /// from FLICKERING during high-rate re-renders (e.g. the podcast playhead
+    /// ticking ~20×/s): a respawned `Text2d` has no glyphs until the next
+    /// layout pass, so it draws blank for one frame. Kept in lockstep with
+    /// `canvas_region_entities` (same index = same region).
+    pub canvas_region_prev: Vec<HashMap<String, CanvasItem>>,
     /// `Element::Editor` id → live portal. These editor child-entities
     /// persist across the per-frame flow teardown (the teardown skips
     /// any entity tracked here) so caret/selection/scroll/undo survive
@@ -1024,7 +1037,9 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             reload_gen: 0,
             applied_reload_gen: 0,
             sprite_entities: HashMap::new(),
+            sprite_prev: HashMap::new(),
             canvas_region_entities: Vec::new(),
+            canvas_region_prev: Vec::new(),
             editor_portals: HashMap::new(),
             last_focus_sig: None,
             // Starts false; mirrored from the worker's `wants_clicks` slot
@@ -1768,6 +1783,9 @@ fn apply_latest_frames(
                 if scroll.y > scroll.max_y {
                     scroll.y = scroll.max_y;
                 }
+                // Reborrow once so the two disjoint fields below don't each go
+                // through `Mut`'s DerefMut (which would borrow `w` twice).
+                let w = &mut *w;
                 diff_render(
                     &mut commands,
                     &mut images,
@@ -1775,6 +1793,7 @@ fn apply_latest_frames(
                     chrome.content_root,
                     &children,
                     &mut w.sprite_entities,
+                    &mut w.sprite_prev,
                     Vec2::ZERO,
                     0.0,
                     // Top-level Canvas: no array-order z bump (these widgets
@@ -1896,10 +1915,17 @@ fn apply_latest_frames(
                             commands.entity(e).try_despawn();
                         }
                     }
+                    w.canvas_region_prev.truncate(region_count);
                 }
                 while w.canvas_region_entities.len() < region_count {
                     w.canvas_region_entities.push(std::collections::HashMap::new());
                 }
+                while w.canvas_region_prev.len() < region_count {
+                    w.canvas_region_prev.push(std::collections::HashMap::new());
+                }
+                // Reborrow once so the two disjoint fields indexed below don't
+                // each go through `Mut`'s DerefMut (which would borrow `w` twice).
+                let w = &mut *w;
                 for (i, region) in targets.canvas_regions.iter().enumerate() {
                     diff_render(
                         &mut commands,
@@ -1908,6 +1934,7 @@ fn apply_latest_frames(
                         chrome.content_root,
                         &region.items,
                         &mut w.canvas_region_entities[i],
+                        &mut w.canvas_region_prev[i],
                         region.rect.min,
                         region.z + 0.005,
                         // Nested region: items typically share z=0 and rely on
@@ -2107,6 +2134,10 @@ fn diff_render(
     content_root: Entity,
     items: &[CanvasItem],
     sprite_entities: &mut HashMap<String, Entity>,
+    // The items rendered last frame, keyed by id. An item byte-identical to
+    // its entry here (and whose entity still exists) is left untouched — see
+    // the skip below. Updated in place as items are (re)rendered.
+    prev_items: &mut HashMap<String, CanvasItem>,
     // Added to every item's position/depth. ZERO/0.0 for a top-level Canvas
     // frame; the box origin + base depth for a nested canvas region embedded
     // in a flow layout (so its items land inside their laid-out box).
@@ -2124,6 +2155,9 @@ fn diff_render(
     default_font: &Handle<Font>,
     fonts: &jim_style::FontRegistry,
 ) {
+    let dbg = std::env::var("CANVAS_DIFF_DBG").is_ok();
+    let mut dbg_spawn_text: Vec<String> = Vec::new();
+    let mut dbg_skipped = 0usize;
     let mut seen: HashSet<String> = HashSet::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
         let order_z = idx as f32 * order_eps;
@@ -2143,13 +2177,63 @@ fn diff_render(
             raw_id.to_string()
         };
         seen.insert(id.clone());
+        // Reuse-when-unchanged. If this exact item (same content) was rendered
+        // last frame and its entity still exists, leave the entity — and any
+        // fallback-glyph span children — completely untouched: no despawn, no
+        // respawn, no component re-insert. This is the fix for canvas
+        // button/label text FLICKERING under high-rate re-renders (the podcast
+        // playhead ticks ~20×/s, re-emitting the whole static button row each
+        // frame): a respawned `Text2d` has no glyphs until the next layout
+        // pass, so it draws blank for one frame. Skipping unchanged items also
+        // sidesteps the per-pane-camera regression below — an item whose
+        // components never change never needs to re-render. (Items that DID
+        // change still fall through to despawn+respawn, which that regression
+        // requires.) The stale-reap pass below keeps a skipped item's span
+        // children alive via the parent-id rule. We compare content only, not
+        // array index: `order_z` drift from a neighbour appearing/disappearing
+        // is sub-ULP at these depths and only tie-breaks items at the SAME
+        // explicit z (which, in practice, are pushed adjacently and move
+        // together), so it's not worth a respawn-induced flash to chase.
+        if prev_items.get(&id) == Some(item) && sprite_entities.contains_key(&id) {
+            dbg_skipped += 1;
+            continue;
+        }
+        if dbg {
+            if let CanvasItem::Text { .. } = item {
+                dbg_spawn_text.push(id.clone());
+            }
+        }
+        prev_items.insert(id.clone(), item.clone());
         // Bevy 0.19 regression: a REUSED entity does not re-render its updated
         // Sprite/Transform under a per-pane camera, so a bar that changes height
         // on zoom keeps its old size and the strip fills to a solid block. Work
         // around it by despawning any existing entity for this id and respawning
         // a fresh one below — fresh entities render at their correct size.
+        // (Reuse is just as broken for Text2d: the glyphs don't regenerate, so
+        // a label that changes shows stale/overlapping text — "Play" and
+        // "Pause" at once.)
         if let Some(e) = sprite_entities.remove(&id) {
             commands.entity(e).try_despawn();
+            // Also drop this text's fallback-glyph span CHILDREN. They are
+            // separate entities keyed `{id}\u{1}fb{n}`. The despawn above is
+            // recursive, so the entities are already gone — but their KEYS
+            // linger in `sprite_entities`, and the span reconciler below would
+            // then "reuse" a now-dead entity (a no-op `try_insert`) instead of
+            // re-creating the glyph under the FRESH parent. That is the bug
+            // behind the Play button's ▶/⏸ glyph vanishing or showing the old
+            // and new label at once when the label flips on click. Remove the
+            // keys (and defensively despawn) so the spans are rebuilt fresh.
+            let span_prefix = format!("{id}\u{1}");
+            let stale_spans: Vec<String> = sprite_entities
+                .keys()
+                .filter(|k| k.starts_with(&span_prefix))
+                .cloned()
+                .collect();
+            for k in stale_spans {
+                if let Some(se) = sprite_entities.remove(&k) {
+                    commands.entity(se).try_despawn();
+                }
+            }
         }
         let existing: Option<Entity> = None;
         match item {
@@ -2368,10 +2452,23 @@ fn diff_render(
         }
     }
 
-    // Despawn entities whose id wasn't seen this frame.
+    // Despawn entities whose id wasn't seen this frame. A skipped (unchanged)
+    // item only put its OWN id in `seen`, not its fallback-span keys
+    // (`{id}\u{1}fb{n}`) — those weren't re-emitted. So also keep any span
+    // whose parent id (the part before the `\u{1}` separator) was seen;
+    // otherwise skipping a button with a non-ASCII glyph would reap its span
+    // and the glyph would vanish — the very flicker we're removing.
     let stale: Vec<String> = sprite_entities
         .keys()
-        .filter(|id| !seen.contains(id.as_str()))
+        .filter(|id| {
+            if seen.contains(id.as_str()) {
+                return false;
+            }
+            match id.find('\u{1}') {
+                Some(i) => !seen.contains(&id[..i]),
+                None => true,
+            }
+        })
         .cloned()
         .collect();
     for id in stale {
@@ -2385,6 +2482,20 @@ fn diff_render(
             // under it — pane teardown is the external authority.
             commands.entity(e).try_despawn();
         }
+    }
+    // Keep the prev-items cache bounded to what's currently on screen, so a
+    // long scrolling list (e.g. the podcast transcript, ids `w0..wN`) doesn't
+    // grow it without limit. `seen` holds every id rendered or skipped this
+    // frame; spans aren't tracked in `prev_items`, so this is exact.
+    prev_items.retain(|id, _| seen.contains(id.as_str()));
+    if dbg {
+        eprintln!(
+            "[canvas-diff] items={} skipped={} text_respawned={} ids={:?}",
+            items.len(),
+            dbg_skipped,
+            dbg_spawn_text.len(),
+            dbg_spawn_text
+        );
     }
     let _ = CanvasAnchor::TopLeft; // suppress unused-import warning
     let _: ImageRef = ImageRef::Path {

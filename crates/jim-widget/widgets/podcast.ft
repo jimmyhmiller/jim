@@ -32,10 +32,11 @@ fn bucket_ms() = 10.0
 fn init_state() = {
     recordings: [], sb_first: 0,
     sel_name: "",
-    words: [], gaps_cut: [], regions: [],
+    words: [], gaps_cut: [], gap_keep: [], regions: [],   // gaps_cut = full cut; gap_keep = [{i, ms}] partial silence kept (scrubbed)
     peaks: [], sumsq: [], dur_ms: 0.0,   // sumsq = prefix sum of peaks² (len peaks+1), for O(1) per-column RMS at any zoom
     sel_kind: "none", sa: -1, sb: -1, ra: -1.0, rb: -1.0,   // word idx + region ms
     drag_target: "", dragging: false, wave_press: 0.0, wave_press_x: 0.0,
+    gap_drag_i: -1, gap_press_x: 0.0, gap_press_keep: 0.0,   // gap-pill scrub (Tangle-style)
     time_overrides: [],   // [{i, t0, t1}] manual word-timing corrections
     status: "select a recording",
     transcribing: false, progress: 0, proc: -1, pk_proc: -1,
@@ -150,10 +151,11 @@ fn upsert_override(ovs, i, t0, t1) {
 }
 fn apply_edits(words, name) {
     let e = read_file(edits_path(name))
-    if not e.ok { return { words: words, gaps: [], regions: [], times: [] } }
+    if not e.ok { return { words: words, gaps: [], gap_keep: [], regions: [], times: [] } }
     let p = parse_json(e.text)
     let del = if typeof(p) == "List" { p } else if typeof(p) == "Record" { unwrap_or(get(p, "deleted"), []) } else { [] }
     let gaps = if typeof(p) == "Record" { unwrap_or(get(p, "gaps"), []) } else { [] }
+    let gap_keep = if typeof(p) == "Record" { unwrap_or(get(p, "gap_keep"), []) } else { [] }
     let regions = if typeof(p) == "Record" { unwrap_or(get(p, "regions"), []) } else { [] }
     let times = if typeof(p) == "Record" { unwrap_or(get(p, "times"), []) } else { [] }
     let mut out = []
@@ -165,25 +167,25 @@ fn apply_edits(words, name) {
         if typeof(ov) == "Record" { out = push(out, { ..base, t0: ov.t0, t1: ov.t1 }) } else { out = push(out, base) }
         i = i + 1
     }
-    { words: out, gaps: gaps, regions: regions, times: times }
+    { words: out, gaps: gaps, gap_keep: gap_keep, regions: regions, times: times }
 }
 fn save_edl() {
     let s = @state
     let mut del = []
     let mut i = 0
     while i < len(s.words) { if s.words[i].deleted { del = push(del, i) } i = i + 1 }
-    write_file(edits_path(s.sel_name), to_json({ deleted: del, gaps: s.gaps_cut, regions: s.regions, times: s.time_overrides }))
+    write_file(edits_path(s.sel_name), to_json({ deleted: del, gaps: s.gaps_cut, gap_keep: unwrap_or(get(s, "gap_keep"), []), regions: s.regions, times: s.time_overrides }))
     emit("edl.changed", { name: s.sel_name })
 }
 
 fn select(name) {
     let s = @state
     let cw = read_file(cache_path(name))
-    let edl = if cw.ok { apply_edits(parse_words(cw.text), name) } else { { words: [], gaps: [], regions: [], times: [] } }
+    let edl = if cw.ok { apply_edits(parse_words(cw.text), name) } else { { words: [], gaps: [], gap_keep: [], regions: [], times: [] } }
     let pc = read_file(peaks_path(name))
     let peaks = if pc.ok { unwrap_or(get(parse_json(pc.text), "peaks"), []) } else { [] }
     let dur = to_float(len(peaks)) * bucket_ms()
-    let ns = { ..s, sel_name: name, words: edl.words, gaps_cut: edl.gaps, regions: edl.regions, time_overrides: edl.times,
+    let ns = { ..s, sel_name: name, words: edl.words, gaps_cut: edl.gaps, gap_keep: edl.gap_keep, regions: edl.regions, time_overrides: edl.times,
                peaks: peaks, sumsq: prefix_sumsq(peaks), dur_ms: dur, scroll: 0.0, wscroll: 0.0, cur_ms: 0.0,
                sel_kind: "none", sa: -1, sb: -1, ra: -1.0, rb: -1.0, edit_dirty: true,
                status: if cw.ok { str(len(edl.words)) + " words" } else { "transcribing…" } }
@@ -281,9 +283,46 @@ fn subtract_regions(clips, regions) {
     }
     out
 }
+// ---- gap pills: full cut (gaps_cut) OR partial keep (gap_keep, scrubbed) ----
+// Full span of the inter-word silence shown by gap pill i (words[i+1].t0 - words[i].t1).
+fn gap_full_ms(words, i) { if i < 0 or i >= len(words) - 1 { 0.0 } else { to_float(words[i + 1].t0) - to_float(words[i].t1) } }
+fn find_gap_keep(gk, i) { for e in gk { if e.i == i { return e } } () }
+fn remove_gap_keep(gk, i) { let mut out = [] for e in gk { if e.i != i { out = push(out, e) } } out }
+fn upsert_gap_keep(gk, i, ms) { let mut out = remove_gap_keep(gk, i) push(out, { i: i, ms: ms }) }
+fn remove_gap_cut(gc, i) { let mut out = [] for x in gc { if x != i { out = push(out, x) } } out }
+// How many ms of gap i's silence is KEPT: an explicit scrub wins; else a full
+// cut keeps 0; else the whole gap (untouched).
+fn gap_kept_ms(s, i) {
+    let full = gap_full_ms(s.words, i)
+    let e = find_gap_keep(unwrap_or(get(s, "gap_keep"), []), i)
+    if typeof(e) == "Record" { return max(0.0, min(full, to_float(e.ms))) }
+    let cut = match index_of(s.gaps_cut, i) { Some(_) => true, None => false }
+    if cut { 0.0 } else { full }
+}
+// Each partial-keep gap becomes a region cut over the MIDDLE of the silence
+// (keep/2 retained at each end), so the kept slice straddles the word boundary
+// symmetrically. Fully-cut gaps stay in gaps_cut (handled by word_clips).
+fn gap_regions(s) {
+    let gk = unwrap_or(get(s, "gap_keep"), [])
+    let mut rs = []
+    for e in gk {
+        let i = e.i
+        if i >= 0 and i < len(s.words) - 1 {
+            let g0 = to_float(s.words[i].t1)
+            let g1 = to_float(s.words[i + 1].t0)
+            let full = g1 - g0
+            let keep = max(0.0, min(full, to_float(e.ms)))
+            if full - keep > 1.0 { rs = push(rs, { from: g0 + keep / 2.0, to: g1 - keep / 2.0 }) }
+        }
+    }
+    rs
+}
 fn edl_clips(s) {
     let base = if len(s.words) > 0 { word_clips(s.words, s.gaps_cut) } else { [{ from: 0.0, to: s.dur_ms }] }
-    subtract_regions(base, s.regions)
+    let mut regs = []
+    for r in s.regions { regs = push(regs, r) }
+    for r in gap_regions(s) { regs = push(regs, r) }
+    subtract_regions(base, regs)
 }
 fn removed_spans(clips, dur) {
     let mut rem = []
@@ -391,12 +430,15 @@ fn remove_fillers() {
     save_edl()
     request_render()
 }
+// Click toggles a FULL cut/restore (and clears any partial scrub on that gap,
+// so click always wins over a prior drag). Dragging the pill scrubs partial —
+// see on_drag's "gap" branch.
 fn toggle_gap(i) {
     let s = @state
     let cut = match index_of(s.gaps_cut, i) { Some(_) => true, None => false }
-    let mut g = []
-    if cut { for x in s.gaps_cut { if x != i { g = push(g, x) } } } else { g = push(s.gaps_cut, i) }
-    reset!(state, commit_edit({ ..s, gaps_cut: g }))
+    let g = if cut { remove_gap_cut(s.gaps_cut, i) } else { push(s.gaps_cut, i) }
+    let nk = remove_gap_keep(unwrap_or(get(s, "gap_keep"), []), i)
+    reset!(state, commit_edit({ ..s, gaps_cut: g, gap_keep: nk }))
     save_edl()
     request_render()
 }
@@ -443,6 +485,11 @@ fn stop_play() {
     if s.play_proc != -1 { proc_kill(s.play_proc) }
     set_tick_interval(0.0)
     reset!(state, { ..s, play_proc: -1, playing: false })
+    // Ticks just stopped, so on_frame won't redraw — ask for one render so the
+    // transport flips ⏸ Pause → ▶ Play immediately (both on a manual pause and
+    // when playback ends). Without this the button stays "Pause" until some
+    // other event (e.g. a resize) forces a re-render.
+    request_render()
 }
 // Play the rendered EDITED file from edited-ms `te`. on_frame maps the edited
 // playhead back to source-ms so the word highlight + waveform cursor track it
@@ -455,16 +502,42 @@ fn start_edit_play(te) {
     reset!(state, { ..s, play_proc: h, playing: true, play_edit: true, play_base: te, play_start: time() })
     request_render()
 }
+// The source-ms at which playback stops: in edited mode it's the end of the
+// concatenated edited timeline; in source mode it's the end of the (single)
+// kept clip — never the physical end of the file, so trailing silence past
+// the last kept word isn't played.
+fn last_clip_to(s) = if len(s.clips) > 0 { s.clips[len(s.clips) - 1].to } else { s.dur_ms }
+// A single contiguous kept span needs no splice: the edited audio is exactly
+// source[clip.from..clip.to]. So play the ORIGINAL file directly (seek with
+// -ss, stop at the span end) with ZERO ffmpeg render — playback is instant.
+// Only a multi-clip timeline (real internal cuts) needs the pre-rendered WAV.
+// This is the common case (just loaded a recording, or only head/tail
+// trimmed), so it's what kills the "huge delay before audio starts".
+fn start_play_at(src) {
+    let s = @state
+    if len(s.clips) > 1 { start_edit_play(edited_at(s.clips, src)); return }
+    if s.play_proc != -1 { proc_kill(s.play_proc) }
+    let from = max(src, if len(s.clips) > 0 { s.clips[0].from } else { 0.0 })
+    let h = proc_spawn("ffplay", ["-nodisp", "-autoexit", "-loglevel", "error", "-af", "atempo=" + str(s.speed), "-ss", str(from / 1000.0), rec_dir() + "/" + s.sel_name])
+    set_tick_interval(0.05)
+    // play_edit:false → on_frame maps the playhead 1:1 in source-ms.
+    reset!(state, { ..s, play_proc: h, playing: true, play_edit: false, play_base: from, play_start: time() })
+    request_render()
+}
+// Can we re-seek instantly while playing? Yes for single-span source playback
+// (no render), or when the multi-clip edited render is already up to date.
+fn can_seek(s) = len(s.clips) <= 1 or not s.edit_dirty
 fn play_edited_from(src) {
     let s = @state
     if len(s.clips) == 0 { reset!(state, { ..s, status: "nothing kept" }); request_render(); return }
-    if s.edit_dirty {
-        // (Re)render the edited timeline, then play once it's ready.
+    if len(s.clips) > 1 and s.edit_dirty {
+        // Multiple kept segments must be concatenated gaplessly: (re)render the
+        // edited timeline once, then play it (on_proc_exit launches playback).
         let h = proc_spawn("sh", ["-c", export_cmd(rec_dir() + "/" + s.sel_name, s.clips, play_path(), s.xfade)])
         reset!(state, { ..s, exp_proc: h, exp_mode: "play", play_from_src: src, status: "preparing…" })
         request_render()
     } else {
-        start_edit_play(edited_at(s.clips, src))
+        start_play_at(src)
     }
 }
 fn play_pause() {
@@ -475,7 +548,7 @@ fn seek(ms) {
     let s = @state
     let m = max(0.0, min(s.dur_ms, ms))
     reset!(state, { ..s, cur_ms: m })
-    if s.playing and not s.edit_dirty { start_edit_play(edited_at(s.clips, m)) } else { request_render() }
+    if s.playing and can_seek(s) { start_play_at(m) } else { request_render() }
 }
 fn on_frame(dt) {
     let s = @state
@@ -492,7 +565,9 @@ fn on_frame(dt) {
     if not s.playing { if not s.pending_layout { set_tick_interval(0.0) } return }
     let elapsed = max(0.0, (time() - s.play_start) * 1000.0 * s.speed - play_lat())
     let te = s.play_base + elapsed
-    if s.play_edit and te >= edited_total(s.clips) { stop_play(); return }
+    // Stop at the timeline end (edited mode) or the kept-span end (source mode).
+    let stop_at = if s.play_edit { edited_total(s.clips) } else { last_clip_to(s) }
+    if te >= stop_at { stop_play(); return }
     let newcur = if s.play_edit { source_at(s.clips, te) } else { te }
     let curi = word_idx_at(s.words, newcur)
     reset!(state, { ..s, cur_ms: newcur, scroll: follow_scroll(s, curi) })   // auto-scroll to follow
@@ -506,7 +581,7 @@ fn cycle_speed() {
     while j < len(speeds) { if speeds[j] == s.speed { idx = j } j = j + 1 }
     let ni = if idx + 1 >= len(speeds) { 0 } else { idx + 1 }
     reset!(state, { ..s, speed: speeds[ni] })
-    if s.playing and not s.edit_dirty { start_edit_play(edited_at(s.clips, s.cur_ms)) } else { request_render() }
+    if s.playing and can_seek(s) { start_play_at(s.cur_ms) } else { request_render() }
 }
 
 // ---- geometry --------------------------------------------------------------
@@ -743,23 +818,51 @@ fn on_click(x, y, shift, cmd, id) {
         // the playhead); a DRAG selects a region (handled in on_drag).
         let ms = max(0.0, min(s.dur_ms, wms(s, cx)))
         reset!(state, { ..s, cur_ms: ms, drag_target: "wave", wave_press: ms, wave_press_x: cx, dragging: false })
-        if s.playing and not s.edit_dirty { start_edit_play(edited_at(s.clips, ms)) } else { request_render() }
+        if s.playing and can_seek(s) { start_play_at(ms) } else { request_render() }
         return
     }
     // transcript
     let p = item_at(s, cx, y)
-    if p.k == "g" { toggle_gap(p.i); return }
+    if p.k == "g" {
+        // Press a gap pill: arm a scrub. A real horizontal drag scrubs the kept
+        // silence (Tangle-style, on_drag); a tap with no drag toggles a full
+        // cut/restore (on_release). gap_press_keep is the current kept ms.
+        reset!(state, { ..s, drag_target: "gap", gap_drag_i: p.i, gap_press_x: cx, gap_press_keep: gap_kept_ms(s, p.i), dragging: false })
+        return
+    }
     if p.k == "w" {
         let na = if shift and s.sel_kind == "words" and s.sa >= 0 { s.sa } else { p.i }
         let cur = to_float(s.words[p.i].t0)
         reset!(state, { ..s, sel_kind: "words", sa: na, sb: p.i, ra: -1.0, rb: -1.0, drag_target: "transcript", dragging: false, cur_ms: cur })
-        if not shift and s.playing and not s.edit_dirty { start_edit_play(edited_at(s.clips, cur)) } else { request_render() }
+        if not shift and s.playing and can_seek(s) { start_play_at(cur) } else { request_render() }
     }
 }
 fn on_drag(x, y) {
     let s = @state
     if typeof(s) != "Record" { return }
     let cx = x - sbw() - 1.0
+    if s.drag_target == "gap" {
+        let i = s.gap_drag_i
+        if i < 0 or i >= len(s.words) - 1 { return }
+        let full = gap_full_ms(s.words, i)
+        let dx = cx - s.gap_press_x
+        if not s.dragging {
+            if abs(dx) < 4.0 { return }       // still a tap; on_release will toggle the full cut
+            stop_play()                        // editing the EDL invalidates an edited render
+            reset!(state, { ..(@state), dragging: true })
+        }
+        // Drag LEFT shortens (keep less silence), RIGHT lengthens, up to the
+        // original gap. Sensitivity scales with the gap so any pill spans a
+        // comfortable drag, with a floor for tiny gaps.
+        let cur = @state
+        let mpp = max(5.0, full / 200.0)
+        let keep = max(0.0, min(full, cur.gap_press_keep + dx * mpp))
+        let nk = upsert_gap_keep(unwrap_or(get(cur, "gap_keep"), []), i, keep)
+        let ng = remove_gap_cut(cur.gaps_cut, i)
+        reset!(state, { ..commit_edit({ ..cur, gap_keep: nk, gaps_cut: ng }), status: "gap " + str(round(keep / 100.0) / 10.0) + "s / " + str(round(full / 100.0) / 10.0) + "s" })
+        request_render()
+        return
+    }
     if s.drag_target == "wave" {
         let curms = max(0.0, min(s.dur_ms, wms(s, cx)))
         if not s.dragging {
@@ -782,7 +885,15 @@ fn on_drag(x, y) {
         if p.k == "w" and p.i != cur.sb { reset!(state, { ..cur, sb: p.i }); request_render() }
     }
 }
-fn on_release(x, y) { let s = @state if typeof(s) == "Record" { reset!(state, { ..s, dragging: false, drag_target: "" }) } }
+fn on_release(x, y) {
+    let s = @state
+    if typeof(s) != "Record" { return }
+    if s.drag_target == "gap" {
+        if s.dragging { save_edl() }            // finished a scrub → persist
+        else { toggle_gap(s.gap_drag_i) }       // tap, no drag → full cut/restore (saves itself)
+    }
+    reset!(state, { ..(@state), dragging: false, drag_target: "", gap_drag_i: -1 })
+}
 fn on_key(key) {
     let s = @state
     if typeof(s) != "Record" { return }
@@ -850,8 +961,8 @@ fn on_proc_exit(handle, code) {
     let s = @state
     if handle == s.proc {
         let c = read_file(cache_path(s.sel_name))
-        let r = if c.ok { apply_edits(parse_words(c.text), s.sel_name) } else { { words: [], gaps: [], regions: [], times: [] } }
-        reset!(state, recache({ ..s, transcribing: false, proc: -1, words: r.words, gaps_cut: r.gaps, regions: r.regions, time_overrides: r.times, edit_dirty: true,
+        let r = if c.ok { apply_edits(parse_words(c.text), s.sel_name) } else { { words: [], gaps: [], gap_keep: [], regions: [], times: [] } }
+        reset!(state, recache({ ..s, transcribing: false, proc: -1, words: r.words, gaps_cut: r.gaps, gap_keep: r.gap_keep, regions: r.regions, time_overrides: r.times, edit_dirty: true,
                         status: if len(r.words) > 0 { str(len(r.words)) + " words" } else { "transcription failed (" + str(code) + ")" } }))
         request_render()
         return
@@ -908,7 +1019,7 @@ fn on_message(topic, payload, sender) {
         if n == s.sel_name and s.sel_name != "" and sender != my_id() {
             let c = read_file(cache_path(s.sel_name))
             if c.ok { let r = apply_edits(parse_words(c.text), s.sel_name)
-                      reset!(state, commit_edit({ ..s, words: r.words, gaps_cut: r.gaps, regions: r.regions, time_overrides: r.times })); request_render() }
+                      reset!(state, commit_edit({ ..s, words: r.words, gaps_cut: r.gaps, gap_keep: r.gap_keep, regions: r.regions, time_overrides: r.times })); request_render() }
         }
     }
 }
@@ -939,9 +1050,19 @@ fn cur_word_idx(s) {
     if not s.playing { return -1 }
     word_idx_at(s.words, s.cur_ms)
 }
+// Canvas z layers. Nested-canvas items sit at a high world z where the host's
+// per-item order-z tie-break (≈0.009/N) collapses below f32 precision, so a
+// label drawn "after" its background ends up at the SAME depth and z-fights —
+// the opaque button background then intermittently hides the text. Give text
+// an explicit z gap above the rects (same trick the waveform uses) so the
+// ordering survives. Backgrounds stay at 0.
+fn ztext() = 0.1      // any label / glyph drawn over a cell background
+fn zmark() = 0.12     // strikethrough drawn over (deleted) word text
+fn zoverlay() = 0.5   // help overlay backdrop + panel
+fn zoverlaytext() = 0.55
 fn btn(items, x0, w, label, fill, fg) {
     let a = push(items, { kind: "rect", id: "b" + label, x: x0, y: 44.0, w: w, h: 30.0, color: fill, anchor: "top-left" })
-    push(a, { kind: "text", id: "bl" + label, x: x0 + 11.0, y: 51.0, value: label, size: 13.0, color: fg })
+    push(a, { kind: "text", id: "bl" + label, x: x0 + 11.0, y: 51.0, value: label, size: 13.0, color: fg, z: ztext() })
 }
 fn footer_geo(cwid) = { sp0: cwid - 250.0, sp1: cwid - 194.0, pv0: cwid - 186.0, pv1: cwid - 110.0,
                         xf0: cwid - 102.0, xf1: cwid - 12.0, zm0: 240.0 }
@@ -950,7 +1071,8 @@ fn help_lines() = [
     "Click word   Play from word",      "Drag text    Select words",
     "Shift+Click  Extend selection",    "Drag wave    Select audio region",
     "Delete       Cut / restore selection", "F            Remove filler words",
-    "Gap pill     Cut the silence",     "X            Toggle crossfade",
+    "Tap gap      Cut / restore silence", "Drag gap     Scrub silence shorter",
+    "X            Toggle crossfade",
     "− / +        Zoom waveform",       "Click wave   Move playhead",
     "[ / ]        Set sel. word start / end @ playhead", "?            Toggle this help",
 ]
@@ -964,11 +1086,11 @@ fn render(w, h) {
     let cwid = w - sbw() - 1.0
     let mut items = []
     items = push(items, { kind: "rect", id: "bg", x: 0.0, y: 0.0, w: cwid, h: h, color: "#0d1014", anchor: "top-left" })
-    items = push(items, { kind: "text", id: "ttl", x: 16.0, y: 12.0, value: if s.sel_name == "" { "Podcast editor" } else { nice_name(s.sel_name) }, size: 16.0, color: "#e7eaf0" })
+    items = push(items, { kind: "text", id: "ttl", x: 16.0, y: 12.0, value: if s.sel_name == "" { "Podcast editor" } else { nice_name(s.sel_name) }, size: 16.0, color: "#e7eaf0", z: ztext() })
 
     // header buttons
     if s.transcribing {
-        items = push(items, { kind: "text", id: "pg", x: 16.0, y: 51.0, value: "transcribing… " + str(s.progress) + "%", size: 13.0, color: "#7fd6c2" })
+        items = push(items, { kind: "text", id: "pg", x: 16.0, y: 51.0, value: "transcribing… " + str(s.progress) + "%", size: 13.0, color: "#7fd6c2", z: ztext() })
         items = push(items, { kind: "rect", id: "pgt", x: 16.0, y: 72.0, w: cwid - 32.0, h: 3.0, color: "#222730", anchor: "top-left" })
         items = push(items, { kind: "rect", id: "pgf", x: 16.0, y: 72.0, w: (cwid - 32.0) * to_float(s.progress) / 100.0, h: 3.0, color: "#5bb8e8", anchor: "top-left" })
     } else if len(s.words) > 0 or s.dur_ms > 0.0 {
@@ -984,12 +1106,12 @@ fn render(w, h) {
         if single {
             items = btn(items, 432.0, 70.0, "⊢ start", "#243827", "#a0e0a0")
             items = btn(items, 510.0, 70.0, "end ⊣", "#243827", "#a0e0a0")
-            items = push(items, { kind: "text", id: "st", x: 590.0, y: 51.0, value: s.status, size: 11.0, color: "#8b93a1" })
+            items = push(items, { kind: "text", id: "st", x: 590.0, y: 51.0, value: s.status, size: 11.0, color: "#8b93a1", z: ztext() })
         } else {
-            items = push(items, { kind: "text", id: "st", x: 436.0, y: 51.0, value: s.status, size: 11.0, color: "#8b93a1" })
+            items = push(items, { kind: "text", id: "st", x: 436.0, y: 51.0, value: s.status, size: 11.0, color: "#8b93a1", z: ztext() })
         }
     } else if s.sel_name != "" {
-        items = push(items, { kind: "text", id: "st2", x: 16.0, y: 51.0, value: s.status, size: 12.0, color: "#8b93a1" })
+        items = push(items, { kind: "text", id: "st2", x: 16.0, y: 51.0, value: s.status, size: 12.0, color: "#8b93a1", z: ztext() })
     }
     items = push(items, { kind: "rect", id: "hd", x: 0.0, y: header_h() - 1.0, w: cwid, h: 1.0, color: "#1c212a", anchor: "top-left" })
 
@@ -1013,21 +1135,28 @@ fn render(w, h) {
                 if selr { items = push(items, { kind: "rect", id: "sl" + str(p.i), x: p.x - 2.0, y: sy - 1.0, w: p.w + 4.0, h: lh - 4.0, color: "#34507a", anchor: "top-left" }) }
                 else if p.i == curi { items = push(items, { kind: "rect", id: "hl" + str(p.i), x: p.x - 2.0, y: sy - 1.0, w: p.w + 4.0, h: lh - 4.0, color: "#2a3a4d", anchor: "top-left" }) }
                 let col = if wd.deleted { "#5a6472" } else if wd.filler { "#9a7bb0" } else if p.i == curi { "#bfeee2" } else { "#cdd3dc" }
-                items = push(items, { kind: "text", id: "w" + str(p.i), x: p.x, y: sy, value: wd.text, size: tsize(), color: col })
-                if wd.deleted { items = push(items, { kind: "rect", id: "st" + str(p.i), x: p.x, y: sy + tsize() * 0.5, w: p.w, h: 1.5, color: "#7a4040", anchor: "top-left" }) }
+                items = push(items, { kind: "text", id: "w" + str(p.i), x: p.x, y: sy, value: wd.text, size: tsize(), color: col, z: ztext() })
+                if wd.deleted { items = push(items, { kind: "rect", id: "st" + str(p.i), x: p.x, y: sy + tsize() * 0.5, w: p.w, h: 1.5, color: "#7a4040", anchor: "top-left", z: zmark() }) }
             } else {
-                let cut = match index_of(s.gaps_cut, p.i) { Some(_) => true, None => false }
-                items = push(items, { kind: "rect", id: "gp" + str(p.i), x: p.x, y: sy + 1.0, w: p.w, h: lh - 8.0, color: if cut { "#3a2730" } else { "#1a2330" }, anchor: "top-left" })
-                items = push(items, { kind: "text", id: "gt" + str(p.i), x: p.x + 6.0, y: sy + 2.0, value: "·· " + str(round(p.ms / 100.0) / 10.0) + "s", size: tsize() - 3.0, color: if cut { "#c08080" } else { "#6b8294" } })
+                // Pill shows the silence KEPT (scrub-shortened or full). Fully
+                // cut → red; partially scrubbed → amber; untouched → blue. Drag
+                // the number to scrub (Tangle-style); tap to fully cut/restore.
+                let kept = gap_kept_ms(s, p.i)
+                let fully = kept <= 1.0
+                let trimmed = kept < p.ms - 1.0
+                let bgcol = if fully { "#3a2730" } else if trimmed { "#33291a" } else { "#1a2330" }
+                let fgcol = if fully { "#c08080" } else if trimmed { "#d8b46a" } else { "#6b8294" }
+                items = push(items, { kind: "rect", id: "gp" + str(p.i), x: p.x, y: sy + 1.0, w: p.w, h: lh - 8.0, color: bgcol, anchor: "top-left" })
+                items = push(items, { kind: "text", id: "gt" + str(p.i), x: p.x + 6.0, y: sy + 2.0, value: "·· " + str(round(kept / 100.0) / 10.0) + "s", size: tsize() - 3.0, color: fgcol, z: ztext() })
             }
         }
         j = j + 1
     }
     if len(placed) == 0 and not s.transcribing and s.sel_name != "" {
-        items = push(items, { kind: "text", id: "empty", x: 18.0, y: header_h() + 10.0, value: "No transcript — click Re-do STT.", size: 13.0, color: "#5a6472" })
+        items = push(items, { kind: "text", id: "empty", x: 18.0, y: header_h() + 10.0, value: "No transcript — click Re-do STT.", size: 13.0, color: "#5a6472", z: ztext() })
     }
     if s.sel_name == "" {
-        items = push(items, { kind: "text", id: "pick", x: 18.0, y: header_h() + 10.0, value: "Pick a recording on the left.", size: 13.0, color: "#5a6472" })
+        items = push(items, { kind: "text", id: "pick", x: 18.0, y: header_h() + 10.0, value: "Pick a recording on the left.", size: 13.0, color: "#5a6472", z: ztext() })
     }
 
     // ---- waveform strip ----
@@ -1070,7 +1199,7 @@ fn render(w, h) {
         let phx = wx(s, s.cur_ms)
         if phx >= 12.0 and phx <= right { items = push(items, { kind: "rect", id: "wph", x: phx, y: wtop, w: 1.5, h: wave_h(), color: "#e8d99f", anchor: "top-left", z: 0.07 }) }
     } else if s.dur_ms <= 0.0 and s.sel_name != "" {
-        items = push(items, { kind: "text", id: "wpk", x: 16.0, y: (wtop + wbot) / 2.0, value: "reading waveform…", size: 12.0, color: "#5a6472" })
+        items = push(items, { kind: "text", id: "wpk", x: 16.0, y: (wtop + wbot) / 2.0, value: "reading waveform…", size: 12.0, color: "#5a6472", z: ztext() })
     }
 
     // ---- footer transport ----
@@ -1080,20 +1209,20 @@ fn render(w, h) {
         items = push(items, { kind: "rect", id: "ft", x: 0.0, y: h - footer_h(), w: cwid, h: footer_h(), color: "#10141a", anchor: "top-left" })
         items = push(items, { kind: "rect", id: "ftl", x: 0.0, y: h - footer_h(), w: cwid, h: 1.0, color: "#1c212a", anchor: "top-left" })
         items = push(items, { kind: "rect", id: "ppb", x: 12.0, y: fy - 3.0, w: 64.0, h: 28.0, color: "#243044", anchor: "top-left" })
-        items = push(items, { kind: "text", id: "ppt", x: 22.0, y: fy + 2.0, value: if s.playing { "⏸ Pause" } else { "▶ Play" }, size: 13.0, color: "#9fe0d0" })
-        items = push(items, { kind: "text", id: "tm", x: 86.0, y: fy + 2.0, value: fmt_time(s.cur_ms) + " / " + fmt_time(s.dur_ms), size: 12.0, color: "#9098a4" })
+        items = push(items, { kind: "text", id: "ppt", x: 22.0, y: fy + 2.0, value: if s.playing { "⏸ Pause" } else { "▶ Play" }, size: 13.0, color: "#9fe0d0", z: ztext() })
+        items = push(items, { kind: "text", id: "tm", x: 86.0, y: fy + 2.0, value: fmt_time(s.cur_ms) + " / " + fmt_time(s.dur_ms), size: 12.0, color: "#9098a4", z: ztext() })
         // zoom −/+
         items = push(items, { kind: "rect", id: "zmm", x: g.zm0, y: fy - 3.0, w: 28.0, h: 28.0, color: "#1a1e25", anchor: "top-left" })
-        items = push(items, { kind: "text", id: "zmmt", x: g.zm0 + 10.0, y: fy + 2.0, value: "−", size: 14.0, color: "#cdd3dc" })
+        items = push(items, { kind: "text", id: "zmmt", x: g.zm0 + 10.0, y: fy + 2.0, value: "−", size: 14.0, color: "#cdd3dc", z: ztext() })
         items = push(items, { kind: "rect", id: "zmp", x: g.zm0 + 32.0, y: fy - 3.0, w: 28.0, h: 28.0, color: "#1a1e25", anchor: "top-left" })
-        items = push(items, { kind: "text", id: "zmpt", x: g.zm0 + 42.0, y: fy + 2.0, value: "+", size: 14.0, color: "#cdd3dc" })
+        items = push(items, { kind: "text", id: "zmpt", x: g.zm0 + 42.0, y: fy + 2.0, value: "+", size: 14.0, color: "#cdd3dc", z: ztext() })
         // speed / preview / xfade
         items = push(items, { kind: "rect", id: "spb", x: g.sp0, y: fy - 3.0, w: g.sp1 - g.sp0, h: 28.0, color: "#2a2a20", anchor: "top-left" })
-        items = push(items, { kind: "text", id: "spt", x: g.sp0 + 8.0, y: fy + 2.0, value: str(s.speed) + "×", size: 12.0, color: "#e8d99f" })
+        items = push(items, { kind: "text", id: "spt", x: g.sp0 + 8.0, y: fy + 2.0, value: str(s.speed) + "×", size: 12.0, color: "#e8d99f", z: ztext() })
         items = push(items, { kind: "rect", id: "pvb", x: g.pv0, y: fy - 3.0, w: g.pv1 - g.pv0, h: 28.0, color: "#243044", anchor: "top-left" })
-        items = push(items, { kind: "text", id: "pvt", x: g.pv0 + 12.0, y: fy + 2.0, value: "Preview", size: 12.0, color: "#9fe0d0" })
+        items = push(items, { kind: "text", id: "pvt", x: g.pv0 + 12.0, y: fy + 2.0, value: "Preview", size: 12.0, color: "#9fe0d0", z: ztext() })
         items = push(items, { kind: "rect", id: "xfb", x: g.xf0, y: fy - 3.0, w: g.xf1 - g.xf0, h: 28.0, color: if s.xfade { "#1f3326" } else { "#26201f" }, anchor: "top-left" })
-        items = push(items, { kind: "text", id: "xft", x: g.xf0 + 8.0, y: fy + 2.0, value: if s.xfade { "xfade ✓" } else { "xfade ✕" }, size: 12.0, color: if s.xfade { "#9fe0c2" } else { "#a08080" } })
+        items = push(items, { kind: "text", id: "xft", x: g.xf0 + 8.0, y: fy + 2.0, value: if s.xfade { "xfade ✓" } else { "xfade ✕" }, size: 12.0, color: if s.xfade { "#9fe0c2" } else { "#a08080" }, z: ztext() })
     }
 
     // ---- help overlay ----
@@ -1103,15 +1232,15 @@ fn render(w, h) {
         let ph = 56.0 + to_float(len(lines)) * 22.0
         let px = (cwid - pw) / 2.0
         let py = (h - ph) / 2.0
-        items = push(items, { kind: "rect", id: "ovl", x: 0.0, y: 0.0, w: cwid, h: h, color: "#000a", anchor: "top-left" })
-        items = push(items, { kind: "rect", id: "hpbg", x: px, y: py, w: pw, h: ph, color: "#161a21", anchor: "top-left" })
-        items = push(items, { kind: "text", id: "hph", x: px + 18.0, y: py + 14.0, value: "Keyboard shortcuts", size: 14.0, weight: "bold", color: "#e7eaf0" })
+        items = push(items, { kind: "rect", id: "ovl", x: 0.0, y: 0.0, w: cwid, h: h, color: "#000a", anchor: "top-left", z: zoverlay() })
+        items = push(items, { kind: "rect", id: "hpbg", x: px, y: py, w: pw, h: ph, color: "#161a21", anchor: "top-left", z: zoverlay() + 0.02 })
+        items = push(items, { kind: "text", id: "hph", x: px + 18.0, y: py + 14.0, value: "Keyboard shortcuts", size: 14.0, weight: "bold", color: "#e7eaf0", z: zoverlaytext() })
         let mut li = 0
         while li < len(lines) {
-            items = push(items, { kind: "text", id: "hpl" + str(li), x: px + 18.0, y: py + 44.0 + to_float(li) * 22.0, value: lines[li], size: 12.0, color: "#cdd3dc", family: "mono" })
+            items = push(items, { kind: "text", id: "hpl" + str(li), x: px + 18.0, y: py + 44.0 + to_float(li) * 22.0, value: lines[li], size: 12.0, color: "#cdd3dc", family: "mono", z: zoverlaytext() })
             li = li + 1
         }
-        items = push(items, { kind: "text", id: "hpc", x: px + 18.0, y: py + ph - 22.0, value: "(click anywhere or ? / Esc to close)", size: 10.0, color: "#5a6472" })
+        items = push(items, { kind: "text", id: "hpc", x: px + 18.0, y: py + ph - 22.0, value: "(click anywhere or ? / Esc to close)", size: 10.0, color: "#5a6472", z: zoverlaytext() })
     }
 
     { kind: "hstack", pad: 0.0, gap: 0.0, children: [ side, divider, { kind: "canvas", style: { width: str(cwid), height: str(h) }, children: items } ] }

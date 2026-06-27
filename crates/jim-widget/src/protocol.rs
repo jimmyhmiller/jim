@@ -1191,7 +1191,10 @@ fn default_textarea_rows() -> u32 {
 
 /// One item inside an absolute-positioned `Canvas`. Position is
 /// pixel-space relative to the canvas top-left, y-down.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+///
+/// `PartialEq` so the host can detect a canvas item that is byte-identical
+/// to last frame and skip re-rendering it entirely — see `diff_render`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum CanvasItem {
     /// A textured sprite, optionally hue-shifted in HSV space.
@@ -1285,7 +1288,7 @@ pub enum CanvasAnchor {
 /// Reference to an image. Today only filesystem paths are supported;
 /// future variants might add a built-in registry of host-provided
 /// sprites or inline pixel buffers.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "image", rename_all = "kebab-case")]
 pub enum ImageRef {
     /// Filesystem path to a PNG/JPEG file. The host loads + caches the
