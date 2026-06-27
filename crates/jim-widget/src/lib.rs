@@ -61,6 +61,7 @@ pub mod glaze_material;
 pub mod glaze_style;
 pub mod layout;
 pub mod msgbus;
+pub mod playback;
 pub mod protocol;
 pub mod render;
 pub mod script_widget;

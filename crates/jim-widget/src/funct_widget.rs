@@ -56,9 +56,11 @@ use crate::script_widget::{HostToWorker, OutMsg, WorkerSlots};
 /// can be a host call (`highlight`/`parse_json`/a big allocation) costing
 /// milliseconds, so a fixed instruction budget bounds the wrong thing. We
 /// drive funct's epoch-interruption (`StopWhen::Epoch` + `set_deadline`) from
-/// ONE shared ~1ms ticker ([`shared_epoch_ticker`]) rather than funct's own
+/// ONE shared ~1ms ticker ([`EpochTicker`]) rather than funct's own
 /// per-VM `Deadline` ticker — which would be one always-on thread PER WIDGET.
-/// At [`EPOCH_TICK`] (1ms) per tick, this is a ~4ms slice.
+/// At [`EPOCH_TICK`] (1ms) per tick, this is a ~4ms slice. The ticker only
+/// runs while a worker is mid-execution (gated by [`EpochActive`]), so idle
+/// widgets cost nothing.
 ///
 /// (Caveat: the epoch is only checked BETWEEN funct instructions, never inside
 /// a single native host call, so a slow host fn still runs to completion.)
@@ -72,36 +74,93 @@ const RUNAWAY_SLICE_WARN: u64 = 50;
 /// Granularity of the shared epoch ticker.
 const EPOCH_TICK: Duration = Duration::from_millis(1);
 
-/// Register a VM's epoch counter with the single process-wide ticker thread,
-/// which advances every live registered epoch every [`EPOCH_TICK`]. This is
-/// what makes time-based slicing cost ONE background thread total instead of
-/// funct's lazily-spawned per-VM `Deadline` ticker (one always-on 1ms thread
-/// per widget — exactly the kind of idle CPU we avoid). Dead VMs' epochs
-/// (held weakly) are pruned as the ticker runs.
-fn register_shared_epoch(epoch: &std::sync::Arc<std::sync::atomic::AtomicU64>) {
+/// Shared state for the single process-wide epoch ticker. `epochs` holds
+/// every live VM's epoch counter weakly (dead widgets are pruned as the
+/// ticker runs). `active` counts how many workers are *mid-execution*; the
+/// ticker only advances epochs while it's > 0 and otherwise parks on `gate`
+/// at zero CPU. This is the key idle win: the old design slept 1ms in a
+/// bare loop forever once any funct widget existed (≈1000 wakeups/s even
+/// with every widget blocked on `recv`), defeating deep CPU idle. Now time
+/// only advances when there is actually a handler to time-slice.
+struct EpochTicker {
+    epochs: std::sync::Mutex<Vec<std::sync::Weak<std::sync::atomic::AtomicU64>>>,
+    active: std::sync::Mutex<usize>,
+    gate: std::sync::Condvar,
+}
+
+static EPOCH_TICKER: std::sync::OnceLock<EpochTicker> = std::sync::OnceLock::new();
+
+fn epoch_ticker() -> &'static EpochTicker {
+    EPOCH_TICKER.get_or_init(|| EpochTicker {
+        epochs: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::Mutex::new(0),
+        gate: std::sync::Condvar::new(),
+    })
+}
+
+/// The ticker thread body: park until a worker is executing, then advance
+/// every live epoch at [`EPOCH_TICK`] until execution stops again.
+fn epoch_ticker_loop(t: &'static EpochTicker) {
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex, OnceLock, Weak};
-    type Reg = Arc<Mutex<Vec<Weak<std::sync::atomic::AtomicU64>>>>;
-    static REG: OnceLock<Reg> = OnceLock::new();
-    let reg = REG.get_or_init(|| {
-        let reg: Reg = Arc::new(Mutex::new(Vec::new()));
-        let ticker = reg.clone();
+    loop {
+        // Park while nothing is executing — no wakeups, no CPU.
+        {
+            let mut active = t.active.lock().unwrap();
+            while *active == 0 {
+                active = t.gate.wait(active).unwrap();
+            }
+        }
+        std::thread::sleep(EPOCH_TICK);
+        let mut live = t.epochs.lock().unwrap();
+        live.retain(|w| match w.upgrade() {
+            Some(e) => {
+                e.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        });
+    }
+}
+
+/// Register a VM's epoch counter with the shared ticker, spawning the one
+/// ticker thread on first use (a process that never loads a funct widget
+/// pays nothing).
+fn register_shared_epoch(epoch: &std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    let t = epoch_ticker();
+    static SPAWN: std::sync::Once = std::sync::Once::new();
+    SPAWN.call_once(|| {
         let _ = std::thread::Builder::new()
             .name("funct-shared-epoch-ticker".into())
-            .spawn(move || loop {
-                std::thread::sleep(EPOCH_TICK);
-                let mut live = ticker.lock().unwrap();
-                live.retain(|w| match w.upgrade() {
-                    Some(e) => {
-                        e.fetch_add(1, Ordering::Relaxed);
-                        true
-                    }
-                    None => false,
-                });
-            });
-        reg
+            .spawn(|| epoch_ticker_loop(epoch_ticker()));
     });
-    reg.lock().unwrap().push(Arc::downgrade(epoch));
+    t.epochs.lock().unwrap().push(std::sync::Arc::downgrade(epoch));
+}
+
+/// RAII handle held by a worker while it is running fuel slices. Creating
+/// it bumps the active count (waking the parked ticker on the 0→1 edge);
+/// dropping it — when the job finishes OR the worker thread exits — releases
+/// the ticker back toward idle once no worker holds one.
+struct EpochActive;
+
+impl EpochActive {
+    fn acquire() -> Self {
+        let t = epoch_ticker();
+        let mut active = t.active.lock().unwrap();
+        *active += 1;
+        // Only meaningful on the 0→1 edge, but notifying unconditionally is
+        // cheap and correct (the ticker re-checks the count on wake).
+        t.gate.notify_one();
+        EpochActive
+    }
+}
+
+impl Drop for EpochActive {
+    fn drop(&mut self) {
+        let t = epoch_ticker();
+        let mut active = t.active.lock().unwrap();
+        *active = active.saturating_sub(1);
+        // No notify on the way down: the ticker only needs waking to *start*.
+    }
 }
 
 /// The shared host interface every funct widget imports with
@@ -240,6 +299,10 @@ struct FunctWorker {
     /// picture — the dominant source of frame spikes. Skipping the bump when
     /// the tree is identical means the host never re-renders, zero churn.
     last_frame_hash: Option<u64>,
+    /// Held while a job is in flight so the shared epoch ticker advances
+    /// (time-slicing this worker). `None` when idle — released the moment a
+    /// job finishes, or on thread exit via `Drop`, so the ticker can park.
+    epoch_active: Option<EpochActive>,
 }
 
 /// Stable content hash of a produced frame. Serializes the `Element` tree
@@ -846,6 +909,7 @@ pub(crate) fn funct_worker_main(
         job: None,
         persist_dirty: false,
         last_frame_hash: None,
+        epoch_active: None,
     };
 
     // ALWAYS evaluate the current source first — this re-reads the widget
@@ -884,7 +948,16 @@ pub(crate) fn funct_worker_main(
         }
 
         if worker.job.is_some() {
+            // Wake the shared epoch ticker for the duration of this job so
+            // `run_slice` can time-slice it; release it again the instant the
+            // job completes so the ticker parks while the worker idles.
+            if worker.epoch_active.is_none() {
+                worker.epoch_active = Some(EpochActive::acquire());
+            }
             worker.run_slice();
+            if worker.job.is_none() {
+                worker.epoch_active = None;
+            }
             continue;
         }
 
@@ -1284,6 +1357,42 @@ fn register_host_surface(
     });
     vm.register0("audio_recording", || -> bool { crate::audio::is_recording() });
     vm.register0("audio_status", || -> String { crate::audio::status() });
+
+    // ---- native audio playback (podcast editor) ----
+    // The cpal output callback reports the EXACT sample hitting the speaker, so
+    // the word-highlight playhead is sample-accurate instead of a wall-clock
+    // estimate against a spawned `ffplay` (see playback.rs). EDL clips are
+    // spliced with crossfades and variable speed is pitch-preserving WSOLA —
+    // no ffmpeg render, no latency fudge.
+    vm.register1("audio_play_load", |path: String| { crate::playback::load(&path); });
+    vm.register1("audio_play_ready", |path: String| -> bool {
+        crate::playback::is_ready(&path)
+    });
+    vm.register1("audio_play_failed", |path: String| -> bool {
+        crate::playback::is_failed(&path)
+    });
+    // clips_json is the EDL as `[{from,to}]` in ms (JSON string from `to_json`).
+    vm.register3(
+        "audio_play_start",
+        |start_ms: f64, clips_json: String, speed: f64| -> bool {
+            let clips: Vec<(f64, f64)> = serde_json::from_str::<Vec<serde_json::Value>>(&clips_json)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|c| {
+                    let from = c.get("from")?.as_f64()?;
+                    let to = c.get("to")?.as_f64()?;
+                    Some((from, to))
+                })
+                .collect();
+            crate::playback::start(start_ms, clips, speed)
+        },
+    );
+    vm.register1("audio_play_seek", |src_ms: f64| { crate::playback::seek(src_ms); });
+    vm.register1("audio_play_set_speed", |speed: f64| { crate::playback::set_speed(speed); });
+    vm.register0("audio_play_stop", || { crate::playback::stop(); });
+    vm.register0("audio_play_pos", || -> f64 { crate::playback::pos_ms() });
+    vm.register0("audio_playing", || -> bool { crate::playback::is_playing() });
+    vm.register0("audio_play_finished", || -> bool { crate::playback::is_finished() });
 
     // ---- widget<->widget message bus ----
     {

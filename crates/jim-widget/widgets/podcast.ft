@@ -40,8 +40,8 @@ fn init_state() = {
     time_overrides: [],   // [{i, t0, t1}] manual word-timing corrections
     status: "select a recording",
     transcribing: false, progress: 0, proc: -1, pk_proc: -1,
-    play_proc: -1, playing: false, play_edit: false, play_base: 0.0, play_start: 0.0, cur_ms: 0.0, speed: 1.0,
-    exp_proc: -1, exp_mode: "save", exp_out: "", play_from_src: 0.0,
+    playing: false, pending_play: -1.0, cur_ms: 0.0, speed: 1.0,   // pending_play: source-ms armed while the file decodes, else -1
+    exp_proc: -1, exp_mode: "save", exp_out: "",
     clips: [], edit_dirty: true,                  // EDL clips cache + "edited render is stale"
     xfade: true, show_help: false,
     scroll: 0.0, wzoom: 60.0, wscroll: 0.0,
@@ -180,6 +180,8 @@ fn save_edl() {
 
 fn select(name) {
     let s = @state
+    audio_play_stop()                  // stop any take of the previous recording
+    audio_play_load(rec_path(name))    // kick off async decode so play is instant
     let cw = read_file(cache_path(name))
     let edl = if cw.ok { apply_edits(parse_words(cw.text), name) } else { { words: [], gaps: [], gap_keep: [], regions: [], times: [] } }
     let pc = read_file(peaks_path(name))
@@ -187,6 +189,7 @@ fn select(name) {
     let dur = to_float(len(peaks)) * bucket_ms()
     let ns = { ..s, sel_name: name, words: edl.words, gaps_cut: edl.gaps, gap_keep: edl.gap_keep, regions: edl.regions, time_overrides: edl.times,
                peaks: peaks, sumsq: prefix_sumsq(peaks), dur_ms: dur, scroll: 0.0, wscroll: 0.0, cur_ms: 0.0,
+               playing: false, pending_play: -1.0,
                sel_kind: "none", sa: -1, sb: -1, ra: -1.0, rb: -1.0, edit_dirty: true,
                status: if cw.ok { str(len(edl.words)) + " words" } else { "transcribing…" } }
     reset!(state, recache({ ..ns, wzoom: if dur > 0.0 { fit_zoom(ns) } else { 60.0 } }))
@@ -331,24 +334,9 @@ fn removed_spans(clips, dur) {
     if cursor < dur { rem = push(rem, { from: cursor, to: dur }) }
     rem
 }
-// Edited timeline (kept clips concatenated) ↔ source-time mapping.
-fn edited_total(clips) { let mut t = 0.0 for c in clips { t = t + (c.to - c.from) } t }
-fn source_at(clips, te) {
-    // edited-ms → source-ms (the playhead jumps over removed spans)
-    let mut acc = 0.0
-    for c in clips { let d = c.to - c.from if te < acc + d { return c.from + (te - acc) } acc = acc + d }
-    if len(clips) > 0 { clips[len(clips) - 1].to } else { 0.0 }
-}
-fn edited_at(clips, src) {
-    // source-ms → edited-ms; if src is inside a removed span, snap to the next clip
-    let mut acc = 0.0
-    for c in clips {
-        if src < c.from { return acc }
-        if src <= c.to { return acc + (src - c.from) }
-        acc = acc + (c.to - c.from)
-    }
-    acc
-}
+// Edited-timeline ↔ source-time mapping now lives natively in playback.rs
+// (the cpal engine splices clips and reports a true source-ms playhead), so the
+// script no longer maps the playhead by hand.
 // Refresh the EDL clips cache and flag the edited render stale, after any edit.
 fn commit_edit(s) { { ..s, clips: edl_clips(s), edit_dirty: true } }
 
@@ -478,77 +466,51 @@ fn do_export() {
     reset!(state, { ..s, exp_proc: h, exp_mode: "save", exp_out: outp, status: "exporting…" })
     request_render()
 }
-fn play_path() = "/tmp/jimstt/play.wav"
-fn play_lat() = 90.0          // ms: ~ffplay start latency, so the highlight doesn't lead the audio
+fn rec_path(name) = rec_dir() + "/" + name
 fn stop_play() {
-    let s = @state
-    if s.play_proc != -1 { proc_kill(s.play_proc) }
+    audio_play_stop()
     set_tick_interval(0.0)
-    reset!(state, { ..s, play_proc: -1, playing: false })
+    reset!(state, { ..(@state), playing: false, pending_play: -1.0 })
     // Ticks just stopped, so on_frame won't redraw — ask for one render so the
     // transport flips ⏸ Pause → ▶ Play immediately (both on a manual pause and
     // when playback ends). Without this the button stays "Pause" until some
     // other event (e.g. a resize) forces a re-render.
     request_render()
 }
-// Play the rendered EDITED file from edited-ms `te`. on_frame maps the edited
-// playhead back to source-ms so the word highlight + waveform cursor track it
-// (and jump over removed spans).
-fn start_edit_play(te) {
+// Begin (or seamlessly restart) NATIVE playback of the kept EDL from source-ms
+// `src`. The cpal engine (playback.rs) splices the clips with crossfades and
+// reports a sample-accurate source-ms playhead (audio_play_pos) that on_frame
+// reads — no ffplay subprocess, no wall-clock estimate, no latency fudge, no
+// pre-render. If the file is still decoding, arm `pending_play` and let
+// on_frame fire it the instant the decode is ready.
+fn start_playback(src) {
     let s = @state
-    if s.play_proc != -1 { proc_kill(s.play_proc) }
-    let h = proc_spawn("ffplay", ["-nodisp", "-autoexit", "-loglevel", "error", "-af", "atempo=" + str(s.speed), "-ss", str(te / 1000.0), play_path()])
-    set_tick_interval(0.05)
-    reset!(state, { ..s, play_proc: h, playing: true, play_edit: true, play_base: te, play_start: time() })
-    request_render()
-}
-// The source-ms at which playback stops: in edited mode it's the end of the
-// concatenated edited timeline; in source mode it's the end of the (single)
-// kept clip — never the physical end of the file, so trailing silence past
-// the last kept word isn't played.
-fn last_clip_to(s) = if len(s.clips) > 0 { s.clips[len(s.clips) - 1].to } else { s.dur_ms }
-// A single contiguous kept span needs no splice: the edited audio is exactly
-// source[clip.from..clip.to]. So play the ORIGINAL file directly (seek with
-// -ss, stop at the span end) with ZERO ffmpeg render — playback is instant.
-// Only a multi-clip timeline (real internal cuts) needs the pre-rendered WAV.
-// This is the common case (just loaded a recording, or only head/tail
-// trimmed), so it's what kills the "huge delay before audio starts".
-fn start_play_at(src) {
-    let s = @state
-    if len(s.clips) > 1 { start_edit_play(edited_at(s.clips, src)); return }
-    if s.play_proc != -1 { proc_kill(s.play_proc) }
-    let from = max(src, if len(s.clips) > 0 { s.clips[0].from } else { 0.0 })
-    let h = proc_spawn("ffplay", ["-nodisp", "-autoexit", "-loglevel", "error", "-af", "atempo=" + str(s.speed), "-ss", str(from / 1000.0), rec_dir() + "/" + s.sel_name])
-    set_tick_interval(0.05)
-    // play_edit:false → on_frame maps the playhead 1:1 in source-ms.
-    reset!(state, { ..s, play_proc: h, playing: true, play_edit: false, play_base: from, play_start: time() })
-    request_render()
-}
-// Can we re-seek instantly while playing? Yes for single-span source playback
-// (no render), or when the multi-clip edited render is already up to date.
-fn can_seek(s) = len(s.clips) <= 1 or not s.edit_dirty
-fn play_edited_from(src) {
-    let s = @state
+    if s.sel_name == "" { return }
     if len(s.clips) == 0 { reset!(state, { ..s, status: "nothing kept" }); request_render(); return }
-    if len(s.clips) > 1 and s.edit_dirty {
-        // Multiple kept segments must be concatenated gaplessly: (re)render the
-        // edited timeline once, then play it (on_proc_exit launches playback).
-        let h = proc_spawn("sh", ["-c", export_cmd(rec_dir() + "/" + s.sel_name, s.clips, play_path(), s.xfade)])
-        reset!(state, { ..s, exp_proc: h, exp_mode: "play", play_from_src: src, status: "preparing…" })
-        request_render()
-    } else {
-        start_play_at(src)
+    if audio_play_failed(rec_path(s.sel_name)) {
+        reset!(state, { ..s, pending_play: -1.0, playing: false, status: "decode failed" }); request_render(); return
     }
+    set_tick_interval(0.05)
+    if not audio_play_ready(rec_path(s.sel_name)) {
+        reset!(state, { ..s, pending_play: src, playing: false, status: "preparing…" })
+        request_render()
+        return
+    }
+    audio_play_start(src, to_json(s.clips), s.speed)
+    reset!(state, { ..s, playing: true, pending_play: -1.0, cur_ms: src })
+    request_render()
 }
 fn play_pause() {
     let s = @state
-    if s.playing { stop_play() } else if s.sel_name != "" { play_edited_from(s.cur_ms) }
+    if s.playing or s.pending_play >= 0.0 { stop_play() }
+    else if s.sel_name != "" { start_playback(s.cur_ms) }
 }
 fn seek(ms) {
     let s = @state
     let m = max(0.0, min(s.dur_ms, ms))
     reset!(state, { ..s, cur_ms: m })
-    if s.playing and can_seek(s) { start_play_at(m) } else { request_render() }
+    if s.playing { audio_play_seek(m) }   // live, instant — no stream rebuild
+    request_render()
 }
 fn on_frame(dt) {
     let s = @state
@@ -558,19 +520,30 @@ fn on_frame(dt) {
     if s.pending_layout and (time() - s.resize_t) > 0.15 {
         let ns = { ..s, pending_layout: false, wzoom: if s.dur_ms > 0.0 and s.wscroll == 0.0 { fit_zoom(s) } else { s.wzoom } }
         reset!(state, recache(ns))
-        if not (@state).playing { set_tick_interval(0.0) }
+        let cur = @state
+        if not cur.playing and cur.pending_play < 0.0 { set_tick_interval(0.0) }
         request_render()
         return
     }
+    // Waiting on the async decode before playback can start.
+    if s.pending_play >= 0.0 {
+        if audio_play_ready(rec_path(s.sel_name)) {
+            let from = s.pending_play
+            audio_play_start(from, to_json(s.clips), s.speed)
+            reset!(state, { ..s, playing: true, pending_play: -1.0, cur_ms: from })
+            request_render()
+        } else if audio_play_failed(rec_path(s.sel_name)) {
+            set_tick_interval(0.0)
+            reset!(state, { ..s, pending_play: -1.0, status: "decode failed" })
+            request_render()
+        }
+        return
+    }
     if not s.playing { if not s.pending_layout { set_tick_interval(0.0) } return }
-    let elapsed = max(0.0, (time() - s.play_start) * 1000.0 * s.speed - play_lat())
-    let te = s.play_base + elapsed
-    // Stop at the timeline end (edited mode) or the kept-span end (source mode).
-    let stop_at = if s.play_edit { edited_total(s.clips) } else { last_clip_to(s) }
-    if te >= stop_at { stop_play(); return }
-    let newcur = if s.play_edit { source_at(s.clips, te) } else { te }
-    let curi = word_idx_at(s.words, newcur)
-    reset!(state, { ..s, cur_ms: newcur, scroll: follow_scroll(s, curi) })   // auto-scroll to follow
+    if audio_play_finished() { stop_play(); return }
+    let p = audio_play_pos()                 // true, sample-accurate source-ms
+    let curi = word_idx_at(s.words, p)
+    reset!(state, { ..s, cur_ms: p, scroll: follow_scroll(s, curi) })   // auto-scroll to follow
     request_render()
 }
 fn cycle_speed() {
@@ -581,7 +554,8 @@ fn cycle_speed() {
     while j < len(speeds) { if speeds[j] == s.speed { idx = j } j = j + 1 }
     let ni = if idx + 1 >= len(speeds) { 0 } else { idx + 1 }
     reset!(state, { ..s, speed: speeds[ni] })
-    if s.playing and can_seek(s) { start_play_at(s.cur_ms) } else { request_render() }
+    if s.playing { audio_play_set_speed(speeds[ni]) }   // live, pitch-preserving
+    request_render()
 }
 
 // ---- geometry --------------------------------------------------------------
@@ -805,7 +779,7 @@ fn on_click(x, y, shift, cmd, id) {
         if cx >= 12.0 and cx <= 76.0 { play_pause(); return }
         let t = footer_geo(s.w - sbw() - 1.0)
         if cx >= t.sp0 and cx <= t.sp1 { cycle_speed(); return }
-        if cx >= t.pv0 and cx <= t.pv1 { play_edited_from(0.0); return }
+        if cx >= t.pv0 and cx <= t.pv1 { start_playback(0.0); return }
         if cx >= t.xf0 and cx <= t.xf1 { reset!(state, { ..s, xfade: not s.xfade }); request_render(); return }
         if cx >= t.zm0 and cx <= t.zm0 + 28.0 { reset!(state, zoom_to(s, s.wzoom / 1.6, s.cur_ms)); request_render(); return }
         if cx >= t.zm0 + 32.0 and cx <= t.zm0 + 60.0 { reset!(state, zoom_to(s, s.wzoom * 1.6, s.cur_ms)); request_render(); return }
@@ -818,7 +792,7 @@ fn on_click(x, y, shift, cmd, id) {
         // the playhead); a DRAG selects a region (handled in on_drag).
         let ms = max(0.0, min(s.dur_ms, wms(s, cx)))
         reset!(state, { ..s, cur_ms: ms, drag_target: "wave", wave_press: ms, wave_press_x: cx, dragging: false })
-        if s.playing and can_seek(s) { start_play_at(ms) } else { request_render() }
+        if s.playing { audio_play_seek(ms) } else { request_render() }
         return
     }
     // transcript
@@ -834,7 +808,7 @@ fn on_click(x, y, shift, cmd, id) {
         let na = if shift and s.sel_kind == "words" and s.sa >= 0 { s.sa } else { p.i }
         let cur = to_float(s.words[p.i].t0)
         reset!(state, { ..s, sel_kind: "words", sa: na, sb: p.i, ra: -1.0, rb: -1.0, drag_target: "transcript", dragging: false, cur_ms: cur })
-        if not shift and s.playing and can_seek(s) { start_play_at(cur) } else { request_render() }
+        if not shift and s.playing { audio_play_seek(cur) } else { request_render() }
     }
 }
 fn on_drag(x, y) {
@@ -978,18 +952,13 @@ fn on_proc_exit(handle, code) {
         return
     }
     if handle == s.exp_proc {
+        // Export (file render) is still ffmpeg — it's a file artifact, not the
+        // timing-critical playback path, so no native engine needed here.
         let ok = code == 0
-        if s.exp_mode == "play" {
-            reset!(state, { ..s, exp_proc: -1, edit_dirty: not ok })
-            if ok { start_edit_play(edited_at(s.clips, s.play_from_src)) }
-            else { reset!(state, { ..(@state), status: "render failed" }); request_render() }
-        } else {
-            reset!(state, { ..s, exp_proc: -1, status: if ok { "exported → " + s.exp_out } else { "export failed" } })
-            request_render()
-        }
+        reset!(state, { ..s, exp_proc: -1, status: if ok { "exported → " + s.exp_out } else { "export failed" } })
+        request_render()
         return
     }
-    if handle == s.play_proc { reset!(state, { ..s, playing: false, play_proc: -1 }); set_tick_interval(0.0); request_render() }
 }
 fn on_message(topic, payload, sender) {
     if topic == "podcast.open" { let n = unwrap_or(get(payload, "name"), ""); if n != "" { select(n) } }

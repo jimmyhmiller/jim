@@ -101,24 +101,33 @@ fi
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS/$EXEC_NAME" 2>/dev/null || true
 
 # Pick a signing identity. A STABLE (self-signed) identity keeps the
-# bundle's code identity constant across rebuilds, so macOS TCC grants
-# (Microphone, Documents/Desktop/Downloads, Full Disk Access, …) persist
-# instead of resetting every build — that reset is why the OS re-prompts
-# for file access "all the time" under ad-hoc signing. Falls back to
-# ad-hoc if the identity isn't set up; run ./scripts/setup-signing.sh once to
-# create it. Override the name via TB_SIGN_IDENTITY.
+# bundle's code identity constant across rebuilds, so macOS keys EVERY
+# identity-scoped grant to it and they persist instead of resetting each
+# build. That covers not just file/mic TCC, but the Developer Tools
+# exemption (Privacy & Security → Developer Tools) — the grant that stops
+# macOS re-running its "Verifying…" malware scan on every freshly built
+# binary you launch from a shell inside Jim. Ad-hoc signing derives the
+# identity from the cdhash (changes every build), so it silently breaks all
+# of those. We therefore self-heal: if the identity is missing, create it
+# (setup-signing.sh) rather than degrading to ad-hoc. Override via
+# TB_SIGN_IDENTITY.
 SIGN_ID="${TB_SIGN_IDENTITY:-TerminalBevy Local Signing}"
 # NB: no -v — a self-signed identity is untrusted by Gatekeeper, which
 # -v filters out, but codesign still signs with it and the resulting
 # designated requirement (cert-leaf anchored) is stable across rebuilds.
+if ! security find-identity -p codesigning 2>/dev/null | grep -qF "$SIGN_ID"; then
+    echo "[make-bundle] signing identity '$SIGN_ID' missing — creating it so the code"
+    echo "[make-bundle] identity (and every TCC / Developer-Tools grant keyed to it) stays stable…"
+    ./scripts/setup-signing.sh || true
+fi
 if security find-identity -p codesigning 2>/dev/null | grep -qF "$SIGN_ID"; then
     SIGN_ARG="$SIGN_ID"
     echo "[make-bundle] signing with stable identity: $SIGN_ID"
 else
     SIGN_ARG="-"
-    echo "[make-bundle] WARNING: '$SIGN_ID' not found — signing AD-HOC." >&2
-    echo "[make-bundle]          TCC grants (mic, Documents, Full Disk) will reset on each rebuild." >&2
-    echo "[make-bundle]          Run ./scripts/setup-signing.sh once to fix." >&2
+    echo "[make-bundle] WARNING: could not create '$SIGN_ID' — signing AD-HOC." >&2
+    echo "[make-bundle]          Identity-scoped grants (mic, Documents, Full Disk, Developer Tools)" >&2
+    echo "[make-bundle]          will reset on each rebuild. Run ./scripts/setup-signing.sh by hand." >&2
 fi
 
 # install_name_tool invalidated the existing signature. Re-sign nested
