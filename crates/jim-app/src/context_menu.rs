@@ -37,6 +37,8 @@ const FONT_SIZE: f32 = 12.0;
 pub enum ContextAction {
     Pin,
     Unpin,
+    /// Move a gathered pane back out of its nested canvas, one level up.
+    EjectFromCanvas,
     Close,
 }
 
@@ -45,6 +47,7 @@ impl ContextAction {
         match self {
             ContextAction::Pin => "Pin to background",
             ContextAction::Unpin => "Unpin",
+            ContextAction::EjectFromCanvas => "Move out of canvas",
             ContextAction::Close => "Close",
         }
     }
@@ -99,7 +102,9 @@ fn context_open_close(
     mut menu: ResMut<ContextMenu>,
     mut consumed: ResMut<InputConsumed>,
     panes: Query<(Entity, &PaneRect, &Visibility, Has<PanePinned>), With<PaneTag>>,
+    gathered: Query<&jim_pane::PaneCanvas>,
     mut pending: ResMut<PendingPaneActions>,
+    mut eject: ResMut<crate::canvas_pane::CanvasEjectQueue>,
     _projects: Res<Projects>,
 ) {
     let Ok(window) = windows.single() else {
@@ -164,11 +169,18 @@ fn context_open_close(
             .find(|(e, _, _)| *e == target)
             .map(|(_, _, p)| *p)
             .unwrap_or(false);
-        let items = if is_pinned {
-            vec![ContextAction::Unpin, ContextAction::Close]
+        // Offer "Move out of canvas" when this pane is gathered into a
+        // nested canvas (PaneCanvas != 0).
+        let in_canvas = gathered.get(target).map(|c| c.0 != 0).unwrap_or(false);
+        let mut items = if is_pinned {
+            vec![ContextAction::Unpin]
         } else {
-            vec![ContextAction::Pin, ContextAction::Close]
+            vec![ContextAction::Pin]
         };
+        if in_canvas {
+            items.push(ContextAction::EjectFromCanvas);
+        }
+        items.push(ContextAction::Close);
         menu.origin = Some(pt);
         menu.target = Some(target);
         menu.items = items;
@@ -188,6 +200,7 @@ fn context_open_close(
         match (pick, target) {
             (Some(ContextAction::Pin), Some(e)) => pending.pin.push(e),
             (Some(ContextAction::Unpin), Some(e)) => pending.unpin.push(e),
+            (Some(ContextAction::EjectFromCanvas), Some(e)) => eject.0.push(e),
             (Some(ContextAction::Close), Some(e)) => pending.close.push(e),
             _ => {}
         }

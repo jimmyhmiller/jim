@@ -97,23 +97,26 @@ impl CanvasViewState {
 pub const MIN_ZOOM: f32 = 0.2;
 pub const MAX_ZOOM: f32 = 4.0;
 
-/// Live per-project view. The active project's state is read by every
-/// projection / inverse-projection system; other projects' states sit
-/// here until the user switches.
+/// Identifies one pan/zoom surface: a `(project, canvas)` pair where
+/// `canvas == 0` is the project's root canvas and a non-zero id is a
+/// nested canvas (see [`jim_pane::PaneCanvas`]). Each nesting level keeps
+/// its own independent pan/zoom.
+pub type LevelKey = (u64, u64);
+
+/// Live per-level view. The active level's state is read by every
+/// projection / inverse-projection system; other levels' states sit here
+/// until the user switches project or descends/ascends a canvas.
 #[derive(Resource, Default)]
 pub struct CanvasView {
-    pub per_project: HashMap<u64, CanvasViewState>,
+    pub per_level: HashMap<LevelKey, CanvasViewState>,
 }
 
 impl CanvasView {
-    pub fn state_for(&self, project_id: u64) -> CanvasViewState {
-        self.per_project
-            .get(&project_id)
-            .copied()
-            .unwrap_or_default()
+    pub fn state_for(&self, level: LevelKey) -> CanvasViewState {
+        self.per_level.get(&level).copied().unwrap_or_default()
     }
-    pub fn state_mut(&mut self, project_id: u64) -> &mut CanvasViewState {
-        self.per_project.entry(project_id).or_default()
+    pub fn state_mut(&mut self, level: LevelKey) -> &mut CanvasViewState {
+        self.per_level.entry(level).or_default()
     }
 }
 
@@ -285,8 +288,9 @@ pub fn zoom_active(world: &mut World, factor: f32) {
             None => return,
         }
     };
+    let canvas = world.resource::<crate::canvas_pane::CanvasNav>().level(active);
     let mut view = world.resource_mut::<CanvasView>();
-    let state = view.state_mut(active);
+    let state = view.state_mut((active, canvas));
     let before = unproject_pos(center, state, origin);
     state.zoom = (state.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
     let after = unproject_pos(center, state, origin);
@@ -300,8 +304,9 @@ pub fn zoom_reset_active(world: &mut World) {
     let Some(active) = world.resource::<Projects>().active else {
         return;
     };
+    let canvas = world.resource::<crate::canvas_pane::CanvasNav>().level(active);
     let mut view = world.resource_mut::<CanvasView>();
-    let state = view.state_mut(active);
+    let state = view.state_mut((active, canvas));
     state.zoom = 1.0;
     state.clamp_pan();
 }
@@ -316,6 +321,7 @@ fn publish_canvas_region(
     sidebar: Res<Sidebar>,
     view: Res<CanvasView>,
     projects: Res<Projects>,
+    nav: Res<crate::canvas_pane::CanvasNav>,
     config: Res<CanvasConfig>,
     mut region: ResMut<PaneCanvasRegion>,
     mut block_zones: ResMut<PaneInputBlockZones>,
@@ -346,7 +352,7 @@ fn publish_canvas_region(
     // it to position/scale panes and to convert cursor↔canvas.
     let state = projects
         .active
-        .map(|a| view.state_for(a))
+        .map(|a| view.state_for((a, nav.level(a))))
         .unwrap_or_default();
     let zoom = if config.zoom_enabled { state.zoom } else { 1.0 };
     let want_vp = jim_pane::PaneViewport {
@@ -382,6 +388,7 @@ fn handle_pan_zoom_input(
     sidebar: Res<Sidebar>,
     config: Res<CanvasConfig>,
     projects: Res<Projects>,
+    nav: Res<crate::canvas_pane::CanvasNav>,
     mut view: ResMut<CanvasView>,
     mut drag: ResMut<PanDragState>,
     panes: Query<(&PaneRect, Option<&Visibility>), With<PaneTag>>,
@@ -403,6 +410,9 @@ fn handle_pan_zoom_input(
     let Some(active) = projects.active else {
         return;
     };
+    // Pan/zoom operate on the canvas level the user is currently viewing
+    // in the active project (root = 0).
+    let level = (active, nav.level(active));
 
     // Sidebar (or any host block-zone) eats canvas input.
     let in_block_zone = pt.x < sidebar.width
@@ -444,7 +454,7 @@ fn handle_pan_zoom_input(
     // it, so the canvas doesn't zoom underneath it. The pane kind handles the
     // `PinchGesture` events itself.
     let pinch_over_capture_pane = had_pinch && {
-        let cursor_canvas = unproject_pos(pt, &view.state_for(active), screen_origin(&sidebar));
+        let cursor_canvas = unproject_pos(pt, &view.state_for(level), screen_origin(&sidebar));
         let rects: Vec<(Entity, PaneRect)> = capture_panes
             .iter()
             .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
@@ -459,7 +469,7 @@ fn handle_pan_zoom_input(
         && config.pinch_to_zoom
     {
         let origin = screen_origin(&sidebar);
-        let state = view.state_mut(active);
+        let state = view.state_mut(level);
         // Pinch delta is per-event scale change. Amplify by `pinch_gain`
         // and apply multiplicatively so consecutive pinch events
         // compose cleanly.
@@ -475,7 +485,7 @@ fn handle_pan_zoom_input(
     if had_wheel && cmd_held && !in_block_zone {
         if alt_held && config.zoom_enabled && config.zoom_with_cmd_scroll {
             let origin = screen_origin(&sidebar);
-            let state = view.state_mut(active);
+            let state = view.state_mut(level);
             // Zoom factor from total wheel y. Each "line" (16 px after
             // our scale) multiplies by zoom_per_line.
             let lines = wheel_total.y / 16.0;
@@ -489,7 +499,7 @@ fn handle_pan_zoom_input(
             state.clamp_pan();
             consumed.0 = true;
         } else if config.pan.trackpad_scroll {
-            let state = view.state_mut(active);
+            let state = view.state_mut(level);
             // Viewport-pan vertical: two-finger swipe up = view moves up
             // (panes appear to scroll down on screen). Horizontal keeps
             // the "drag canvas with fingers" sign.
@@ -523,7 +533,7 @@ fn handle_pan_zoom_input(
             // Only when the click DIDN'T land on a visible pane. Pane
             // rects are canvas-space — compare to cursor in canvas
             // coords.
-            let state_for_active = view.state_for(active);
+            let state_for_active = view.state_for(level);
             let origin = screen_origin(&sidebar);
             let pt_canvas = unproject_pos(pt, &state_for_active, origin);
             let on_pane = panes.iter().any(|(r, vis)| {
@@ -555,7 +565,7 @@ fn handle_pan_zoom_input(
         } else {
             let delta_screen = pt - drag.last_pt;
             drag.last_pt = pt;
-            let state = view.state_mut(active);
+            let state = view.state_mut(level);
             // Drag canvas-with-cursor: moving the cursor right pans the
             // canvas right (pan decreases, since pan is "canvas point
             // at screen_origin").
@@ -584,17 +594,27 @@ fn handle_pan_zoom_input(
 /// the canvas drifting off the top-left edge.
 fn jump_to_double_clicked_pane(
     mut events: MessageReader<PaneDoubleClicked>,
-    panes: Query<(&PaneRect, Option<&PaneProject>)>,
+    panes: Query<(
+        &PaneRect,
+        Option<&PaneProject>,
+        Option<&jim_pane::PaneCanvas>,
+        Has<crate::canvas_pane::CanvasPane>,
+    )>,
     projects: Res<Projects>,
     mut view: ResMut<CanvasView>,
 ) {
     const JUMP_MARGIN: f32 = 24.0;
     for ev in events.read() {
-        let Ok((rect, proj)) = panes.get(ev.pane) else { continue };
+        let Ok((rect, proj, canvas, is_tile)) = panes.get(ev.pane) else { continue };
+        // Double-clicking a nested-canvas tile descends into it (handled
+        // by `canvas_pane`), so don't also yank the view around here.
+        if is_tile {
+            continue;
+        }
         // Pane belongs to its own project (most cases) or the active
         // one if it's project-less.
         let Some(pid) = proj.map(|p| p.0).or(projects.active) else { continue };
-        let state = view.state_mut(pid);
+        let state = view.state_mut((pid, canvas.map_or(0, |c| c.0)));
         // Only jump when zoomed away from native. At zoom 1 the pane is
         // already at full size, so a double-click shouldn't yank the
         // view around — it's almost certainly meant for the pane itself.
@@ -617,6 +637,7 @@ fn cycle_config_hotkey(
     owner: Res<jim_pane::KeyboardOwner>,
     mut view: ResMut<CanvasView>,
     projects: Res<Projects>,
+    nav: Res<crate::canvas_pane::CanvasNav>,
 ) {
     if owner.is_modal() {
         events.clear();
@@ -653,7 +674,7 @@ fn cycle_config_hotkey(
     }
     if fire_reset {
         if let Some(id) = projects.active {
-            let state = view.state_mut(id);
+            let state = view.state_mut((id, nav.level(id)));
             state.pan = Vec2::ZERO;
             state.zoom = 1.0;
             eprintln!("[canvas] view reset for project {}", id);
@@ -709,6 +730,7 @@ fn sync_origin_indicators(
     sidebar: Res<Sidebar>,
     view: Res<CanvasView>,
     projects: Res<Projects>,
+    nav: Res<crate::canvas_pane::CanvasNav>,
     theme: Res<jim_style::Theme>,
     mut init: Local<OriginIndicatorsInit>,
     mut strips: Query<(&OriginStripLayer, &mut Sprite, &mut Transform)>,
@@ -747,7 +769,9 @@ fn sync_origin_indicators(
     }
 
     let active = projects.active;
-    let state = active.map(|a| view.state_for(a)).unwrap_or_default();
+    let state = active
+        .map(|a| view.state_for((a, nav.level(a))))
+        .unwrap_or_default();
     let pan = state.pan;
     let zoom = state.zoom.max(0.0001);
 

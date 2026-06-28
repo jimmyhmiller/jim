@@ -27,6 +27,7 @@ use jim_terminal::{
 pub mod actions;
 pub mod agent;
 pub mod canvas;
+pub mod canvas_pane;
 pub mod command_palette;
 pub mod claude_events_pane;
 pub mod context_menu;
@@ -208,6 +209,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(projects::ProjectsPlugin)
             .add_plugins(actions::ActionsPlugin)
             .add_plugins(canvas::CanvasPlugin)
+            .add_plugins(canvas_pane::CanvasPanePlugin)
             .add_plugins(context_menu::ContextMenuPlugin)
             .add_plugins(cube::CubePlugin)
             .add_plugins(radial::RadialPlugin)

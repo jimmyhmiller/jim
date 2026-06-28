@@ -553,7 +553,17 @@ fn overview_apply(
         Res<crate::projects::Sidebar>,
     ),
     windows: Query<&Window>,
-    panes: Query<(Entity, &PaneRect, &PaneProject, Has<PanePinned>, &PaneLayer), With<PaneTag>>,
+    panes: Query<
+        (
+            Entity,
+            &PaneRect,
+            &PaneProject,
+            Has<PanePinned>,
+            &PaneLayer,
+            Option<&jim_pane::PaneCanvas>,
+        ),
+        With<PaneTag>,
+    >,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -716,7 +726,17 @@ fn build(
     viewport: &jim_pane::PaneViewport,
     sidebar_width: f32,
     window: &Window,
-    panes: &Query<(Entity, &PaneRect, &PaneProject, Has<PanePinned>, &PaneLayer), With<PaneTag>>,
+    panes: &Query<
+        (
+            Entity,
+            &PaneRect,
+            &PaneProject,
+            Has<PanePinned>,
+            &PaneLayer,
+            Option<&jim_pane::PaneCanvas>,
+        ),
+        With<PaneTag>,
+    >,
     images: &mut Assets<Image>,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
@@ -767,7 +787,13 @@ fn build(
     // assert uniqueness here where the cube relies on it.
     let mut by_project: BTreeMap<u64, Vec<(Entity, PaneRect, bool, usize)>> = BTreeMap::new();
     let mut seen_layers: std::collections::HashMap<usize, Entity> = std::collections::HashMap::new();
-    for (e, rect, proj, pinned, layer) in panes.iter() {
+    for (e, rect, proj, pinned, layer, canvas) in panes.iter() {
+        // The cube shows each project's ROOT canvas only. Panes gathered
+        // into a nested canvas (PaneCanvas != 0) are hidden inside their
+        // tile and would otherwise pile onto the face.
+        if canvas.map_or(0, |c| c.0) != 0 {
+            continue;
+        }
         if let Some(prev) = seen_layers.insert(layer.0, e) {
             panic!(
                 "panes {prev:?} and {e:?} share render layer {} — per-pane render \
@@ -922,8 +948,9 @@ fn build(
         let k = (face_w * params.face_fill / bbox.x).min(FACE_HEIGHT * params.face_fill / bbox.y);
 
         // This project's live pan/zoom — used to place panes exactly where
-        // the flat view shows them, for the seamless dive morph.
-        let view = canvas_view.state_for(pid);
+        // the flat view shows them, for the seamless dive morph. The cube
+        // shows each project's root canvas (level 0).
+        let view = canvas_view.state_for((pid, 0));
 
         let mut ordered: Vec<&(Entity, PaneRect, bool, usize)> = plist.iter().collect();
         ordered.sort_by(|a, b| a.1.z.partial_cmp(&b.1.z).unwrap_or(std::cmp::Ordering::Equal));

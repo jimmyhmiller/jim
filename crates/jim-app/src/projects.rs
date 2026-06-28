@@ -166,9 +166,16 @@ struct PersistedState {
     panes: Vec<PaneSnapshot>,
     #[serde(default)]
     next_terminal_id: u64,
-    /// Per-project canvas view (pan + zoom). Keyed by project id as a
-    /// string for JSON friendliness. `serde(default)` keeps old saves
-    /// loadable; missing projects use the default view.
+    /// Next nested-canvas id to hand out (see [`Projects::next_canvas_id`]).
+    #[serde(default)]
+    next_canvas_id: u64,
+    /// Next per-pane thumbnail id (see [`Projects::next_snap_id`]).
+    #[serde(default)]
+    next_snap_id: u64,
+    /// Per-level canvas view (pan + zoom). Keyed by `"project:canvas"` as
+    /// a string for JSON friendliness (`canvas == 0` is the project
+    /// root). `serde(default)` keeps old saves loadable; missing levels
+    /// use the default view.
     #[serde(default)]
     canvas_views: std::collections::HashMap<String, crate::canvas::CanvasViewState>,
 }
@@ -236,6 +243,14 @@ pub struct Projects {
     /// Counter for `TerminalSession` ids. Bumped on every spawn (new or
     /// restored) so we never collide with an existing scrollback file.
     pub next_terminal_id: u64,
+    /// Counter for nested-canvas ids (see [`jim_pane::PaneCanvas`]).
+    /// Globally unique across projects; `0` is reserved for "root
+    /// canvas", so allocation starts at 1. Bumped when a `canvas` tile is
+    /// created and persisted so restored tiles never collide.
+    pub next_canvas_id: u64,
+    /// Counter for per-pane thumbnail ids (see [`jim_pane::PaneSnapId`]).
+    /// `0` = none; allocation starts at 1.
+    pub next_snap_id: u64,
     /// Set when the on-disk file is out of date.
     pub dirty: bool,
     /// Set when the sidebar entity tree needs rebuilding (rows added /
@@ -278,17 +293,52 @@ impl Projects {
             .next_terminal_id
             .max(legacy_max_session.max(panes_max_session))
             .max(1);
+        // Guard the canvas counter against hand-edited / legacy saves the
+        // same way as terminals: never hand out an id a restored tile or
+        // gathered pane already uses.
+        let panes_max_canvas = p.panes.iter().map(|pane| pane.canvas + 1).max().unwrap_or(0);
+        let tiles_max_canvas = p
+            .panes
+            .iter()
+            .filter(|pane| pane.kind == crate::canvas_pane::PANE_KIND)
+            .filter_map(|pane| pane.config.get("canvas_id").and_then(|v| v.as_u64()))
+            .map(|id| id + 1)
+            .max()
+            .unwrap_or(0);
+        let next_canvas_id = p
+            .next_canvas_id
+            .max(panes_max_canvas.max(tiles_max_canvas))
+            .max(1);
+        let panes_max_snap = p.panes.iter().map(|pane| pane.snap_id + 1).max().unwrap_or(0);
+        let next_snap_id = p.next_snap_id.max(panes_max_snap).max(1);
         Self {
             list: p.projects,
             active: p.active,
             next_id,
             next_terminal_id,
+            next_canvas_id,
+            next_snap_id,
             dirty: false,
             layout_dirty: true,
             terminals_dirty: false,
             unread_bells: std::collections::HashMap::new(),
             show_hidden: false,
         }
+    }
+    /// Hand out a fresh nested-canvas id and mark state dirty so the
+    /// bumped counter is persisted.
+    pub fn allocate_canvas_id(&mut self) -> u64 {
+        let id = self.next_canvas_id.max(1);
+        self.next_canvas_id = id + 1;
+        self.dirty = true;
+        id
+    }
+    /// Hand out a fresh per-pane thumbnail id.
+    pub fn allocate_snap_id(&mut self) -> u64 {
+        let id = self.next_snap_id.max(1);
+        self.next_snap_id = id + 1;
+        self.dirty = true;
+        id
     }
     pub fn allocate_terminal_id(&mut self) -> u64 {
         let id = self.next_terminal_id.max(1);
@@ -696,13 +746,22 @@ fn load_or_seed_projects(
         .sidebar_width
         .unwrap_or(SIDEBAR_DEFAULT_WIDTH)
         .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
-    // Restore per-project canvas views (pan + zoom).
+    // Restore per-level canvas views (pan + zoom). Keys are
+    // `"project:canvas"`; legacy saves stored a bare `"project"` (root
+    // level), so accept both forms.
     let mut canvas_view = crate::canvas::CanvasView::default();
     for (k, v) in &persisted.canvas_views {
-        if let Ok(id) = k.parse::<u64>() {
+        let level = match k.split_once(':') {
+            Some((p, c)) => match (p.parse::<u64>(), c.parse::<u64>()) {
+                (Ok(p), Ok(c)) => Some((p, c)),
+                _ => None,
+            },
+            None => k.parse::<u64>().ok().map(|p| (p, 0)),
+        };
+        if let Some(level) = level {
             let mut state = *v;
             state.clamp_zoom();
-            canvas_view.per_project.insert(id, state);
+            canvas_view.per_level.insert(level, state);
         }
     }
     commands.insert_resource(canvas_view);
@@ -749,6 +808,8 @@ fn load_or_seed_projects(
             z: legacy.z,
             config: serde_json::json!({ "session_id": legacy.session_id }),
             pinned: false,
+            canvas: 0,
+            snap_id: 0,
             dock_group: None,
             dock_slot: 0,
         });
@@ -1457,6 +1518,12 @@ fn apply_pending_actions(world: &mut World) {
     // Project the user is currently looking at; new panes spawned into it
     // follow the current scroll/pan instead of sitting near the origin.
     let active_project = world.resource::<Projects>().active;
+    // Nested-canvas level the user is currently viewing in that project.
+    // New panes spawned into the active project are gathered onto it, and
+    // the cascade origin uses that level's pan.
+    let active_canvas = active_project
+        .map(|p| world.resource::<crate::canvas_pane::CanvasNav>().level(p))
+        .unwrap_or(0);
 
     // Restore persisted panes first so they appear before any new ones
     // queued in the same frame.
@@ -1618,7 +1685,7 @@ fn apply_pending_actions(world: &mut World) {
             if active_project == Some(req.project_id) {
                 base + world
                     .resource::<crate::canvas::CanvasView>()
-                    .state_for(req.project_id)
+                    .state_for((req.project_id, active_canvas))
                     .pan
             } else {
                 base
@@ -1648,6 +1715,15 @@ fn apply_pending_actions(world: &mut World) {
             Some(req.project_id),
             &req.config,
         ) {
+            // Gather the new pane onto the canvas level the user is
+            // viewing (root = no marker), but only when it lands in the
+            // active project — panes pushed into another project go to
+            // that project's root.
+            if active_project == Some(req.project_id) && active_canvas != 0 {
+                world
+                    .entity_mut(entity)
+                    .insert(jim_pane::PaneCanvas(active_canvas));
+            }
             world.resource_mut::<FocusedPane>().0 = Some(entity);
             let mut projects = world.resource_mut::<Projects>();
             projects.layout_dirty = true;
@@ -1685,7 +1761,7 @@ fn apply_pending_actions(world: &mut World) {
             if active_project == Some(project_id) {
                 base + world
                     .resource::<crate::canvas::CanvasView>()
-                    .state_for(project_id)
+                    .state_for((project_id, active_canvas))
                     .pan
             } else {
                 base
@@ -1710,6 +1786,11 @@ fn apply_pending_actions(world: &mut World) {
             world
                 .entity_mut(entity)
                 .insert(EditorFilePath(req.path.clone()));
+            if active_project == Some(project_id) && active_canvas != 0 {
+                world
+                    .entity_mut(entity)
+                    .insert(jim_pane::PaneCanvas(active_canvas));
+            }
             if world.resource::<Projects>().active == Some(project_id) {
                 world.resource_mut::<FocusedPane>().0 = Some(entity);
             }
@@ -1762,6 +1843,17 @@ fn restore_pane(world: &mut World, snap: PaneSnapshot) {
         if snap.pinned {
             world.entity_mut(e).insert(PanePinned);
         }
+        // Restore nested-canvas membership. `0` is the project root
+        // (no component needed); a non-zero id confines the pane to the
+        // canvas tile that owns it until the user descends into it.
+        if snap.canvas != 0 {
+            world.entity_mut(e).insert(jim_pane::PaneCanvas(snap.canvas));
+        }
+        // Restore the stable thumbnail id so the tile can find this
+        // (now-hidden) pane's saved snapshot PNG.
+        if snap.snap_id != 0 {
+            world.entity_mut(e).insert(jim_pane::PaneSnapId(snap.snap_id));
+        }
         // Defer dock relinking: stamp the group id/slot so
         // `link_restored_docks` can rebuild Dock/DockMember once every
         // pane in the group has spawned (spawn order is unspecified).
@@ -1785,6 +1877,7 @@ pub(crate) fn kind_to_static(kind: &str) -> &'static str {
         "run-button" => "run-button",
         "script_widget" => "script_widget",
         "dock" => "dock",
+        "canvas" => crate::canvas_pane::PANE_KIND,
         other => Box::leak(other.to_string().into_boxed_str()),
     }
 }
@@ -1883,14 +1976,21 @@ pub fn assert_pane_project_invariant(
 /// Inherited here would show it for its final frame.
 pub fn sync_visibility(
     projects: Res<Projects>,
+    nav: Res<crate::canvas_pane::CanvasNav>,
     mut panes: Query<
-        (&PaneProject, &mut Visibility),
+        (&PaneProject, Option<&jim_pane::PaneCanvas>, &mut Visibility),
         (With<PaneTag>, Without<jim_pane::PaneClosing>),
     >,
 ) {
     let active = projects.active;
-    for (m, mut vis) in &mut panes {
-        let want = if Some(m.0) == active {
+    // The nested-canvas level currently visible in the active project.
+    // A pane shows only when it's in the active project AND sits on that
+    // exact level (root = 0 / no marker) — descending swaps the visible
+    // set without moving any pane.
+    let active_level = active.map(|p| nav.level(p)).unwrap_or(0);
+    for (m, canvas, mut vis) in &mut panes {
+        let pane_level = canvas.map_or(0, |c| c.0);
+        let want = if Some(m.0) == active && pane_level == active_level {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -2132,9 +2232,9 @@ fn save_if_dirty(
     let sidebar_width = world.resource::<Sidebar>().width;
     let canvas_views: std::collections::HashMap<String, crate::canvas::CanvasViewState> = world
         .resource::<crate::canvas::CanvasView>()
-        .per_project
+        .per_level
         .iter()
-        .map(|(k, v)| (k.to_string(), *v))
+        .map(|((p, c), v)| (format!("{p}:{c}"), *v))
         .collect();
     let snapshot = PersistedState {
         projects: projects.list.clone(),
@@ -2144,6 +2244,8 @@ fn save_if_dirty(
         terminals: Vec::new(),
         panes,
         next_terminal_id: projects.next_terminal_id,
+        next_canvas_id: projects.next_canvas_id,
+        next_snap_id: projects.next_snap_id,
         canvas_views,
     };
     save_persisted(&snapshot);
@@ -2171,23 +2273,33 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
         }
         m
     };
-    let entries: Vec<(Entity, String, Option<u64>, PaneRect, bool)> = {
+    let entries: Vec<(Entity, String, Option<u64>, PaneRect, bool, u64, u64)> = {
         let mut q = world.query::<(
             Entity,
             &PaneKindMarker,
             Option<&PaneProject>,
             &PaneRect,
             Has<PanePinned>,
+            Option<&jim_pane::PaneCanvas>,
+            Option<&jim_pane::PaneSnapId>,
         )>();
         q.iter(world)
-            .map(|(e, k, p, r, pinned)| {
-                (e, k.0.to_string(), p.map(|p| p.0), *r, pinned)
+            .map(|(e, k, p, r, pinned, canvas, snap)| {
+                (
+                    e,
+                    k.0.to_string(),
+                    p.map(|p| p.0),
+                    *r,
+                    pinned,
+                    canvas.map_or(0, |c| c.0),
+                    snap.map_or(0, |s| s.0),
+                )
             })
             .collect()
     };
     let snapshots: Vec<PaneSnapshot> = entries
         .into_iter()
-        .filter_map(|(entity, kind, project_id, rect, pinned)| {
+        .filter_map(|(entity, kind, project_id, rect, pinned, canvas, snap_id)| {
             let snap_fn = world.resource::<PaneRegistry>().get(&kind).map(|s| s.snapshot)?;
             let config = (snap_fn)(world, entity);
             let (dock_group, dock_slot) = dock_info
@@ -2202,6 +2314,8 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
                 z: rect.z,
                 config,
                 pinned,
+                canvas,
+                snap_id,
                 dock_group,
                 dock_slot,
             })
@@ -2218,7 +2332,11 @@ fn mark_terminals_dirty_on_change(
         (),
         (
             With<PaneTag>,
-            Or<(Changed<PaneRect>, Changed<PaneProject>)>,
+            Or<(
+                Changed<PaneRect>,
+                Changed<PaneProject>,
+                Changed<jim_pane::PaneCanvas>,
+            )>,
         ),
     >,
     pin_added: Query<(), Added<PanePinned>>,

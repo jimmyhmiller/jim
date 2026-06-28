@@ -168,6 +168,34 @@ pub struct PaneChrome {
 #[derive(Component, Copy, Clone, Debug)]
 pub struct PaneProject(pub u64);
 
+/// Which **nested canvas** within a project this pane lives on. `0` (or
+/// the absence of this component) means the project's root canvas. A
+/// non-zero id means the pane has been gathered into the nested-canvas
+/// tile that owns that id, so it's only visible when the user has
+/// descended into that canvas. Pane-bevy doesn't interpret the value —
+/// the host gates visibility on it (a second namespace dimension layered
+/// on top of [`PaneProject`]) and reparents panes between levels by
+/// rewriting it. Recursive: a tile can itself sit on a deeper canvas.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct PaneCanvas(pub u64);
+
+/// A stable, persisted id used to associate a pane with its saved
+/// thumbnail PNG (`~/.jim/canvas-thumbs/pane-<id>.png`). Allocated by the
+/// host the first time a pane is snapshotted for a nested-canvas tile;
+/// survives restarts via [`PaneSnapshot::snap_id`] so a restored (hidden)
+/// gathered pane can still show its last preview without re-rendering.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct PaneSnapId(pub u64);
+
+/// Marker: emit [`PaneDoubleClicked`] for this pane even when it's
+/// **pinned**. Pinned panes are background decoration whose clicks only
+/// route through registered hot-zones, and the normal double-click path
+/// is skipped for them — so a pinned pane that still wants a double-click
+/// gesture (e.g. a nested-canvas tile you double-click to descend into)
+/// carries this marker to opt back in.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct PaneDoubleClickable;
+
 /// Marker: this pane is "pinned to the background". Drag/resize/focus
 /// are suppressed, `bring_to_front` never bumps its z, its chrome
 /// (title bar, close button, resize handle) is hidden, and its z is
@@ -571,6 +599,15 @@ pub struct PaneSnapshot {
     /// `serde(default)` keeps old saves loadable.
     #[serde(default)]
     pub pinned: bool,
+    /// Which nested canvas this pane lived on (see [`PaneCanvas`]). `0`
+    /// (the default for old saves) is the project's root canvas. A
+    /// non-zero id means the pane was gathered into that canvas tile.
+    #[serde(default)]
+    pub canvas: u64,
+    /// Stable id linking this pane to its saved thumbnail (see
+    /// [`PaneSnapId`]). `0` = none captured yet.
+    #[serde(default)]
+    pub snap_id: u64,
     /// If this pane belonged to a dock at snapshot time, the dock
     /// group's stable id (the dock entity's `to_bits()`). The dock
     /// container pane itself also carries its own id here so the restore
@@ -667,6 +704,20 @@ pub struct PaneDoubleClicked {
     pub pane: Entity,
 }
 
+/// Fired when a **title-bar (window) drag** ends — i.e. the user let go
+/// after dragging a pane by its title bar. Carries where the cursor was
+/// released so the host can decide if the pane was dropped onto another
+/// pane (e.g. a nested-canvas tile to gather it). Pane-bevy itself does
+/// nothing with this; the drop policy lives in the host.
+#[derive(Message, Clone, Copy, Debug)]
+pub struct PaneWindowDragReleased {
+    pub pane: Entity,
+    /// Release point in window pixels.
+    pub window_pt: Vec2,
+    /// Release point in canvas-space (same frame as [`PaneRect`]).
+    pub canvas_pt: Vec2,
+}
+
 // ---------- Plugin ----------
 
 /// `reserved_layers` are RenderLayer ids the host owns for non-pane
@@ -702,6 +753,7 @@ impl Plugin for PanePlugin {
             .add_message::<PaneContentReleased>()
             .add_message::<PaneContentHovered>()
             .add_message::<PaneDoubleClicked>()
+            .add_message::<PaneWindowDragReleased>()
             .add_plugins((TextInputPlugin, ChromeMaterialPlugin))
             .add_systems(
                 Update,
@@ -1576,9 +1628,30 @@ struct DoublePress<'w, 's> {
     time: Res<'w, Time>,
     tracker: Local<'s, PressTracker>,
     writer: MessageWriter<'w, PaneDoubleClicked>,
+    /// Bundled here too so `handle_pane_mouse` stays at Bevy's 16-param
+    /// limit (this isn't about double-clicks — it's the title-bar-drag
+    /// release signal the host uses to gather panes into canvas tiles).
+    drag_release: MessageWriter<'w, PaneWindowDragReleased>,
+    /// Panes that opt into double-click while pinned (see
+    /// [`PaneDoubleClickable`]). Read in the pinned hit-test path.
+    dbl_clickable: Query<'w, 's, (), With<PaneDoubleClickable>>,
+    /// Forces the next frame to render even in reactive idle. Used so a
+    /// drag stays smooth while the cursor is held still, and so the frame
+    /// *after* a press/release runs promptly — that's where host
+    /// consequences (gather a pane, descend a canvas) become visible.
+    redraw: MessageWriter<'w, bevy::window::RequestRedraw>,
 }
 
 impl<'w, 's> DoublePress<'w, 's> {
+    /// Whether `pane` opts into double-click while pinned.
+    fn is_clickable(&self, pane: Entity) -> bool {
+        self.dbl_clickable.get(pane).is_ok()
+    }
+
+    fn request_redraw(&mut self) {
+        self.redraw.write(bevy::window::RequestRedraw);
+    }
+
     /// Update press history. Fire a double-click when the second
     /// consecutive press lands on the same pane within 500ms and 8px
     /// of the prior press. Counter resets after firing so a 3rd press
@@ -1641,18 +1714,43 @@ fn handle_pane_mouse(
     // frame once; every hit-test below operates in canvas-space.
     let pt_canvas = viewport.window_to_canvas(pt);
 
+    // A press may start a drag or a double-click; either way its
+    // consequences want the following frame to run. An in-progress drag
+    // wants every frame (smooth even while the cursor is held still).
+    if buttons.just_pressed(MouseButton::Left)
+        || !matches!(*mode, PaneMouseMode::Idle)
+    {
+        dbl.request_redraw();
+    }
+
     if buttons.just_released(MouseButton::Left) {
-        if let PaneMouseMode::ContentDrag { pane, pinned } = *mode {
-            if let Ok((_, rect, _, _, anchored)) = panes.get(pane) {
-                let cur = hit_cursor(anchored, pt, pt_canvas);
-                content_release.write(PaneContentReleased {
+        match *mode {
+            PaneMouseMode::ContentDrag { pane, pinned } => {
+                if let Ok((_, rect, _, _, anchored)) = panes.get(pane) {
+                    let cur = hit_cursor(anchored, pt, pt_canvas);
+                    content_release.write(PaneContentReleased {
+                        pane,
+                        window_pt: pt,
+                        local_pt: pt_to_content_local(cur, &rect),
+                        pinned,
+                    });
+                }
+            }
+            PaneMouseMode::WindowDrag { pane, .. } => {
+                // Title-bar drag ended — tell the host where it was
+                // dropped so it can gather the pane into a tile, etc.
+                dbl.drag_release.write(PaneWindowDragReleased {
                     pane,
                     window_pt: pt,
-                    local_pt: pt_to_content_local(cur, &rect),
-                    pinned,
+                    canvas_pt: pt_canvas,
                 });
             }
+            _ => {}
         }
+        // The release is the last input in a reactive idle, but its
+        // consequences (reparent, etc.) land on the *next* frame — force
+        // that frame so they don't stall until the 5s idle wake.
+        dbl.request_redraw();
         *mode = PaneMouseMode::Idle;
     }
 
@@ -1771,6 +1869,10 @@ fn handle_pane_mouse(
         // decoration" promise). Chrome (drag/resize/close/focus) stays
         // suppressed for pinned panes regardless.
         let mut best: Option<(Entity, f32, Vec2)> = None;
+        // Topmost pinned pane that opted into double-click (e.g. a
+        // nested-canvas tile) under the cursor, so descend-on-double-click
+        // works even while the tile is pinned to the background.
+        let mut best_dclick: Option<(Entity, f32)> = None;
         for (e, r, vis, pinned, anchored) in panes.iter() {
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
                 continue;
@@ -1778,6 +1880,11 @@ fn handle_pane_mouse(
             let cur = hit_cursor(anchored, pt, pt_canvas);
             if !matches!(region_at(cur, &r), Some(PaneRegion::Content)) {
                 continue;
+            }
+            // Double-click candidacy doesn't require a hot-zone — the
+            // gesture targets the whole pinned pane.
+            if dbl.is_clickable(e) && best_dclick.map_or(true, |(_, z)| r.z >= z) {
+                best_dclick = Some((e, r.z));
             }
             let local = pt_to_content_local(cur, &r);
             let Ok(zones) = hot_zones.get(e) else { continue };
@@ -1787,6 +1894,9 @@ fn handle_pane_mouse(
             if best.map_or(true, |(_, z, _)| r.z >= z) {
                 best = Some((e, r.z, local));
             }
+        }
+        if let Some((target, _)) = best_dclick {
+            dbl.note(target, pt);
         }
         if let Some((target, _, local)) = best {
             consumed.0 = true;
