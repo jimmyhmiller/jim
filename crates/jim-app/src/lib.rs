@@ -436,6 +436,7 @@ impl Plugin for AppShellPlugin {
             // consumer reads it.
             .add_systems(PreUpdate, compute_keyboard_owner)
             .add_systems(Update, debug_fps_log)
+            .add_systems(Update, debug_layer_cameras)
             .add_systems(Update, ipc_stats::publish_ipc_stats)
             .add_systems(
                 Update,
@@ -1236,6 +1237,57 @@ fn debug_fps_log(
         eprintln!("[fps] {:.1}", *frames as f64 / (now - *last));
         *frames = 0;
         *last = now;
+    }
+}
+
+/// Debug (`JIM_LAYER_DBG`): for every editor pane, report which render
+/// layer it owns and EVERY camera whose mask includes that layer, with
+/// each camera's order + world scale. If an editor's content is drawn by
+/// more than one camera (or by cameras at different scales), that's the
+/// double/overlapping render. Logs only when the picture changes.
+fn debug_layer_cameras(
+    panes: Query<(
+        Entity,
+        &jim_pane::PaneLayer,
+        &jim_pane::PaneKindMarker,
+        Option<&jim_pane::PaneCanvas>,
+    )>,
+    cameras: Query<(
+        Entity,
+        &Camera,
+        &bevy::camera::visibility::RenderLayers,
+        &GlobalTransform,
+    )>,
+    mut last: Local<Option<String>>,
+) {
+    if std::env::var("JIM_LAYER_DBG").is_err() {
+        return;
+    }
+    let mut report = String::new();
+    for (e, layer, kind, canvas) in &panes {
+        if kind.0 != "editor" {
+            continue;
+        }
+        let mut cams: Vec<String> = Vec::new();
+        for (ce, cam, rl, gt) in &cameras {
+            if rl.intersects(&bevy::camera::visibility::RenderLayers::layer(layer.0)) {
+                let s = gt.compute_transform().scale;
+                cams.push(format!(
+                    "{ce:?}(order={},scale={:.3})",
+                    cam.order, s.x
+                ));
+            }
+        }
+        report.push_str(&format!(
+            "editor {e:?} layer={} canvas={:?} cameras=[{}]\n",
+            layer.0,
+            canvas.map(|c| c.0),
+            cams.join(", "),
+        ));
+    }
+    if last.as_deref() != Some(report.as_str()) {
+        eprintln!("[cam-dbg]\n{report}");
+        *last = Some(report);
     }
 }
 

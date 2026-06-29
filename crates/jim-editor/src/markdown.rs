@@ -339,6 +339,189 @@ pub fn detect_markdown_mode(
     }
 }
 
+/// Marker: this editor has a keepalive sprite under its content_root.
+#[derive(Component)]
+pub struct MdKeepalive;
+
+/// Bevy 0.19's `update_text2d_layout` only lays out `Text2d` for cameras
+/// that currently have at least one visible `Sprite` entity (it builds
+/// `target_scale_factors` from `camera_query.filter(visible Sprite)`).
+///
+/// A WYSIWYG markdown pane is pure `Text2d` — its only sprites are the
+/// caret and (optional) selection / code-block / blockquote decorations.
+/// When none of those are visible (caret blinked off or off-screen, no
+/// selection, a doc with no code/quote blocks), the pane camera has NO
+/// visible sprite, so the text never lays out: glyphs stay empty, every
+/// render line collapses to the one-row fallback height, and wrapped
+/// paragraphs stack on top of the lines below them. Worse, it self-
+/// sustains: a collapsed layout can push the caret off-screen, hiding the
+/// one sprite that would have re-armed layout.
+///
+/// Park one always-visible, fully-transparent sprite under each markdown
+/// pane's content_root so its camera ALWAYS qualifies and the text lays
+/// out every frame.
+pub fn ensure_md_keepalive(
+    mut commands: Commands,
+    editors: Query<
+        (Entity, &PaneChrome, &PaneKindMarker, Option<&MarkdownMode>),
+        Without<MdKeepalive>,
+    >,
+) {
+    if std::env::var("MD_NO_KEEPALIVE").is_ok() {
+        return;
+    }
+    for (entity, chrome, kind, md) in &editors {
+        if kind.0 != crate::PANE_KIND || !wysiwyg_active(md) {
+            continue;
+        }
+        commands.spawn((
+            MdKeepalive,
+            ChildOf(chrome.content_root),
+            Sprite {
+                color: Color::NONE,
+                // HUGE and anchored at the content origin so it spans the
+                // entire scrollable range: no matter how far the pane is
+                // scrolled, this transparent sprite still intersects the
+                // camera frustum, keeping the camera in `update_text2d_layout`'s
+                // set of "cameras with a visible Sprite". Without that, a pure-
+                // text markdown pane's text never lays out and every wrapped
+                // line collapses to one row (the overlap bug).
+                custom_size: Some(Vec2::new(8000.0, 200_000.0)),
+                ..default()
+            },
+            Anchor::TOP_LEFT,
+            // Behind the text; transparent regardless.
+            Transform::from_xyz(0.0, 0.0, -10.0),
+        ));
+        commands.entity(entity).insert(MdKeepalive);
+    }
+}
+
+/// Toggleable debug overlay for markdown layout. `boxes` draws one
+/// translucent rectangle per layout line at the position + height the
+/// MODEL claims; `labels` adds a per-line index/height tag. Lets us put
+/// "what we think is there" on screen next to "what is actually rendered".
+#[derive(Resource, Default)]
+pub struct MdDebugViz {
+    pub boxes: bool,
+    pub labels: bool,
+    pub hide_md_text: bool,
+}
+
+/// Marker for a debug overlay entity (box or label) so we can clear them.
+#[derive(Component)]
+pub struct MdDebugItem;
+
+/// Keyboard toggles for the markdown debug overlay — all are
+/// `Ctrl+Alt+<key>` so macOS / the editor's text input never swallow them:
+///   Ctrl+Alt+B — toggle per-line boxes (what the MODEL thinks)
+///   Ctrl+Alt+L — toggle per-line index/height labels
+///   Ctrl+Alt+H — hide/show the tracked markdown render-lines
+pub fn markdown_debug_toggle(keys: Res<ButtonInput<KeyCode>>, mut viz: ResMut<MdDebugViz>) {
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    if !(ctrl && alt) {
+        return;
+    }
+    if keys.just_pressed(KeyCode::KeyB) {
+        viz.boxes = !viz.boxes;
+        eprintln!("[md-viz] boxes = {}", viz.boxes);
+    }
+    if keys.just_pressed(KeyCode::KeyL) {
+        viz.labels = !viz.labels;
+        eprintln!("[md-viz] labels = {}", viz.labels);
+    }
+    if keys.just_pressed(KeyCode::KeyH) {
+        viz.hide_md_text = !viz.hide_md_text;
+        eprintln!("[md-viz] hide_md_text = {}", viz.hide_md_text);
+    }
+}
+
+/// F11: hide/show the tracked markdown render-line entities. If text is
+/// STILL visible after hiding them, that text is coming from some OTHER
+/// renderer (e.g. the monospace grid editor that should have been torn
+/// down) — i.e. the duplicate, overlapping copy.
+pub fn markdown_debug_hide_text(
+    viz: Res<MdDebugViz>,
+    mut lines: Query<&mut Visibility, With<MdLineRef>>,
+) {
+    let want = if viz.hide_md_text {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut v in &mut lines {
+        if *v != want {
+            *v = want;
+        }
+    }
+}
+
+/// Draw the debug overlay: a translucent box per layout line (alternating
+/// red/blue so adjacent lines and any overlap are obvious), optionally with
+/// an index/height label. If the boxes line up cleanly with the rendered
+/// text, the layout MODEL matches the render. If the text overlaps while
+/// the boxes are clean (or vice-versa), the mismatch is right there.
+pub fn markdown_debug_boxes(
+    mut commands: Commands,
+    viz: Res<MdDebugViz>,
+    fonts: Option<Res<MarkdownFonts>>,
+    editors: Query<(&PaneChrome, &PaneRect, Option<&MarkdownMode>, &MdLayout), With<PaneTag>>,
+    existing: Query<Entity, With<MdDebugItem>>,
+) {
+    for e in &existing {
+        commands.entity(e).despawn();
+    }
+    if !viz.boxes && !viz.labels {
+        return;
+    }
+    for (chrome, rect, md, layout) in &editors {
+        if !wysiwyg_active(md) {
+            continue;
+        }
+        let width = content_area_size(rect).x;
+        for (i, g) in layout.lines.iter().enumerate() {
+            if viz.boxes {
+                let color = if i % 2 == 0 {
+                    Color::srgba(1.0, 0.25, 0.25, 0.25)
+                } else {
+                    Color::srgba(0.25, 0.6, 1.0, 0.25)
+                };
+                let w = (width - g.x_offset).max(4.0);
+                commands.spawn((
+                    MdDebugItem,
+                    ChildOf(chrome.content_root),
+                    Sprite {
+                        color,
+                        custom_size: Some(Vec2::new(w, g.height.max(1.0))),
+                        ..default()
+                    },
+                    Anchor::TOP_LEFT,
+                    // Above the text so the tint is visible.
+                    Transform::from_xyz(g.x_offset, -g.top, 0.6),
+                ));
+            }
+            if viz.labels {
+                if let Some(fonts) = fonts.as_ref() {
+                    commands.spawn((
+                        MdDebugItem,
+                        ChildOf(chrome.content_root),
+                        Text2d::new(format!("{i}·h{:.0}·g{}", g.height, g.glyphs.len())),
+                        TextFont {
+                            font: fonts.mono.clone().into(),
+                            font_size: FontSize::Px(11.0),
+                            ..default()
+                        },
+                        TextColor(Color::srgb(1.0, 1.0, 0.3)),
+                        Anchor::TOP_LEFT,
+                        Transform::from_xyz(width - 90.0, -g.top, 0.7),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 // ---------- Render (Update) ----------
 
 /// Rebuild render-line entities when the document, active block, width,
@@ -422,6 +605,14 @@ pub fn markdown_render(
         let need_rebuild = doc_changed || rect.is_changed() || lines.0.is_empty();
         if !need_rebuild {
             continue;
+        }
+        if std::env::var("JIM_MD_DBG").is_ok() {
+            eprintln!(
+                "[md-rebuild {entity:?}] doc_changed={doc_changed} rect_changed={} empty={} pool_before={}",
+                rect.is_changed(),
+                lines.0.is_empty(),
+                lines.0.len(),
+            );
         }
         mdstate.active = active;
 
@@ -614,6 +805,17 @@ fn build_line(
         spans.push((run.src.start, rendered));
     }
 
+    // Blank line: no spans. The entity may have been REUSED from a line that
+    // previously held text — and Bevy's `detect_text_needs_rerender` only
+    // re-lays-out a text block on `Changed<TextSpan>`/`Changed<Children>`.
+    // Removing all children doesn't fire that, so the pipeline keeps the old
+    // glyphs and the entity renders stale text at its new (shifted) position
+    // — the "old line sticks around" duplication when a newline is inserted.
+    // Explicitly clear the layout so a blank line renders nothing.
+    if spans.is_empty() {
+        commands.entity(entity).insert(TextLayoutInfo::default());
+    }
+
     commands.entity(entity).insert(MdLineRef {
         editor,
         spans,
@@ -743,6 +945,11 @@ fn build_code_line(
         src += text.chars().count();
     }
 
+    // See build_line: clear stale glyphs when a reused entity has no spans.
+    if spans.is_empty() {
+        commands.entity(entity).insert(TextLayoutInfo::default());
+    }
+
     commands.entity(entity).insert(MdLineRef {
         editor,
         spans,
@@ -772,6 +979,12 @@ pub fn markdown_readback(
         }
         let mut geoms: Vec<MdLineGeom> = Vec::with_capacity(pool.0.len());
         let mut top = 0.0f32;
+        // True if a line that HAS text (non-empty spans) produced no glyphs
+        // this frame — i.e. Bevy didn't lay the text out (the pane camera had
+        // no qualifying sprite, so `update_text2d_layout` skipped it). On such
+        // a frame every wrapped paragraph would collapse to the one-row
+        // fallback height, so we must NOT commit this layout.
+        let mut incomplete = false;
         for &line_e in &pool.0 {
             let Ok((lref, info)) = lines_q.get(line_e) else {
                 continue;
@@ -798,6 +1011,17 @@ pub fn markdown_readback(
                 x: f32,
                 half: f32,
                 section: usize,
+            }
+            if std::env::var("JIM_MD_RAW").is_ok() && lref.src.end - lref.src.start > 50 {
+                eprintln!(
+                    "[md-raw] src={:?} raw_glyphs={} size=({:.0},{:.0}) sf={:.2} spans={} bounds_w?",
+                    (lref.src.start, lref.src.end),
+                    info.glyphs.len(),
+                    info.size.x,
+                    info.size.y,
+                    info.scale_factor,
+                    lref.spans.len(),
+                );
             }
             let mut gs: Vec<G> = info
                 .glyphs
@@ -855,6 +1079,9 @@ pub fn markdown_readback(
             // Code-fence lines render to nothing (markers hidden) — collapse
             // them to zero so a code block has no blank gap above/below its
             // content. Blank lines and rules keep a row of height.
+            if !lref.spans.is_empty() && glyphs.is_empty() {
+                incomplete = true;
+            }
             let height = if !glyphs.is_empty() {
                 if info.size.y > 0.5 { info.size.y } else { rh }
             } else if lref.collapse {
@@ -874,6 +1101,20 @@ pub fn markdown_readback(
                 active: lref.active,
             });
             top += height;
+        }
+        // Text didn't lay out this frame (e.g. the pane just became visible
+        // and the camera hasn't acquired a qualifying sprite yet). Committing
+        // now would collapse every wrapped line to one row and overlap the
+        // lines below. Keep the last good layout; a subsequent frame that
+        // lays out fully will replace it. Only fall through on first build
+        // (no prior layout to preserve).
+        // Only safe to keep the old layout if it still lines up 1:1 with the
+        // current pool — otherwise `markdown_position` would map entities onto
+        // stale slots (a paragraph drawn in a blank line's position). If the
+        // pool changed (doc edited), commit the new geometry even if a frame's
+        // layout is briefly incomplete; it self-corrects next frame.
+        if incomplete && layout.lines.len() == pool.0.len() {
+            continue;
         }
         layout.total_height = top;
         layout.lines = geoms;
@@ -902,7 +1143,38 @@ pub fn markdown_position(
     >,
     mut tf_q: Query<&mut Transform>,
     mut caret_q: Query<(Entity, &EditorCaret, &mut Sprite, &mut Visibility)>,
+    all_refs: Query<(Entity, &MdLineRef)>,
+    grid_lines: Query<(), With<crate::LineRender>>,
+    mut dbg_last: Local<std::collections::HashMap<Entity, String>>,
+    mut dbg_frame: Local<u32>,
 ) {
+    *dbg_frame += 1;
+    // Force a reprint of the steady state every ~1.5s even when nothing
+    // changed, so we can read the picture the user is actually staring at.
+    if *dbg_frame % 90 == 0 {
+        dbg_last.clear();
+    }
+    if std::env::var("JIM_MD_DBG").is_ok() && *dbg_frame % 90 == 0 {
+        // GLOBAL orphan sweep: MdLineRef entities whose editor is no longer a
+        // live wysiwyg editor in this query. Such entities keep rendering at
+        // their last positions — a second, untracked copy of the doc.
+        let live_editors: std::collections::HashSet<Entity> =
+            editors.iter().map(|t| t.0).collect();
+        let mut orphan_editors: std::collections::HashMap<Entity, usize> =
+            std::collections::HashMap::new();
+        for (_e, r) in &all_refs {
+            if !live_editors.contains(&r.editor) {
+                *orphan_editors.entry(r.editor).or_default() += 1;
+            }
+        }
+        let total_refs = all_refs.iter().count();
+        let grid_count = grid_lines.iter().count();
+        eprintln!(
+            "[md-global] total_MdLineRef_entities={total_refs} live_editors={} GHOST_editors={:?} GRID_LineRender_entities={grid_count}",
+            live_editors.len(),
+            orphan_editors,
+        );
+    }
     for (editor, state, rect, scroll, md, pool, layout) in &editors {
         if !wysiwyg_active(md) {
             continue;
@@ -914,6 +1186,81 @@ pub fn markdown_position(
                 t.translation.x = g.x_offset;
                 t.translation.y = -g.top;
                 t.translation.z = 0.0;
+            }
+        }
+        if std::env::var("JIM_MD_DBG").is_ok() {
+            // How many entities carry an MdLineRef pointing at THIS editor?
+            // (rendered lines, whether or not they're in the live pool.)
+            let live: std::collections::HashSet<Entity> = pool.0.iter().copied().collect();
+            let mut total_refs = 0usize;
+            let mut orphans = 0usize;
+            for (e, r) in &all_refs {
+                if r.editor != editor {
+                    continue;
+                }
+                total_refs += 1;
+                if !live.contains(&e) {
+                    orphans += 1;
+                }
+            }
+            // Detect duplicate source ranges inside the live layout (the same
+            // doc line rendered by more than one pool entity).
+            let mut seen: std::collections::HashMap<(usize, usize), usize> =
+                std::collections::HashMap::new();
+            for g in &layout.lines {
+                *seen.entry((g.src.start, g.src.end)).or_default() += 1;
+            }
+            let dup_src = seen.values().filter(|&&c| c > 1).count();
+            let report = format!(
+                "pool={} layout={} refs={} ORPHANS={} dup_src_ranges={} total_h={:.0}",
+                pool.0.len(),
+                layout.lines.len(),
+                total_refs,
+                orphans,
+                dup_src,
+                layout.total_height,
+            );
+            // Map each pool ENTITY to the src range its MdLineRef currently
+            // holds (what it will actually render), to compare against the
+            // layout slot it's being positioned into.
+            let ent_src: std::collections::HashMap<Entity, (usize, usize)> = all_refs
+                .iter()
+                .map(|(e, r)| (e, (r.src.start, r.src.end)))
+                .collect();
+            let mut mismatches = 0usize;
+            for (i, &line_e) in pool.0.iter().enumerate() {
+                if let (Some(es), Some(g)) = (ent_src.get(&line_e), layout.lines.get(i)) {
+                    if *es != (g.src.start, g.src.end) {
+                        mismatches += 1;
+                    }
+                }
+            }
+            let report = format!("{report} POOL_LAYOUT_MISMATCH={mismatches}");
+            if dbg_last.get(&editor) != Some(&report) {
+                eprintln!("[md-pos {editor:?}] {report}");
+                let doc_str = state.0.doc.to_string();
+                for (i, &line_e) in pool.0.iter().enumerate().take(24) {
+                    let Some(g) = layout.lines.get(i) else { continue };
+                    let max_row = g.glyphs.iter().map(|gl| gl.row + 1).max().unwrap_or(0);
+                    let ent = ent_src.get(&line_e).copied().unwrap_or((0, 0));
+                    let flag = if ent != (g.src.start, g.src.end) { " <<MISMATCH" } else { "" };
+                    let txt: String = doc_str
+                        .get(g.src.start..g.src.end)
+                        .unwrap_or("<oob>")
+                        .chars()
+                        .take(24)
+                        .collect();
+                    eprintln!(
+                        "    [{i:>3}] top={:>6.1} h={:>5.1} rows={max_row} g={:>3} layout_src={:?} entity_src={:?} {:?}{flag}",
+                        g.top,
+                        g.height,
+                        g.glyphs.len(),
+                        (g.src.start, g.src.end),
+                        ent,
+                        txt,
+                    );
+                }
+                dbg_last.insert(editor, report);
             }
         }
 

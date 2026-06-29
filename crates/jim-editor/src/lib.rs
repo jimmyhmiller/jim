@@ -166,6 +166,15 @@ impl Plugin for EditorEmbedPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(highlight::HighlightPlugin)
             .init_resource::<FocusedEmbeddedEditor>()
+            .init_resource::<markdown::MdDebugViz>()
+            .add_systems(
+                Update,
+                (
+                    markdown::markdown_debug_toggle,
+                    markdown::markdown_debug_boxes,
+                    markdown::markdown_debug_hide_text,
+                ),
+            )
             .add_message::<EmbeddedEditorPress>()
             .add_message::<EmbeddedEditorDrag>()
             .add_message::<EmbeddedEditorRelease>()
@@ -192,6 +201,7 @@ impl Plugin for EditorEmbedPlugin {
                     sync_content_root,
                     sync_caret,
                     sync_selection,
+                    markdown::ensure_md_keepalive,
                     markdown::markdown_render,
                     markdown::markdown_decorations,
                 )

@@ -995,7 +995,15 @@ fn update_pane_cursor(
     mode: Res<PaneMouseMode>,
     viewport: Res<PaneViewport>,
     windows: Query<(Entity, &Window)>,
-    panes: Query<(&PaneRect, Option<&Visibility>, Has<PanePinned>), With<PaneTag>>,
+    panes: Query<
+        (
+            &PaneRect,
+            Option<&Visibility>,
+            Has<PanePinned>,
+            Option<&PaneKindMarker>,
+        ),
+        With<PaneTag>,
+    >,
 ) {
     use bevy::window::SystemCursorIcon;
     let _prof = prof::sys_span("pane_cursor");
@@ -1020,9 +1028,11 @@ fn update_pane_cursor(
             // Highest z whose BODY (title/content — not an edge) covers the
             // point. A resize edge belonging to a pane underneath that is
             // occluded here, so it must not draw a resize cursor through the
-            // pane (or widget) the user is actually hovering.
-            let mut covered_z: Option<f32> = None;
-            for (rect, vis, pinned) in &panes {
+            // pane (or widget) the user is actually hovering. We also remember
+            // whether that topmost body is an editor's content area, so we can
+            // show the I-beam (text) cursor there.
+            let mut covered: Option<(f32, bool)> = None;
+            for (rect, vis, pinned, kind) in &panes {
                 if matches!(vis, Some(Visibility::Hidden)) || pinned {
                     continue;
                 }
@@ -1034,16 +1044,21 @@ fn update_pane_cursor(
                             best = Some((cursor_for_edges(e), rect.z));
                         }
                     }
-                    Some(_) => {
-                        if covered_z.map_or(true, |z| rect.z > z) {
-                            covered_z = Some(rect.z);
+                    Some(region) => {
+                        if covered.map_or(true, |(z, _)| rect.z > z) {
+                            let is_editor_content = matches!(region, PaneRegion::Content)
+                                && matches!(kind, Some(PaneKindMarker("editor")));
+                            covered = Some((rect.z, is_editor_content));
                         }
                     }
                     None => {}
                 }
             }
             match best {
-                Some((i, z)) if covered_z.map_or(true, |cz| z >= cz) => i,
+                // A resize edge that isn't occluded by a higher pane body wins.
+                Some((i, z)) if covered.map_or(true, |(cz, _)| z >= cz) => i,
+                // Otherwise the topmost body decides: editor content → I-beam.
+                _ if matches!(covered, Some((_, true))) => SystemCursorIcon::Text,
                 _ => {
                     commands.entity(win_entity).remove::<bevy::window::CursorIcon>();
                     return;
