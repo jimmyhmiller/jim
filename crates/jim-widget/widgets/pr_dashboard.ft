@@ -1,0 +1,746 @@
+// pr_dashboard.ft — "my open PRs" dashboard.
+//
+// Lists every PR you have open (via the `gh` CLI), groups stacked PRs
+// together, shows a per-PR CI status dot, flags NEW activity since you
+// last looked, and opens straight to the PR on click.
+//
+// SETTINGS — a JSON file at ~/.jim/pr-dashboard.json (auto-created on
+// first run, hot-reloaded on Refresh). Per-instance overrides can also be
+// passed as `--params` when spawning. Keys:
+//
+//   author                  GitHub login or "@me"     (default "@me")
+//   state                   "open" | "closed"         (default "open")
+//   limit                   max PRs to fetch          (default 50)
+//   repos                   ["owner/repo", ...]       filter to these repos
+//   owners                  ["owner", ...]            filter to these owners
+//   include_drafts          show draft PRs            (default true)
+//   show_ci                 fetch + show CI status     (default true)
+//                           (one extra gh call per PR)
+//   show_stack              detect + group stacked PRs (default true)
+//                           (shares show_ci's gh call)
+//   ci_comment_marker       bot-comment marker whose   (default the
+//                           heading is the authoritative next.js one)
+//                           CI verdict; falls back to
+//                           raw checks when absent
+//   track_since_my_comment  count replies after YOUR  (default false)
+//                           last comment per PR
+//   shell / gh / jq / open_cmd   binaries (defaults: /bin/zsh, gh, jq,
+//                                /usr/bin/open)
+//
+// CI VERDICT. Raw check rollups are noisy — a cancelled Stats run or a
+// skipped deploy check makes a PR look "failed" when the tests actually
+// passed. So when a PR has a bot comment carrying `ci_comment_marker`
+// (next.js posts `__NEXT_TEST_REPORT_COMMENT__`), we take the verdict from
+// that comment's heading instead:
+//   "## Tests Passed"                    -> pass
+//   "## Tests in progress"               -> pending
+//   "## Failing test suites|CI jobs"     -> fail
+// When there's no such comment we fall back to rolling up
+// statusCheckRollup. Both come from the SAME `gh pr view` call, reduced to
+// a tiny object in jq before it crosses the proc pipe.
+//
+// STACKS. A PR is grouped into a stack when its base branch is another
+// open PR's head branch (or vice-versa), within the same repo. Purely
+// branch-topology based, so it works regardless of stack tool.
+//
+// "New since last viewed" is a per-PR baseline (comment count + updatedAt)
+// in widget state; opening a PR — or "Mark all read" — re-baselines it.
+// The baseline survives app restarts.
+import "host"
+
+// ---------------------------------------------------------------- colors
+fn c_text()  = "#cfd2d8"
+fn c_muted() = "#9098a4"
+fn c_new()   = "#8fe3b0"
+fn c_newpr() = "#8fb7ff"
+fn c_warn()  = "#e0b066"
+fn c_err()   = "#e08a8a"
+fn c_rail()  = "#5b626e"
+
+// ---------------------------------------------------------------- helpers
+// All of these are PURE (funct helper fns can't see globals) — they take
+// what they need as parameters. Natives (proc_spawn, read_file, …) ARE
+// callable from a helper; globals like `state`/`params` are not.
+
+fn shq(s) = "'" + s + "'"
+
+fn get_or(m, k, d) = if typeof(m) == "Record" { unwrap_or(get(m, k), d) } else { d }
+
+fn mget(meta, url) = unwrap_or(get(meta, url), ())
+
+// `params` overrides the config file overrides the built-in default.
+fn pick(p, c, k, d) {
+    let mut v = d
+    if typeof(c) == "Record" { v = unwrap_or(get(c, k), v) }
+    if typeof(p) == "Record" { v = unwrap_or(get(p, k), v) }
+    v
+}
+
+fn starts(s, p) = len(s) >= len(p) and slice(s, 0, len(p)) == p
+
+// ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" -> sortable/comparable integer. String
+// ordering of timestamps isn't relied on; everything goes through this.
+fn ts_num(iso) {
+    if len(iso) < 19 { return 0 }
+    let s = slice(iso, 0, 4) + slice(iso, 5, 7) + slice(iso, 8, 10) +
+            slice(iso, 11, 13) + slice(iso, 14, 16) + slice(iso, 17, 19)
+    unwrap_or(parse_int(s), 0)
+}
+
+fn default_cfg_json() =
+"{\n" +
+"  \"author\": \"@me\",\n" +
+"  \"state\": \"open\",\n" +
+"  \"limit\": 50,\n" +
+"  \"repos\": [],\n" +
+"  \"owners\": [],\n" +
+"  \"include_drafts\": true,\n" +
+"  \"show_ci\": true,\n" +
+"  \"show_stack\": true,\n" +
+"  \"ci_comment_marker\": \"__NEXT_TEST_REPORT_COMMENT__\",\n" +
+"  \"track_since_my_comment\": false,\n" +
+"  \"shell\": \"/bin/zsh\",\n" +
+"  \"gh\": \"gh\",\n" +
+"  \"jq\": \"jq\",\n" +
+"  \"open_cmd\": \"/usr/bin/open\"\n" +
+"}\n"
+
+// Build the resolved config record from params + file config.
+fn resolve_cfg(p, fc) = {
+    author:                 pick(p, fc, "author", "@me"),
+    state:                  pick(p, fc, "state", "open"),
+    limit:                  pick(p, fc, "limit", 50),
+    repos:                  pick(p, fc, "repos", []),
+    owners:                 pick(p, fc, "owners", []),
+    include_drafts:         pick(p, fc, "include_drafts", true),
+    show_ci:                pick(p, fc, "show_ci", true),
+    show_stack:             pick(p, fc, "show_stack", true),
+    ci_comment_marker:      pick(p, fc, "ci_comment_marker", "__NEXT_TEST_REPORT_COMMENT__"),
+    track_since_my_comment: pick(p, fc, "track_since_my_comment", false),
+    shell:                  pick(p, fc, "shell", "/bin/zsh"),
+    gh:                     pick(p, fc, "gh", "gh"),
+    jq:                     pick(p, fc, "jq", "jq"),
+    open_cmd:               pick(p, fc, "open_cmd", "/usr/bin/open"),
+}
+
+fn build_list_cmd(cfg) {
+    let mut c = cfg.gh + " search prs"
+    c = c + " --author=" + shq(cfg.author)
+    c = c + " --state=" + shq(cfg.state)
+    c = c + " --limit=" + str(cfg.limit)
+    c = c + " --json number,title,repository,url,updatedAt,commentsCount,isDraft"
+    for r in cfg.repos  { c = c + " --repo="  + shq(r) }
+    for o in cfg.owners { c = c + " --owner=" + shq(o) }
+    c + " 2>/dev/null | " + cfg.jq + " -c ."
+}
+
+fn build_comments_cmd(repo, number, gh, jq) {
+    let ep = shq("repos/" + repo + "/issues/" + str(number) + "/comments")
+    let f  = shq("[.[]|{u:.user.login,at:.created_at}]")
+    gh + " api --paginate " + ep + " --jq " + f + " 2>/dev/null | " + jq + " -sc 'add // []'"
+}
+
+// jq that reduces `gh pr view`'s output to one compact object:
+//   {base, head, t, f, w, ci, src}
+// `ci` is "pass"|"fail"|"pending"|"none". It prefers the bot-comment
+// verdict (marker `m`) and falls back to the statusCheckRollup rollup;
+// `src` records which won ("comment" | "checks"). Uses only standard jq
+// and no single quotes, so it survives shq's single-quote wrapping. `m`
+// (the marker) is interpolated in — keep it free of quotes/backslashes.
+fn meta_jq(m) =
+"def k: if .__typename==\"StatusContext\" then (if .state==\"SUCCESS\" then \"p\" elif (.state==\"PENDING\" or .state==\"EXPECTED\") then \"w\" else \"f\" end) else (if .status!=\"COMPLETED\" then \"w\" elif (.conclusion==\"SUCCESS\" or .conclusion==\"SKIPPED\" or .conclusion==\"NEUTRAL\") then \"p\" elif .conclusion==null then \"w\" else \"f\" end) end; " +
+"(.statusCheckRollup // []) as $r | ($r|map(k)) as $c | " +
+"($c|map(select(.==\"f\"))|length) as $f | ($c|map(select(.==\"w\"))|length) as $w | ($c|length) as $t | " +
+"(if $t==0 then \"none\" elif $f>0 then \"fail\" elif $w>0 then \"pending\" else \"pass\" end) as $rv | " +
+"([.comments[]? | select(.body|contains(\"" + m + "\"))] | last) as $cm | " +
+"(if $cm==null then \"none\" elif ($cm.body|contains(\"## Tests Passed\")) then \"pass\" elif ($cm.body|contains(\"## Tests in progress\")) then \"pending\" elif ($cm.body|test(\"## Failing (test suites|CI jobs)\")) then \"fail\" else \"none\" end) as $cv | " +
+"{base:.baseRefName, head:.headRefName, t:$t, f:$f, w:$w, ci:(if $cv==\"none\" then $rv else $cv end), src:(if $cv==\"none\" then \"checks\" else \"comment\" end)}"
+
+fn build_meta_cmd(repo, number, gh, jq, marker) {
+    let flags = " --json baseRefName,headRefName,statusCheckRollup,comments"
+    gh + " pr view " + str(number) + " --repo " + shq(repo) + flags +
+        " 2>/dev/null | " + jq + " -c " + shq(meta_jq(marker))
+}
+
+// Number of comments by other people AFTER your most recent comment.
+// -1 means you never commented on this PR.
+fn since_my_comment(comments, me) {
+    let mut last_mine = 0
+    for cm in comments {
+        if get_or(cm, "u", "") == me {
+            let t = ts_num(get_or(cm, "at", ""))
+            if t > last_mine { last_mine = t }
+        }
+    }
+    if last_mine == 0 { return -1 }
+    let mut n = 0
+    for cm in comments {
+        if get_or(cm, "u", "") != me and ts_num(get_or(cm, "at", "")) > last_mine { n = n + 1 }
+    }
+    n
+}
+
+fn find_pr(prs, url) {
+    for pr in prs { if pr.url == url { return pr } }
+    ()
+}
+
+// ---------------------------------------------------------------- stacks
+// Branch-topology helpers. `head2url`/`base2url` map a repo's branch names
+// to the PR that has that head/base branch. A PR is stacked when its base
+// is some PR's head (it has a parent) or its head is some PR's base (a
+// child). We walk up to the root (bottom of the stack) and down to build
+// the ordered chain. All guarded against cycles.
+
+fn repo_maps(prs, meta, repo) {
+    let mut h = {}
+    let mut b = {}
+    for p in prs {
+        if p.repo == repo {
+            let m = mget(meta, p.url)
+            if typeof(m) == "Record" {
+                h = assoc(h, m.head, p.url)
+                b = assoc(b, m.base, p.url)
+            }
+        }
+    }
+    { h: h, b: b }
+}
+
+fn is_stacked(maps, m0) =
+    typeof(m0) == "Record" and (has(maps.h, m0.base) or has(maps.b, m0.head))
+
+// Bottom-of-stack url (follow base -> the PR whose head == that base).
+fn root_of(meta, maps, url) {
+    let mut cur = url
+    let mut guard = 0
+    while guard < 64 {
+        let m = mget(meta, cur)
+        if typeof(m) != "Record" { return cur }
+        if has(maps.h, m.base) {
+            cur = unwrap_or(get(maps.h, m.base), cur)
+            guard = guard + 1
+        } else {
+            return cur
+        }
+    }
+    cur
+}
+
+// Ordered chain from the root: [bottom, …, top].
+fn chain_down(meta, maps, rooturl) {
+    let mut chain = [rooturl]
+    let mut cur = rooturl
+    let mut guard = 0
+    while guard < 64 {
+        let m = mget(meta, cur)
+        if typeof(m) != "Record" { return chain }
+        if has(maps.b, m.head) {
+            let nx = unwrap_or(get(maps.b, m.head), "")
+            if nx == "" { return chain }
+            chain = push(chain, nx)
+            cur = nx
+            guard = guard + 1
+        } else {
+            return chain
+        }
+    }
+    chain
+}
+
+// ---------------------------------------------------------------- effects
+// These call natives + spawn procs but, being helpers, take state in and
+// hand a new state map back (the handler does the reset!).
+
+// staged=true keeps the current view intact and fetches into stage_* for
+// an atomic swap (Refresh); staged=false is the initial progressive load.
+fn run_fetch(p, s, staged) {
+    let home = host_env("HOME")
+    let path = home + "/.jim/pr-dashboard.json"
+    let rf = read_file(path)
+    let mut fc = ()
+    if typeof(rf) == "Record" and get_or(rf, "ok", false) {
+        fc = parse_json(get_or(rf, "text", ""))
+    } else {
+        write_file(path, default_cfg_json())
+    }
+    let cfg = resolve_cfg(p, fc)
+
+    let lp = proc_spawn(cfg.shell, ["-lc", build_list_cmd(cfg)])
+    // Live prs/meta are left untouched on a staged refresh so the view
+    // doesn't collapse mid-fetch; only the staging buffers reset here.
+    let mut ns = { ..s, cfg: cfg, error: "",
+                   status: if staged { "refreshing…" } else { "fetching…" },
+                   loading: not staged, refreshing: staged,
+                   list_proc: lp, enrich: {}, me_proc: -1, meta_procs: {},
+                   stage_prs: [], stage_meta: {}, stage_out: 0, spin: 0 }
+    if not staged { ns = { ..ns, meta: {} } }
+    if cfg.track_since_my_comment and s.me == "" {
+        ns = { ..ns, me_proc: proc_spawn(cfg.shell, ["-lc", cfg.gh + " api user --jq .login 2>/dev/null"]) }
+    }
+    ns
+}
+
+// Baseline any PR we've never seen, so its existing comments don't all
+// read as "new". Existing baselines are left untouched.
+fn seed_seen(s) {
+    let mut sn = s.seen
+    for pr in s.prs {
+        if not has(sn, pr.url) {
+            sn = assoc(sn, pr.url, { comments: pr.comments, updated: pr.updated })
+        }
+    }
+    { ..s, seen: sn }
+}
+
+// One `gh api …/comments` per PR; results land in on_proc_output keyed by
+// proc handle. Only fired when track_since_my_comment is on and `me` known.
+fn kick_enrich(s) {
+    let cfg = s.cfg
+    let mut en = {}
+    for pr in s.prs {
+        let h = proc_spawn(cfg.shell, ["-lc", build_comments_cmd(pr.repo, pr.number, cfg.gh, cfg.jq)])
+        en = assoc(en, str(h), pr.url)
+    }
+    { ..s, enrich: en }
+}
+
+// One `gh pr view` per PR for base/head branch + CI verdict. Fired after
+// the list lands when show_ci or show_stack is on. Keyed by proc handle.
+fn kick_meta(s) {
+    let cfg = s.cfg
+    let mut mp = {}
+    for pr in s.prs {
+        let cmd = build_meta_cmd(pr.repo, pr.number, cfg.gh, cfg.jq, cfg.ci_comment_marker)
+        let h = proc_spawn(cfg.shell, ["-lc", cmd])
+        mp = assoc(mp, str(h), pr.url)
+    }
+    { ..s, meta: {}, meta_procs: mp }
+}
+
+// Same, but for a staged refresh: enrich the staged prs into stage_meta
+// (live meta keeps rendering). stage_out tracks outstanding procs.
+fn kick_meta_staged(s) {
+    let cfg = s.cfg
+    let mut mp = {}
+    for pr in s.stage_prs {
+        let cmd = build_meta_cmd(pr.repo, pr.number, cfg.gh, cfg.jq, cfg.ci_comment_marker)
+        let h = proc_spawn(cfg.shell, ["-lc", cmd])
+        mp = assoc(mp, str(h), pr.url)
+    }
+    { ..s, meta_procs: mp, stage_meta: {}, stage_out: len(s.stage_prs) }
+}
+
+// Promote the staging buffers to the live view in one shot, then clear
+// staging and (re)baseline unseen PRs.
+fn swap_in(s) {
+    let mut ns = { ..s, prs: s.stage_prs, meta: s.stage_meta,
+                   refreshing: false, loading: false,
+                   status: str(len(s.stage_prs)) + " open",
+                   stage_prs: [], stage_meta: {}, stage_out: 0, meta_procs: {} }
+    ns = seed_seen(ns)
+    if ns.cfg.track_since_my_comment and ns.me != "" { ns = kick_enrich(ns) }
+    ns
+}
+
+// Parse the `gh search prs` JSON array into our flat PR records.
+fn parse_prs(arr, include_drafts) {
+    let mut prs = []
+    for it in arr {
+        let draft = get_or(it, "isDraft", false)
+        if draft and not include_drafts {
+            // skip
+        } else {
+            let ro = get_or(it, "repository", {})
+            prs = push(prs, {
+                url:      get_or(it, "url", ""),
+                title:    get_or(it, "title", "(untitled)"),
+                repo:     get_or(ro, "nameWithOwner", get_or(ro, "name", "?")),
+                number:   get_or(it, "number", 0),
+                comments: get_or(it, "commentsCount", 0),
+                updated:  get_or(it, "updatedAt", ""),
+                draft:    draft,
+            })
+        }
+    }
+    sort_by(prs, p => -ts_num(get_or(p, "updated", "")))
+}
+
+// ---------------------------------------------------------------- state
+fn init_state() = {
+    cfg: (), prs: [], seen: {}, sincemine: {}, me: "",
+    loading: false, error: "", status: "",
+    list_proc: -1, me_proc: -1, enrich: {},
+    meta: {}, meta_procs: {},
+    // Refresh is double-buffered: the in-flight fetch accumulates into
+    // stage_* while the live prs/meta keep rendering unchanged, then swaps
+    // in atomically once complete. refreshing gates that; stage_out is the
+    // count of meta procs still outstanding.
+    refreshing: false, stage_prs: [], stage_meta: {}, stage_out: 0,
+    spin: 0,
+}
+
+let state = atom(init_state())
+
+// ---------------------------------------------------------------- lifecycle
+fn on_init() { request_render() }
+
+// Side effects belong in on_start (runs after state is rehydrated, on
+// every fresh spawn / restart / hot-reload).
+fn on_start() {
+    reset!(state, run_fetch(params, @state, false))
+    request_render()
+}
+
+// Spinner tick. Runs only while a refresh is in flight (started in
+// on_click); self-cancels the tick as soon as the swap clears refreshing.
+fn on_frame(dt) {
+    let s = @state
+    if not get_or(s, "refreshing", false) {
+        set_tick_interval(0.0)
+        return
+    }
+    reset!(state, { ..s, spin: get_or(s, "spin", 0) + 1 })
+    request_render()
+}
+
+// ---------------------------------------------------------------- procs
+fn on_proc_output(handle, line) {
+    let s = @state
+
+    if handle == s.list_proc {
+        let v = parse_json(line)
+        if typeof(v) == "List" {
+            let prs = parse_prs(v, s.cfg.include_drafts)
+            let do_meta = (s.cfg.show_ci or s.cfg.show_stack) and len(prs) > 0
+            if s.refreshing {
+                // Stage it; the live view keeps rendering until swap_in.
+                let mut ns = { ..s, stage_prs: prs }
+                if do_meta { ns = kick_meta_staged(ns) } else { ns = swap_in(ns) }
+                reset!(state, ns)
+                request_render()
+                return
+            }
+            let mut ns = seed_seen({ ..s, prs: prs, loading: false, error: "",
+                                     status: str(len(prs)) + " open" })
+            if s.cfg.track_since_my_comment and s.me != "" { ns = kick_enrich(ns) }
+            if do_meta { ns = kick_meta(ns) }
+            reset!(state, ns)
+            request_render()
+        }
+        return
+    }
+
+    if handle == s.me_proc {
+        if line != "" {
+            let mut ns = { ..s, me: line }
+            if s.cfg.track_since_my_comment and len(s.prs) > 0 and len(s.enrich) == 0 {
+                ns = kick_enrich(ns)
+            }
+            reset!(state, ns)
+            request_render()
+        }
+        return
+    }
+
+    if has(s.enrich, str(handle)) {
+        let url = unwrap_or(get(s.enrich, str(handle)), "")
+        let arr = parse_json(line)
+        if typeof(arr) == "List" {
+            reset!(state, { ..s, sincemine: assoc(s.sincemine, url, since_my_comment(arr, s.me)) })
+            request_render()
+        }
+        return
+    }
+
+    if has(s.meta_procs, str(handle)) {
+        let url = unwrap_or(get(s.meta_procs, str(handle)), "")
+        let m = parse_json(line)
+        if s.refreshing {
+            // Accumulate into staging; swap once every staged PR has a
+            // verdict (proc exits cover the ones that produced no output).
+            let mut sm = s.stage_meta
+            if typeof(m) == "Record" { sm = assoc(sm, url, m) }
+            let mut ns = { ..s, stage_meta: sm }
+            if len(sm) >= len(s.stage_prs) { ns = swap_in(ns) }
+            reset!(state, ns)
+            request_render()
+            return
+        }
+        if typeof(m) == "Record" {
+            reset!(state, { ..s, meta: assoc(s.meta, url, m) })
+            request_render()
+        }
+        return
+    }
+    // unknown handle (e.g. the `open <url>` proc) — ignore.
+}
+
+fn on_proc_exit(handle, code) {
+    let s = @state
+    if handle == s.list_proc {
+        if s.loading {
+            reset!(state, { ..s, loading: false,
+                            error: "fetch failed (gh exit " + str(code) + ") — is `gh` on PATH & authed?",
+                            status: "" })
+            request_render()
+        } else if s.refreshing and len(s.stage_prs) == 0 {
+            // A staged refresh whose list fetch died before producing any
+            // rows — drop back to the (still-intact) live view.
+            reset!(state, { ..s, refreshing: false, status: "",
+                            error: "refresh failed (gh exit " + str(code) + ")" })
+            request_render()
+        }
+        return
+    }
+
+    // A staged meta proc finished. Decrement outstanding; swap once the
+    // last one is done (covers procs that emitted no verdict line).
+    if s.refreshing and has(s.meta_procs, str(handle)) {
+        let out = s.stage_out - 1
+        let mut ns = { ..s, stage_out: out }
+        if out <= 0 { ns = swap_in(ns) }
+        reset!(state, ns)
+        request_render()
+    }
+}
+
+// ---------------------------------------------------------------- input
+fn on_click(x, y, shift, cmd, id) {
+    if id == "" { return }
+    let s = @state
+
+    if id == "refresh" {
+        if get_or(s, "refreshing", false) { return }   // already fetching; keep the view still
+        set_tick_interval(0.1)            // drive the spinner while refreshing
+        reset!(state, run_fetch(params, s, true))
+        request_render()
+        return
+    }
+    if id == "markall" {
+        let mut sn = {}
+        for pr in s.prs { sn = assoc(sn, pr.url, { comments: pr.comments, updated: pr.updated }) }
+        reset!(state, { ..s, seen: sn })
+        request_render()
+        return
+    }
+    if starts(id, "copy::") {
+        clipboard_set(slice(id, 6, len(id)))
+        return
+    }
+
+    // A row click, an "Open" context entry, or a "Mark read" context entry
+    // all resolve to a PR url. Everything but "read::" also opens it.
+    let mut url = ""
+    let mut open_it = true
+    if starts(id, "open::")      { url = slice(id, 6, len(id)) }
+    else if starts(id, "read::") { url = slice(id, 6, len(id)); open_it = false }
+    else if starts(id, "http")   { url = id }
+
+    if url != "" {
+        let pr = find_pr(s.prs, url)
+        let mut sn = s.seen
+        if typeof(pr) == "Record" { sn = assoc(sn, url, { comments: pr.comments, updated: pr.updated }) }
+        if open_it { proc_spawn(s.cfg.open_cmd, [url]) }
+        reset!(state, { ..s, seen: sn })
+        request_render()
+    }
+}
+
+// ---------------------------------------------------------------- render
+fn badge(value, color) = { kind: "badge", value: value, color: color }
+
+fn spinner_glyph(n) {
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    frames[n % 10]
+}
+
+fn dot_glyph(ci) = if ci == "none" { "○" } else { "●" }
+fn dot_color(ci) =
+    if ci == "pass" { c_new() }
+    else if ci == "fail" { c_err() }
+    else if ci == "pending" { c_warn() }
+    else { c_muted() }
+
+// CI status dot element, or () when show_ci is off.
+fn ci_dot(s, pr) {
+    if not get_or(s.cfg, "show_ci", true) { return () }
+    let m = mget(s.meta, pr.url)
+    let ci = if typeof(m) == "Record" { get_or(m, "ci", "none") } else { "none" }
+    { kind: "text", value: dot_glyph(ci), color: dot_color(ci), size: 12.0, wrap: false }
+}
+
+// Condensed "what changed" for this PR, or () when nothing's new. Returns
+// { label, color } so the caller can style it inline.
+fn activity(s, pr) {
+    if not has(s.seen, pr.url) { return { label: "NEW", color: c_newpr() } }
+    let b = unwrap_or(get(s.seen, pr.url), {})
+    let mut newc = pr.comments - get_or(b, "comments", pr.comments)
+    if newc < 0 { newc = 0 }
+    if newc > 0 { return { label: str(newc) + " new", color: c_new() } }
+    if ts_num(pr.updated) > ts_num(get_or(b, "updated", "")) { return { label: "updated", color: c_warn() } }
+    if has(s.sincemine, pr.url) {
+        let sm = unwrap_or(get(s.sincemine, pr.url), -1)
+        if sm > 0 { return { label: str(sm) + " since you", color: c_new() } }
+    }
+    ()
+}
+
+fn pr_context(url) = [
+    { label: "Open in browser", id: "open::" + url },
+    { label: "Mark read",       id: "read::" + url },
+    { label: "Copy URL",        id: "copy::" + url },
+]
+
+fn title_text(pr, draft) =
+    { kind: "text", value: pr.title, color: if draft { c_muted() } else { c_text() },
+      size: 13.0, wrap: false }
+
+// A standalone PR (not part of any stack): dot + title over a muted
+// "repo #num · activity" line.
+fn solo_row(s, pr) {
+    let mut head = []
+    let d = ci_dot(s, pr)
+    if typeof(d) == "Record" { head = push(head, d) }
+
+    let mut meta_kids = [ { kind: "text", value: pr.repo + " #" + str(pr.number),
+                            color: c_muted(), size: 11.0, wrap: false } ]
+    let act = activity(s, pr)
+    if typeof(act) == "Record" {
+        meta_kids = push(meta_kids, { kind: "text", value: "·", color: c_muted(), size: 11.0 })
+        meta_kids = push(meta_kids, { kind: "text", value: act.label, color: act.color, size: 11.0 })
+    }
+    if pr.draft {
+        meta_kids = push(meta_kids, { kind: "text", value: "· draft", color: c_muted(), size: 11.0 })
+    }
+
+    head = push(head, { kind: "vstack", gap: 1.0, children: [
+        title_text(pr, pr.draft),
+        { kind: "hstack", gap: 5.0, align: "center", children: meta_kids },
+    ]})
+
+    { kind: "list-item", id: pr.url, pad: 8.0, gap: 2.0, context: pr_context(pr.url),
+      children: [ { kind: "hstack", gap: 8.0, align: "center", children: head } ] }
+}
+
+// A row inside a stack group: rail glyph + dot + title (+ inline activity),
+// with the PR number pushed to the right. Repo lives in the group header.
+fn stack_row(s, pr, rail) {
+    let mut kids = [ { kind: "text", value: rail, color: c_rail(), size: 13.0, wrap: false } ]
+    let d = ci_dot(s, pr)
+    if typeof(d) == "Record" { kids = push(kids, d) }
+
+    let mut title_kids = [ title_text(pr, pr.draft) ]
+    let act = activity(s, pr)
+    if typeof(act) == "Record" {
+        title_kids = push(title_kids, { kind: "text", value: act.label, color: act.color, size: 11.0 })
+    }
+    kids = push(kids, { kind: "hstack", gap: 6.0, align: "center", children: title_kids })
+    kids = push(kids, { kind: "frame", style: { flex_grow: 1.0 } })
+    kids = push(kids, { kind: "text", value: "#" + str(pr.number), color: c_muted(), size: 11.0, wrap: false })
+
+    { kind: "list-item", id: pr.url, pad: 6.0, gap: 2.0, context: pr_context(pr.url),
+      children: [ { kind: "hstack", gap: 6.0, align: "center", children: kids } ] }
+}
+
+fn group_header(repo, n) = { kind: "hstack", gap: 6.0, align: "center", children: [
+    { kind: "text", value: repo, color: c_text(), size: 12.0, weight: "bold", wrap: false },
+    { kind: "text", value: "· stack of " + str(n), color: c_muted(), size: 11.0, wrap: false },
+]}
+
+// Emit one stacked group (header + rows top→bottom) as a tight vstack.
+fn stack_group(s, prs, meta, maps, rooturl) {
+    let chain = chain_down(meta, maps, rooturl)   // [bottom … top]
+    let n = len(chain)
+    let repo = { let pr = find_pr(prs, rooturl); if typeof(pr) == "Record" { pr.repo } else { "?" } }
+
+    let mut gkids = [ group_header(repo, n) ]
+    let mut i = n - 1                              // walk top → bottom
+    while i >= 0 {
+        let url = chain[i]
+        let pr = find_pr(prs, url)
+        if typeof(pr) == "Record" {
+            let rail = if i == n - 1 { "┌" } else if i == 0 { "└" } else { "├" }
+            gkids = push(gkids, stack_row(s, pr, rail))
+        }
+        i = i - 1
+    }
+    { kind: "vstack", gap: 2.0, children: gkids }
+}
+
+fn render(w, h) {
+    let s = @state
+
+    let mut kids = []
+
+    // header
+    let mut hdr = [
+        { kind: "text", value: "Pull Requests", color: c_text(), size: 16.0, weight: "bold" },
+        badge(str(len(s.prs)), c_muted()),
+    ]
+    let refreshing = get_or(s, "refreshing", false)
+    if refreshing {
+        hdr = push(hdr, { kind: "hstack", gap: 4.0, align: "center", children: [
+            { kind: "text", value: spinner_glyph(get_or(s, "spin", 0)), color: c_newpr(), size: 14.0, wrap: false },
+            { kind: "text", value: "refreshing…", color: c_muted(), size: 11.0, wrap: false },
+        ]})
+    }
+    hdr = push(hdr, { kind: "frame", style: { flex_grow: 1.0 } })
+    hdr = push(hdr, { kind: "button", id: "refresh", label: if refreshing { "Refreshing…" } else { "Refresh" } })
+    hdr = push(hdr, { kind: "button", id: "markall", label: "Mark all read" })
+    kids = push(kids, { kind: "hstack", gap: 8.0, align: "center", children: hdr })
+
+    if s.error != "" {
+        kids = push(kids, { kind: "text", value: s.error, color: c_err(), size: 12.0 })
+    } else if s.loading {
+        kids = push(kids, { kind: "text", value: "Loading…", color: c_muted(), size: 12.0 })
+    }
+
+    kids = push(kids, { kind: "divider" })
+
+    if len(s.prs) == 0 and not s.loading and s.error == "" {
+        kids = push(kids, { kind: "text", value: "No open PRs.", color: c_muted(), size: 12.0 })
+        return { kind: "vstack", pad: 10.0, gap: 6.0, children: kids }
+    }
+
+    // Per-repo branch maps (built once), then partition PRs into stack
+    // groups (keyed by their root url) and standalones, preserving the
+    // updated-desc order of first appearance.
+    let show_stack = get_or(s.cfg, "show_stack", true)
+    let mut repomaps = {}
+    for pr in s.prs {
+        if not has(repomaps, pr.repo) {
+            repomaps = assoc(repomaps, pr.repo, repo_maps(s.prs, s.meta, pr.repo))
+        }
+    }
+
+    let mut order = []          // group keys, first-appearance order
+    let mut seen_keys = {}
+    for pr in s.prs {
+        let maps = unwrap_or(get(repomaps, pr.repo), { h: {}, b: {} })
+        let m0 = mget(s.meta, pr.url)
+        let stacked = show_stack and is_stacked(maps, m0)
+        let key = if stacked { "stk::" + root_of(s.meta, maps, pr.url) } else { "solo::" + pr.url }
+        if not has(seen_keys, key) {
+            seen_keys = assoc(seen_keys, key, true)
+            order = push(order, key)
+        }
+    }
+
+    for key in order {
+        if starts(key, "stk::") {
+            let rooturl = slice(key, 5, len(key))
+            let pr = find_pr(s.prs, rooturl)
+            if typeof(pr) == "Record" {
+                let maps = unwrap_or(get(repomaps, pr.repo), { h: {}, b: {} })
+                kids = push(kids, stack_group(s, s.prs, s.meta, maps, rooturl))
+            }
+        } else {
+            let url = slice(key, 6, len(key))
+            let pr = find_pr(s.prs, url)
+            if typeof(pr) == "Record" { kids = push(kids, solo_row(s, pr)) }
+        }
+    }
+
+    { kind: "vstack", pad: 10.0, gap: 6.0, children: kids }
+}
