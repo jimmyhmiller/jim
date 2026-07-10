@@ -236,13 +236,13 @@ impl DaemonClient {
     }
 }
 
-/// Fork-exec the daemon in the background. By default this re-execs
-/// the editor's own binary with `--daemon <session_id> <cmd…>`; the
-/// daemonize() inside the child's `jim_daemon::daemon::run`
+/// Fork-exec the daemon in the background. Prefers the standalone
+/// `jim-daemon` binary (see `daemon_invocation`) and falls back to
+/// re-execing the editor's own binary with `--daemon <session_id>
+/// <cmd…>`. Either way the `daemonize()` inside `jim_daemon::daemon::run`
 /// double-forks so the immediate child exits quickly. We `wait()` it
-/// to avoid a zombie. Tests can point `TERMINAL_BEVY_DAEMON_BIN` at
-/// the standalone `terminal-daemon` binary; in that mode argv is
-/// positional with no `--daemon` flag.
+/// to avoid a zombie. The standalone (and the `TERMINAL_BEVY_DAEMON_BIN`
+/// test override) take positional argv with no `--daemon` flag.
 fn spawn_daemon(
     session_id: u64,
     command: Vec<String>,
@@ -266,14 +266,28 @@ fn spawn_daemon(
     Ok(())
 }
 
-/// Resolve the daemon binary and whether to prepend `--daemon`. Honors
-/// `TERMINAL_BEVY_DAEMON_BIN` (tests) — that path is the standalone
-/// `terminal-daemon` and takes positional argv. Otherwise self-exec.
+/// Resolve the daemon binary and whether to prepend `--daemon`.
+///
+/// Preference order:
+/// 1. `TERMINAL_BEVY_DAEMON_BIN` (tests) — positional argv, no flag.
+/// 2. A `jim-daemon` sibling of our own executable — the dylib-free
+///    standalone daemon. Same positional argv. This is the fast path:
+///    a ~1 MB binary that doesn't drag in libghostty/Bevy at process
+///    start, so the daemon boots in single-digit ms instead of the
+///    hundreds of ms it takes dyld to fault in the 400 MB GUI image.
+/// 3. Self-exec `<exe> --daemon …` as a fallback when the sibling is
+///    missing (e.g. an unbundled/partial build). Behaviorally identical
+///    via `jim_daemon::daemon::run`, just slower to start.
 fn daemon_invocation() -> std::io::Result<(PathBuf, bool)> {
     if let Some(p) = std::env::var_os("TERMINAL_BEVY_DAEMON_BIN") {
         return Ok((PathBuf::from(p), false));
     }
     let exe = std::env::current_exe()?;
+    if let Some(standalone) = exe.parent().map(|dir| dir.join("jim-daemon")) {
+        if standalone.is_file() {
+            return Ok((standalone, false));
+        }
+    }
     Ok((exe, true))
 }
 

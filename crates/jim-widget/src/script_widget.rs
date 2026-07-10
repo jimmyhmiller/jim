@@ -525,6 +525,15 @@ pub struct ScriptWidget {
     /// flight, so the next `apply_latest_frames` pass re-renders with the
     /// advanced eased values even though the frame itself didn't change.
     pub force_render: bool,
+    /// Content-area size at the last host-side layout in `apply_latest_frames`.
+    /// A funct widget can emit a frame whose element tree is INDEPENDENT of the
+    /// pane width (e.g. the diff viewer: `wrap:false` rows truncated host-side
+    /// at the row box width). Resizing such a pane re-renders the worker to a
+    /// byte-identical tree, so `frame_gen` doesn't bump and the frame-gen gate
+    /// would skip re-layout — leaving lines clipped at the old width. Track the
+    /// laid-out size here and re-layout whenever it changes, matching the
+    /// subprocess path's `size_changed` term in `rerender_widgets`.
+    pub last_layout_size: Vec2,
 }
 
 /// A live `Element::Editor` portal tracked across re-render diffs.
@@ -1048,6 +1057,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             wants_hover: false,
             wants_pinch: false,
             force_render: false,
+            last_layout_size: Vec2::ZERO,
         },
         WidgetTargets::default(),
         crate::WidgetScroll::default(),
@@ -1718,7 +1728,23 @@ fn apply_latest_frames(
         let focus_changed = focus_sig != w.last_focus_sig;
         // Theme changes also re-emit so widgets pick up new palette colors.
         let forced = w.force_render;
-        if current_gen == w.applied_frame_gen && !theme_changed && !focus_changed && !forced {
+        // Re-layout on a content-size change even when `frame_gen` didn't bump.
+        // A widget whose element tree is width-independent (the diff viewer's
+        // host-truncated `wrap:false` rows) re-renders to an identical tree on
+        // resize, so the worker dedupes it (no frame_gen bump). Without this
+        // term the pane would stay laid out at the old width. Mirrors the
+        // subprocess path (`rerender_widgets`).
+        let content_size = Vec2::new(
+            (rect.size.x - 2.0 * MARGIN).max(0.0),
+            (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0),
+        );
+        let size_changed = w.last_layout_size != content_size;
+        if current_gen == w.applied_frame_gen
+            && !theme_changed
+            && !focus_changed
+            && !forced
+            && !size_changed
+        {
             continue;
         }
         // Over the per-frame budget? Defer this (and the rest of the dirty)
@@ -1735,6 +1761,11 @@ fn apply_latest_frames(
         w.applied_frame_gen = current_gen;
         w.last_focus_sig = focus_sig;
         w.force_render = false;
+        // Committed to laying out at this size; record it so a later frame
+        // with an unchanged size+tree doesn't re-render. Set only after the
+        // budget-defer gate so a deferred pane keeps `size_changed` true and
+        // is retried next frame.
+        w.last_layout_size = content_size;
 
         // Grab the frame the worker last produced.
         let frame = w

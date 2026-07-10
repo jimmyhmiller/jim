@@ -609,6 +609,15 @@ pub struct ShaderSpec {
     pub overlay: bool,
 }
 
+/// One entry in a `ListItem`'s right-click context menu. `label` is the
+/// text shown in the host menu; `id` is the `Click` id routed back to the
+/// widget when the entry is picked (handle it in `on_click` like a button).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContextItem {
+    pub label: String,
+    pub id: String,
+}
+
 /// Border specification. `color` is a token name or literal; `width`
 /// is in pixels.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -958,6 +967,13 @@ pub enum Element {
         selected: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         style: Option<Style>,
+        /// Right-click context-menu items for this row. When non-empty,
+        /// the host opens its native context menu on a right-click that
+        /// lands inside this item; picking an entry routes a `Click {id}`
+        /// back to the widget (same as a button press). Empty = no menu
+        /// (right-click falls through to the host's pane menu).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context: Vec<ContextItem>,
     },
     /// Single-line text input. Click to focus; typing emits
     /// `{"event":"input-change","id":"<id>","value":"<new>"}` back to

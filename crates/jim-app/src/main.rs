@@ -104,6 +104,16 @@ fn main() {
     // can overwrite window.json with the wrong creation-time size.
     app.insert_resource(jim_app::window_geometry::RestoredGeometry(saved));
     app.add_plugins(AppShellPlugin);
+    // Boot the claude-bus daemon if it isn't already running, so the
+    // terminal's `cwd_changed` events (and the cwd→project inference they
+    // drive) have somewhere to land. Nothing else keeps this bus alive —
+    // the GUI self-execs `jim bus-daemon` for the *jim-bus*, but claude-bus
+    // is a separate binary shipped beside `jim` in the bundle. Best-effort:
+    // publish and subscribe both self-heal via connect_or_spawn if this
+    // misses, so a failure here only delays the first event.
+    if let Err(e) = claude_bus::client::ensure_running() {
+        eprintln!("[terminal-bevy] claude-bus not started (events may be dropped): {e}");
+    }
     // Subscribe to Claude Code hook events from the central bus. Any
     // system in this app (or its panes) can react by reading
     // MessageReader<claude_bus_bevy::ClaudeBusEvent>. If the bus isn't

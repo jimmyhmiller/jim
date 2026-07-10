@@ -265,6 +265,12 @@ pub fn classify_command_suggestion(
     cwd: &str,
     exit_code: i32,
 ) -> Result<CommandSuggestion, LlmError> {
+    // Never let inlined secrets leave the machine: redact the values of
+    // leading `NAME=value` environment assignments before the command
+    // reaches the model. The caller still publishes the *original*
+    // command (so a saved run-button keeps its env), so this redaction is
+    // scoped strictly to the prompt.
+    let command = redact_env_values(command);
     let user = format!(
         "Project name (label only): {project_name}\n\
          cwd: {cwd}\n\
@@ -272,6 +278,52 @@ pub fn classify_command_suggestion(
          command:\n  {command}\n"
     );
     llm::classify(cfg, COMMAND_SUGGEST_SYSTEM, &user)
+}
+
+/// Replace the *values* of leading environment-variable assignments
+/// (`NAME=value`, e.g. `DEPLOY_TOKEN=… cargo run`) with `<redacted>` so a
+/// secret inlined as an env var is never sent to the model. Only the
+/// leading prefix is touched — the same `VAR=val … sudo/env/time/nice`
+/// run that [`crate::llm`]-side callers treat as env vars — so a real
+/// program argument that merely looks like an assignment (`make FOO=bar`)
+/// passes through untouched. The variable *name* is kept (it's not the
+/// secret and gives the model mild signal); only the value is removed.
+fn redact_env_values(command: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_prefix = true;
+    for tok in command.split_whitespace() {
+        if in_prefix {
+            if let Some(name) = env_assignment_name(tok) {
+                out.push(format!("{name}=<redacted>"));
+                continue;
+            }
+            if matches!(tok, "sudo" | "env" | "time" | "nice") {
+                out.push(tok.to_string());
+                continue;
+            }
+            // First real program token: stop redacting; everything after
+            // is arguments/flags, not environment variables.
+            in_prefix = false;
+        }
+        out.push(tok.to_string());
+    }
+    out.join(" ")
+}
+
+/// If `tok` is a shell environment assignment `NAME=value` with a valid
+/// identifier name (`[A-Za-z_][A-Za-z0-9_]*`), return the name; else
+/// `None`.
+fn env_assignment_name(tok: &str) -> Option<&str> {
+    let (name, _value) = tok.split_once('=')?;
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .map_or(false, |c| c.is_ascii_alphabetic() || c == '_');
+    if first_ok && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +337,39 @@ mod tests {
         assert!(f.manifests.is_empty());
         assert!(f.entries.is_empty());
         assert_eq!(f.entries_total, 0);
+    }
+
+    #[test]
+    fn redacts_leading_env_var_values_only() {
+        // Leading env assignment → value redacted, name kept.
+        assert_eq!(
+            redact_env_values("DEPLOY_TOKEN=secret cargo run"),
+            "DEPLOY_TOKEN=<redacted> cargo run"
+        );
+        // Multiple leading assignments + a wrapper.
+        assert_eq!(
+            redact_env_values("env FOO=a BAR=b npm test"),
+            "env FOO=<redacted> BAR=<redacted> npm test"
+        );
+        assert_eq!(
+            redact_env_values("RUST_LOG=debug cargo build"),
+            "RUST_LOG=<redacted> cargo build"
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_program_args_untouched() {
+        // `FOO=bar` after the program is a make/cmd argument, not an env
+        // var — must survive verbatim.
+        assert_eq!(redact_env_values("make FOO=bar"), "make FOO=bar");
+        assert_eq!(
+            redact_env_values("cargo test --features=full"),
+            "cargo test --features=full"
+        );
+        // No assignment at all.
+        assert_eq!(redact_env_values("cargo run"), "cargo run");
+        // Flags that merely contain '=' aren't valid identifiers → kept.
+        assert_eq!(redact_env_values("-Dfoo=bar make"), "-Dfoo=bar make");
     }
 
     #[test]
