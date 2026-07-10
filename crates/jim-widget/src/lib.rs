@@ -247,6 +247,21 @@ pub struct WidgetTargets {
     /// instead of re-rendering the whole pane on hover — re-rendering made
     /// text flash as the cursor moved between rows.
     pub hover_washes: Vec<HoverWash>,
+    /// Right-click context-menu regions collected this frame (one per
+    /// `Element::ListItem` carrying a non-empty `context`). The host's
+    /// pane context menu (jim-app) hit-tests these on a right-click and,
+    /// if one is hit, shows the widget's items instead of the default
+    /// pane menu; picking an item routes a `Click {id}` back to the widget.
+    /// `rect` is content_root-local (y-down), pre-scroll (add `scroll.y`).
+    pub context_menus: Vec<ContextTarget>,
+}
+
+/// A right-click context-menu region collected during render: the row's
+/// box plus the items to offer. See [`WidgetTargets::context_menus`].
+#[derive(Clone, Debug)]
+pub struct ContextTarget {
+    pub rect: Rect,
+    pub items: Vec<protocol::ContextItem>,
 }
 
 /// A list-item hover-wash region collected during render. The wash is the
@@ -3344,6 +3359,7 @@ fn rerender_widgets(
         targets.anims.clear();
         targets.canvas_regions.clear();
         targets.hover_washes.clear();
+        targets.context_menus.clear();
 
         let frame_clone = render_state.current_frame.clone().unwrap();
 

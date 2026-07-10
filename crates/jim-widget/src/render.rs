@@ -357,6 +357,7 @@ fn render_node(
             children,
             selected,
             style,
+            context,
             ..
         } => {
             if *selected {
@@ -410,11 +411,18 @@ fn render_node(
                 radius: ctx.resolve_f32("radius_sm").unwrap_or(4.0),
             });
             recurse_children(commands, targets, children, style.as_ref());
+            let rect = Rect::new(origin.x, origin.y, origin.x + size.x, origin.y + size.y);
             targets.clicks.push(ClickTarget {
                 id: id.clone(),
                 kind: ClickKind::Button,
-                rect: Rect::new(origin.x, origin.y, origin.x + size.x, origin.y + size.y),
+                rect,
             });
+            if !context.is_empty() {
+                targets.context_menus.push(crate::ContextTarget {
+                    rect,
+                    items: context.clone(),
+                });
+            }
         }
         Element::Text {
             value,
@@ -3050,13 +3058,22 @@ fn render_input_at(
     let line_h = line_height(DEFAULT_FONT_SIZE);
     let text_y = (size.y - line_h) * 0.5;
     let content_w = (size.x - 2.0 * INPUT_PAD_X).max(0.0);
+    // Monospace widget font, so a fixed char width maps chars↔pixels exactly.
+    // Used to window both the value and the placeholder to the box.
+    let char_w = ctx.metrics.char_width(DEFAULT_FONT_SIZE).max(1.0);
+    let max_chars = (content_w / char_w).floor().max(1.0) as usize;
 
     if display_value.is_empty() && !is_focused {
         // Placeholder (muted), shown only when empty and unfocused.
         if !placeholder.is_empty() {
+            // Truncate to the box like the value path below — inputs are
+            // PaneContentNoClip + no_wrap, so an over-long placeholder would
+            // otherwise spill past the box edge over neighboring elements
+            // (clipped only at the far pane edge, not the input's own bounds).
+            let shown: String = placeholder.chars().take(max_chars).collect();
             commands.spawn((
                 ChildOf(ctx.content_root),
-                Text2d::new(placeholder.to_string()),
+                Text2d::new(shown),
                 TextFont {
                     font: (ctx.font.clone()).into(),
                     font_size: FontSize::Px(DEFAULT_FONT_SIZE),
@@ -3081,10 +3098,7 @@ fn render_input_at(
     } else {
         // Single line: render only the character window that fits the box
         // (scrolled to keep the caret visible) so a long value never
-        // overflows into sibling elements. Monospace widget font, so a
-        // fixed char width maps chars↔pixels exactly.
-        let char_w = ctx.metrics.char_width(DEFAULT_FONT_SIZE).max(1.0);
-        let max_chars = (content_w / char_w).floor().max(1.0) as usize;
+        // overflows into sibling elements.
         let chars: Vec<char> = display_value.chars().collect();
         let caret_pos = caret_pos.min(chars.len());
         let start = caret_pos.saturating_sub(max_chars);

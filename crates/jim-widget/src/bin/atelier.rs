@@ -540,6 +540,7 @@ fn list_card(selected: &str) -> Element {
                 }),
                 ..Default::default()
             }),
+            context: Vec::new(),
         })
         .collect();
     card("anatomy", "Application shell", rows)

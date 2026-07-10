@@ -770,6 +770,7 @@ fn list_row(id: &str, title: &str, hint: &str, selected: bool, title_color: &str
             }),
         }],
         style: None,
+        context: Vec::new(),
     }
 }
 

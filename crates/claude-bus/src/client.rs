@@ -14,11 +14,12 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::proto::{decode, encode, BusFrame, ClientFrame, Role};
 
@@ -104,6 +105,83 @@ impl Subscriber {
     }
 }
 
+/// How long [`connect_or_spawn`] waits for a freshly-spawned daemon to
+/// bind its socket before giving up.
+const BOOT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Connect to the bus at `socket`, spawning the daemon if nothing is
+/// listening yet. Mirrors `jim_bus::client::connect_or_spawn`: both the
+/// terminal cwd publisher and the in-process subscriber route through
+/// here, so the bus self-heals after a daemon death or a cold start
+/// (e.g. a fresh GUI launch with no daemon running). The spawn only
+/// fires when the connect *fails* — a live daemon is never disturbed,
+/// which matters because the daemon has no liveness guard and would
+/// steal the socket from a running predecessor.
+pub fn connect_or_spawn(socket: &Path) -> std::io::Result<UnixStream> {
+    match UnixStream::connect(socket) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            spawn_daemon()?;
+            wait_for_socket(socket, BOOT_TIMEOUT)
+        }
+    }
+}
+
+/// Best-effort: ensure the daemon is running, spawning it if needed, and
+/// return once the socket accepts a connection (or on timeout). Callers
+/// at startup use this to boot the bus once before subscribing, so the
+/// subscriber connects to a live daemon instead of racing several spawns.
+pub fn ensure_running() -> std::io::Result<()> {
+    let socket = crate::socket_path()
+        .ok_or_else(|| std::io::Error::other("HOME not set; cannot locate bus socket"))?;
+    let _ = connect_or_spawn(&socket)?;
+    Ok(())
+}
+
+/// Spawn the `claude-bus` daemon binary. Resolution order: the
+/// `CLAUDE_BUS_BIN` env override, then a `claude-bus` sibling of the
+/// current exe (the bundle ships it next to `jim` in `Contents/MacOS/`;
+/// a dev build leaves it next to `target/<profile>/jim`), then bare
+/// `claude-bus` on `PATH`. The daemon double-forks itself
+/// (`daemonize_if_requested`), so the immediate child exits at once —
+/// we `wait()` it to avoid a zombie.
+fn spawn_daemon() -> std::io::Result<()> {
+    let mut child = Command::new(daemon_bin()).spawn()?;
+    let _ = child.wait();
+    Ok(())
+}
+
+fn daemon_bin() -> PathBuf {
+    if let Some(p) = std::env::var_os("CLAUDE_BUS_BIN") {
+        return PathBuf::from(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let sib = exe.with_file_name("claude-bus");
+        if sib.is_file() {
+            return sib;
+        }
+    }
+    PathBuf::from("claude-bus")
+}
+
+fn wait_for_socket(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let deadline = Instant::now() + timeout;
+    let mut backoff = Duration::from_millis(5);
+    loop {
+        if let Ok(sock) = UnixStream::connect(path) {
+            return Ok(sock);
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "claude-bus daemon socket never appeared: {}",
+                path.display()
+            )));
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(50));
+    }
+}
+
 /// Fire-and-forget publish: open the bus socket, send Hello+Publish, drop.
 ///
 /// Returns the wire error if the socket is missing or the bus is down;
@@ -119,7 +197,7 @@ pub fn publish_oneshot(
     claude_pid: u32,
     payload_json: &str,
 ) -> std::io::Result<()> {
-    let mut s = UnixStream::connect(socket)?;
+    let mut s = connect_or_spawn(socket)?;
     s.write_all(
         &encode(&ClientFrame::Hello {
             role: Role::Publisher,
@@ -203,7 +281,9 @@ fn run_session(
     stop: &Arc<AtomicBool>,
     last_delivered: &mut Option<u64>,
 ) -> std::io::Result<()> {
-    let mut s = UnixStream::connect(socket)?;
+    // Spawn the daemon if it isn't up yet, so a fresh GUI launch (or a
+    // daemon that died mid-session) self-heals on the next reconnect.
+    let mut s = connect_or_spawn(socket)?;
     // Short read timeout lets us check the stop flag responsively
     // without spinning.
     s.set_read_timeout(Some(Duration::from_millis(250)))?;

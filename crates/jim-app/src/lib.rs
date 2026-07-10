@@ -396,6 +396,15 @@ impl Plugin for AppShellPlugin {
             radial_icon: None,
             default_keys: &[],
             run: ActionRun::Custom(|ctx| actions::rebuild_keymap(ctx.world)),
+        })
+        .add_action(Action {
+            id: "project.set_cwd_from_terminal",
+            title: "Set Project Default Dir from Focused Terminal",
+            category: "Project",
+            keywords: &["cwd", "directory", "default", "terminal", "working"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(action_set_project_cwd_from_focused),
         });
         app
             .add_systems(
@@ -470,7 +479,9 @@ impl Plugin for AppShellPlugin {
                     sync_dock_badge,
                 )
                     .chain(),
-            );
+            )
+            .init_resource::<TerminalCwds>()
+            .add_systems(Update, track_terminal_cwds);
     }
 }
 
@@ -1489,6 +1500,80 @@ fn apply_claude_notification_pulse(
             projects.unread_total()
         );
     }
+}
+
+/// Latest known working directory for each terminal session, keyed by
+/// `TerminalSession` id. Populated from the `terminal.cwd_changed` bus
+/// events the terminal worker emits on every OSC 7 (i.e. on each shell
+/// prompt). This is the *live* cwd — distinct from a project's persisted
+/// `default_cwd` and from a terminal's spawn-time `initial_cwd`. Session-
+/// scoped and not persisted: a GUI restart rebuilds it from the first
+/// prompt of each live terminal.
+#[derive(Resource, Default)]
+pub struct TerminalCwds(pub std::collections::HashMap<u64, String>);
+
+/// Mirror `terminal.cwd_changed` bus events into [`TerminalCwds`] so
+/// in-app code (e.g. the `project.set_cwd_from_terminal` action) can ask
+/// "what directory is this terminal in right now?" without re-parsing the
+/// bus. Mirrors the event-shape handling of `apply_claude_notification_pulse`.
+fn track_terminal_cwds(
+    mut events: MessageReader<claude_bus_bevy::ClaudeBusEvent>,
+    mut cwds: ResMut<TerminalCwds>,
+) {
+    for ev in events.read() {
+        if ev.kind != jim_inference::event_kinds::TERMINAL_CWD_CHANGED {
+            continue;
+        }
+        let Ok(sid) = ev.terminal_session_id.parse::<u64>() else {
+            continue;
+        };
+        #[derive(serde::Deserialize)]
+        struct CwdPayload {
+            cwd: String,
+        }
+        let Ok(payload) = serde_json::from_str::<CwdPayload>(&ev.payload_json) else {
+            continue;
+        };
+        cwds.0.insert(sid, payload.cwd);
+    }
+}
+
+/// `project.set_cwd_from_terminal` — set the active/owning project's
+/// remembered `default_cwd` to the current working directory of the
+/// focused terminal. No-op (with a log line) when nothing is focused, the
+/// focused pane isn't a terminal, the terminal has no project, or we
+/// haven't yet seen a cwd for it (no OSC 7 emitted — e.g. a full-screen
+/// program is running and the shell hasn't reprinted its prompt).
+fn action_set_project_cwd_from_focused(ctx: &mut actions::ActionCtx) {
+    let world = &mut ctx.world;
+    let Some(entity) = world.resource::<jim_pane::FocusedPane>().0 else {
+        eprintln!("[set-cwd] no focused pane");
+        return;
+    };
+    let Some(session) = world.get::<jim_terminal::TerminalSession>(entity) else {
+        eprintln!("[set-cwd] focused pane is not a terminal");
+        return;
+    };
+    let sid = session.0;
+    let Some(project) = world.get::<jim_pane::PaneProject>(entity) else {
+        eprintln!("[set-cwd] focused terminal has no project");
+        return;
+    };
+    let project_id = project.0;
+    let Some(cwd) = world.resource::<TerminalCwds>().0.get(&sid).cloned() else {
+        eprintln!(
+            "[set-cwd] no known cwd for terminal session {} yet (waiting on OSC 7)",
+            sid
+        );
+        return;
+    };
+    let changed = world
+        .resource_mut::<projects::Projects>()
+        .set_default_cwd(project_id, Some(cwd.clone()));
+    eprintln!(
+        "[set-cwd] project={} default_cwd={:?} changed={}",
+        project_id, cwd, changed
+    );
 }
 
 /// Clears the active project's unread count whenever the OS window is

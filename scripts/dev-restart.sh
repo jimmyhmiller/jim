@@ -66,12 +66,15 @@ fi
 # the .app wrapper). Exclude:
 #   - `jim-daemon` binary (separate path; survives by design)
 #   - any `jim --daemon ...` invocation (the daemon-mode subprocess)
+#   - `jim bus-daemon` (the widget/agent message-bus daemon; survives
+#     GUI restarts so retained messages + agent roster persist)
 ABS_BIN="$(pwd)/$BIN"
 KILL=$(ps -ax -o pid,command \
     | awk '($0 ~ /Jim\.app\/Contents\/MacOS\/jim($|[[:space:]])/ \
             || $0 ~ /target\/(debug|release)\/jim($|[[:space:]])/) \
            && $0 !~ /--daemon/ \
-           && $0 !~ /jim-daemon/ { print $1 }')
+           && $0 !~ /jim-daemon/ \
+           && $0 !~ /bus-daemon/ { print $1 }')
 if [ -n "$KILL" ]; then
     echo "[dev-restart] killing existing GUI(s): $KILL"
     kill $KILL 2>/dev/null || true
@@ -80,12 +83,26 @@ if [ -n "$KILL" ]; then
 fi
 
 LOG=${TMPDIR:-/tmp}/jim-${PROFILE}.log
+APP="$(pwd)/Jim.app"
 echo "[dev-restart] launching → $LOG"
-# The dylib lives inside the bundle (Contents/Frameworks) and the
-# binary's rpath was set to @executable_path/../Frameworks by
-# make-bundle.sh, so no DYLD_* env vars are needed. `& disown`
-# detaches the child cleanly without going through nohup.
-"$ABS_BIN" $GUI_ARGS </dev/null >"$LOG" 2>&1 &
-NEW_PID=$!
-disown $NEW_PID 2>/dev/null || true
-echo "[dev-restart] started PID $NEW_PID"
+# Launch from a FRESH login-shell environment, not this script's inherited
+# env. dev-restart is usually run from inside a Claude Code session, which
+# exports GIT_EDITOR=true, CLAUDECODE=1, CLAUDE_CODE_*, etc. Those would
+# otherwise flow all the way through to the GUI → the long-lived jim-daemon
+# it spawns → every terminal pane (so git silently uses GIT_EDITOR=true
+# instead of the user's core.editor). Note `open` does NOT isolate us here:
+# on current macOS it forwards the caller's environment to the launched app.
+#
+# `env -i` drops the inherited env entirely; `zsh -l` then rebuilds PATH and
+# friends from /etc/zprofile + the user's profile — giving the GUI exactly
+# the environment a Terminal.app login shell has, with no agent vars to chase
+# by name. We still launch via `open` (inside that clean shell) so the app
+# keeps its bundle/Dock identity; -n forces a fresh instance and
+# --stdout/--stderr reproduce the log redirection (stdin defaults to
+# /dev/null). The dylib lives inside the bundle (rpath
+# @executable_path/../Frameworks), so no DYLD_* env vars are needed.
+env -i \
+    HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" \
+    TERM="${TERM:-xterm-256color}" SHELL="$SHELL" TMPDIR="$TMPDIR" LANG="$LANG" \
+    /bin/zsh -lc "exec open -n '$APP' --stdout '$LOG' --stderr '$LOG' ${GUI_ARGS:+--args $GUI_ARGS}"
+echo "[dev-restart] launched Jim.app via LaunchServices → $LOG"
