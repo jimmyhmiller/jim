@@ -391,12 +391,20 @@ fn handle_pan_zoom_input(
     nav: Res<crate::canvas_pane::CanvasNav>,
     mut view: ResMut<CanvasView>,
     mut drag: ResMut<PanDragState>,
+    expose: Res<crate::expose::Expose>,
     panes: Query<(&PaneRect, Option<&Visibility>), With<PaneTag>>,
     capture_panes: Query<
         (Entity, &PaneRect, Option<&Visibility>),
         (With<PaneTag>, With<jim_pane::PaneCapturesPinch>),
     >,
 ) {
+    // Exposé locks the canvas so its grid can't drift under a stray
+    // scroll/pinch. Swallow the events so they don't leak to panes either.
+    if expose.active {
+        wheel.clear();
+        pinch.clear();
+        return;
+    }
     let Ok(window) = windows.single() else {
         return;
     };

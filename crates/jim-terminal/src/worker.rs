@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use bevy::winit::{EventLoopProxy, WinitUserEvent};
 use libghostty_vt::{
-    paste,
+    key, mouse, paste,
     render::{CellIterator, Dirty, RenderState, RowIterator},
     style::RgbColor,
     terminal::{Mode, Point, PointCoordinate, ScrollViewport},
@@ -151,6 +151,37 @@ pub struct GridSnapshot {
     /// are anchored against this so a selection follows its content
     /// while the user scrolls.
     pub viewport_offset: u64,
+    /// True while the child has *any* mouse tracking mode active (X10 /
+    /// normal / button / any-event; DECSET 9/1000/1002/1003). The main
+    /// thread reads this to decide whether a click/drag should be
+    /// *reported to the child* instead of starting a local text
+    /// selection. Published from `terminal.is_mouse_tracking()`.
+    pub mouse_tracking: bool,
+    /// True when the child wants motion reported: button-event tracking
+    /// (1002, drag while a button is held) or any-event tracking (1003,
+    /// bare hover). Lets the main thread skip shipping motion events for
+    /// the common press/release-only (1000) case.
+    pub mouse_motion: bool,
+}
+
+/// A mouse gesture phase, mirroring libghostty's `mouse::Action` but
+/// kept as a plain `Send` enum so the `!Send` libghostty types never
+/// have to cross the channel.
+#[derive(Clone, Copy, Debug)]
+pub enum MouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+/// A mouse button identity the encoder understands. Wheel notches keep
+/// going through [`WorkerMsg::Wheel`], so only the three physical
+/// buttons live here.
+#[derive(Clone, Copy, Debug)]
+pub enum MouseBtn {
+    Left,
+    Middle,
+    Right,
 }
 
 /// Messages the main (Bevy) thread sends to a worker.
@@ -184,6 +215,30 @@ pub enum WorkerMsg {
     ///     mode (DECCKM);
     ///   - otherwise → scroll libghostty's local scrollback viewport.
     Wheel { lines: isize, col: u16, row: u16 },
+    /// A mouse button/motion event to report to the child. Only acted on
+    /// when the VT currently has a mouse tracking mode active; the worker
+    /// asks libghostty's mouse encoder to turn it into the right escape
+    /// sequence for whatever tracking mode + output format (SGR / X10 /
+    /// urxvt / SGR-pixels) the child selected via DECSET. `x`/`y` are
+    /// content-local surface pixels (top-left origin, same space as the
+    /// rendered grid) and `cell_w`/`cell_h` the rendered cell size, so the
+    /// encoder floors to the exact cell the user sees. `shift` is
+    /// deliberately never forwarded — the main thread reserves Shift as
+    /// the "force local selection" override, matching xterm.
+    Mouse {
+        action: MouseAction,
+        button: Option<MouseBtn>,
+        x: f32,
+        y: f32,
+        cell_w: u16,
+        cell_h: u16,
+        ctrl: bool,
+        alt: bool,
+        sup: bool,
+        /// Whether any mouse button is currently held (the encoder needs
+        /// this to decide whether motion is a drag or a bare move).
+        any_button: bool,
+    },
     ScrollToBottom,
     /// Extract the text of a selection that may span scrollback the
     /// visible snapshot doesn't hold. `start`/`end` are normalised
@@ -285,6 +340,8 @@ impl WorkerHandle {
             generation: 0,
             child_alive: true,
             viewport_offset: 0,
+            mouse_tracking: false,
+            mouse_motion: false,
         }));
         let snapshot_w = snapshot.clone();
         let bell_count = Arc::new(AtomicU64::new(0));
@@ -522,6 +579,16 @@ fn worker_loop(
     // and then idle waiting for Shutdown from the main thread.
     let mut daemon_gone = false;
 
+    // libghostty's mouse encoder + a reusable event, created once and
+    // kept on this thread (both are `!Send`). The encoder holds the
+    // last-reported cell so motion within one cell is deduplicated
+    // (`set_track_last_cell`), keeping a fast drag from flooding the pty.
+    // Reused `mouse_out` buffer avoids a per-report allocation.
+    let mut mouse_encoder = mouse::Encoder::new().expect("mouse encoder");
+    mouse_encoder.set_track_last_cell(true);
+    let mut mouse_event = mouse::Event::new().expect("mouse event");
+    let mut mouse_out: Vec<u8> = Vec::with_capacity(32);
+
     // Local "I have a wake pending" flag. The actual throttle is
     // process-global (`try_wake_winit_throttled`); this flag remembers
     // that we wanted to wake during the cooldown so the top of the
@@ -741,6 +808,81 @@ fn worker_loop(
                         }
                     }
                 }
+                Ok(WorkerMsg::Mouse {
+                    action,
+                    button,
+                    x,
+                    y,
+                    cell_w,
+                    cell_h,
+                    ctrl,
+                    alt,
+                    sup,
+                    any_button,
+                }) => {
+                    // Only report while the child actually asked for mouse
+                    // tracking; otherwise a stray event during the tail of a
+                    // just-disabled mode would inject junk at the prompt.
+                    if cell_w > 0
+                        && cell_h > 0
+                        && terminal.is_mouse_tracking().unwrap_or(false)
+                    {
+                        let cols = terminal.cols().unwrap_or(1) as u32;
+                        let rows = terminal.rows().unwrap_or(1) as u32;
+                        // `set_options_from_terminal` copies the child's
+                        // current tracking mode + output format straight out
+                        // of the VT, so we don't reimplement xterm's mode
+                        // decision table.
+                        mouse_encoder.set_options_from_terminal(&terminal);
+                        mouse_encoder.set_size(mouse::EncoderSize {
+                            screen_width: cols * cell_w as u32,
+                            screen_height: rows * cell_h as u32,
+                            cell_width: cell_w as u32,
+                            cell_height: cell_h as u32,
+                            padding_top: 0,
+                            padding_bottom: 0,
+                            padding_right: 0,
+                            padding_left: 0,
+                        });
+                        mouse_encoder.set_any_button_pressed(any_button);
+
+                        let mut mods = key::Mods::empty();
+                        if ctrl {
+                            mods |= key::Mods::CTRL;
+                        }
+                        if alt {
+                            mods |= key::Mods::ALT;
+                        }
+                        if sup {
+                            mods |= key::Mods::SUPER;
+                        }
+                        mouse_event.set_action(match action {
+                            MouseAction::Press => mouse::Action::Press,
+                            MouseAction::Release => mouse::Action::Release,
+                            MouseAction::Motion => mouse::Action::Motion,
+                        });
+                        mouse_event.set_button(button.map(|b| match b {
+                            MouseBtn::Left => mouse::Button::Left,
+                            MouseBtn::Middle => mouse::Button::Middle,
+                            MouseBtn::Right => mouse::Button::Right,
+                        }));
+                        mouse_event.set_mods(mods);
+                        mouse_event.set_position(mouse::Position { x, y });
+
+                        mouse_out.clear();
+                        // Not every event produces bytes (e.g. bare motion in
+                        // press/release-only mode) — encode_to_vec leaves the
+                        // buffer empty in that case.
+                        if mouse_encoder
+                            .encode_to_vec(&mouse_event, &mut mouse_out)
+                            .is_ok()
+                            && !mouse_out.is_empty()
+                        {
+                            client.send(&ClientMessage::Input(mouse_out.clone()));
+                            did_anything = true;
+                        }
+                    }
+                }
                 Ok(WorkerMsg::ScrollToBottom) => {
                     terminal.scroll_viewport(ScrollViewport::Bottom);
                     did_anything = true;
@@ -895,6 +1037,14 @@ fn publish_snapshot(
     prev_cols: u16,
     prev_rows: u16,
 ) -> (u16, u16, bool) {
+    // Mouse tracking mode is toggled by escape sequences that don't dirty
+    // the grid, so read it up front and reconcile it on *every* publish
+    // path — including the clean early-return below — or the main thread
+    // would keep seeing a stale value after an app enables/disables it.
+    let mouse_tracking = terminal.is_mouse_tracking().unwrap_or(false);
+    let mouse_motion = terminal.mode(Mode::BUTTON_MOUSE).unwrap_or(false)
+        || terminal.mode(Mode::ANY_MOUSE).unwrap_or(false);
+
     let snap = match render_state.update(terminal) {
         Ok(s) => s,
         Err(_) => return (prev_cols, prev_rows, false),
@@ -904,11 +1054,16 @@ fn publish_snapshot(
     let rows = snap.rows().unwrap_or(0);
     let dims_changed = cols != prev_cols || rows != prev_rows;
     if matches!(dirty, Dirty::Clean) && !force_full && !dims_changed {
-        // Still update child_alive flag without touching cells.
+        // Still update child_alive + mouse mode flags without touching cells.
         let mut g = snapshot_arc.lock().expect("snapshot lock");
         let mut published = false;
-        if g.child_alive != child_alive {
+        if g.child_alive != child_alive
+            || g.mouse_tracking != mouse_tracking
+            || g.mouse_motion != mouse_motion
+        {
             g.child_alive = child_alive;
+            g.mouse_tracking = mouse_tracking;
+            g.mouse_motion = mouse_motion;
             g.generation = g.generation.wrapping_add(1);
             published = true;
         }
@@ -1054,6 +1209,8 @@ fn publish_snapshot(
     // already inside the snapshot publish path which runs at most a
     // few times per second under steady-state output.
     g.viewport_offset = terminal.scrollbar().map(|s| s.offset).unwrap_or(0);
+    g.mouse_tracking = mouse_tracking;
+    g.mouse_motion = mouse_motion;
     g.generation = g.generation.wrapping_add(1);
     (cols, rows, true)
 }

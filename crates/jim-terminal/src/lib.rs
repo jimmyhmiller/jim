@@ -54,7 +54,7 @@ use term_material::{
     make_cells_image, pack_rgb, GpuCell, TermMaterial, TermMaterialPlugin, TermParams,
 };
 use pty::PtySize;
-use worker::{SnapCell, WorkerHandle, WorkerMsg};
+use worker::{MouseAction, MouseBtn, SnapCell, WorkerHandle, WorkerMsg};
 
 pub const FONT_SIZE: f32 = 14.0;
 pub const LINE_HEIGHT: f32 = 18.0;
@@ -306,6 +306,7 @@ impl Plugin for TerminalPlugin {
             .add_systems(
                 Update,
                 (
+                    handle_terminal_mouse_report,
                     handle_terminal_content_press,
                     handle_terminal_selection_drag,
                     handle_resize,
@@ -555,7 +556,7 @@ pub fn populate_terminal_pane(
         .insert(terminal_entity, data);
 }
 
-fn grid_size_for_rect(size: Vec2, cell_width: f32) -> (u16, u16) {
+pub fn grid_size_for_rect(size: Vec2, cell_width: f32) -> (u16, u16) {
     let content_w = (size.x - 2.0 * MARGIN).max(0.0);
     let content_h = (size.y - TITLE_H - 2.0 * MARGIN).max(0.0);
     let cols = ((content_w / cell_width).floor() as u16).max(1);
@@ -566,7 +567,10 @@ fn grid_size_for_rect(size: Vec2, cell_width: f32) -> (u16, u16) {
 /// Spawn the single quad+material that renders an entire terminal grid
 /// on the GPU. Returns the `TermGrid` component that goes on the pane
 /// entity; the render entity itself becomes a child of `content_root`.
-fn build_term_grid(
+///
+/// Public so other VT-grid pane kinds (jim-emacs) can build the same
+/// pipeline; `sync_grid` then serves them via their `TerminalStore` entry.
+pub fn build_term_grid(
     world: &mut World,
     content_root: Entity,
     cell_width: f32,
@@ -657,12 +661,11 @@ fn build_term_grid(
 fn handle_resize(
     metrics: Res<MonoMetrics>,
     store: Res<TerminalStore>,
-    rect_q: Query<(Entity, &PaneRect, &PaneKindMarker)>,
+    rect_q: Query<(Entity, &PaneRect)>,
 ) {
-    for (entity, rect, kind) in &rect_q {
-        if kind.0 != PANE_KIND {
-            continue;
-        }
+    for (entity, rect) in &rect_q {
+        // Store membership is the gate: every VT-grid pane kind
+        // (terminal, emacs) registers its worker here.
         let Some(data) = store.map.get(&entity) else {
             continue;
         };
@@ -857,12 +860,27 @@ fn handle_keyboard(
         // Printable text via Bevy's logical_key.
         match &ev.logical_key {
             Key::Character(s) => {
-                let mut bytes: Vec<u8> = s.as_str().as_bytes().to_vec();
-                // Alt+letter sends ESC-prefixed byte (meta convention).
+                // Alt acts as Meta (the "Use Option as Meta key" behavior
+                // emacs/readline users expect): prefix ESC and, crucially,
+                // emit the *base* character derived from the physical key,
+                // not the composed logical key. On macOS, holding Option
+                // composes the character — Option+x → `≈`, Option+a → `å` —
+                // so trusting `logical_key` here would send emacs `M-≈`
+                // instead of `M-x`, which is exactly the "meta key doesn't
+                // work" symptom. Re-deriving from `key_code` fixes it.
                 if alt && !ctrl {
                     out.push(0x1b);
+                    if let Some(ch) = keycode_to_base_char(ev.key_code, shift) {
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    } else {
+                        // No base-char mapping for this physical key; fall
+                        // back to whatever the OS composed.
+                        out.extend_from_slice(s.as_str().as_bytes());
+                    }
+                } else {
+                    out.extend_from_slice(s.as_str().as_bytes());
                 }
-                out.append(&mut bytes);
             }
             Key::Space => {
                 if alt && !ctrl {
@@ -1060,6 +1078,69 @@ fn keycode_to_ctrl_byte(code: KeyCode) -> u8 {
     base
 }
 
+/// Map a *physical* key to its base US-QWERTY character, applying `shift`.
+///
+/// Used for the Alt-as-Meta path: macOS composes Option+key into accented
+/// glyphs (Option+x → `≈`), so we can't trust the OS-composed logical key
+/// for meta sequences. Re-deriving from the physical `KeyCode` gives emacs
+/// the `M-x`, `M-<`, `M-%`, `M-1`… bytes it expects. Returns `None` for keys
+/// with no printable base char (the caller then falls back to the composed
+/// bytes). US layout only for v0 — matches the direct-mapping philosophy of
+/// `handle_keyboard`.
+fn keycode_to_base_char(code: KeyCode, shift: bool) -> Option<char> {
+    let ch = match code {
+        KeyCode::KeyA => if shift { 'A' } else { 'a' },
+        KeyCode::KeyB => if shift { 'B' } else { 'b' },
+        KeyCode::KeyC => if shift { 'C' } else { 'c' },
+        KeyCode::KeyD => if shift { 'D' } else { 'd' },
+        KeyCode::KeyE => if shift { 'E' } else { 'e' },
+        KeyCode::KeyF => if shift { 'F' } else { 'f' },
+        KeyCode::KeyG => if shift { 'G' } else { 'g' },
+        KeyCode::KeyH => if shift { 'H' } else { 'h' },
+        KeyCode::KeyI => if shift { 'I' } else { 'i' },
+        KeyCode::KeyJ => if shift { 'J' } else { 'j' },
+        KeyCode::KeyK => if shift { 'K' } else { 'k' },
+        KeyCode::KeyL => if shift { 'L' } else { 'l' },
+        KeyCode::KeyM => if shift { 'M' } else { 'm' },
+        KeyCode::KeyN => if shift { 'N' } else { 'n' },
+        KeyCode::KeyO => if shift { 'O' } else { 'o' },
+        KeyCode::KeyP => if shift { 'P' } else { 'p' },
+        KeyCode::KeyQ => if shift { 'Q' } else { 'q' },
+        KeyCode::KeyR => if shift { 'R' } else { 'r' },
+        KeyCode::KeyS => if shift { 'S' } else { 's' },
+        KeyCode::KeyT => if shift { 'T' } else { 't' },
+        KeyCode::KeyU => if shift { 'U' } else { 'u' },
+        KeyCode::KeyV => if shift { 'V' } else { 'v' },
+        KeyCode::KeyW => if shift { 'W' } else { 'w' },
+        KeyCode::KeyX => if shift { 'X' } else { 'x' },
+        KeyCode::KeyY => if shift { 'Y' } else { 'y' },
+        KeyCode::KeyZ => if shift { 'Z' } else { 'z' },
+        KeyCode::Digit1 => if shift { '!' } else { '1' },
+        KeyCode::Digit2 => if shift { '@' } else { '2' },
+        KeyCode::Digit3 => if shift { '#' } else { '3' },
+        KeyCode::Digit4 => if shift { '$' } else { '4' },
+        KeyCode::Digit5 => if shift { '%' } else { '5' },
+        KeyCode::Digit6 => if shift { '^' } else { '6' },
+        KeyCode::Digit7 => if shift { '&' } else { '7' },
+        KeyCode::Digit8 => if shift { '*' } else { '8' },
+        KeyCode::Digit9 => if shift { '(' } else { '9' },
+        KeyCode::Digit0 => if shift { ')' } else { '0' },
+        KeyCode::Minus => if shift { '_' } else { '-' },
+        KeyCode::Equal => if shift { '+' } else { '=' },
+        KeyCode::BracketLeft => if shift { '{' } else { '[' },
+        KeyCode::BracketRight => if shift { '}' } else { ']' },
+        KeyCode::Backslash => if shift { '|' } else { '\\' },
+        KeyCode::Semicolon => if shift { ':' } else { ';' },
+        KeyCode::Quote => if shift { '"' } else { '\'' },
+        KeyCode::Comma => if shift { '<' } else { ',' },
+        KeyCode::Period => if shift { '>' } else { '.' },
+        KeyCode::Slash => if shift { '?' } else { '/' },
+        KeyCode::Backquote => if shift { '~' } else { '`' },
+        _ => return None,
+    };
+    Some(ch)
+}
+
 fn named_key_bytes(code: &KeyCode, app_cursor: bool) -> Option<&'static [u8]> {
     Some(match code {
         KeyCode::Enter | KeyCode::NumpadEnter => b"\r",
@@ -1164,6 +1245,13 @@ fn handle_terminal_content_press(
         if kind.0 != PANE_KIND {
             continue;
         }
+        // If the child grabbed the mouse (any tracking mode), a plain
+        // click is reported to it by `handle_terminal_mouse_report`, not
+        // turned into a local text selection. Shift is the escape hatch:
+        // Shift+drag always selects locally, matching xterm.
+        if mouse_tracking_of(&store, ev.pane) && !ev.shift {
+            continue;
+        }
         // Clear any other terminal's selection.
         for mut sel in &mut selections {
             sel.clear();
@@ -1215,6 +1303,185 @@ fn handle_terminal_selection_drag(
     }
 }
 
+/// Whether `entity`'s terminal currently has any mouse tracking mode
+/// active (read straight from the worker's published snapshot).
+fn mouse_tracking_of(store: &TerminalStore, entity: Entity) -> bool {
+    mouse_modes_of(store, entity).0
+}
+
+/// Public form of [`mouse_tracking_of`] for the app shell. When this is
+/// true for the pane under the cursor, host-level right-click / drag
+/// gestures (the per-pane context menu, canvas pan) should yield so the
+/// click is reported to the child instead. Returns false for any entity
+/// that isn't a live terminal.
+pub fn pane_mouse_tracking(store: &TerminalStore, entity: Entity) -> bool {
+    mouse_tracking_of(store, entity)
+}
+
+/// `(mouse_tracking, mouse_motion)` for `entity`'s terminal. `mouse_motion`
+/// is true only when the child asked for drag/hover reports (DECSET
+/// 1002/1003), so the main thread can avoid shipping motion in the common
+/// press/release-only case.
+fn mouse_modes_of(store: &TerminalStore, entity: Entity) -> (bool, bool) {
+    let Some(data) = store.map.get(&entity) else {
+        return (false, false);
+    };
+    let g = data.worker.snapshot.lock().expect("snapshot lock");
+    (g.mouse_tracking, g.mouse_motion)
+}
+
+/// In-progress mouse-report gesture: which terminal grabbed the mouse on
+/// press, the button that started it, and the last window cursor position
+/// (so we only ship motion when the cursor actually moved).
+#[derive(Default)]
+struct MouseReportState {
+    target: Option<Entity>,
+    button: Option<MouseBtn>,
+    last_pt: Option<Vec2>,
+}
+
+/// The physical buttons we translate into mouse reports, paired with the
+/// encoder-side identity. Wheel notches keep their own path
+/// (`WorkerMsg::Wheel`). Middle is deliberately absent: the app shell
+/// reserves middle-drag for canvas panning, and TUIs rarely need the
+/// middle button — so it stays a pan gesture rather than a report.
+const REPORT_BUTTONS: [(MouseButton, MouseBtn); 2] = [
+    (MouseButton::Left, MouseBtn::Left),
+    (MouseButton::Right, MouseBtn::Right),
+];
+
+/// Forward mouse presses / drags / releases to a terminal whose child
+/// enabled mouse tracking (vim, tmux, htop, lazygit, …). The worker owns
+/// the actual escape-sequence encoding; this system just decides *which*
+/// pane a gesture targets and *when* to send an event.
+///
+/// Coordination with text selection lives in `handle_terminal_content_press`:
+/// while tracking is on, a plain (non-Shift) click is reported here and the
+/// selection path bails, so the two never both fire on one click.
+fn handle_terminal_mouse_report(
+    windows: Query<&Window>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    metrics: Res<MonoMetrics>,
+    viewport: Res<jim_pane::PaneViewport>,
+    store: Res<TerminalStore>,
+    panes: Query<(Entity, &PaneRect, &PaneKindMarker, &Visibility)>,
+    mut state: Local<MouseReportState>,
+) {
+    let Ok(window) = windows.single() else { return };
+    let Some(win_pt) = window.cursor_position() else {
+        // Cursor left the window — any in-flight gesture resolves on the
+        // next release we actually observe. Nothing to report right now.
+        return;
+    };
+    let moved = state.last_pt != Some(win_pt);
+    state.last_pt = Some(win_pt);
+
+    let just_changed = REPORT_BUTTONS
+        .iter()
+        .any(|(b, _)| buttons.just_pressed(*b) || buttons.just_released(*b));
+    // Idle fast-path: no movement, no button transition, no live gesture.
+    if !moved && !just_changed && state.target.is_none() {
+        return;
+    }
+
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    let sup = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);
+
+    let canvas_pt = viewport.window_to_canvas(win_pt);
+    let cell_w = metrics.cell_width.round().max(1.0) as u16;
+    let cell_h = LINE_HEIGHT.round().max(1.0) as u16;
+    let any_button = REPORT_BUTTONS.iter().any(|(b, _)| buttons.pressed(*b));
+
+    // Hit-test against ALL panes (respecting z-order) so a widget sitting
+    // on top of a terminal correctly swallows the click; only proceed when
+    // the topmost pane under the cursor is itself a terminal.
+    let mut all_panes: Vec<(Entity, PaneRect)> = Vec::new();
+    let mut term_entities: Vec<Entity> = Vec::new();
+    for (e, r, _k, vis) in &panes {
+        if matches!(vis, Visibility::Hidden) {
+            continue;
+        }
+        all_panes.push((e, *r));
+        // Any VT-backed pane (terminal, emacs) can be a mouse-report
+        // target; the per-pane `mouse_tracking` snapshot flag still
+        // gates whether a report is actually sent.
+        if store.map.contains_key(&e) {
+            term_entities.push(e);
+        }
+    }
+    let hovered = jim_pane::topmost_pane_at(canvas_pt, &all_panes)
+        .filter(|e| term_entities.contains(e));
+
+    let report = |pane: Entity, action: MouseAction, button: Option<MouseBtn>| {
+        let Some((_, rect)) = all_panes.iter().find(|(e, _)| *e == pane) else {
+            return;
+        };
+        let local = jim_pane::pt_to_content_local(canvas_pt, rect);
+        if let Some(data) = store.map.get(&pane) {
+            data.worker.send(WorkerMsg::Mouse {
+                action,
+                button,
+                x: local.x,
+                y: local.y,
+                cell_w,
+                cell_h,
+                ctrl,
+                alt,
+                sup,
+                any_button,
+            });
+        }
+    };
+
+    // Presses. Shift forces local selection, so we never start a report
+    // gesture while it's held.
+    if !shift {
+        for (mb, mbtn) in REPORT_BUTTONS {
+            if buttons.just_pressed(mb) {
+                if let Some(pane) = hovered {
+                    if mouse_tracking_of(&store, pane) {
+                        report(pane, MouseAction::Press, Some(mbtn));
+                        state.target = Some(pane);
+                        state.button = Some(mbtn);
+                    }
+                }
+            }
+        }
+    }
+
+    // Motion. Only when the cursor actually moved and the child wants it.
+    if moved {
+        if let Some(pane) = state.target {
+            // Drag: report with the gesture's originating button.
+            if any_button && mouse_modes_of(&store, pane).1 {
+                report(pane, MouseAction::Motion, state.button);
+            }
+        } else if let Some(pane) = hovered {
+            // Bare hover (any-event tracking, DECSET 1003) — no button.
+            if !shift && mouse_modes_of(&store, pane).1 {
+                report(pane, MouseAction::Motion, None);
+            }
+        }
+    }
+
+    // Releases go to the pane that grabbed the gesture, so a drag that
+    // ends outside the pane still delivers its release to the right child.
+    for (mb, mbtn) in REPORT_BUTTONS {
+        if buttons.just_released(mb) {
+            if let Some(pane) = state.target {
+                report(pane, MouseAction::Release, Some(mbtn));
+            }
+        }
+    }
+    if state.target.is_some() && !any_button {
+        state.target = None;
+        state.button = None;
+    }
+}
+
 // ---------- Rendering ----------
 
 fn sync_grid(
@@ -1232,7 +1499,6 @@ fn sync_grid(
             Entity,
             &TerminalCursor,
             &mut TermGrid,
-            &PaneKindMarker,
             &Visibility,
             Option<&jim_pane::PaneProject>,
         ),
@@ -1268,7 +1534,7 @@ fn sync_grid(
     // the dirty-row hot path.
     let mut pending_writes: Vec<(usize, GpuCell)> = Vec::new();
 
-    for (entity, cursor_marker, mut grid, kind, vis, proj) in &mut terminals {
+    for (entity, cursor_marker, mut grid, vis, proj) in &mut terminals {
         // Per-pane theme defaults: this terminal's project theme if known,
         // else the global (active) theme.
         let (theme_default_fg, theme_default_bg) = proj
@@ -1280,10 +1546,9 @@ fn sync_grid(
                 )
             })
             .unwrap_or((global_default_fg, global_default_bg));
-        if kind.0 != PANE_KIND {
-            continue;
-        }
         let _prof = jim_pane::prof::pane_span(entity.to_bits(), "terminal");
+        // No kind gate: TermGrid + a TerminalStore entry mean this pane
+        // renders through the shared VT-grid pipeline (terminal, emacs).
         let Some(data) = store.map.get(&entity) else {
             continue;
         };

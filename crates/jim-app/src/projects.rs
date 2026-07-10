@@ -2215,6 +2215,13 @@ struct InferenceSuggestionPayload {
 fn save_if_dirty(
     world: &mut World,
 ) {
+    // While Exposé is open the panes are displaced into a transient grid
+    // (or animating back). Never persist that layout — panes always tween
+    // back to their exact original rects, so once the grid closes the next
+    // save writes the real positions.
+    if world.resource::<crate::expose::Expose>().active {
+        return;
+    }
     let mouse_down = world
         .resource::<ButtonInput<MouseButton>>()
         .pressed(MouseButton::Left);

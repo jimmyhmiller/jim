@@ -1056,7 +1056,9 @@ fn build(
                     }),
                     image_target(&image, tex_sf),
                     Transform::from_xyz(cam_center.x, cam_center.y, 0.0),
-                    RenderLayers::layer(*layer),
+                    // Growable ctor: pane layer ids are unbounded, and the
+                    // const `layer()` asserts < 64 (one inline u64 block).
+                    RenderLayers::from_layers(&[*layer]),
                     // No MSAA: text/terminal content is already antialiased,
                     // and a 4x MSAA buffer per pane image is ~4x the texture
                     // memory (the bulk of the overview's footprint).

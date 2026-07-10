@@ -101,7 +101,10 @@ pub fn spawn_pane_cameras(
             // pane is dragged partly off-screen. See
             // `pane_camera_setup`.
             Transform::from_xyz(cam_setup.cam_center.x, cam_setup.cam_center.y, 0.0),
-            RenderLayers::layer(layer.0),
+            // `from_layers` (growable) not `layer()` (const, asserts < 64):
+            // pane layer ids are unbounded, so a pane camera must be able to
+            // filter on an id ≥ 64 without panicking.
+            RenderLayers::from_layers(&[layer.0]),
             PaneCameraOf(pane_entity),
         ));
     }
@@ -113,6 +116,7 @@ pub fn spawn_pane_cameras(
 pub fn sync_pane_cameras(
     panes: Query<&PaneRect, With<PaneTag>>,
     anchored: Query<(), With<crate::PaneScreenAnchored>>,
+    vscale_q: Query<&crate::PaneVisualScale>,
     mut cameras: Query<(&PaneCameraOf, &mut Camera, &mut Transform)>,
     windows: Query<&Window>,
     region: Option<Res<PaneCanvasRegion>>,
@@ -129,11 +133,19 @@ pub fn sync_pane_cameras(
             // close handler will reap it. Skip.
             continue;
         };
-        let projected = if anchored.get(owner.0).is_ok() {
+        let mut projected = if anchored.get(owner.0).is_ok() {
             *rect
         } else {
             viewport.projected_rect(rect)
         };
+        // Thumbnail scale (Exposé): shrink the camera's viewport about the
+        // pane's top-left to match the transform scale applied in
+        // `position_panes`, so the scaled content maps 1:1 into it. Absent
+        // → 1.0. rect.size (logical) is untouched, so no re-layout.
+        let vscale = vscale_q.get(owner.0).map_or(1.0, |v| v.0);
+        if vscale != 1.0 {
+            projected.size *= vscale;
+        }
         let setup = pane_camera_setup(&projected, window, region);
         let new_order = pane_camera_order(rect, owner.0);
 
@@ -426,7 +438,7 @@ pub fn reconcile_pane_content_layers(
 ) {
     let layer0 = RenderLayers::layer(0);
     for (pane, pane_layer, chrome, kind) in &panes {
-        let want = RenderLayers::layer(pane_layer.0);
+        let want = RenderLayers::from_layers(&[pane_layer.0]);
         // Allocator never hands out layer 0 to a pane, but guard anyway:
         // if a pane WERE on layer 0 there is nothing to confine it to.
         if want == layer0 {
@@ -498,7 +510,9 @@ fn stamp_subtree(
     children_q: &Query<&Children>,
     commands: &mut Commands,
 ) {
-    let target = RenderLayers::layer(layer_n);
+    // Growable ctor: `layer_n` is an unbounded pane id (see `layers.rs`),
+    // and the const `layer()` asserts it fits in one u64 block (< 64).
+    let target = RenderLayers::from_layers(&[layer_n]);
     let mut stack: Vec<Entity> = vec![root];
     while let Some(e) = stack.pop() {
         if layers_q.get(e).is_err() {

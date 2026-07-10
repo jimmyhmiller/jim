@@ -1,0 +1,18 @@
+[package]
+name = "jim_emacs"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+jim_pane = { path = "../jim-pane" }
+jim_terminal = { path = "../jim-terminal" }
+jim_style = { path = "../jim-style" }
+serde_json = "1"
+# Native emacs pane: rasterize Emacs's glyph ids from its own font file.
+swash = "0.2"
+bevy = { version = "0.19", default-features = false, features = [
+    "2d",
+    "x11",
+    "wayland",
+] }

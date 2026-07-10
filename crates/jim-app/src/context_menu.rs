@@ -106,6 +106,8 @@ fn context_open_close(
     mut pending: ResMut<PendingPaneActions>,
     mut eject: ResMut<crate::canvas_pane::CanvasEjectQueue>,
     _projects: Res<Projects>,
+    key_state: Res<ButtonInput<KeyCode>>,
+    term_store: Res<jim_terminal::TerminalStore>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -164,6 +166,16 @@ fn context_open_close(
             // Miss every pane — let the radial menu handle the click.
             return;
         };
+        // If the target is a terminal whose child grabbed the mouse, a
+        // plain right-click belongs to that child (tmux/mc/ranger menus,
+        // etc.), not to our per-pane menu. Yield without consuming so
+        // jim_terminal's report system forwards it. Shift is the escape
+        // hatch — Shift+right-click still opens this menu.
+        let shift = key_state.pressed(KeyCode::ShiftLeft)
+            || key_state.pressed(KeyCode::ShiftRight);
+        if !shift && jim_terminal::pane_mouse_tracking(&term_store, target) {
+            return;
+        }
         let is_pinned = visible
             .iter()
             .find(|(e, _, _)| *e == target)

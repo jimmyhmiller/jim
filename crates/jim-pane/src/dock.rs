@@ -1311,6 +1311,21 @@ pub fn create_dock(world: &mut World, members: &[Entity]) -> Option<Entity> {
     create_dock_template(world, members, DockTemplate::Columns)
 }
 
+/// Split `anchor` with `pane` on `edge`: if `anchor` already belongs to
+/// a dock, insert `pane` beside it in that dock; otherwise frame the two
+/// into a fresh dock. The programmatic equivalent of dropping `pane` on
+/// `anchor`'s `edge` — used by Emacs splits-as-panes.
+pub fn dock_split(world: &mut World, anchor: Entity, pane: Entity, edge: DropEdge) {
+    if world.get_entity(anchor).is_err() || world.get_entity(pane).is_err() {
+        return;
+    }
+    if let Some(dm) = world.get::<DockMember>(anchor).copied() {
+        insert_into_dock(world, dm.dock, anchor, pane, edge);
+    } else {
+        create_dock_around(world, anchor, pane, edge);
+    }
+}
+
 pub fn create_dock_template(
     world: &mut World,
     members: &[Entity],

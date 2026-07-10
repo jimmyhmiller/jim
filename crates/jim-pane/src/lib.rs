@@ -179,6 +179,17 @@ pub struct PaneProject(pub u64);
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct PaneCanvas(pub u64);
 
+/// An extra *visual* scale for the whole pane (chrome **and** content),
+/// applied on top of the canvas zoom WITHOUT changing the logical
+/// [`PaneRect::size`] — so the pane is scaled like a thumbnail rather than
+/// re-laid-out (a widget/terminal keeps its full-size layout, just drawn
+/// smaller). `1.0`, or the component's absence, means normal size. The
+/// pane's top-left (`PaneRect::pos`) is the scaling pivot. Exposé uses
+/// this to shrink panes into a grid; `position_panes` folds it into the
+/// pane transform and `sync_pane_cameras` into the pane camera's viewport.
+#[derive(Component, Copy, Clone, Debug)]
+pub struct PaneVisualScale(pub f32);
+
 /// A stable, persisted id used to associate a pane with its saved
 /// thumbnail PNG (`~/.jim/canvas-thumbs/pane-<id>.png`). Allocated by the
 /// host the first time a pane is snapshotted for a nested-canvas tile;
@@ -1469,7 +1480,11 @@ pub fn spawn_pane(
     let layer_id = world
         .resource_mut::<PaneLayerAllocator>()
         .allocate();
-    let pane_layer_component = bevy::camera::visibility::RenderLayers::layer(layer_id);
+    // `from_layers` (growable), NOT the `layer()` const constructor: the
+    // latter asserts `id < 64` (one inline u64 block), so once enough panes
+    // exist for the allocator to hand out an id ≥ 64 it panics. `from_layers`
+    // grows the bitset instead, giving effectively unbounded pane layers.
+    let pane_layer_component = bevy::camera::visibility::RenderLayers::from_layers(&[layer_id]);
     for chrome_entity in [bg, title_bar, title_text, title_cover, close_button] {
         world
             .entity_mut(chrome_entity)
@@ -2076,6 +2091,7 @@ fn position_panes(
     viewport: Res<PaneViewport>,
     panes: Query<(&PaneRect, &PaneChrome), With<PaneTag>>,
     anchored: Query<(), With<PaneScreenAnchored>>,
+    vscale_q: Query<&PaneVisualScale>,
     mut t_q: Query<&mut Transform>,
     mut sprite_q: Query<&mut Sprite>,
     mut color_q: Query<&mut TextColor>,
@@ -2128,7 +2144,12 @@ fn position_panes(
                 t.translation = want;
             }
             let zoom = if is_anchored { 1.0 } else { viewport.zoom };
-            let want_scale = Vec3::new(zoom, zoom, 1.0);
+            // Extra thumbnail scale (Exposé). Absent → 1.0. Scales the
+            // whole pane about its top-left without touching rect.size, so
+            // content shrinks visually instead of re-laying-out.
+            let vscale = vscale_q.get(entity).map_or(1.0, |v| v.0);
+            let s = zoom * vscale;
+            let want_scale = Vec3::new(s, s, 1.0);
             if t.scale != want_scale {
                 t.scale = want_scale;
             }

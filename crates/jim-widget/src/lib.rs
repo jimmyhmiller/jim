@@ -2427,7 +2427,7 @@ fn update_widget_hover(
                     if let Ok(layer) = pane_layers.get(pane) {
                         commands
                             .entity(ent)
-                            .insert(bevy::camera::visibility::RenderLayers::layer(layer.0));
+                            .insert(bevy::camera::visibility::RenderLayers::from_layers(&[layer.0]));
                     }
                     hover.hover_overlay = Some(ent);
                 }

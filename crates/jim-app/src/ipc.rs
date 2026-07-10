@@ -107,6 +107,11 @@ pub enum IpcRequest {
     /// variant, so the wire form is the bare JSON string `"ToggleCube"`.
     /// Primarily a dev/scripting hook mirroring the Cmd+Shift+C keybind.
     ToggleCube,
+    /// Toggle Exposé (spread every pane of the active project/level into a
+    /// tidy grid) on/off. Unit variant → wire form is the bare JSON string
+    /// `"ToggleExpose"`. Mirrors the Cmd+Shift+E keybind / `view.toggle_expose`
+    /// action; handy for scripting and headless verification.
+    ToggleExpose,
     /// `tbinbox --project NAME --sender X --body "..."` — append a
     /// message to a project's inbox. The receiver writes the message
     /// to `~/.jim/inbox/<id>.jsonl`; the running app's

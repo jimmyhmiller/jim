@@ -35,6 +35,7 @@ pub mod cube;
 pub mod debug_bar;
 pub mod diagnostics;
 pub mod drawer;
+pub mod expose;
 pub mod fps;
 pub mod graph_view;
 pub mod inference_dispatch;
@@ -134,6 +135,9 @@ impl Plugin for AppShellPlugin {
         // Terminal widget crate: GPU material, selection, font/atlas
         // startup, terminal pane kind + per-frame terminal systems.
         app.add_plugins(jim_terminal::TerminalPlugin);
+        // Emacs pane kind: tty frames on a shared `emacs --daemon=jim`,
+        // rendered through the terminal crate's VT-grid pipeline.
+        app.add_plugins(jim_emacs::EmacsPlugin);
         // Install the shell-coupling seams the terminal spawn/restore
         // path calls through (session-id allocator, initial cwd, dirty
         // hook) so jim_terminal stays free of a jim_app dependency.
@@ -212,6 +216,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(canvas_pane::CanvasPanePlugin)
             .add_plugins(context_menu::ContextMenuPlugin)
             .add_plugins(cube::CubePlugin)
+            .add_plugins(expose::ExposePlugin)
             .add_plugins(radial::RadialPlugin)
             .add_plugins(command_palette::CommandPalettePlugin)
             .add_plugins(screenshot_consent::ScreenshotConsentPlugin)
@@ -612,6 +617,7 @@ fn drain_ipc_open_requests(
     mut projects: ResMut<Projects>,
     mut drawer: ResMut<drawer::Drawer>,
     mut prism: ResMut<cube::Prism>,
+    mut expose: ResMut<expose::Expose>,
     mut msg_bus: ResMut<jim_widget::WidgetMsgBus>,
     mut palette_open: ResMut<command_palette::PaletteOpenRequest>,
     mut issues: ResMut<issues_pane::IssuesStore>,
@@ -727,6 +733,9 @@ fn drain_ipc_open_requests(
             }
             ipc::IpcRequest::ToggleCube => {
                 prism.pending_toggle = true;
+            }
+            ipc::IpcRequest::ToggleExpose => {
+                expose.pending_toggle = true;
             }
             ipc::IpcRequest::ActivateProject { project } => {
                 match projects::resolve_project(
@@ -1161,12 +1170,12 @@ fn handle_scroll(
     else {
         return;
     };
-    // Only consume the wheel if that topmost pane is a terminal in
-    // the active project.
+    // Only consume the wheel if that topmost pane is a VT-grid pane
+    // (terminal or emacs) in the active project.
     let Ok((_, membership, kind)) = terminals.get(target) else {
         return;
     };
-    if kind.0 != PANE_KIND {
+    if kind.0 != PANE_KIND && kind.0 != jim_emacs::PANE_KIND {
         return;
     }
     let in_active_project = match (projects.active, membership) {
@@ -1270,7 +1279,7 @@ fn debug_layer_cameras(
         }
         let mut cams: Vec<String> = Vec::new();
         for (ce, cam, rl, gt) in &cameras {
-            if rl.intersects(&bevy::camera::visibility::RenderLayers::layer(layer.0)) {
+            if rl.intersects(&bevy::camera::visibility::RenderLayers::from_layers(&[layer.0])) {
                 let s = gt.compute_transform().scale;
                 cams.push(format!(
                     "{ce:?}(order={},scale={:.3})",
@@ -1841,6 +1850,7 @@ fn maintain_winit_mode_for_animation(
     registry: Res<jim_style::StylePresetRegistry>,
     drawer: Res<drawer::Drawer>,
     prism: Res<cube::Prism>,
+    expose: Res<expose::Expose>,
     palette: Res<command_palette::CommandPalette>,
     script_widgets: Query<&jim_widget::script_widget::ScriptWidget>,
     widget_anim: Res<jim_widget::anim::WidgetAnim>,
@@ -1900,6 +1910,11 @@ fn maintain_winit_mode_for_animation(
         || drawer.animating()
         || prism.active
         || prism.continuous_cooldown > 0
+        // Exposé: keep painting while the grid is open (a sustained
+        // source, like the prism / palette — deliberately excluded from
+        // the transient-pin warning below) and while it settles/closes.
+        || expose.active
+        || expose.continuous_cooldown > 0
         // Keep ticking while the palette is open so its DeepSeek worker
         // result is polled promptly (reactive mode would wake only every
         // 5s otherwise) and keystrokes feel instant.

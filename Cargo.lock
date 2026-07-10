@@ -4116,6 +4116,7 @@ dependencies = [
  "jim_bus",
  "jim_daemon",
  "jim_editor",
+ "jim_emacs",
  "jim_flame",
  "jim_inference",
  "jim_pane",
@@ -4190,6 +4191,18 @@ dependencies = [
  "skrifa 0.39.0",
  "tree-sitter",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "jim_emacs"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "jim_pane",
+ "jim_style",
+ "jim_terminal",
+ "serde_json",
+ "swash",
 ]
 
 [[package]]

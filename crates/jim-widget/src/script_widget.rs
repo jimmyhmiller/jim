@@ -787,7 +787,7 @@ fn debug_widget_layers(
         if kind.0 != PANE_KIND {
             continue;
         }
-        let want = RenderLayers::layer(pane_layer.0);
+        let want = RenderLayers::from_layers(&[pane_layer.0]);
         let mut total = 0usize;
         let mut bad = 0usize;
         let mut stack = vec![chrome.content_root];
