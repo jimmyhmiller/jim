@@ -1745,6 +1745,26 @@ fn sync_grid(
         // existing-vs-new in pass 2.
         pending_writes.clear();
         let force_all = pool_changed || just_shown || theme_changed;
+        // The dominant cell in any grid is a default-colored space
+        // (trailing blanks on every line). During scrolling output every
+        // row is dirty, so this loop runs rows×cols per frame — the
+        // blank case gets one precomputed GpuCell instead of the
+        // per-cell color substitution + glyph resolution below. The
+        // slow path produces exactly this value for such a cell.
+        let blank_gpu = GpuCell {
+            glyph_index: atlas.lookup_or_insert(' ', &mut images, &mut layouts),
+            fg_packed: pack_rgb(
+                theme_default_fg.0,
+                theme_default_fg.1,
+                theme_default_fg.2,
+            ),
+            bg_packed: pack_rgb(
+                theme_default_bg.0,
+                theme_default_bg.1,
+                theme_default_bg.2,
+            ),
+            flags: 0,
+        };
         for r in 0..rows as usize {
             let row_dirty = force_all
                 || local_dirty_rows.get(r).copied().unwrap_or(true);
@@ -1758,6 +1778,19 @@ fn sync_grid(
                     Some(c) => *c,
                     None => continue,
                 };
+                if cell.ch == ' '
+                    && !cell.inverse
+                    && cell.fg.r == default_fg.r
+                    && cell.fg.g == default_fg.g
+                    && cell.fg.b == default_fg.b
+                    && cell.bg.r == default_bg.r
+                    && cell.bg.g == default_bg.g
+                    && cell.bg.b == default_bg.b
+                {
+                    pending_writes.push((idx, blank_gpu));
+                    cells_touched += 1;
+                    continue;
+                }
                 let (final_fg, final_bg) = if cell.inverse {
                     (cell.bg, cell.fg)
                 } else {

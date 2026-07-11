@@ -17,7 +17,10 @@
 //! screenful of tofu before the first publish lands. Slot 1 holds the
 //! tofu glyph, used as the genuine font-missing / atlas-full fallback.
 
-use std::collections::HashMap;
+// Bevy's foldhash-backed map, not std's SipHash: non-ASCII lookups
+// (box-drawing chars in TUI frames, emoji) hit this once per dirty cell
+// per frame, so hashing a 4-byte char must be cheap.
+use bevy::platform::collections::HashMap;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, TextureAtlasLayout};
@@ -53,6 +56,12 @@ pub struct GlyphAtlas {
     pub layout: Handle<TextureAtlasLayout>,
     /// Char → atlas slot index. Built up over the session.
     slots: HashMap<char, u32>,
+    /// ASCII fast path: slot index per codepoint < 128, `u32::MAX` =
+    /// not yet resolved. `sync_grid` resolves a glyph for every dirty
+    /// cell every frame — during scrolling output that's rows×cols
+    /// lookups per frame — and terminal content is overwhelmingly
+    /// ASCII, so the hot path must be an array index, not a hash.
+    ascii: [u32; 128],
     /// Usable glyph area (the rect we blit into / sample from).
     slot_w: u32,
     slot_h: u32,
@@ -261,7 +270,8 @@ impl GlyphAtlas {
         let mut atlas = Self {
             image: image_handle,
             layout: layout_handle,
-            slots: HashMap::new(),
+            slots: HashMap::default(),
+            ascii: [u32::MAX; 128],
             slot_w,
             slot_h,
             stride_w,
@@ -324,11 +334,16 @@ impl GlyphAtlas {
         images: &mut Assets<Image>,
         layouts: &mut Assets<TextureAtlasLayout>,
     ) -> u32 {
-        if let Some(&idx) = self.slots.get(&ch) {
+        if (ch as usize) < 128 {
+            let slot = self.ascii[ch as usize];
+            if slot != u32::MAX {
+                return slot;
+            }
+        } else if let Some(&idx) = self.slots.get(&ch) {
             return idx;
         }
         if self.next_slot >= self.max_slots {
-            self.slots.insert(ch, self.tofu_slot);
+            self.cache_slot(ch, self.tofu_slot);
             return self.tofu_slot;
         }
 
@@ -352,7 +367,7 @@ impl GlyphAtlas {
 
         let Some((raster_data, placement)) = raster else {
             // No font has this glyph — cache the miss so we don't retry.
-            self.slots.insert(ch, self.tofu_slot);
+            self.cache_slot(ch, self.tofu_slot);
             return self.tofu_slot;
         };
 
@@ -382,9 +397,19 @@ impl GlyphAtlas {
         let mut layout = layouts.get_mut(&self.layout).expect("atlas layout asset");
         layout.add_texture(rect);
 
-        self.slots.insert(ch, slot);
+        self.cache_slot(ch, slot);
         self.next_slot += 1;
         slot
+    }
+
+    /// Record a resolved slot in whichever cache serves `ch` on the hot
+    /// path: the ASCII array for codepoints < 128, the map otherwise.
+    fn cache_slot(&mut self, ch: char, slot: u32) {
+        if (ch as usize) < 128 {
+            self.ascii[ch as usize] = slot;
+        } else {
+            self.slots.insert(ch, slot);
+        }
     }
 }
 
