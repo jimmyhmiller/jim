@@ -36,9 +36,10 @@ use bevy::sprite::Anchor;
 use serde_json::Value;
 
 use crate::{
-    content_area, next_pane_z, spawn_pane, FocusedPane, PaneChrome, PaneKindMarker, PaneKindSpec,
-    PaneMouseMode, PanePinned, PaneProject, PaneRect, PaneRegistry, PaneScreenAnchored, PaneTag,
-    PaneViewport, SpawnedPane, MARGIN, MIN_PANE_SIZE, TITLE_H,
+    content_area, next_pane_z, spawn_pane, ChromeTextStyle, FocusedPane, PaneChrome,
+    PaneChromeOverride, PaneCursorOverride, PaneKindMarker, PaneKindSpec, PaneMouseMode, PanePinned,
+    PaneProject, PaneRect, PaneRegistry, PaneScreenAnchored, PaneTag, PaneViewport,
+    PendingPaneActions, SpawnedPane, MARGIN, MIN_PANE_SIZE, TITLE_H,
 };
 
 /// Registry key for the dock container pane kind.
@@ -51,9 +52,10 @@ pub const DOCK_KIND: &str = "dock";
 pub const DOCK_OVERLAY_LAYER: usize = 29;
 const DOCK_OVERLAY_ORDER: isize = 900_000;
 
-/// Gap between cells, in canvas units; the dock background shows through
-/// as a seam / splitter.
-const GUTTER: f32 = 6.0;
+/// Gap between cells, in canvas units; the dock background (painted in
+/// the theme's divider color) shows through as a 1px hairline seam /
+/// splitter — so docked cells read as a proper split, not floating cards.
+const GUTTER: f32 = 1.0;
 /// Half-thickness of the splitter hit zone around a gutter centerline.
 const SPLITTER_HIT: f32 = 7.0;
 /// Minimum fraction a split child may shrink to (keeps cells grabbable).
@@ -522,7 +524,9 @@ impl Plugin for DockPlugin {
                     dock_snap_apply,
                     splitter_drag,
                     link_restored_docks,
+                    apply_undock,
                     collapse_member_chrome,
+                    flatten_dock_container_chrome,
                     dock_focus_raise,
                     dock_layout,
                     render_dock_slots,
@@ -806,32 +810,60 @@ fn dock_focus_raise(
     }
 }
 
-/// Collapse member chrome (drop shadow + close button) on docking so a
-/// dock reads as one cohesive surface; restore on undock. Member title
-/// bars stay as slim per-cell drag handles.
+/// Docked members "melt into" the dock: drop the shadow and stamp a
+/// [`PaneChromeOverride`] so the SDF chrome flattens to a slim 18px header
+/// with no rounded corners and no border (see `sync_chrome_uniforms` /
+/// `sync_chrome_override_geometry`). The close button stays visible — its
+/// geometry (`CLOSE_BTN_SIZE+INSET = 18`) fits the slim header exactly —
+/// so each cell keeps a per-cell close. The slim header doubles as the
+/// undock drag handle. Everything is restored on undock.
 fn collapse_member_chrome(
-    added: Query<(&DockMember, &PaneChrome), Added<DockMember>>,
+    mut commands: Commands,
+    added: Query<(Entity, &DockMember, &PaneChrome), Added<DockMember>>,
     docks: Query<&Dock>,
     mut removed: RemovedComponents<DockMember>,
     chromes: Query<&PaneChrome>,
     mut vis: Query<&mut Visibility>,
 ) {
-    for (dm, chrome) in &added {
+    for (entity, dm, chrome) in &added {
         let collapse = docks.get(dm.dock).map(|d| d.collapse_chrome).unwrap_or(true);
         if !collapse {
             continue;
         }
-        for e in [chrome.shadow, chrome.close_button] {
+        // A docked member is part of the dock frame, not its own window:
+        // hide ALL of its chrome (shadow, title bar, title text, title
+        // cover, close button) so it has no header and no `x`. Undock is a
+        // right-click action on the member, not a header drag.
+        for e in [
+            chrome.shadow,
+            chrome.title_bar,
+            chrome.title_text,
+            chrome.title_cover,
+            chrome.close_button,
+        ] {
             if let Ok(mut v) = vis.get_mut(e) {
                 if *v != Visibility::Hidden {
                     *v = Visibility::Hidden;
                 }
             }
         }
+        // title_h = 0: content fills the cell (no header strip), flat body.
+        commands.entity(entity).insert(PaneChromeOverride {
+            title_h: 0.0,
+            corner_radius: 0.0,
+            border_width: 0.0,
+            bg: None,
+        });
     }
     for entity in removed.read() {
         if let Ok(chrome) = chromes.get(entity) {
-            for e in [chrome.shadow, chrome.close_button] {
+            for e in [
+                chrome.shadow,
+                chrome.title_bar,
+                chrome.title_text,
+                chrome.title_cover,
+                chrome.close_button,
+            ] {
                 if let Ok(mut v) = vis.get_mut(e) {
                     if *v != Visibility::Inherited {
                         *v = Visibility::Inherited;
@@ -839,6 +871,83 @@ fn collapse_member_chrome(
                 }
             }
         }
+        // Restore the full floating-pane chrome. (The entity may already be
+        // despawned if the member was closed; `try_insert`-style guard via
+        // get_entity avoids a panic.)
+        if let Ok(mut e) = commands.get_entity(entity) {
+            e.remove::<PaneChromeOverride>();
+        }
+    }
+}
+
+/// Drain [`PendingPaneActions::undock`] (queued by the right-click
+/// "Undock" menu item): pop each member out of its dock into a
+/// free-floating pane. Same tree surgery as the drag-out undock in
+/// `dock_drag_track` — prune the leaf, collapse, drop the dock if empty
+/// (or revert the cell to `Empty` on a template skeleton) — then remove
+/// `DockMember` so the pane's full chrome is restored.
+fn apply_undock(
+    mut commands: Commands,
+    mut pending: ResMut<PendingPaneActions>,
+    member_q: Query<&DockMember>,
+    mut docks: Query<&mut Dock>,
+) {
+    if pending.undock.is_empty() {
+        return;
+    }
+    let list = std::mem::take(&mut pending.undock);
+    for pane in list {
+        if let Ok(dm) = member_q.get(pane) {
+            if let Ok(mut dock) = docks.get_mut(dm.dock) {
+                let is_template = dock.template;
+                if let Some(mut r) = dock.root.take() {
+                    if is_template {
+                        replace_leaf_with_empty(&mut r, pane);
+                        dock.root = Some(r);
+                    } else {
+                        r.remove_leaf(pane);
+                        let r = collapse(r);
+                        dock.root = if has_content(&r) { Some(r) } else { None };
+                    }
+                }
+            }
+            commands.entity(pane).remove::<DockMember>();
+        }
+    }
+}
+
+/// Flatten the outer dock *container* so it reads as one frame around the
+/// melted-in cells — but KEEP a proper header: its title text and close
+/// button stay visible so the whole dock has an obvious grab handle (move
+/// the group) and an `x` (close the dock). Only the drop shadow is hidden
+/// and the corners/border are squared off (flat, not a rounded card); the
+/// content backdrop is painted the theme divider color so it shows through
+/// the 1px `GUTTER` as a hairline between cells (the header keeps its normal
+/// readable color — see `sync_chrome_uniforms`). Runs once per dock spawn.
+fn flatten_dock_container_chrome(
+    mut commands: Commands,
+    added: Query<(Entity, &PaneChrome), Added<Dock>>,
+    text_style: Res<ChromeTextStyle>,
+    mut vis: Query<&mut Visibility>,
+) {
+    if added.is_empty() {
+        return;
+    }
+    let d = text_style.divider.to_linear();
+    let bg = Vec4::new(d.red, d.green, d.blue, d.alpha);
+    for (entity, chrome) in &added {
+        // Only the shadow is hidden; the header (title + close x) stays.
+        if let Ok(mut v) = vis.get_mut(chrome.shadow) {
+            if *v != Visibility::Hidden {
+                *v = Visibility::Hidden;
+            }
+        }
+        commands.entity(entity).insert(PaneChromeOverride {
+            title_h: TITLE_H,
+            corner_radius: 0.0,
+            border_width: 0.0,
+            bg: Some(bg),
+        });
     }
 }
 
@@ -1428,11 +1537,32 @@ fn splitter_drag(
     mode: Res<PaneMouseMode>,
     mut consumed: ResMut<crate::InputConsumed>,
     mut split: ResMut<SplitterDrag>,
+    mut cursor_override: ResMut<PaneCursorOverride>,
     mut docks: Query<(Entity, &PaneRect, &mut Dock, Option<&Visibility>)>,
 ) {
+    use bevy::window::SystemCursorIcon;
+    // Default: no splitter cursor this frame (self-clears when not hovering).
+    cursor_override.0 = None;
     let Ok(window) = windows.single() else { return };
     let Some(cursor) = window.cursor_position() else { return };
     let cur = viewport.window_to_canvas(cursor);
+
+    // Cursor feedback: ↔ over a vertical divider (horizontal split), ↕ over
+    // a horizontal one. While actively dragging, use the drag orientation;
+    // otherwise probe for a handle under the cursor. A horizontal split
+    // (columns) has a vertical divider → EwResize.
+    let hovered_horizontal: Option<bool> = if split.dock.is_some() {
+        Some(split.horizontal)
+    } else {
+        find_split_handle(cur, &docks).map(|(_, h)| h.horizontal)
+    };
+    if let Some(horizontal) = hovered_horizontal {
+        cursor_override.0 = Some(if horizontal {
+            SystemCursorIcon::EwResize
+        } else {
+            SystemCursorIcon::NsResize
+        });
+    }
 
     if buttons.just_released(MouseButton::Left) {
         split.dock = None;
@@ -1443,30 +1573,7 @@ fn splitter_drag(
         && matches!(*mode, PaneMouseMode::Idle)
         && !consumed.0
     {
-        let mut best: Option<(Entity, f32, SplitHandle)> = None; // (dock, z, handle)
-        for (e, rect, dock, vis) in &docks {
-            if matches!(vis, Some(Visibility::Hidden)) {
-                continue;
-            }
-            let Some(root) = &dock.root else { continue };
-            let (ip, is) = dock_inner(rect);
-            let mut cells = Vec::new();
-            let mut handles = Vec::new();
-            walk_layout(root, ip, is, &[], &mut cells, &mut handles);
-            for h in handles {
-                let along = if h.horizontal { cur.x } else { cur.y };
-                let within = cur.x >= h.node_pos.x
-                    && cur.x <= h.node_pos.x + h.node_size.x
-                    && cur.y >= h.node_pos.y
-                    && cur.y <= h.node_pos.y + h.node_size.y;
-                if within && (along - h.center).abs() <= SPLITTER_HIT {
-                    if best.as_ref().map_or(true, |(_, z, _)| rect.z > *z) {
-                        best = Some((e, rect.z, h));
-                    }
-                }
-            }
-        }
-        if let Some((dock, _, h)) = best {
+        if let Some((dock, h)) = find_split_handle(cur, &docks) {
             split.dock = Some(dock);
             split.path = h.path;
             split.boundary = h.boundary;
@@ -1503,10 +1610,48 @@ fn splitter_drag(
     let cursor_frac = ((along - origin) / extent.max(1.0)).clamp(0.0, 1.0);
     let left_cum: f32 = fracs.iter().take(b).copied().sum();
     let pair = fracs[b] + fracs[b + 1];
-    let new_b = (cursor_frac - left_cum).clamp(MIN_FRAC, pair - MIN_FRAC);
+    // Floor each cell at MIN_PANE_SIZE in pixels (not just MIN_FRAC), so a
+    // cell can't be squished below the normal minimum regardless of how
+    // many siblings share the split or how large the dock is.
+    let min_dim = if split.horizontal { MIN_PANE_SIZE.x } else { MIN_PANE_SIZE.y };
+    let min_frac = (min_dim / extent.max(1.0)).max(MIN_FRAC).min(pair * 0.49);
+    let new_b = (cursor_frac - left_cum).clamp(min_frac, pair - min_frac);
     fracs[b] = new_b;
     fracs[b + 1] = pair - new_b;
     consumed.0 = true;
+}
+
+/// Topmost visible dock's split handle under the cursor, if any. Shared by
+/// the splitter press (start a drag) and the hover-cursor feedback.
+fn find_split_handle(
+    cur: Vec2,
+    docks: &Query<(Entity, &PaneRect, &mut Dock, Option<&Visibility>)>,
+) -> Option<(Entity, SplitHandle)> {
+    let mut best: Option<(Entity, f32, SplitHandle)> = None;
+    for (e, rect, dock, vis) in docks {
+        if matches!(vis, Some(Visibility::Hidden)) {
+            continue;
+        }
+        let Some(root) = &dock.root else { continue };
+        let (ip, is) = dock_inner(rect);
+        let mut cells = Vec::new();
+        let mut handles = Vec::new();
+        walk_layout(root, ip, is, &[], &mut cells, &mut handles);
+        for h in handles {
+            let along = if h.horizontal { cur.x } else { cur.y };
+            let within = cur.x >= h.node_pos.x
+                && cur.x <= h.node_pos.x + h.node_size.x
+                && cur.y >= h.node_pos.y
+                && cur.y <= h.node_pos.y + h.node_size.y;
+            if within
+                && (along - h.center).abs() <= SPLITTER_HIT
+                && best.as_ref().map_or(true, |(_, z, _)| rect.z > *z)
+            {
+                best = Some((e, rect.z, h));
+            }
+        }
+    }
+    best.map(|(e, _, h)| (e, h))
 }
 
 // ---------- Restore linking ----------

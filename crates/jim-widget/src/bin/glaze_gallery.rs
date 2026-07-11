@@ -12,7 +12,10 @@ use bevy::sprite_render::MeshMaterial2d;
 use bevy::window::{ExitCondition, WindowPlugin, WindowResolution};
 
 use glaze::{Layer, parse};
-use jim_widget::glaze_material::{GlazeMaterial, GlazeMaterialPlugin, GlazeUniforms, assemble_wgsl};
+use jim_widget::glaze_material::{
+    GlazeAnimates, GlazeMaterial, GlazeMaterialPlugin, GlazeUniforms, assemble_wgsl,
+    body_reads_clock,
+};
 
 const SHEET: &str = include_str!("challenges.glz");
 
@@ -143,6 +146,10 @@ fn setup(
         commands.spawn((
             bevy::mesh::Mesh2d(mesh.clone()),
             MeshMaterial2d(mat),
+            // Gate the per-frame clock push on whether this tile's shader reads
+            // it (matches the widget-host path), so static tiles aren't
+            // re-uploaded to the GPU every frame.
+            GlazeAnimates(body_reads_clock(body)),
             Transform::from_xyz(x, y, 0.0),
         ));
     }

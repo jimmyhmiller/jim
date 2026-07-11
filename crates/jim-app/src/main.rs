@@ -70,7 +70,29 @@ fn main() {
     let init_position = saved
         .map(|g| WindowPosition::At(IVec2::new(g.x, g.y)))
         .unwrap_or(WindowPosition::default());
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+    app.add_plugins(DefaultPlugins
+        // Cap the Bevy compute task pool at 2 threads. Profiling a live
+        // session showed the six default Compute Task Pool threads burning
+        // ~195s cumulative CPU vs ~33s on the main thread: the multithreaded
+        // executor's per-frame fan-out / park / work-steal across ~100 tiny
+        // systems costs roughly 6× the actual work, because a frame here is
+        // only ~1-2ms of real work. Fewer worker threads means far less
+        // park/wake/steal churn. io / async-compute keep their small defaults
+        // (their policies are untouched). `TaskPoolThreadAssignmentPolicy`
+        // has no `Default`, so all fields are spelled out.
+        .set(bevy::app::TaskPoolPlugin {
+            task_pool_options: bevy::app::TaskPoolOptions {
+                compute: bevy::app::TaskPoolThreadAssignmentPolicy {
+                    min_threads: 1,
+                    max_threads: 2,
+                    percent: 1.0,
+                    on_thread_spawn: None,
+                    on_thread_destroy: None,
+                },
+                ..default()
+            },
+        })
+        .set(WindowPlugin {
         primary_window: Some(Window {
             title: "Jim".into(),
             resolution: (init_w, init_h).into(),
@@ -98,6 +120,22 @@ fn main() {
         close_when_requested: false,
         ..default()
     }));
+    // Run the Update schedule single-threaded. Same measurement as the
+    // compute-pool cap above: with ~100 tiny systems and ~1-2ms of real
+    // per-frame work, the multithreaded executor's per-system scheduling
+    // overhead (dependency bookkeeping, task hand-off, thread wakeups)
+    // dominates the work it parallelizes. Running Update on the main thread
+    // deletes that overhead. Correctness is preserved: the executor kind
+    // only decides whether independent systems may run concurrently, never
+    // their relative order (explicit `.chain()` / `.before` / `.after`
+    // ordering is honored either way), and NonSend resources already pin
+    // their systems to the main thread. Systems that parallelize internally
+    // (`par_iter`, task-pool spawns) still use the task pools, so this does
+    // not serialize their inner work. Scoped to Update only — the render
+    // app, First/Last, and PostUpdate keep their default executors.
+    app.edit_schedule(Update, |schedule| {
+        schedule.set_executor(bevy::ecs::schedule::SingleThreadedExecutor::new());
+    });
     // Stash the saved geometry so `fit_window_to_monitor` can re-apply it
     // once the OS scale factor is known (the window-creation path mis-
     // scales it — see window_geometry). Captured here, before any system

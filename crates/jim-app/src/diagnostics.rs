@@ -70,9 +70,11 @@ const OVERLAY_Z: f32 = 951.0;
 /// brief: garden growth is 8s, transitions <1s, even a busy back-to-back
 /// agent session rarely keeps it continuous for a solid minute — so a full
 /// minute of *uninterrupted* continuous means something is genuinely
-/// stuck. Intentionally-sustained modes (an animated theme, an open
-/// palette, the 3D prism) are excluded from the timer in
-/// `maintain_winit_mode_for_animation`, so they never trip it.
+/// stuck. Intentionally-sustained modes (an animated theme, the 3D prism,
+/// an open Exposé) are excluded from the timer in
+/// `maintain_winit_mode_for_animation`, so they never trip it. (An open
+/// command palette is no longer a Continuous source at all — it only
+/// tightens the reactive cadence.)
 /// See [[project_widget_slow_tick_decouple]].
 const CONTINUOUS_WARN_SECS: f32 = 60.0;
 /// Height of the warning bar across the top edge.

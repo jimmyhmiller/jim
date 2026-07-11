@@ -424,20 +424,78 @@ pub fn propagate_render_layers(
 /// project — a leak no amount of per-pane-camera gating can stop, because
 /// the leak is on a different, un-gated camera.
 ///
-/// So every frame, for every pane, force any `content_root` descendant
-/// that is on layer 0 (or has no `RenderLayers` at all) onto the pane's
-/// own layer. Content that deliberately chose a different NON-zero layer
-/// is left alone. Runs `.before(CheckVisibility)` so the correction lands
-/// the same frame Bevy decides which camera draws each entity.
+/// A leak can only be *born* when an entity enters (is spawned or
+/// reparented into) a pane's `content_root` subtree — an entity already
+/// sitting on the correct pane layer never spontaneously drops to layer 0.
+/// So instead of re-walking EVERY pane's whole subtree EVERY frame (an
+/// O(all pane entities) tree walk per tick, most of it re-confirming
+/// already-correct layers), we drive the walk from the frames that can
+/// actually introduce a leak:
+///
+/// - FAST PATH: query `Changed<ChildOf>` — every entity whose parent link
+///   was established or changed this frame (a fresh spawn is `Added`, which
+///   is a subset of `Changed`; a reparent is `Changed` but NOT `Added`, so
+///   `Changed` is the complete signal where `Added` alone would miss
+///   reparenting an existing entity into the subtree). Map each such entity
+///   UP to its owning pane (nearest `PaneLayer` ancestor) and reconcile
+///   ONLY those panes. Widget panes despawn+respawn their whole element
+///   tree every frame, so every one of those children is `Changed<ChildOf>`
+///   and the owning pane is reconciled the same frame it churns — which is
+///   exactly the case the backstop exists for. Because `Changed<ChildOf>`
+///   covers every way an entity can enter a subtree, this fast path is the
+///   PRIMARY catch, complete on its own.
+///
+/// - PERIODIC FULL SWEEP: every 60th `Update` (~1s at 60fps) we still walk
+///   every pane, as a pure backstop for the pathological residue the fast
+///   path can't see — e.g. an existing in-subtree entity whose
+///   `RenderLayers` is later removed or mutated to layer 0 without any
+///   `ChildOf` change (nothing in the tree does this today, but if it ever
+///   did the leak would self-heal within ~a second instead of forever).
+///
+/// For each reconciled pane, force any `content_root` descendant that is on
+/// layer 0 (or has no `RenderLayers` at all) onto the pane's own layer.
+/// Content that deliberately chose a different NON-zero layer is left alone.
+/// Runs `.before(CheckVisibility)` so the correction lands the same frame
+/// Bevy decides which camera draws each entity.
 pub fn reconcile_pane_content_layers(
     panes: Query<(Entity, &PaneLayer, &crate::PaneChrome, &crate::PaneKindMarker)>,
+    changed_children: Query<Entity, Changed<ChildOf>>,
+    pane_layers: Query<&PaneLayer>,
+    parents_q: Query<&ChildOf>,
     layers_q: Query<&RenderLayers>,
     children_q: Query<&Children>,
     mut commands: Commands,
     mut warned: Local<std::collections::HashSet<Entity>>,
+    mut sweep_counter: Local<u32>,
 ) {
+    // Cadence of the full-sweep backstop. 60 Update ticks ≈ 1s at 60fps.
+    const FULL_SWEEP_EVERY: u32 = 60;
+    *sweep_counter = sweep_counter.wrapping_add(1);
+    let full_sweep = *sweep_counter % FULL_SWEEP_EVERY == 0;
+
+    // Fast path: collect the set of panes whose subtree gained/changed an
+    // entity this frame. Deduped because one churn respawns many children of
+    // a single pane. On a full-sweep frame we walk everything, so skip the
+    // collection entirely.
+    let mut dirty_panes: std::collections::HashSet<Entity> = std::collections::HashSet::new();
+    if !full_sweep {
+        for child in &changed_children {
+            if let Some(pane) = ancestor_pane_entity(child, &pane_layers, &parents_q) {
+                dirty_panes.insert(pane);
+            }
+        }
+        // Nothing entered any pane subtree this frame → no new leak possible.
+        if dirty_panes.is_empty() {
+            return;
+        }
+    }
+
     let layer0 = RenderLayers::layer(0);
     for (pane, pane_layer, chrome, kind) in &panes {
+        // Skip panes untouched this frame unless we're doing the full sweep.
+        if !full_sweep && !dirty_panes.contains(&pane) {
+            continue;
+        }
         let want = RenderLayers::from_layers(&[pane_layer.0]);
         // Allocator never hands out layer 0 to a pane, but guard anyway:
         // if a pane WERE on layer 0 there is nothing to confine it to.
@@ -489,6 +547,30 @@ fn ancestor_pane_layer(
     for _ in 0..256 {
         if let Ok(pl) = pane_layers.get(entity) {
             return Some(pl.0);
+        }
+        let Ok(parent) = parents_q.get(entity) else {
+            return None;
+        };
+        entity = parent.0;
+    }
+    None
+}
+
+/// Walk up the ChildOf chain from `entity` looking for the ancestor
+/// entity that carries `PaneLayer` (the pane entity itself), returning it
+/// or `None` if the chain hits a parentless entity first. Sibling of
+/// [`ancestor_pane_layer`], but returns the pane ENTITY (needed by
+/// `reconcile_pane_content_layers` to key its dirty-pane set) rather than
+/// just the layer id.
+fn ancestor_pane_entity(
+    mut entity: Entity,
+    pane_layers: &Query<&PaneLayer>,
+    parents_q: &Query<&ChildOf>,
+) -> Option<Entity> {
+    // Bound the walk so a pathological cycle can't hang the system.
+    for _ in 0..256 {
+        if pane_layers.get(entity).is_ok() {
+            return Some(entity);
         }
         let Ok(parent) = parents_q.get(entity) else {
             return None;

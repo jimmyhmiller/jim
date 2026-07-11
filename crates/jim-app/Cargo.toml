@@ -58,7 +58,10 @@ bevy = { version = "0.19", default-features = false, features = [
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSDockTile", "NSWorkspace", "NSRunningApplication", "NSEvent", "libc"] }
-objc2-foundation = "0.2"
+# NSNotification / NSOperation / block2 features enable the block-based
+# NSNotificationCenter observer API (addObserverForName:object:queue:usingBlock:)
+# used by `install_app_focus_observers` to make focus tracking event-driven.
+objc2-foundation = { version = "0.2", features = ["NSNotification", "NSString", "NSOperation", "block2"] }
 # Obj-C block support, for the AVCaptureDevice mic-access completion
 # handler (see request_microphone_access). 0.5 matches objc2 0.5.
 block2 = "0.5"

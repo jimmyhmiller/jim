@@ -11,6 +11,9 @@ jim_style = { path = "../jim-style" }
 serde_json = "1"
 # Native emacs pane: rasterize Emacs's glyph ids from its own font file.
 swash = "0.2"
+# Reap the forked emacs child on jim exit (process-group SIGTERM +
+# async-signal-safe SIGTERM/SIGINT/SIGHUP handler); uses nix's libc re-export.
+nix = { version = "0.31", features = ["signal", "process"] }
 bevy = { version = "0.19", default-features = false, features = [
     "2d",
     "x11",

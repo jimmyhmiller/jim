@@ -47,6 +47,8 @@ pub enum ContextAction {
     Unpin,
     /// Move a gathered pane back out of its nested canvas, one level up.
     EjectFromCanvas,
+    /// Pop a docked member back out into a free-floating pane.
+    Undock,
     Close,
 }
 
@@ -56,6 +58,7 @@ impl ContextAction {
             ContextAction::Pin => "Pin to background",
             ContextAction::Unpin => "Unpin",
             ContextAction::EjectFromCanvas => "Move out of canvas",
+            ContextAction::Undock => "Undock",
             ContextAction::Close => "Close",
         }
     }
@@ -145,6 +148,7 @@ fn context_open_close(
     mut menu: ResMut<ContextMenu>,
     mut consumed: ResMut<InputConsumed>,
     panes: Query<(Entity, &PaneRect, &Visibility, Has<PanePinned>), With<PaneTag>>,
+    members: Query<(), With<jim_pane::dock::DockMember>>,
     gathered: Query<&jim_pane::PaneCanvas>,
     mut pending: ResMut<PendingPaneActions>,
     mut eject: ResMut<crate::canvas_pane::CanvasEjectQueue>,

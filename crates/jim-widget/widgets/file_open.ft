@@ -1,0 +1,165 @@
+// file_open.ft — a real file TREE that opens files in a docked emacs pane.
+//
+// Roots at a directory (params.path, else params.project_root, else $HOME).
+// Directories expand/collapse in place; clicking a file emits
+// `emacs.open_file` {path}, which jim routes to a native-emacs pane docked
+// alongside this widget (the "mini editor") — or the focused emacs pane.
+// See `route_emacs_open_requests` in jim-app and the `list_entries` host fn.
+//
+// Fully event-driven: re-renders only on click (expand/collapse or open).
+import "host"
+import { col_text, col_muted, col_accent, col_panel } from "df"
+
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+
+fn root_dir() {
+    let p = param("path", "")
+    if p != "" { return p }
+    let r = param("project_root", "")
+    if r != "" { return r }
+    host_env("HOME")
+}
+
+fn basename(p) {
+    let parts = split(p, "/")
+    let n = len(parts)
+    if n > 0 { parts[n - 1] } else { p }
+}
+
+fn ext_of(name) {
+    let parts = split(name, ".")
+    let n = len(parts)
+    if n > 1 { parts[n - 1] } else { "" }
+}
+
+// Small monochrome type-colored dot per file (color emoji panic the
+// rasterizer; a tinted ● is safe).
+fn dot_color(name) {
+    let e = ext_of(name)
+    if e == "rs" { "#e0965f" }
+    else if e == "ft" { "#c794db" }
+    else if e == "md" or e == "txt" { "#6fb3e0" }
+    else if e == "toml" or e == "json" or e == "lock" or e == "yml" or e == "yaml" { "#c9a96a" }
+    else if e == "sh" or e == "el" or e == "coil" or e == "py" { "#7fb37f" }
+    else { "#6b7280" }
+}
+
+fn fmt_size(n) {
+    if n < 1024 { str(n) + " B" }
+    else if n < 1048576 { str(to_int(n / 1024)) + " KB" }
+    else { str(to_int(n / 1048576)) + " MB" }
+}
+
+// ---- expanded-directory set (list of full paths) ----
+fn mem(xs, x) {
+    let mut found = false
+    for v in xs { if v == x { found = true } }
+    found
+}
+fn without(xs, x) {
+    let mut out = []
+    for v in xs { if v != x { out = push(out, v) } }
+    out
+}
+
+fn init_state() = { root: root_dir(), expanded: [] }
+let state = atom(init_state())
+
+fn on_init() {
+    request_render()
+}
+
+// Flatten the tree into visible rows: each expanded directory contributes
+// its children (indented by depth) right after it. Directory I/O only
+// happens for the root and expanded dirs, and only on (click-driven) render.
+fn visible_rows(dir, depth, expanded) {
+    let mut out = []
+    for e in list_entries(dir) {
+        let full = dir + "/" + e.name
+        let is_open = e.is_dir and mem(expanded, full)
+        out = push(out, { name: e.name, path: full, is_dir: e.is_dir,
+                          size: e.size, depth: depth, open: is_open })
+        if is_open {
+            for r in visible_rows(full, depth + 1, expanded) {
+                out = push(out, r)
+            }
+        }
+    }
+    out
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = @state
+    if id == "refresh" {
+        request_render()
+    } else if id == "collapse_all" {
+        reset!(state, { ..s, expanded: [] })
+        request_render()
+    } else if starts_with(id, "dir:") {
+        let path = slice(id, 4, len(id))
+        let nx = if mem(s.expanded, path) { without(s.expanded, path) } else { push(s.expanded, path) }
+        reset!(state, { ..s, expanded: nx })
+        request_render()
+    } else if starts_with(id, "open:") {
+        let path = slice(id, 5, len(id))
+        emit("emacs.open_file", { path: path })
+        host_log("[file_open] open " + path)
+    }
+}
+
+fn spacer() = { kind: "frame", style: { flex_grow: 1.0 }, children: [] }
+
+fn row_el(r) {
+    let indent = 8.0 + r.depth * 13.0
+    let lead = if r.is_dir {
+        { kind: "text", value: if r.open { "▾" } else { "▸" }, size: 10.0,
+          color: col_muted(), selectable: false, wrap: false }
+    } else {
+        { kind: "text", value: "●", size: 8.0, color: dot_color(r.name),
+          selectable: false, wrap: false }
+    }
+    let name = { kind: "text", value: r.name, family: "mono", size: 12.5,
+                 weight: if r.is_dir { "bold" } else { "normal" },
+                 color: if r.is_dir { col_accent() } else { col_text() },
+                 selectable: false, wrap: false }
+    let mut kids = [ lead, name ]
+    if not r.is_dir {
+        kids = push(kids, spacer())
+        kids = push(kids, { kind: "text", value: fmt_size(r.size), family: "mono",
+                            size: 10.0, color: col_muted(), selectable: false, wrap: false })
+    }
+    let inner = { kind: "hstack", gap: 7.0, align: "center", style: { width: "100%" }, children: kids }
+    let idp = if r.is_dir { "dir:" + r.path } else { "open:" + r.path }
+    { kind: "list-item", id: idp, selected: false, pad: 0.0,
+      style: { padding: { top: 3.0, bottom: 3.0, left: indent, right: 8.0 },
+               radius: "6", width: "100%" },
+      children: [ inner ] }
+}
+
+fn render(w, h) {
+    let s = @state
+    let rowsData = visible_rows(s.root, 0, s.expanded)
+    let mut rows = []
+    for r in rowsData {
+        rows = push(rows, row_el(r))
+    }
+    if len(rows) == 0 {
+        rows = push(rows, { kind: "text", value: "(empty)", size: 12.0,
+                            color: col_muted(), selectable: false })
+    }
+    let header = { kind: "hstack", gap: 8.0, align: "center", style: { width: "100%" },
+      children: [
+        { kind: "text", value: basename(s.root), size: 13.5, weight: "bold",
+          color: col_text(), selectable: false, wrap: false },
+        spacer(),
+        { kind: "button", id: "collapse_all", label: "⤒" },
+        { kind: "button", id: "refresh", label: "↻" },
+      ] }
+    { kind: "vstack", gap: 8.0, pad: 12.0, children: [
+        header,
+        { kind: "text", value: s.root, size: 10.0, color: col_muted(),
+          selectable: false, wrap: false },
+        { kind: "divider" },
+        { kind: "scroll", gap: 1.0, children: rows },
+    ]}
+}

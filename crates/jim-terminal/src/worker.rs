@@ -56,7 +56,25 @@ use crate::daemon_client::DaemonClient;
 /// chunk-driven wake inside the cooldown into a no-op — the snapshot
 /// the worker just published will be picked up by the next scheduled
 /// frame anyway.
-const MIN_WAKE_INTERVAL: Duration = Duration::from_millis(16);
+///
+/// The interval is dynamic (see [`set_wake_throttle_ms`]): 16 ms (~60 Hz)
+/// on AC power, 33 ms (~30 Hz) on battery. It MUST stay process-global —
+/// the throttle it feeds is process-global — so a single atomic, not a
+/// per-worker field, is the right home. Read on every wake decision; the
+/// power-source poller in `jim-app` is the only writer.
+static WAKE_INTERVAL_MS: AtomicU64 = AtomicU64::new(16);
+
+/// Set the minimum interval (in milliseconds) between winit wakeups any
+/// terminal worker may issue. Called by `jim-app`'s power-source poller:
+/// 16 on AC, 33 on battery. Clamped to `[1, 1000]` so a bad value can
+/// neither spin the wake loop (0) nor freeze the screen for seconds.
+pub fn set_wake_throttle_ms(ms: u64) {
+    WAKE_INTERVAL_MS.store(ms.clamp(1, 1000), Ordering::Relaxed);
+}
+
+fn wake_interval() -> Duration {
+    Duration::from_millis(WAKE_INTERVAL_MS.load(Ordering::Relaxed))
+}
 
 static WAKE_THROTTLE: std::sync::OnceLock<Mutex<Instant>> = std::sync::OnceLock::new();
 
@@ -69,7 +87,7 @@ fn wake_throttle() -> &'static Mutex<Instant> {
 /// expected to remember and retry later.
 fn try_wake_winit_throttled(wakeup: &Option<EventLoopProxy<WinitUserEvent>>) -> bool {
     let mut last = wake_throttle().lock().expect("wake throttle poisoned");
-    if last.elapsed() < MIN_WAKE_INTERVAL {
+    if last.elapsed() < wake_interval() {
         return false;
     }
     *last = Instant::now();
@@ -84,12 +102,13 @@ fn try_wake_winit_throttled(wakeup: &Option<EventLoopProxy<WinitUserEvent>>) -> 
 /// worker's `poll(2)` loop to size its timeout so the deferred wake
 /// fires on time.
 fn wake_cooldown_remaining_ms() -> u64 {
+    let interval = wake_interval();
     let last = wake_throttle().lock().expect("wake throttle poisoned");
     let elapsed = last.elapsed();
-    if elapsed >= MIN_WAKE_INTERVAL {
+    if elapsed >= interval {
         0
     } else {
-        (MIN_WAKE_INTERVAL - elapsed).as_millis() as u64 + 1
+        (interval - elapsed).as_millis() as u64 + 1
     }
 }
 use crate::daemon_proto::{ClientMessage, DaemonMessage};
@@ -292,6 +311,20 @@ impl WorkerHandle {
         let _ = self.tx.send(msg);
         // Best-effort poke. Pipe is non-blocking; if the kernel buffer
         // is full there's already a pending wake — no need to add more.
+        let _ = nix::unistd::write(self.wake_w.as_fd(), b"x");
+    }
+
+    /// Poke the worker's wake pipe without sending a message. The
+    /// renderer calls this the frame it flips a pane back to visible
+    /// (see `sync_grid`'s `just_shown`). While hidden the worker skips
+    /// snapshot publishes, so its last-published grid is stale; on reveal
+    /// it must publish a fresh FULL snapshot before the next frame. But
+    /// an idle hidden pane's worker is parked in `poll(2)` with a
+    /// multi-second timeout — without this nudge it wouldn't observe the
+    /// visibility edge until that timeout expired, leaving the revealed
+    /// pane showing stale content for up to several seconds. The nudge
+    /// wakes it now so the reveal publish lands within ~1 frame.
+    pub fn wake(&self) {
         let _ = nix::unistd::write(self.wake_w.as_fd(), b"x");
     }
 }
@@ -595,23 +628,50 @@ fn worker_loop(
     // loop can retry once it expires.
     let mut pending_wake = false;
 
+    // Local mirror of the shared `visible` flag, so we can detect the
+    // hidden→visible edge and force one full republish on reveal. Starts
+    // true: a freshly spawned pane is visible (matches the `visible`
+    // atomic's initial value in `spawn`).
+    let mut was_visible = true;
+
     loop {
+        // Read the shared visibility once per iteration. Acquire pairs
+        // with the Release store in `sync_grid` so the reveal edge below
+        // is never missed: whatever the renderer stored before poking our
+        // wake pipe is visible to us here.
+        let visible_now = visible.load(Ordering::Acquire);
+        // Hidden→visible edge. On reveal we owe the renderer one FULL
+        // publish (it repaints from the snapshot via `just_shown`, and
+        // that snapshot is stale — we skipped publishes while hidden).
+        let just_revealed = visible_now && !was_visible;
+        was_visible = visible_now;
+
         // Drain any deferred wake whose cooldown has now expired. Safety
         // net: a snapshot got published during the global cooldown and
         // no further chunks have arrived; we still need to notify Bevy
         // so the screen doesn't go stale. Hidden panes never wake — the
         // visibility sync will fire one for us on un-hide.
-        if pending_wake && visible.load(Ordering::Relaxed) {
+        if pending_wake && visible_now {
             if try_wake_winit_throttled(&wakeup) {
                 pending_wake = false;
             }
-        } else if pending_wake && !visible.load(Ordering::Relaxed) {
+        } else if pending_wake && !visible_now {
             pending_wake = false;
         }
 
         let mut did_anything = false;
         let mut force_full_publish = false;
         tick_count += 1;
+
+        // On the reveal edge, force a full publish this iteration even if
+        // no pty bytes arrived — `did_anything` gates the publish, and an
+        // idle pane produced nothing. `force_full_publish` makes it repaint
+        // ALL rows regardless of libghostty's accumulated dirty flags, so
+        // it doesn't matter whether those saturated while we were hidden.
+        if just_revealed {
+            did_anything = true;
+            force_full_publish = true;
+        }
 
         // 1. Drain socket: pull every available DaemonMessage frame.
         if !daemon_gone {
@@ -910,7 +970,25 @@ fn worker_loop(
 
         // 4. Publish snapshot if anything changed, except during the
         //    replay window — that's a one-shot final publish at ReplayEnd.
-        let want_publish = did_anything && !in_replay;
+        //
+        //    Hidden panes skip the steady-state publish entirely: the
+        //    per-cell row extraction below is pure waste when no renderer
+        //    reads the snapshot for an off-screen pane, and it's the top
+        //    CPU cost when several inactive-project TUIs stream at once.
+        //    We keep draining the socket + feeding vt_write above, so VT
+        //    state, the bell counter, OSC 7 cwd and OSC 133 command marks
+        //    all stay correct (none of them read the published snapshot);
+        //    only the grid extraction is deferred. The `just_revealed`
+        //    edge (which sets `visible_now` true + `force_full_publish`)
+        //    guarantees a pane gets one fresh full publish the instant it
+        //    is shown again.
+        //
+        //    `replay_just_ended` is exempt from the visibility gate: it's
+        //    a rare one-shot that must run even while hidden, because the
+        //    same block resets `replay_just_ended` and section 2 keys the
+        //    pty-response *drop* on it — leaving it stuck true would make
+        //    us swallow the live child's DA/mode replies indefinitely.
+        let want_publish = did_anything && !in_replay && visible_now;
         if want_publish || replay_just_ended {
             let force = force_full_publish || replay_just_ended;
             let t = Instant::now();
@@ -931,13 +1009,12 @@ fn worker_loop(
             publish_ns_since_log += t.elapsed().as_nanos();
             publishes_since_log += 1;
             if published {
-                // Skip waking the renderer for hidden panes — the
-                // libghostty Terminal still tracks state correctly via
-                // the snapshot mutex, so when the pane becomes visible
-                // again `sync_grid` reads the up-to-date generation and
-                // does a forced repaint. Cuts the per-frame schedule
-                // cost of TUIs running in inactive-project terminals.
-                if visible.load(Ordering::Relaxed) {
+                // Skip waking the renderer for hidden panes. The only
+                // publish that reaches here while hidden is the exempt
+                // `replay_just_ended` one-shot; there's no visible pane to
+                // repaint, so we suppress the wake and the reveal edge will
+                // republish + wake later.
+                if visible_now {
                     if try_wake_winit_throttled(&wakeup) {
                         pending_wake = false;
                     } else {

@@ -648,6 +648,21 @@ impl FunctWorker {
                     self.slots.render_dirty.store(true, Ordering::Release);
                 }
             }
+            HostToWorker::SetVisible { visible } => {
+                // A wake + bit-sync, not a handler. The host already wrote
+                // `slots.visible` before sending this; store it again so the
+                // message is self-consistent regardless of any ordering. The
+                // real effect is that receiving ANY message unblocks the idle
+                // `recv`, so the main loop re-evaluates its render gate: on a
+                // hidden→visible edge, if a handler dirtied state while we were
+                // hidden, `render_dirty` is still set and the loop now renders
+                // that pending frame once (and `request_main_loop_wakeup` from
+                // `finish_job` gets it applied promptly). We deliberately do NOT
+                // force `render_dirty` here — a reveal with nothing changed must
+                // NOT re-render (the last-applied entity tree is still on screen,
+                // hidden not despawned), which keeps reveals cheap.
+                self.slots.visible.store(visible, Ordering::Release);
+            }
             HostToWorker::Resize { canvas_w, canvas_h } => {
                 self.canvas_w = canvas_w;
                 self.canvas_h = canvas_h;
@@ -965,7 +980,17 @@ pub(crate) fn funct_worker_main(
             if !worker.dispatch(m) {
                 return;
             }
-        } else if worker.loaded && worker.slots.render_dirty.load(Ordering::Acquire) {
+        } else if worker.loaded
+            && worker.slots.render_dirty.load(Ordering::Acquire)
+            && worker.slots.visible.load(Ordering::Acquire)
+        {
+            // Only evaluate `render`/publish when the pane is actually visible.
+            // While hidden we deliberately do NOT consume `render_dirty` (that
+            // only happens inside `start_render`), so state a handler mutated
+            // while hidden accumulates in the flag and is drawn in ONE render on
+            // reveal — driven by the host's `SetVisible` wake below. This is the
+            // whole battery win: a hidden pane keeps running handlers but pays
+            // zero render eval and zero host entity churn.
             worker.start_render();
         } else {
             match rx.recv() {
@@ -1326,6 +1351,45 @@ fn register_host_surface(
         let arr: Vec<serde_json::Value> = entries
             .into_iter()
             .map(|(name, size, mtime)| serde_json::json!({ "name": name, "size": size, "mtime": mtime }))
+            .collect();
+        Value::from_json(&serde_json::Value::Array(arr))
+    });
+
+    // list_entries(path) -> [{ name, is_dir, size }] for files AND
+    // directories, directories first then files, each alphabetical
+    // (case-insensitive). Dotfiles are included but sort after non-dot
+    // within their group. `~` is expanded. Powers the file-tree widget.
+    vm.register1("list_entries", |path: String| -> Value {
+        let p = expand_tilde(&path);
+        let mut entries: Vec<(String, bool, u64)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&p) {
+            for e in rd.flatten() {
+                let (is_dir, is_file) = e
+                    .file_type()
+                    .map(|t| (t.is_dir(), t.is_file()))
+                    .unwrap_or((false, false));
+                if !is_dir && !is_file {
+                    continue; // skip sockets/fifos/broken symlinks
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                let size = if is_dir {
+                    0
+                } else {
+                    e.metadata().map(|m| m.len()).unwrap_or(0)
+                };
+                entries.push((name, is_dir, size));
+            }
+        }
+        // Directories before files; within each, case-insensitive by name.
+        entries.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+        let arr: Vec<serde_json::Value> = entries
+            .into_iter()
+            .map(|(name, is_dir, size)| {
+                serde_json::json!({ "name": name, "is_dir": is_dir, "size": size })
+            })
             .collect();
         Value::from_json(&serde_json::Value::Array(arr))
     });

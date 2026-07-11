@@ -1594,13 +1594,20 @@ fn paint_shader_layer(
 ) {
     use crate::button_material::WidgetButtonMesh;
     use crate::glaze_material::{
-        GlazeInteractionTarget, GlazeMaterial, GlazeShaderCache, GlazeUniforms,
+        GlazeAnimates, GlazeInteractionTarget, GlazeMaterial, GlazeShaderCache, GlazeUniforms,
+        body_reads_clock,
     };
 
     if size.x <= 0.0 || size.y <= 0.0 {
         return;
     }
     let body = body.to_string();
+    // Derive the "reads the per-frame clock" bit once, at layer creation, from
+    // the compiler-produced fragment body — so `update_glaze_materials` can push
+    // `time`/`dt` only into the shaders that actually use them (see
+    // `GlazeAnimates`). A hot-reload rebuilds this entity, so the bit is always
+    // recomputed from the current body.
+    let animates = GlazeAnimates(body_reads_clock(&body));
     let interaction = GlazeInteractionTarget {
         pane: ctx.owner_pane,
         element_id: element_id.map(str::to_string),
@@ -1610,6 +1617,7 @@ fn paint_shader_layer(
         .spawn((
             ChildOf(ctx.content_root),
             interaction,
+            animates,
             // Unit quad centered on the element box (Y flipped: content uses a
             // top-left origin, Bevy 2D is Y-up). uv runs 0..1 across the quad.
             Transform::from_xyz(origin.x + size.x * 0.5, -(origin.y + size.y * 0.5), z)

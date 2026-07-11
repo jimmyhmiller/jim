@@ -26,7 +26,8 @@ use jim_pane::{FocusedPane, PaneChrome, PaneKindMarker, PaneTag};
 
 use crate::worker::WorkerMsg;
 use crate::{
-    MonoMetrics, TermGrid, TerminalSelection, TerminalStore, LINE_HEIGHT, PANE_KIND,
+    MonoMetrics, SelectionOverlayCache, TermGrid, TerminalSelection, TerminalStore, LINE_HEIGHT,
+    PANE_KIND,
 };
 
 // Selection color now driven by theme tokens::SELECTION (look up
@@ -78,20 +79,34 @@ fn render_selection_overlays(
         let cols = grid.cols as i32;
         let rows = grid.rows as i32;
 
-        // Tear down whatever's there. Cheap: at most `rows` entities,
-        // and only when the selection is being rebuilt.
-        for &e in &sel.overlays {
-            if let Ok(mut ec) = commands.get_entity(e) {
-                ec.despawn();
-            }
-        }
-        sel.overlays.clear();
-
+        // Nothing to draw (no active selection, or a zero-size grid): tear
+        // the strips down ONCE and stay torn down. Clearing the cache means
+        // the next active frame is treated as a fresh build.
         if !active || cols == 0 || rows == 0 {
+            if !sel.overlays.is_empty() {
+                for &e in &sel.overlays {
+                    if let Ok(mut ec) = commands.get_entity(e) {
+                        ec.despawn();
+                    }
+                }
+                sel.overlays.clear();
+            }
+            sel.overlay_cache = None;
             continue;
         }
 
         let Some((start, end)) = sel.normalised() else {
+            // `is_active()` guarantees both endpoints are `Some`, so this is
+            // defensive only; treat it like "nothing to draw".
+            if !sel.overlays.is_empty() {
+                for &e in &sel.overlays {
+                    if let Ok(mut ec) = commands.get_entity(e) {
+                        ec.despawn();
+                    }
+                }
+                sel.overlays.clear();
+            }
+            sel.overlay_cache = None;
             continue;
         };
 
@@ -105,6 +120,35 @@ fn render_selection_overlays(
             .get(&entity)
             .map(|d| d.worker.snapshot.lock().expect("snapshot lock").viewport_offset as i64)
             .unwrap_or(0);
+
+        // Skip the whole despawn/respawn if every input that determines the
+        // strip geometry matches what we last built. Scrolling, resizing,
+        // moving the selection, or a theme recolor all change one of these,
+        // so they still rebuild the same frame. (The `viewport_offset` lock
+        // above stays — it is a single O(1) `u64` read; the cost this fix
+        // removes is the per-row sprite churn, not the lock.)
+        let key = SelectionOverlayCache {
+            start,
+            end,
+            offset,
+            cols,
+            rows,
+            cell_w: metrics.cell_width,
+            color: sel_color,
+            content_root: chrome.content_root,
+        };
+        if sel.overlay_cache == Some(key) {
+            continue;
+        }
+
+        // Something changed → full rebuild. Tear down the old strips first.
+        for &e in &sel.overlays {
+            if let Ok(mut ec) = commands.get_entity(e) {
+                ec.despawn();
+            }
+        }
+        sel.overlays.clear();
+
         let start_view = start.1 - offset;
         let end_view = end.1 - offset;
 
@@ -113,6 +157,10 @@ fn render_selection_overlays(
         let visible_first = start_view.max(0);
         let visible_last = end_view.min((rows - 1) as i64);
         if visible_first > visible_last {
+            // Selection is entirely scrolled off-screen: zero strips, but
+            // still record the inputs so we don't recompute this every frame
+            // while the user leaves the (off-screen) selection sitting there.
+            sel.overlay_cache = Some(key);
             continue;
         }
         for row in visible_first..=visible_last {
@@ -151,6 +199,9 @@ fn render_selection_overlays(
                 .id();
             sel.overlays.push(entity);
         }
+        // Record the inputs this strip set was built from so identical
+        // subsequent frames skip the rebuild entirely.
+        sel.overlay_cache = Some(key);
     }
 }
 

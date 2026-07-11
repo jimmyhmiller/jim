@@ -262,6 +262,39 @@ pub struct TerminalSelection {
     /// (children of the terminal's `content_root`). Rebuilt by the
     /// selection-render system as the selection changes.
     pub overlays: Vec<Entity>,
+    /// Inputs the current `overlays` were built from. `render_selection_overlays`
+    /// compares the live inputs against this each frame and skips the
+    /// (expensive) despawn/respawn of one sprite-per-row when nothing that
+    /// affects overlay geometry changed. `None` whenever there are no
+    /// overlays (inactive selection, zero-size grid, or never built).
+    pub overlay_cache: Option<SelectionOverlayCache>,
+}
+
+/// Snapshot of every input that determines the selection-overlay geometry.
+/// While a selection is live the render system would otherwise despawn and
+/// respawn a `Sprite` per selected visible row EVERY frame (and lock the
+/// snapshot mutex for `viewport_offset`) even when the resulting strips are
+/// byte-identical. Caching these lets it rebuild only on a real change —
+/// moving the selection, scrolling, resizing, or a theme recolor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectionOverlayCache {
+    /// Normalised selection endpoints, `(col, absolute_row)`.
+    pub start: (i32, i64),
+    pub end: (i32, i64),
+    /// libghostty viewport offset at build time — scrolling during a
+    /// selection slides the visible strips, so a change here must rebuild.
+    pub offset: i64,
+    /// Grid dimensions and cell width; a resize or font-metric change alters
+    /// strip extents and positions. (`LINE_HEIGHT` is a compile-time const,
+    /// so it is intentionally not tracked.)
+    pub cols: i32,
+    pub rows: i32,
+    pub cell_w: f32,
+    /// Resolved selection color; a theme change recolors every strip.
+    pub color: Color,
+    /// The `content_root` the strips are parented under; if a pane's content
+    /// root entity ever changes the strips must be reparented (rebuilt).
+    pub content_root: Entity,
 }
 
 impl TerminalSelection {
@@ -1559,35 +1592,76 @@ fn sync_grid(
         // state stays correct — but inactive-project panes contribute
         // zero to per-frame schedule cost.
         let is_hidden = matches!(vis, Visibility::Hidden);
+        // Release-store so the worker's Acquire-load of the same edge
+        // (worker.rs, top of `worker_loop`) can't miss the transition —
+        // this is what guarantees the reveal publish is never skipped.
         data.worker
             .visible
-            .store(!is_hidden, std::sync::atomic::Ordering::Relaxed);
+            .store(!is_hidden, std::sync::atomic::Ordering::Release);
         if is_hidden {
             grid.was_visible = false;
             continue;
         }
-        // First frame after un-hide: libghostty's dirty_rows only reflect
-        // changes SINCE the last publish, but the worker has been
-        // publishing all along without us reading. Force a full repaint
-        // to bring the cells texture up to the current grid state.
+        // First frame after un-hide: the worker SKIPS snapshot publishes
+        // while hidden, so its last-published grid is stale. Force a full
+        // repaint here to paint whatever it last published, and nudge the
+        // worker so it observes the visibility edge, publishes a fresh
+        // full snapshot, and wakes us — the next frame repaints from that.
+        // Worst case is one frame of the pane's last-visible content; the
+        // nudge keeps the worker from sitting in its multi-second poll(2)
+        // before catching up (which would leave the pane stale for
+        // seconds — the one thing we must never do).
         let just_shown = !grid.was_visible;
         grid.was_visible = true;
+        if just_shown {
+            data.worker.wake();
+        }
 
-        // Lock briefly, copy snapshot fields into locals, drop lock.
+        // Lock briefly, read the cheap scalars, and only clone the (large)
+        // cells + dirty_rows vectors when a repaint is actually due. An
+        // idle-but-visible terminal wakes here every frame the app renders
+        // for ANY reason; it used to pay two full-grid memcpys per frame
+        // unconditionally, then throw them away at the `nothing_changed`
+        // check below. We now decide up front — under the SAME single lock
+        // acquisition, using the exact negation of `nothing_changed` — and
+        // skip both copies entirely on idle frames.
+        //
+        // This is safe against dropping dirty-row information: the worker
+        // (worker.rs) bumps `generation` on every publish, and the cells +
+        // dirty_rows vectors are only ever mutated during a publish, under
+        // this very mutex. So an unchanged `generation` guarantees both the
+        // cells AND the dirty_rows are byte-identical to what we'd have
+        // copied — there is nothing new to consume. The worker fully
+        // REPLACES dirty_rows each publish (it does not accumulate flags for
+        // the renderer to clear), so we never owe it a read.
         let lock_t = Instant::now();
-        let (cols, rows, default_fg, default_bg, cursor, generation) = {
+        let (cols, rows, default_fg, default_bg, cursor, generation, pool_changed, work_pending) = {
             let g = data.worker.snapshot.lock().expect("snapshot lock");
-            local_cells.clear();
-            local_cells.extend_from_slice(&g.cells);
-            local_dirty_rows.clear();
-            local_dirty_rows.extend_from_slice(&g.dirty_rows);
+            let cols = g.cols;
+            let rows = g.rows;
+            let generation = g.generation;
+            let pool_changed = grid.cols != cols || grid.rows != rows;
+            // Identical predicate to the historical `nothing_changed` guard,
+            // hoisted ahead of the copy so the copy can be elided.
+            let work_pending = pool_changed
+                || just_shown
+                || theme_changed
+                || grid.last_rendered_generation != generation;
+            if work_pending {
+                local_cells.clear();
+                local_cells.extend_from_slice(&g.cells);
+                local_dirty_rows.clear();
+                local_dirty_rows.extend_from_slice(&g.dirty_rows);
+            }
             (
-                g.cols,
-                g.rows,
+                cols,
+                rows,
                 g.default_fg,
                 g.default_bg,
                 g.cursor,
-                g.generation,
+                generation,
+                pool_changed,
+                work_pending,
             )
         };
         lock_ns += lock_t.elapsed().as_nanos();
@@ -1620,12 +1694,13 @@ fn sync_grid(
             }
         }
 
-        let pool_changed = grid.cols != cols || grid.rows != rows;
-        let nothing_changed = !pool_changed
-            && !just_shown
-            && !theme_changed
-            && grid.last_rendered_generation == generation;
-        if nothing_changed {
+        // `work_pending` was decided under the lock above (its exact
+        // negation is the historical `nothing_changed` predicate); if no
+        // work is due we already skipped the cell copy, so bail now. Cursor
+        // visibility/position was still reconciled above every frame, as
+        // before. `pool_changed` was computed under the same lock and is
+        // reused below for the resize + force-all paths.
+        if !work_pending {
             continue;
         }
         work_done = true;

@@ -99,6 +99,15 @@ pub const CLOSE_BTN_SIZE: f32 = 14.0;
 pub const CLOSE_BTN_INSET: f32 = 4.0;
 pub const MIN_PANE_SIZE: Vec2 = Vec2::new(160.0, 120.0);
 
+/// Slim title-bar height used by docked panes ("melt into the dock").
+/// Chosen so the existing close-button geometry
+/// (`CLOSE_BTN_SIZE + CLOSE_BTN_INSET = 18`) fits the header exactly.
+pub const DOCKED_TITLE_H: f32 = 18.0;
+/// Title-bar height for the outer dock *container* pane — an invisible
+/// but still hit-testable band so the whole dock can be dragged as a
+/// unit (nothing is painted there; not 0, or the drag gesture is lost).
+pub const DOCK_CONTAINER_TITLE_H: f32 = 8.0;
+
 // Pane body color lives in `chrome_material::ChromeStyle` (SDF
 // uniform). Text-side chrome colors (title / close / handle /
 // divider) live in `chrome_material::ChromeTextStyle`, also theme-
@@ -159,6 +168,34 @@ pub struct PaneChrome {
     pub title_cover: Entity,
     pub content_root: Entity,
     pub close_button: Entity,
+}
+
+/// Per-pane chrome geometry override. Absent = normal floating pane
+/// (uses the global `TITLE_H` / corner-radius / border). Present =
+/// dock-style flat chrome: a slimmer title bar, no rounded corners, no
+/// border. Produced solely by the dock module (from `DockMember` /
+/// `Dock` presence) and consulted by every geometry, hit-test, and
+/// chrome-uniform system so docked cells "melt into" the dock. `MARGIN`
+/// is deliberately NOT overridden — the inter-cell gap is
+/// gutter+radius+border, not the internal content margin.
+#[derive(Component, Copy, Clone, Debug)]
+pub struct PaneChromeOverride {
+    pub title_h: f32,
+    pub corner_radius: f32,
+    pub border_width: f32,
+    /// Body + title-strip fill (linear RGBA) forced onto the SDF chrome
+    /// material, overriding the theme `bg`. Used to paint the outer dock
+    /// *container* in the divider color so the 1px inter-cell gutter reads
+    /// as a hairline. `None` = keep the pane's normal themed background
+    /// (docked *members* use `None`).
+    pub bg: Option<Vec4>,
+}
+
+/// Title-bar height for a pane given its optional chrome override:
+/// the override's `title_h` if present, else the global [`TITLE_H`].
+#[inline]
+pub fn override_title_h(ov: Option<&PaneChromeOverride>) -> f32 {
+    ov.map(|o| o.title_h).unwrap_or(TITLE_H)
 }
 
 /// Membership in a host-defined "project" / workspace bucket. Pane-bevy
@@ -456,6 +493,9 @@ pub struct PendingPaneActions {
     pub pin: Vec<Entity>,
     /// Unpin: remove `PanePinned`, bump z above all unpinned panes.
     pub unpin: Vec<Entity>,
+    /// Pop a member back out of its dock into a free-floating pane
+    /// (drained by the dock module's `apply_undock`).
+    pub undock: Vec<Entity>,
 }
 
 /// Host-published canvas viewport. `PaneRect.pos/size` lives in
@@ -756,6 +796,7 @@ impl Plugin for PanePlugin {
             .init_resource::<PaneCanvasRegion>()
             .init_resource::<PaneViewport>()
             .init_resource::<PaneZoom>()
+            .init_resource::<PaneCursorOverride>()
             .insert_resource(PaneLayerAllocator::with_reserved(
                 self.reserved_layers.iter().copied(),
             ))
@@ -774,6 +815,7 @@ impl Plugin for PanePlugin {
                     position_panes,
                     apply_pending_pane_actions,
                     sync_pinned_chrome,
+                    sync_chrome_override_geometry,
                     sync_chrome_uniforms,
                     push_chrome_time,
                     (update_pane_cursor, emit_pane_hover),
@@ -871,6 +913,8 @@ fn emit_pane_hover(
             Option<&Visibility>,
             Has<PanePinned>,
             Has<PaneScreenAnchored>,
+            Option<&PaneChromeOverride>,
+            Has<dock::DockMember>,
         ),
         With<PaneTag>,
     >,
@@ -912,28 +956,33 @@ fn emit_pane_hover(
     // wins outright.
     // (entity, rect, anchored). Anchored panes hit-test against the window
     // cursor; canvas panes against the canvas cursor.
-    let unpinned_rects: Vec<(Entity, PaneRect, bool)> = panes
+    // (entity, rect, anchored, title_h, resizable)
+    let unpinned_rects: Vec<(Entity, PaneRect, bool, f32, bool)> = panes
         .iter()
-        .filter(|(_, _, vis, pinned, _)| !matches!(vis, Some(Visibility::Hidden)) && !pinned)
-        .map(|(e, r, _, _, anchored)| (e, *r, anchored))
+        .filter(|(_, _, vis, pinned, _, _, _)| {
+            !matches!(vis, Some(Visibility::Hidden)) && !pinned
+        })
+        .map(|(e, r, _, _, anchored, ov, member)| {
+            (e, *r, anchored, override_title_h(ov), !member)
+        })
         .collect();
     let mut target = {
         // Topmost unpinned pane under the cursor (in its own coordinate frame).
-        let mut best: Option<(Entity, PaneRect, bool, f32)> = None;
-        for &(e, r, anchored) in &unpinned_rects {
+        let mut best: Option<(Entity, PaneRect, bool, f32, bool, f32)> = None;
+        for &(e, r, anchored, title_h, resizable) in &unpinned_rects {
             let c = hit_cursor(anchored, pt, pt_canvas);
             let inside = c.x >= r.pos.x
                 && c.x <= r.pos.x + r.size.x
                 && c.y >= r.pos.y
                 && c.y <= r.pos.y + r.size.y;
-            if inside && best.map_or(true, |(_, _, _, z)| r.z > z) {
-                best = Some((e, r, anchored, r.z));
+            if inside && best.map_or(true, |(_, _, _, _, _, z)| r.z > z) {
+                best = Some((e, r, anchored, title_h, resizable, r.z));
             }
         }
-        best.and_then(|(e, r, anchored, _)| {
+        best.and_then(|(e, r, anchored, title_h, resizable, _)| {
             let c = hit_cursor(anchored, pt, pt_canvas);
-            if matches!(region_at(c, &r), Some(PaneRegion::Content)) {
-                Some((e, pt_to_content_local(c, &r)))
+            if matches!(region_at_ex(c, &r, title_h, resizable), Some(PaneRegion::Content)) {
+                Some((e, pt_to_content_local_th(c, &r, title_h)))
             } else {
                 None
             }
@@ -946,15 +995,16 @@ fn emit_pane_hover(
     // and the press path exactly).
     if target.is_none() {
         let mut best: Option<(Entity, f32, Vec2)> = None;
-        for (e, r, vis, pinned, anchored) in panes.iter() {
+        for (e, r, vis, pinned, anchored, ov, member) in panes.iter() {
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
                 continue;
             }
+            let title_h = override_title_h(ov);
             let cur = hit_cursor(anchored, pt, pt_canvas);
-            if !matches!(region_at(cur, r), Some(PaneRegion::Content)) {
+            if !matches!(region_at_ex(cur, r, title_h, !member), Some(PaneRegion::Content)) {
                 continue;
             }
-            let local = pt_to_content_local(cur, r);
+            let local = pt_to_content_local_th(cur, r, title_h);
             let Ok(zones) = hot_zones.get(e) else { continue };
             if !zones.contains(local) {
                 continue;
@@ -996,6 +1046,13 @@ fn emit_pane_hover(
     }
 }
 
+/// A cursor icon another system (e.g. the dock splitter) wants shown,
+/// overriding the per-pane hover scan. `None` = no override. Written
+/// every frame by whoever owns it (self-clears), applied by
+/// [`update_pane_cursor`] — same write/apply layering as `InputConsumed`.
+#[derive(Resource, Default)]
+pub struct PaneCursorOverride(pub Option<bevy::window::SystemCursorIcon>);
+
 /// Update the window cursor icon based on what's under the mouse.
 /// Resize edges + corners get the matching directional resize cursor;
 /// title bar gets the move cursor while idle; everywhere else stays
@@ -1005,6 +1062,7 @@ fn update_pane_cursor(
     mut commands: Commands,
     mode: Res<PaneMouseMode>,
     viewport: Res<PaneViewport>,
+    cursor_override: Res<PaneCursorOverride>,
     windows: Query<(Entity, &Window)>,
     panes: Query<
         (
@@ -1012,6 +1070,8 @@ fn update_pane_cursor(
             Option<&Visibility>,
             Has<PanePinned>,
             Option<&PaneKindMarker>,
+            Option<&PaneChromeOverride>,
+            Has<dock::DockMember>,
         ),
         With<PaneTag>,
     >,
@@ -1030,6 +1090,11 @@ fn update_pane_cursor(
             return;
         }
         PaneMouseMode::Idle => {
+            // A dock splitter (or other owner) can override the cursor while
+            // idle — e.g. ↔/↕ over a resizable gutter. Wins over the scan.
+            if let Some(over) = cursor_override.0 {
+                over
+            } else {
             let Some(pt) = window.cursor_position() else {
                 commands.entity(win_entity).remove::<bevy::window::CursorIcon>();
                 return;
@@ -1043,13 +1108,13 @@ fn update_pane_cursor(
             // whether that topmost body is an editor's content area, so we can
             // show the I-beam (text) cursor there.
             let mut covered: Option<(f32, bool)> = None;
-            for (rect, vis, pinned, kind) in &panes {
+            for (rect, vis, pinned, kind, ov, member) in &panes {
                 if matches!(vis, Some(Visibility::Hidden)) || pinned {
                     continue;
                 }
                 // Only resize edges get a special cursor. The title
                 // bar stays default — no hand / grab indicator there.
-                match region_at(pt_canvas, rect) {
+                match region_at_ex(pt_canvas, rect, override_title_h(ov), !member) {
                     Some(PaneRegion::ResizeEdge(e)) => {
                         if best.map_or(true, |(_, z)| rect.z > z) {
                             best = Some((cursor_for_edges(e), rect.z));
@@ -1074,6 +1139,7 @@ fn update_pane_cursor(
                     commands.entity(win_entity).remove::<bevy::window::CursorIcon>();
                     return;
                 }
+            }
             }
         }
     };
@@ -1136,6 +1202,7 @@ fn sync_chrome_uniforms(
         &PaneChrome,
         Option<Ref<chrome_material::PaneChromeStyle>>,
         Option<Ref<chrome_material::PaneChromeShader>>,
+        Option<Ref<PaneChromeOverride>>,
     )>,
     mut bgs: Query<(&MeshMaterial2d<PaneChromeMaterial>, &mut Transform), Without<MeshMaterial2d<PaneShadowMaterial>>>,
     mut shadows: Query<(&MeshMaterial2d<PaneShadowMaterial>, &mut Transform), Without<MeshMaterial2d<PaneChromeMaterial>>>,
@@ -1149,9 +1216,12 @@ fn sync_chrome_uniforms(
     let focus_changed = focused.is_changed();
     let global_changed = global_style.is_changed();
     let shader_changed = active_shader.is_changed();
-    for (pane_entity, rect, chrome, pane_style, pane_shader) in &panes {
+    for (pane_entity, rect, chrome, pane_style, pane_shader, chrome_ov) in &panes {
         // Per-pane override (its project's theme) if present, else global.
         let pane_style_changed = pane_style.as_ref().is_some_and(|s| s.is_changed());
+        // Docked-chrome geometry override (slim header, flat corners/border).
+        let ov_changed = chrome_ov.as_ref().is_some_and(|o| o.is_changed());
+        let title_h = chrome_ov.as_ref().map(|o| o.title_h).unwrap_or(TITLE_H);
         let style: &chrome_material::ChromeStyle =
             pane_style.as_ref().map(|s| &s.0).unwrap_or(&global_style);
         let style_changed = if pane_style.is_some() {
@@ -1168,11 +1238,12 @@ fn sync_chrome_uniforms(
             shader_changed
         };
         let needs_chrome_update =
-            rect.is_changed() || focus_changed || style_changed || frag_changed;
+            rect.is_changed() || focus_changed || style_changed || frag_changed || ov_changed;
         if !needs_chrome_update {
             continue;
         }
         let is_focused = focused.0 == Some(pane_entity);
+        let ov = chrome_ov.as_deref();
 
         // Title cover: identical params to the body except for the
         // cover_mode + title_h flags, so it tracks resize / focus /
@@ -1185,7 +1256,12 @@ fn sync_chrome_uniforms(
             transform.scale.x = rect.size.x.max(1.0);
             transform.scale.y = rect.size.y.max(1.0);
             if let Some(mut mat) = chrome_mats.get_mut(&handle.0) {
-                mat.params = style.params_for_title_cover(rect.size, is_focused, TITLE_H);
+                mat.params = style.params_for_title_cover(rect.size, is_focused, title_h);
+                if let Some(o) = ov {
+                    // Flat docked corners: the cover must not round the top
+                    // corners either, or it squares off against a 0-radius bg.
+                    mat.params.corner_radius = o.corner_radius;
+                }
             }
         }
 
@@ -1197,6 +1273,20 @@ fn sync_chrome_uniforms(
             transform.scale.y = rect.size.y.max(1.0);
             if let Some(mut mat) = chrome_mats.get_mut(&handle.0) {
                 mat.params = style.params_for(rect.size, is_focused);
+                if let Some(o) = ov {
+                    // Docked cell: flat body — slim header, no rounded
+                    // corners, no border. Content "melts into" the dock.
+                    mat.params.corner_radius = o.corner_radius;
+                    mat.params.border_width = o.border_width;
+                    mat.params.title_h = o.title_h;
+                    if let Some(bg) = o.bg {
+                        // Outer dock container: paint the CONTENT backdrop the
+                        // divider color so the 1px gutter between cells reads as
+                        // a hairline. Leave `title_bg` alone so the dock's
+                        // header strip keeps its normal, readable color.
+                        mat.params.bg = bg;
+                    }
+                }
                 if frag_changed {
                     mat.fragment = frag.clone();
                 }
@@ -1551,6 +1641,20 @@ pub enum PaneRegion {
 pub const RESIZE_EDGE_PX: f32 = 6.0;
 
 pub fn region_at(pt: Vec2, rect: &PaneRect) -> Option<PaneRegion> {
+    region_at_ex(pt, rect, TITLE_H, true)
+}
+
+/// Like [`region_at`] but with a caller-supplied title-bar height (for
+/// docked panes with a slim header) and a `resizable` flag. When
+/// `resizable` is false the edge-drag band is skipped entirely — docked
+/// members are laid out by the dock, so their own edges must not start a
+/// resize (it would be reverted by `dock_layout` next frame).
+pub fn region_at_ex(
+    pt: Vec2,
+    rect: &PaneRect,
+    title_h: f32,
+    resizable: bool,
+) -> Option<PaneRegion> {
     if pt.x < rect.pos.x || pt.x > rect.pos.x + rect.size.x {
         return None;
     }
@@ -1568,19 +1672,21 @@ pub fn region_at(pt: Vec2, rect: &PaneRect) -> Option<PaneRegion> {
     }
     // Edge-band hit test. Any of the four outer rings — plus corners
     // (combined N+E, N+W, S+E, S+W) — become a resize gesture.
-    let near_n = pt.y - rect.pos.y < RESIZE_EDGE_PX;
-    let near_s = (rect.pos.y + rect.size.y) - pt.y < RESIZE_EDGE_PX;
-    let near_w = pt.x - rect.pos.x < RESIZE_EDGE_PX;
-    let near_e = (rect.pos.x + rect.size.x) - pt.x < RESIZE_EDGE_PX;
-    if near_n || near_s || near_w || near_e {
-        return Some(PaneRegion::ResizeEdge(ResizeDir {
-            north: near_n,
-            south: near_s,
-            east: near_e,
-            west: near_w,
-        }));
+    if resizable {
+        let near_n = pt.y - rect.pos.y < RESIZE_EDGE_PX;
+        let near_s = (rect.pos.y + rect.size.y) - pt.y < RESIZE_EDGE_PX;
+        let near_w = pt.x - rect.pos.x < RESIZE_EDGE_PX;
+        let near_e = (rect.pos.x + rect.size.x) - pt.x < RESIZE_EDGE_PX;
+        if near_n || near_s || near_w || near_e {
+            return Some(PaneRegion::ResizeEdge(ResizeDir {
+                north: near_n,
+                south: near_s,
+                east: near_e,
+                west: near_w,
+            }));
+        }
     }
-    if pt.y < rect.pos.y + TITLE_H {
+    if pt.y < rect.pos.y + title_h {
         return Some(PaneRegion::TitleBar);
     }
     Some(PaneRegion::Content)
@@ -1619,16 +1725,28 @@ pub fn topmost_pane_at(pt: Vec2, panes: &[(Entity, PaneRect)]) -> Option<Entity>
 /// y-down; (0,0) is the top-left of the content area (just inside
 /// MARGIN below the title bar).
 pub fn pt_to_content_local(pt: Vec2, rect: &PaneRect) -> Vec2 {
-    let origin = rect.pos + Vec2::new(MARGIN, TITLE_H + MARGIN);
+    pt_to_content_local_th(pt, rect, TITLE_H)
+}
+
+/// Like [`pt_to_content_local`] but with a caller-supplied title-bar
+/// height (docked panes use a slim header).
+pub fn pt_to_content_local_th(pt: Vec2, rect: &PaneRect, title_h: f32) -> Vec2 {
+    let origin = rect.pos + Vec2::new(MARGIN, title_h + MARGIN);
     pt - origin
 }
 
 /// Top-left + size of the content area (not including chrome).
 pub fn content_area(rect: &PaneRect) -> (Vec2, Vec2) {
-    let origin = Vec2::new(MARGIN, -(TITLE_H + MARGIN));
+    content_area_th(rect, TITLE_H)
+}
+
+/// Like [`content_area`] but with a caller-supplied title-bar height
+/// (docked panes use a slim header, reclaiming the vertical space).
+pub fn content_area_th(rect: &PaneRect, title_h: f32) -> (Vec2, Vec2) {
+    let origin = Vec2::new(MARGIN, -(title_h + MARGIN));
     let size = Vec2::new(
         (rect.size.x - 2.0 * MARGIN).max(0.0),
-        (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0),
+        (rect.size.y - title_h - 2.0 * MARGIN).max(0.0),
     );
     (origin, size)
 }
@@ -1706,6 +1824,21 @@ impl<'w, 's> DoublePress<'w, 's> {
     }
 }
 
+/// Bundled read-only queries for `handle_pane_mouse`, packed into one
+/// `SystemParam` so the system stays under Bevy's 16-argument ceiling.
+/// `chrome_ov` is disjoint (components-wise) from the `&mut PaneRect`
+/// query, so there's no access conflict.
+#[derive(bevy::ecs::system::SystemParam)]
+struct PaneMouseAux<'w, 's> {
+    chrome_ov: Query<
+        'w,
+        's,
+        (Option<&'static PaneChromeOverride>, Has<dock::DockMember>),
+        With<PaneTag>,
+    >,
+    hot_zones: Query<'w, 's, &'static PaneHotZones>,
+}
+
 fn handle_pane_mouse(
     windows: Query<&Window>,
     buttons: Res<ButtonInput<MouseButton>>,
@@ -1731,9 +1864,18 @@ fn handle_pane_mouse(
         ),
         With<PaneTag>,
     >,
-    hot_zones: Query<&PaneHotZones>,
+    aux: PaneMouseAux,
 ) {
     let _prof = prof::sys_span("pane_mouse");
+    let hot_zones = &aux.hot_zones;
+    // (title_h, resizable) for a pane: docked cells get a slim header and
+    // no edge-resize (the dock owns their layout); everything else normal.
+    let geom = |e: Entity| -> (f32, bool) {
+        match aux.chrome_ov.get(e) {
+            Ok((ov, member)) => (override_title_h(ov), !member),
+            Err(_) => (TITLE_H, true),
+        }
+    };
     let Ok(window) = windows.single() else {
         return;
     };
@@ -1758,10 +1900,11 @@ fn handle_pane_mouse(
             PaneMouseMode::ContentDrag { pane, pinned } => {
                 if let Ok((_, rect, _, _, anchored)) = panes.get(pane) {
                     let cur = hit_cursor(anchored, pt, pt_canvas);
+                    let (th, _) = geom(pane);
                     content_release.write(PaneContentReleased {
                         pane,
                         window_pt: pt,
-                        local_pt: pt_to_content_local(cur, &rect),
+                        local_pt: pt_to_content_local_th(cur, &rect, th),
                         pinned,
                     });
                 }
@@ -1829,7 +1972,8 @@ fn handle_pane_mouse(
                 (*r, a)
             };
             let cur = hit_cursor(anchored, pt, pt_canvas);
-            let region = region_at(cur, &rect);
+            let (title_h, resizable) = geom(target);
+            let region = region_at_ex(cur, &rect, title_h, resizable);
             // Double-click on a pane is a "zoom/jump to this pane"
             // gesture — but only when it isn't landing on an interactive
             // element. A content click that hits one of the kind's
@@ -1838,7 +1982,7 @@ fn handle_pane_mouse(
             let on_click_target = matches!(region, Some(PaneRegion::Content))
                 && hot_zones
                     .get(target)
-                    .map_or(false, |z| z.contains(pt_to_content_local(cur, &rect)));
+                    .map_or(false, |z| z.contains(pt_to_content_local_th(cur, &rect, title_h)));
             if region.is_some() && !on_click_target {
                 dbl.note(target, pt);
             }
@@ -1878,7 +2022,7 @@ fn handle_pane_mouse(
                     content_press.write(PaneContentPressed {
                         pane: target,
                         window_pt: pt,
-                        local_pt: pt_to_content_local(cur, &rect),
+                        local_pt: pt_to_content_local_th(cur, &rect, title_h),
                         shift,
                         pinned: false,
                     });
@@ -2015,10 +2159,11 @@ fn handle_pane_mouse(
         PaneMouseMode::ContentDrag { pane, pinned } => {
             if let Ok((_, rect, _, _, anchored)) = panes.get(pane) {
                 let cur = hit_cursor(anchored, pt, pt_canvas);
+                let (th, _) = geom(pane);
                 content_drag.write(PaneContentDragged {
                     pane,
                     window_pt: pt,
-                    local_pt: pt_to_content_local(cur, &rect),
+                    local_pt: pt_to_content_local_th(cur, &rect, th),
                     pinned,
                 });
             }
@@ -2089,7 +2234,7 @@ fn position_panes(
     text_style: Res<ChromeTextStyle>,
     chrome_style: Res<chrome_material::ChromeStyle>,
     viewport: Res<PaneViewport>,
-    panes: Query<(&PaneRect, &PaneChrome), With<PaneTag>>,
+    panes: Query<(&PaneRect, &PaneChrome, Option<&PaneChromeOverride>), With<PaneTag>>,
     anchored: Query<(), With<PaneScreenAnchored>>,
     vscale_q: Query<&PaneVisualScale>,
     mut t_q: Query<&mut Transform>,
@@ -2113,9 +2258,10 @@ fn position_panes(
     let win_size = Vec2::new(win.width(), win.height());
 
     for entity in &parents {
-        let Ok((rect, chrome)) = panes.get(entity) else {
+        let Ok((rect, chrome, chrome_ov)) = panes.get(entity) else {
             continue;
         };
+        let title_h = override_title_h(chrome_ov);
         let is_focused = focused.0 == Some(entity);
 
         // Every write below goes through a "compare first, write only on
@@ -2177,7 +2323,7 @@ fn position_panes(
             }
         }
         if let Ok(mut t) = t_q.get_mut(chrome.title_bar) {
-            let want_y = -(TITLE_H - bar_h);
+            let want_y = -(title_h - bar_h);
             if t.translation.y != want_y {
                 t.translation.y = want_y;
             }
@@ -2244,6 +2390,45 @@ fn sync_pinned_chrome(
     for entity in removed.read() {
         if let Ok(chrome) = chromes.get(entity) {
             set_vis(chrome, Visibility::Inherited, &mut vis_q);
+        }
+    }
+}
+
+/// Move a pane's `content_root` to match a `PaneChromeOverride`'s slim
+/// header (`-(title_h + MARGIN)`), and restore it to the normal
+/// `-(TITLE_H + MARGIN)` when the override is removed (undock). Also
+/// forces a chrome-uniform refresh on removal by touching the PaneRect —
+/// on insertion the override's own change-tick already drives the refresh,
+/// but on removal there's no component left to observe. Driven by
+/// `Added`/`Removed<PaneChromeOverride>` so it only runs on transitions.
+fn sync_chrome_override_geometry(
+    added: Query<(&PaneChrome, &PaneChromeOverride), Added<PaneChromeOverride>>,
+    mut removed: RemovedComponents<PaneChromeOverride>,
+    chromes: Query<&PaneChrome>,
+    mut t_q: Query<&mut Transform>,
+    mut rects: Query<&mut PaneRect>,
+) {
+    let _prof = prof::sys_span("chrome_override_geom");
+    for (chrome, ov) in &added {
+        if let Ok(mut t) = t_q.get_mut(chrome.content_root) {
+            let want_y = -(ov.title_h + MARGIN);
+            if t.translation.y != want_y {
+                t.translation.y = want_y;
+            }
+        }
+    }
+    for entity in removed.read() {
+        if let Ok(chrome) = chromes.get(entity) {
+            if let Ok(mut t) = t_q.get_mut(chrome.content_root) {
+                let want_y = -(TITLE_H + MARGIN);
+                if t.translation.y != want_y {
+                    t.translation.y = want_y;
+                }
+            }
+        }
+        // Force sync_chrome_uniforms to restore the rounded/bordered look.
+        if let Ok(mut r) = rects.get_mut(entity) {
+            r.set_changed();
         }
     }
 }

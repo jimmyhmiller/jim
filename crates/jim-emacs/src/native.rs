@@ -19,8 +19,9 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bevy::asset::RenderAssetUsages;
@@ -170,6 +171,85 @@ fn parse_op(line: &str) -> Option<(u32, Op)> {
 // routed to per-frame queues by frame id; input records carry the
 // target frame id.
 
+/// PID (== process-group id, since we spawn emacs with `process_group(0)`)
+/// of the shared emacs child, or 0 when there is none. Recorded so the
+/// async-signal-safe `handle_term_signal` can reap it when jim is killed
+/// with SIGTERM/SIGINT/SIGHUP — the paths where `Drop`/`AppExit` never
+/// run. A single shared emacs means one pid is enough.
+static EMACS_CHILD_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Previous disposition of each signal we hook (indexed by
+/// `prev_handler_slot`), captured at install time so we can CHAIN to it
+/// rather than replace it. Bevy's `TerminalCtrlCHandlerPlugin` (via the
+/// `ctrlc` crate) already owns SIGINT/SIGTERM and turns them into a
+/// graceful `AppExit` — which is what runs `kill_emacs_on_app_exit`,
+/// layout persistence, etc. Overriding it with SIG_DFL + re-raise would
+/// trade the orphan bug for a broken graceful shutdown.
+static PREV_SIG_HANDLERS: [AtomicUsize; 3] =
+    [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+
+fn prev_handler_slot(sig: i32) -> Option<usize> {
+    match sig {
+        nix::libc::SIGTERM => Some(0),
+        nix::libc::SIGINT => Some(1),
+        nix::libc::SIGHUP => Some(2),
+        _ => None,
+    }
+}
+
+/// SIGTERM/SIGINT/SIGHUP handler: SIGTERM the emacs process group so it
+/// (and any grandchildren) die instead of orphaning at 100% CPU, then
+/// hand off to whatever handler was installed before us (bevy's ctrl-c →
+/// graceful AppExit). If there was none, restore the default disposition
+/// and re-raise so jim terminates as it normally would. This makes the
+/// emacs kill unconditional (even if the graceful exit later wedges)
+/// without stealing the graceful path. ASYNC-SIGNAL-SAFE: only `kill`,
+/// `signal`, `raise`, atomic loads, and a call into the previous handler
+/// (ctrlc's is a self-pipe write) — no allocation, no locks, no `wait`.
+extern "C" fn handle_term_signal(sig: i32) {
+    let pid = EMACS_CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // Negative pid → the whole process group (emacs is the group
+        // leader). SIGTERM lets emacs auto-save via its own handler.
+        unsafe {
+            nix::libc::kill(-pid, nix::libc::SIGTERM);
+        }
+    }
+    let prev = prev_handler_slot(sig)
+        .map(|i| PREV_SIG_HANDLERS[i].load(Ordering::SeqCst))
+        .unwrap_or(nix::libc::SIG_DFL);
+    if prev == nix::libc::SIG_IGN {
+        return;
+    }
+    if prev != nix::libc::SIG_DFL && prev != nix::libc::SIG_ERR {
+        let f: extern "C" fn(i32) = unsafe { std::mem::transmute(prev) };
+        f(sig);
+        return;
+    }
+    unsafe {
+        nix::libc::signal(sig, nix::libc::SIG_DFL);
+        nix::libc::raise(sig);
+    }
+}
+
+/// Install `handle_term_signal` for the fatal terminating signals, once
+/// per process, capturing (and later chaining to) the handlers that were
+/// there first — in practice bevy's ctrl-c handler, installed during
+/// plugin build, well before the first emacs pane spawns. Kept
+/// intentionally tiny.
+fn install_term_signal_handlers() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let h = handle_term_signal as *const () as nix::libc::sighandler_t;
+        for sig in [nix::libc::SIGTERM, nix::libc::SIGINT, nix::libc::SIGHUP] {
+            let prev = nix::libc::signal(sig, h);
+            if let Some(i) = prev_handler_slot(sig) {
+                PREV_SIG_HANDLERS[i].store(prev, Ordering::SeqCst);
+            }
+        }
+    });
+}
+
 /// 24-byte input record: [type, mods, button, down, fid(4), code(4),
 /// x(4), y(4), reserved(4)]. For resize, code/x hold new w/h.
 struct SharedConn {
@@ -182,7 +262,13 @@ struct SharedConn {
     generation: Arc<AtomicU64>,
     child: std::process::Child,
     sock_path: PathBuf,
+    /// Control channel: jim → emacs newline-delimited commands (e.g.
+    /// `open <fid> <path>`). jim is the server; emacs connects as a client
+    /// (see `jim--ctl` in jim-win.el) and the accepted stream lands here.
+    ctl_writer: Arc<Mutex<Option<UnixStream>>>,
+    ctl_sock_path: PathBuf,
     _thread: std::thread::JoinHandle<()>,
+    _ctl_thread: std::thread::JoinHandle<()>,
 }
 
 impl SharedConn {
@@ -206,6 +292,30 @@ impl SharedConn {
         r[8..12].copy_from_slice(&w.to_le_bytes());
         r[12..16].copy_from_slice(&h.to_le_bytes());
         self.send(r)
+    }
+    /// Ask emacs to `find-file` `path` in the frame `fid`. Newline-delimited
+    /// on the control socket; `path` is the rest of the line (may contain
+    /// spaces, must not contain `\n`). Returns false if emacs hasn't
+    /// connected the control channel yet.
+    fn send_open_file(&self, fid: u32, path: &str) -> bool {
+        if path.contains('\n') {
+            return false;
+        }
+        self.send_ctl(&format!("open {fid} {path}\n"))
+    }
+    /// Set the emacs default font size (points), applied to all frames.
+    fn send_font(&self, size: i32) -> bool {
+        self.send_ctl(&format!("font {size}\n"))
+    }
+    /// Write one newline-terminated command to the control channel.
+    fn send_ctl(&self, line: &str) -> bool {
+        if let Ok(mut w) = self.ctl_writer.lock() {
+            if let Some(stream) = w.as_mut() {
+                use std::io::Write;
+                return stream.write_all(line.as_bytes()).is_ok();
+            }
+        }
+        false
     }
     fn send_key(&self, fid: u32, code: u32, mods: u8) {
         let mut r = Self::rec(1, fid);
@@ -251,6 +361,33 @@ impl SharedConn {
     fn send_delete_frame(&self, fid: u32) {
         self.send(Self::rec(6, fid));
     }
+
+    /// Terminate the shared emacs child. Idempotent: safe to call from
+    /// both the `AppExit` system and `Drop`. SIGTERM the whole process
+    /// group first (graceful — emacs auto-saves and grandchildren die),
+    /// give it a brief moment, then guarantee the reap with SIGKILL.
+    fn kill_child(&mut self) {
+        let pid = self.child.id() as i32;
+        // Clear the static so the signal handler won't also target a pid
+        // we're already reaping.
+        EMACS_CHILD_PID.store(0, Ordering::SeqCst);
+        if pid > 0 {
+            unsafe {
+                nix::libc::kill(-pid, nix::libc::SIGTERM);
+            }
+            // ~500ms grace for emacs to auto-save (SIGTERM → Fkill_emacs)
+            // and exit before we force it.
+            for _ in 0..50 {
+                match self.child.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// jim theme colors handed to Emacs so its frame matches the native UI.
@@ -285,6 +422,16 @@ impl SharedConn {
         }
         let listener = UnixListener::bind(&sock_path)?;
 
+        // Control channel (jim → emacs commands). Separate socket so the
+        // fixed-24-byte input protocol stays untouched; parsing lives in
+        // elisp (a normal process filter), where variable-length strings
+        // belong.
+        let ctl_sock_path = jim_pane_data_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("emacs-ctl.sock");
+        let _ = std::fs::remove_file(&ctl_sock_path);
+        let ctl_listener = UnixListener::bind(&ctl_sock_path)?;
+
         let emacs_bin = emacs_binary();
         // Load the user's real init (no `-Q`) so their completion
         // framework, keybindings, etc. are present. `--no-splash` keeps
@@ -315,10 +462,21 @@ impl SharedConn {
         }
         let child = cmd
             .env("JIM_DISPLAY", &sock_path)
+            .env("JIM_CTL", &ctl_sock_path)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::null())
+            // Own process group (pgid == child pid) so we can reap emacs
+            // and any grandchildren as a unit, and so terminal signals to
+            // jim's group don't hit emacs at the wrong time.
+            .process_group(0)
             .spawn()?;
+
+        // Record the pid + arm the signal handler so a SIGTERM/SIGINT/
+        // SIGHUP to jim (where Drop/AppExit never run) still kills emacs
+        // instead of orphaning it.
+        EMACS_CHILD_PID.store(child.id() as i32, Ordering::SeqCst);
+        install_term_signal_handlers();
 
         let frame_ops: Arc<Mutex<HashMap<u32, Vec<Op>>>> = Arc::new(Mutex::new(HashMap::new()));
         let split_hints: Arc<Mutex<HashMap<u32, u8>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -333,6 +491,13 @@ impl SharedConn {
             .spawn(move || conn_loop(listener, fo_w, sh_w, gen_w, writer_w, wakeup))
             .expect("spawn emacs-native thread");
 
+        let ctl_writer: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
+        let ctl_writer_w = ctl_writer.clone();
+        let ctl_thread = std::thread::Builder::new()
+            .name("emacs-native-ctl".into())
+            .spawn(move || ctl_accept_loop(ctl_listener, ctl_writer_w))
+            .expect("spawn emacs-native-ctl thread");
+
         Ok(Self {
             writer,
             frame_ops,
@@ -340,16 +505,35 @@ impl SharedConn {
             generation,
             child,
             sock_path,
+            ctl_writer,
+            ctl_sock_path,
             _thread: thread,
+            _ctl_thread: ctl_thread,
         })
     }
 }
 
 impl Drop for SharedConn {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill_child();
         let _ = std::fs::remove_file(&self.sock_path);
+        let _ = std::fs::remove_file(&self.ctl_sock_path);
+    }
+}
+
+/// Accept emacs's control-channel connection and stash the stream so
+/// `send_open_file` can write to it. Keeps accepting so an emacs restart
+/// re-establishes the channel.
+fn ctl_accept_loop(listener: UnixListener, writer: Arc<Mutex<Option<UnixStream>>>) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(s) => {
+                if let Ok(mut w) = writer.lock() {
+                    *w = Some(s);
+                }
+            }
+            Err(_) => break,
+        }
     }
 }
 
@@ -432,6 +616,25 @@ pub struct EmacsNativeStore {
     /// every frame until sent — otherwise a pane spawned before Emacs
     /// boots would silently never get its frame.
     pending_create: Vec<u32>,
+}
+
+impl EmacsNativeStore {
+    /// Ask the emacs pane `pane` to open `path` via `find-file` in its own
+    /// frame. Returns false if there's no live emacs, `pane` isn't a known
+    /// emacs frame, or the control channel isn't connected yet.
+    pub fn send_open_file(&self, pane: Entity, path: &str) -> bool {
+        let (Some(conn), Some(&fid)) = (self.shared.as_ref(), self.frame_of_pane.get(&pane))
+        else {
+            return false;
+        };
+        conn.send_open_file(fid, path)
+    }
+
+    /// Set the emacs default font size (points) on all native panes. Font
+    /// is a global face attribute, so no per-pane frame id is needed.
+    pub fn send_font(&self, size: i32) -> bool {
+        self.shared.as_ref().is_some_and(|c| c.send_font(size))
+    }
 }
 
 /// Per-pane framebuffer + glyph rasterizer state.
@@ -612,7 +815,26 @@ impl Plugin for EmacsNativePlugin {
             )
             // Exclusive (needs &mut World to spawn panes) — runs after
             // the op queues are populated.
-            .add_systems(Update, reconcile_frames.after(sync_emacs_frames));
+            .add_systems(Update, reconcile_frames.after(sync_emacs_frames))
+            // Belt-and-suspenders: kill the shared emacs child on a clean
+            // AppExit (the Coil read_socket_hook EOF path + the signal
+            // handler cover the crash/force-quit paths).
+            .add_systems(Last, kill_emacs_on_app_exit);
+    }
+}
+
+/// On `AppExit`, terminate the shared emacs child so a normal jim quit
+/// never leaves it running. Complements `Drop for SharedConn` (which may
+/// not run on every teardown ordering) and the signal handler.
+fn kill_emacs_on_app_exit(
+    mut exit: MessageReader<AppExit>,
+    mut store: ResMut<EmacsNativeStore>,
+) {
+    if exit.read().next().is_none() {
+        return;
+    }
+    if let Some(conn) = store.shared.as_mut() {
+        conn.kill_child();
     }
 }
 
@@ -723,21 +945,24 @@ fn flush_pending_creates(mut store: ResMut<EmacsNativeStore>) {
 /// logical px == Emacs frame px (the sprite renders 1:1 logical).
 fn sync_native_resize(
     store: Res<EmacsNativeStore>,
-    panes: Query<(Entity, &PaneRect, &PaneKindMarker)>,
+    panes: Query<(Entity, &PaneRect, &PaneKindMarker, Option<&jim_pane::PaneChromeOverride>)>,
     mut last: Local<std::collections::HashMap<Entity, (i32, i32)>>,
 ) {
     let Some(conn) = store.shared.as_ref() else {
         return;
     };
-    for (entity, rect, kind) in &panes {
+    for (entity, rect, kind, chrome_ov) in &panes {
         if kind.0 != PANE_KIND {
             continue;
         }
         let Some(&fid) = store.frame_of_pane.get(&entity) else {
             continue;
         };
+        // Docked panes have a slim header — size the frame to the reclaimed
+        // content area so emacs fills the cell below it.
+        let title_h = jim_pane::override_title_h(chrome_ov);
         let cw = (rect.size.x - 2.0 * MARGIN).max(32.0) as i32;
-        let ch = (rect.size.y - TITLE_H - 2.0 * MARGIN).max(32.0) as i32;
+        let ch = (rect.size.y - title_h - 2.0 * MARGIN).max(32.0) as i32;
         if last.get(&entity) == Some(&(cw, ch)) {
             continue;
         }
@@ -756,7 +981,7 @@ fn handle_native_wheel(
     windows: Query<&Window>,
     viewport: Res<jim_pane::PaneViewport>,
     store: Res<EmacsNativeStore>,
-    panes: Query<(Entity, &PaneRect, &PaneKindMarker)>,
+    panes: Query<(Entity, &PaneRect, &PaneKindMarker, Option<&jim_pane::PaneChromeOverride>)>,
     mut accum: Local<f32>,
 ) {
     use bevy::input::mouse::MouseScrollUnit;
@@ -786,17 +1011,17 @@ fn handle_native_wheel(
     let canvas = viewport.window_to_canvas(cur);
     let visible: Vec<(Entity, PaneRect)> = panes
         .iter()
-        .filter(|(_, _, k)| k.0 == PANE_KIND)
-        .map(|(e, r, _)| (e, r.clone()))
+        .filter(|(_, _, k, _)| k.0 == PANE_KIND)
+        .map(|(e, r, _, _)| (e, r.clone()))
         .collect();
     let Some(pane) = jim_pane::topmost_pane_at(canvas, &visible) else {
         return;
     };
-    let Ok(rect) = panes.get(pane).map(|(_, r, _)| r) else { return };
+    let Ok((rect, ov)) = panes.get(pane).map(|(_, r, _, ov)| (r, ov)) else { return };
     let Some(&fid) = store.frame_of_pane.get(&pane) else {
         return;
     };
-    let local = jim_pane::pt_to_content_local(canvas, rect);
+    let local = jim_pane::pt_to_content_local_th(canvas, rect, jim_pane::override_title_h(ov));
     let up = steps > 0;
     for _ in 0..steps.abs() {
         conn.send_wheel(fid, up, local.x as i32, local.y as i32);
@@ -814,7 +1039,7 @@ fn handle_native_mouse(
     windows: Query<&Window>,
     viewport: Res<jim_pane::PaneViewport>,
     store: Res<EmacsNativeStore>,
-    rects: Query<&PaneRect>,
+    rects: Query<(&PaneRect, Option<&jim_pane::PaneChromeOverride>)>,
     kinds: Query<&PaneKindMarker>,
     mut pressed: Local<Option<(Entity, i32, i32)>>,
 ) {
@@ -844,12 +1069,13 @@ fn handle_native_mouse(
     // and region selection in Emacs).
     if let Some((pane, lx, ly)) = *pressed {
         if buttons.pressed(MouseButton::Left) {
-            if let (Ok(win), Ok(rect), Some(&fid)) =
+            if let (Ok(win), Ok((rect, ov)), Some(&fid)) =
                 (windows.single(), rects.get(pane), store.frame_of_pane.get(&pane))
             {
                 if let Some(cur) = win.cursor_position() {
                     let canvas = viewport.window_to_canvas(cur);
-                    let local = jim_pane::pt_to_content_local(canvas, rect);
+                    let local =
+                        jim_pane::pt_to_content_local_th(canvas, rect, jim_pane::override_title_h(ov));
                     let (x, y) = (local.x as i32, local.y as i32);
                     if (x, y) != (lx, ly) {
                         conn.send_motion(fid, x, y);
@@ -902,6 +1128,27 @@ fn handle_native_keyboard(
     let alt = mods.pressed(KeyCode::AltLeft) || mods.pressed(KeyCode::AltRight);
     let cmd = mods.pressed(KeyCode::SuperLeft) || mods.pressed(KeyCode::SuperRight);
     if cmd {
+        // Mac clipboard muscle memory: translate Cmd+C/X/V into the
+        // equivalent Emacs kill-ring chords so the pbcopy/pbpaste bridge
+        // (interprogram-cut/paste-function in jim-win.el) round-trips them
+        // to the macOS pasteboard. modbits layout: ctrl=1, alt(meta)=2.
+        //   Cmd+C -> M-w (kill-ring-save)  Cmd+X -> C-w (kill-region)
+        //   Cmd+V -> C-y (yank)
+        // Everything else under Cmd is still jim's and is dropped below.
+        for ev in &buffered {
+            if !ev.state.is_pressed() {
+                continue;
+            }
+            let chord: Option<(u32, u8)> = match ev.key_code {
+                KeyCode::KeyC => Some(('w' as u32, 0b010)), // M-w
+                KeyCode::KeyX => Some(('w' as u32, 0b001)), // C-w
+                KeyCode::KeyV => Some(('y' as u32, 0b001)), // C-y
+                _ => None,
+            };
+            if let Some((code, m)) = chord {
+                conn.send_key(fid, code, m);
+            }
+        }
         return; // Cmd is jim's; don't forward.
     }
 

@@ -281,6 +281,15 @@ pub(crate) enum HostToWorker {
     /// `Reload` only re-evals a widget's OWN script and would reuse the
     /// cached module. No-op if this widget doesn't import the module.
     ReloadModule { name: String },
+    /// The host's view of this pane's visibility changed to `visible`. This
+    /// is primarily a WAKE: while a pane is hidden the worker either blocks on
+    /// `recv` (idle) or runs handlers without rendering, so nothing would
+    /// otherwise re-check the render gate when the pane is revealed. The
+    /// authoritative bit is `WorkerSlots::visible` (the host writes it every
+    /// frame); receiving this message just unblocks the worker on the
+    /// hidden→visible edge so it renders the pending frame (`render_dirty`)
+    /// promptly. Sent only on a transition, not per frame.
+    SetVisible { visible: bool },
     /// Exit the worker loop. Sent by `on_close` and by `Drop`.
     Shutdown,
 }
@@ -325,6 +334,20 @@ pub(crate) struct WorkerSlots {
     /// `render(canvas_w, canvas_h)` and publishes a frame whenever
     /// this is set after a handler completes, then clears it.
     pub(crate) render_dirty: Arc<AtomicBool>,
+    /// Host-written visibility bit: false while the pane is hidden
+    /// (`Visibility::Hidden` — it belongs to a non-active project, or is
+    /// stowed behind the cube/Exposé). The worker keeps running ALL handlers
+    /// (`on_bus`/`on_message`/`on_frame`/`on_click`/…) so state, subprocess
+    /// drains and bus emits stay live, but while this is false it SUPPRESSES
+    /// the presentation pipeline: after a handler mutates state it leaves
+    /// `render_dirty` set instead of evaluating `render` and publishing a
+    /// frame. A hidden pane therefore costs zero render-eval and zero host-
+    /// side entity churn — the #2 CPU sink during active use, spent drawing a
+    /// picture nobody can see. On the hidden→visible edge the host sends
+    /// `SetVisible` to wake the (recv-blocked) worker, which then renders once
+    /// iff `render_dirty` is set (state changed while hidden). Default true so
+    /// a widget renders normally until the host says otherwise.
+    pub(crate) visible: Arc<AtomicBool>,
     /// Widget↔widget bus messages the script published via `emit` /
     /// `emit_retained`, awaiting pickup by the main thread.
     pub(crate) outbox: Arc<Mutex<Vec<OutMsg>>>,
@@ -359,6 +382,10 @@ impl WorkerSlots {
             animating: Arc::new(AtomicBool::new(false)),
             tick_interval_ms: Arc::new(AtomicU32::new(0)),
             render_dirty: Arc::new(AtomicBool::new(true)),
+            // Assume visible until the host's first visibility sweep tells us
+            // otherwise — a widget that spawns into the active project must
+            // render immediately, not wait for a hidden→visible edge.
+            visible: Arc::new(AtomicBool::new(true)),
             outbox: Arc::new(Mutex::new(Vec::new())),
             wants_clicks: Arc::new(AtomicBool::new(false)),
             wants_hover: Arc::new(AtomicBool::new(false)),
@@ -534,6 +561,13 @@ pub struct ScriptWidget {
     /// laid-out size here and re-layout whenever it changes, matching the
     /// subprocess path's `size_changed` term in `rerender_widgets`.
     pub last_layout_size: Vec2,
+    /// Was this pane visible on the previous host visibility sweep? Used to
+    /// detect the hidden→visible edge so we send the worker exactly one
+    /// `SetVisible` wake on reveal (see `forward_inputs_to_workers`). Mirrors
+    /// `jim-terminal`'s `TermGrid::was_visible`. Starts true to match the
+    /// worker's default-visible slot and to avoid a spurious wake on the first
+    /// frame of a pane that spawns already visible.
+    pub was_visible: bool,
 }
 
 /// A live `Element::Editor` portal tracked across re-render diffs.
@@ -1058,6 +1092,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             wants_pinch: false,
             force_render: false,
             last_layout_size: Vec2::ZERO,
+            was_visible: true,
         },
         WidgetTargets::default(),
         crate::WidgetScroll::default(),
@@ -1552,7 +1587,7 @@ fn forward_inputs_to_workers(
     metrics: Res<jim_pane::PaneFontMetrics>,
     mut theme_events: MessageReader<jim_style::ThemeChanged>,
     mut events: MessageReader<ClaudeBusEvent>,
-    mut widgets: Query<(&PaneKindMarker, &PaneRect, &mut ScriptWidget)>,
+    mut widgets: Query<(&PaneKindMarker, &PaneRect, &mut ScriptWidget, Option<&Visibility>)>,
 ) {
     // A palette edit only updates the shared theme snapshot; canvas
     // widgets bake theme colors into their frame, so without a nudge
@@ -1584,10 +1619,37 @@ fn forward_inputs_to_workers(
         .collect();
 
     let now = std::time::Instant::now();
-    for (kind, rect, mut w) in &mut widgets {
+    for (kind, rect, mut w, vis) in &mut widgets {
         if kind.0 != PANE_KIND {
             continue;
         }
+
+        // --- Presentation gating for hidden panes ---
+        //
+        // A pane in a non-active project (or stowed behind the cube / Exposé)
+        // is `Visibility::Hidden`. It keeps receiving events so its handlers
+        // run — `on_bus`/`on_message` from chatty Claude sessions, slow ticks,
+        // `on_frame` proc drains — but the worker must stop rendering and
+        // publishing frames while nobody can see it. That render eval plus the
+        // host-side despawn/respawn of the pane's entity subtree (widget churn)
+        // is the #2 CPU consumer during active use, all spent drawing a picture
+        // for no one. Mirror `jim-terminal`'s `sync_grid`: write the bit every
+        // frame (cheap, authoritative), and on the hidden→visible edge send a
+        // single wake so the recv-blocked worker re-checks its render gate and
+        // draws whatever state changed while it was hidden (`render_dirty`).
+        //
+        // Store BEFORE the wake: the channel send/recv establishes the
+        // happens-before that lets the worker's loop observe the fresh `true`.
+        let is_hidden = matches!(vis, Some(Visibility::Hidden));
+        w.handle
+            .slots
+            .visible
+            .store(!is_hidden, Ordering::Release);
+        if !is_hidden && !w.was_visible {
+            w.handle.send(HostToWorker::SetVisible { visible: true });
+        }
+        w.was_visible = !is_hidden;
+
         // PaneRect is canvas-units now; pane Transform handles zoom.
         let content_size = Vec2::new(
             (rect.size.x - 2.0 * MARGIN).max(0.0),
@@ -1702,6 +1764,7 @@ fn apply_latest_frames(
         &mut crate::WidgetScroll,
         Option<&crate::WidgetHover>,
         Option<&crate::WidgetInputFocus>,
+        Option<&Visibility>,
     )>,
     children_q: Query<&Children>,
 ) {
@@ -1715,8 +1778,23 @@ fn apply_latest_frames(
     let frame_start = std::time::Instant::now();
     let mut rendered_any = false;
     let mut deferred = false;
-    for (entity, kind, chrome, rect, mut w, mut targets, mut scroll, hover, input_focus) in &mut q {
+    for (entity, kind, chrome, rect, mut w, mut targets, mut scroll, hover, input_focus, vis) in
+        &mut q
+    {
         if kind.0 != PANE_KIND {
+            continue;
+        }
+        // Never rebuild a hidden pane's entity subtree. The worker already
+        // suppresses renders while hidden, but a frame can still be sitting in
+        // `latest_frame` from just before the pane was hidden (the host's
+        // visibility store and the worker's in-flight render race), or from a
+        // host-forced path (theme/resize). Skip WITHOUT advancing
+        // `applied_frame_gen` so that pending frame is stashed and applied on
+        // reveal — through this same path, so the editor-portal skip-set and
+        // canvas diffing are preserved and it is applied exactly once, in order
+        // (frame_gen is monotonic; `applied_frame_gen` never moves ahead of a
+        // frame we actually applied).
+        if matches!(vis, Some(Visibility::Hidden)) {
             continue;
         }
         let current_gen = w.handle.slots.frame_gen.load(Ordering::Acquire);

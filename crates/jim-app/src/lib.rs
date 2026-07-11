@@ -421,6 +421,11 @@ impl Plugin for AppShellPlugin {
                     jim_editor::setup_editor_font.after(jim_terminal::setup_terminal_font),
                     setup_ipc_listener,
                     request_microphone_access,
+                    // Register NSWorkspace activation observers so
+                    // `track_app_focus` reads a cached atomic instead of
+                    // making a synchronous XPC `frontmostApplication` call
+                    // every frame. See `install_app_focus_observers`.
+                    install_app_focus_observers,
                 ),
             )
             .add_systems(
@@ -433,6 +438,7 @@ impl Plugin for AppShellPlugin {
                     sync_canvas_clear_color,
                     window_geometry::fit_window_to_monitor,
                     window_geometry::save_on_change,
+                    sync_wake_throttle_to_power,
                 ),
             )
             // Survive lid-close / display-sleep: when the monitor goes away
@@ -458,6 +464,7 @@ impl Plugin for AppShellPlugin {
                     drain_ipc_open_requests,
                     drain_file_picks,
                     dispatch_bus_actions,
+                    route_emacs_open_requests,
                 ),
             )
             .add_systems(
@@ -592,6 +599,95 @@ fn request_microphone_access() {
 
 #[cfg(not(target_os = "macos"))]
 fn request_microphone_access() {}
+
+/// True if the machine is currently running on AC (wall) power. On
+/// battery this returns false, and the wake throttle relaxes to ~30 Hz.
+///
+/// Uses IOKit's power-source API directly via a minimal FFI block rather
+/// than pulling in an `iokit`/`core-foundation` crate: the whole surface
+/// is three C calls, and `jim-app` already links frameworks by hand for
+/// the mic permission (see `request_microphone_access`). The empty
+/// `#[link]` attributes force the IOKit + CoreFoundation load commands
+/// into the binary so the symbols resolve at runtime — winit/Bevy don't
+/// pull either framework in on their own.
+///
+/// Conservative on any uncertainty (null snapshot, unreadable string, a
+/// value that's neither AC nor Battery such as "Off Line" / a UPS): we
+/// report AC, i.e. prefer display responsiveness over the battery saving.
+#[cfg(target_os = "macos")]
+fn power_on_ac() -> bool {
+    use std::ffi::{c_char, c_void, CStr};
+
+    // CFTypeRef / CFStringRef are opaque pointers. `IOPSCopyPowerSourcesInfo`
+    // returns a +1 CFDictionary we must `CFRelease`; the string from
+    // `IOPSGetProvidingPowerSourceType` is borrowed from it (do NOT release).
+    #[link(name = "IOKit", kind = "framework")]
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPSCopyPowerSourcesInfo() -> *const c_void;
+        fn IOPSGetProvidingPowerSourceType(blob: *const c_void) -> *const c_void;
+        fn CFStringGetCString(
+            s: *const c_void,
+            buffer: *mut c_char,
+            size: isize,
+            encoding: u32,
+        ) -> u8;
+        fn CFRelease(cf: *const c_void);
+    }
+    // kCFStringEncodingUTF8.
+    const UTF8: u32 = 0x0800_0100;
+    // kIOPSBatteryPowerValue. Everything else (kIOPSACPowerValue "AC Power",
+    // kIOPSOffLineValue, unknown) is treated as "on AC".
+    const BATTERY: &[u8] = b"Battery Power";
+
+    unsafe {
+        let blob = IOPSCopyPowerSourcesInfo();
+        if blob.is_null() {
+            return true;
+        }
+        let src = IOPSGetProvidingPowerSourceType(blob);
+        let mut buf = [0i8; 64];
+        let ok = !src.is_null()
+            && CFStringGetCString(src, buf.as_mut_ptr(), buf.len() as isize, UTF8) != 0;
+        CFRelease(blob);
+        if !ok {
+            return true;
+        }
+        CStr::from_ptr(buf.as_ptr()).to_bytes() != BATTERY
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn power_on_ac() -> bool {
+    true
+}
+
+/// Poll the power source on a slow timer and keep the terminal workers'
+/// wake throttle in step: 16 ms (~60 Hz) on AC, 33 ms (~30 Hz) on
+/// battery. The battery interval halves the worst-case winit wake rate
+/// for background terminals streaming output, the dominant active-use
+/// idle-ish CPU/GPU draw. `power_on_ac` is a cheap in-process IOKit call,
+/// but the source flips rarely, so a 30 s cadence keeps the response to
+/// (un)plugging snappy without adding measurable idle cost. Only calls
+/// the setter when the value actually changes.
+fn sync_wake_throttle_to_power(
+    time: Res<Time>,
+    mut timer: Local<Option<Timer>>,
+    mut last_on_ac: Local<Option<bool>>,
+) {
+    let t = timer.get_or_insert_with(|| Timer::from_seconds(30.0, TimerMode::Repeating));
+    let ticked = t.tick(time.delta()).just_finished();
+    // First frame (`last_on_ac` still None) runs regardless of the timer
+    // so the throttle is correct from startup, not 30 s in.
+    if last_on_ac.is_some() && !ticked {
+        return;
+    }
+    let on_ac = power_on_ac();
+    if *last_on_ac != Some(on_ac) {
+        *last_on_ac = Some(on_ac);
+        jim_terminal::worker::set_wake_throttle_ms(if on_ac { 16 } else { 33 });
+    }
+}
 
 /// Holds the receiver half of the IPC channel. `mpsc::Receiver` is
 /// `Send` but `!Sync`, so we install it as a `NonSend` resource and
@@ -1043,6 +1139,76 @@ fn dispatch_bus_actions(mut events: MessageReader<jim_widget::BusMessageObserved
     }
 }
 
+/// Decode a funct/subprocess widget bus id (`rw<hex>` / `sw<hex>`, where
+/// `<hex>` is `Entity::to_bits`) back into the sender's pane `Entity`.
+fn widget_id_to_entity(id: &str) -> Option<Entity> {
+    let hex = id.strip_prefix("rw").or_else(|| id.strip_prefix("sw"))?;
+    let bits = u64::from_str_radix(hex, 16).ok()?;
+    Entity::try_from_bits(bits)
+}
+
+/// Route `emacs.open_file` bus messages (payload `{ "path": "…" }`) to an
+/// emacs pane. Prefers a native-emacs pane docked with the sender (so a
+/// file widget in a dock drives its dock's editor — the "mini editor"),
+/// falling back to the focused pane if it's a native-emacs pane. This is
+/// the one consumer of the dock's co-member relationship: the sender's
+/// pane entity is recovered from `BusMessageObserved.sender`, then its
+/// dock siblings are searched for an emacs pane.
+#[allow(clippy::type_complexity)]
+fn route_emacs_open_requests(
+    mut events: MessageReader<jim_widget::BusMessageObserved>,
+    store: Res<jim_emacs::native::EmacsNativeStore>,
+    focused: Res<jim_pane::FocusedPane>,
+    members: Query<&jim_pane::dock::DockMember>,
+    docks: Query<&jim_pane::dock::Dock>,
+    kinds: Query<&jim_pane::PaneKindMarker>,
+) {
+    let is_emacs = |e: Entity| matches!(kinds.get(e), Ok(k) if k.0 == jim_emacs::native::PANE_KIND);
+    for ev in events.read() {
+        // Global font-size command: `{ "size": N }`. Font is a face
+        // attribute shared by all emacs frames, so no pane target needed.
+        if ev.topic == "emacs.font" {
+            if let Some(size) = ev.payload.get("size").and_then(|v| v.as_i64()) {
+                if !store.send_font(size as i32) {
+                    eprintln!("[emacs.font] size {size}: emacs not ready");
+                }
+            }
+            continue;
+        }
+        if ev.topic != "emacs.open_file" {
+            continue;
+        }
+        let Some(path) = ev.payload.get("path").and_then(|v| v.as_str()) else {
+            eprintln!("[emacs.open_file] missing 'path' from {}", ev.sender);
+            continue;
+        };
+        // Prefer a native-emacs pane docked with the sender widget.
+        let target = widget_id_to_entity(&ev.sender)
+            .and_then(|sender| members.get(sender).ok().map(|dm| (sender, dm.dock)))
+            .and_then(|(sender, dock)| {
+                docks.get(dock).ok().and_then(|d| {
+                    d.member_entities()
+                        .into_iter()
+                        .find(|&m| m != sender && is_emacs(m))
+                })
+            })
+            // Fallback: the focused pane, if it's a native-emacs pane.
+            .or_else(|| focused.0.filter(|&e| is_emacs(e)));
+
+        match target {
+            Some(pane) => {
+                if !store.send_open_file(pane, path) {
+                    eprintln!("[emacs.open_file] '{path}': emacs not ready / no frame");
+                }
+            }
+            None => eprintln!(
+                "[emacs.open_file] '{path}' from {}: no docked or focused emacs pane",
+                ev.sender
+            ),
+        }
+    }
+}
+
 /// Channel the async Open dialog delivers chosen paths back on.
 /// `action_open_file` clones [`FilePickChannel::tx`] into the off-thread
 /// task that awaits the sheet; [`drain_file_picks`] reads
@@ -1315,7 +1481,14 @@ fn track_app_focus(
     mut focused: ResMut<AppFocused>,
     mut keys: ResMut<ButtonInput<KeyCode>>,
 ) {
-    let now = current_app_active();
+    // Read the cached focus state maintained by the NSWorkspace activation
+    // observers (`install_app_focus_observers`). This used to call
+    // `current_app_active()` directly — a synchronous XPC round-trip to
+    // LaunchServices — every frame; at 60fps during a terminal stream that
+    // showed up as `_LSCopyApplicationInformation` inside this ECS system in
+    // process samples. The observers push activation changes into the atomic
+    // instead, so the per-frame cost is now a plain atomic load.
+    let now = app_focused_snapshot();
     if focused.0 != now {
         eprintln!("[focus] {} → {}", focused.0, now);
         focused.0 = now;
@@ -1368,6 +1541,97 @@ fn reconcile_macos_modifiers(mut keys: ResMut<ButtonInput<KeyCode>>) {
 
 #[cfg(not(target_os = "macos"))]
 fn reconcile_macos_modifiers() {}
+
+/// Cached whole-app focus state, maintained by the NSWorkspace activation
+/// observers on macOS (`install_app_focus_observers`). `track_app_focus`
+/// reads it every frame; the observers write it only on an actual app
+/// switch. Seeded `true` for the same reason `AppFocused` defaults true: on
+/// the first frame the user is presumably looking at us.
+#[cfg(target_os = "macos")]
+static APP_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Cheap in-process read of the cached app-focus state. On macOS this is the
+/// `APP_FOCUSED` atomic kept current by the activation observers (no XPC).
+/// Off macOS we're always considered focused.
+fn app_focused_snapshot() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        APP_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
+}
+
+/// Install NSWorkspace activation observers that keep `APP_FOCUSED` current,
+/// replacing the per-frame `frontmostApplication` poll that used to live in
+/// `track_app_focus`.
+///
+/// Why observers instead of polling: `frontmostApplication` is a synchronous
+/// XPC round-trip to LaunchServices. Calling it 60×/sec (e.g. while a
+/// terminal streams) is pure waste — the frontmost app changes only on an
+/// actual app switch. NSWorkspace stays the authoritative signal
+/// (`NSApplication.isActive` is unreliable under winit — see
+/// `current_app_active`), but its notification center *pushes* activation
+/// changes, so we pull the XPC value only when one actually happens.
+///
+/// `NSWorkspaceDidActivateApplicationNotification` posts *after* the
+/// frontmost app has already changed, so re-reading `current_app_active()`
+/// inside the block yields the correct new value while preserving the exact
+/// pid-compare the old poll used. We also observe DidDeactivate so a
+/// deactivation with no paired activation still refreshes the cache. The
+/// observer tokens must outlive the process for the observers to stay live,
+/// so they are intentionally leaked.
+///
+/// `NonSendMarker` forces this Startup system onto the main thread, which
+/// AppKit requires for NSWorkspace notification-center registration.
+#[cfg(target_os = "macos")]
+fn install_app_focus_observers(_main_thread: bevy::ecs::system::NonSendMarker) {
+    use block2::RcBlock;
+    use objc2_app_kit::{
+        NSWorkspace, NSWorkspaceDidActivateApplicationNotification,
+        NSWorkspaceDidDeactivateApplicationNotification,
+    };
+    use objc2_foundation::NSNotification;
+    use std::ptr::NonNull;
+    use std::sync::atomic::Ordering;
+
+    // Seed with one authoritative read so the first frames are correct even
+    // before any activation event arrives.
+    APP_FOCUSED.store(current_app_active(), Ordering::Relaxed);
+
+    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
+    let center = unsafe { workspace.notificationCenter() };
+
+    // Both notifications resolve focus the same way: ask who's frontmost now.
+    let handler = RcBlock::new(|_notif: NonNull<NSNotification>| {
+        APP_FOCUSED.store(current_app_active(), Ordering::Relaxed);
+    });
+
+    for name in [
+        unsafe { NSWorkspaceDidActivateApplicationNotification },
+        unsafe { NSWorkspaceDidDeactivateApplicationNotification },
+    ] {
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(name),
+                None,
+                // nil queue → the block runs synchronously on the posting
+                // (main) thread, so `current_app_active`'s AppKit calls are
+                // main-thread-safe.
+                None,
+                &handler,
+            )
+        };
+        // The observer stays registered only while its token is retained;
+        // this observer lives for the whole process, so leak the token.
+        std::mem::forget(token);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_app_focus_observers() {}
 
 #[cfg(target_os = "macos")]
 fn current_app_active() -> bool {
@@ -1996,22 +2260,26 @@ fn maintain_winit_mode_for_animation(
         || prism.active
         || prism.continuous_cooldown > 0
         // Exposé: keep painting while the grid is open (a sustained
-        // source, like the prism / palette — deliberately excluded from
-        // the transient-pin warning below) and while it settles/closes.
+        // source, like the prism — deliberately excluded from the
+        // transient-pin warning below) and while it settles/closes.
         || expose.active
-        || expose.continuous_cooldown > 0
-        // Keep ticking while the palette is open so its DeepSeek worker
-        // result is polled promptly (reactive mode would wake only every
-        // 5s otherwise) and keystrokes feel instant.
-        || palette.open;
+        || expose.continuous_cooldown > 0;
+    // NOTE: an open command palette is deliberately NOT a Continuous source.
+    // It only needs its DeepSeek worker result polled promptly; pinning full
+    // 60fps for that is wasteful. Below it instead tightens the *reactive*
+    // cadence to ~30Hz. Keystrokes still wake the loop instantly in reactive
+    // mode (input events always wake), so typing stays snappy.
 
     // Regression canary: time how long we've been Continuous for a
     // *transient* reason (one that should resolve in seconds). Excludes
-    // the intentionally-sustained sources (animated theme, open palette,
-    // active 3D prism) — those legitimately stay continuous as long as the
-    // user wants and must NOT trip the warning bar. If a transient reason
-    // holds past `CONTINUOUS_WARN_SECS`, `update_continuous_pin_overlay`
-    // shows a yellow bar naming the culprit. See diagnostics.rs.
+    // the intentionally-sustained sources (animated theme, active 3D prism,
+    // open Exposé) — those legitimately stay continuous as long as the user
+    // wants and must NOT trip the warning bar. The command palette is no
+    // longer a Continuous source at all (it only tightens the reactive
+    // cadence below), so it likewise never appears in transient_reasons.
+    // If a transient reason holds past `CONTINUOUS_WARN_SECS`,
+    // `update_continuous_pin_overlay` shows a yellow bar naming the
+    // culprit. See diagnostics.rs.
     let mut transient_reasons: Vec<String> = Vec::new();
     if widget_animating {
         let mut stems: Vec<&str> = script_widgets
@@ -2061,13 +2329,25 @@ fn maintain_winit_mode_for_animation(
         (Some(iv), false) => Some(iv),
         (None, true) => Some(0.1),
         (None, false) => None,
+    }
+    // Clamp before the palette term: the [0.1s, 5s] floor exists to stop
+    // *widget-requested* sub-100ms intervals, not host-side cadences.
+    .map(|iv: f32| iv.clamp(0.1, 5.0));
+    // An open command palette tightens the cadence to ~30Hz — enough that
+    // its DeepSeek worker result lands promptly and streamed transcript
+    // updates read as live, at half the frames of the old Continuous pin.
+    // Keystroke latency doesn't depend on this: input events wake the
+    // reactive loop immediately.
+    let effective_tick = if palette.open {
+        const PALETTE_TICK: f32 = 1.0 / 30.0;
+        Some(effective_tick.map_or(PALETTE_TICK, |iv| iv.min(PALETTE_TICK)))
+    } else {
+        effective_tick
     };
     let target = if want_continuous {
         bevy::winit::UpdateMode::Continuous
     } else if let Some(iv) = effective_tick {
-        bevy::winit::UpdateMode::reactive(std::time::Duration::from_secs_f32(
-            iv.clamp(0.1, 5.0),
-        ))
+        bevy::winit::UpdateMode::reactive(std::time::Duration::from_secs_f32(iv))
     } else {
         bevy::winit::UpdateMode::reactive(std::time::Duration::from_secs(5))
     };
