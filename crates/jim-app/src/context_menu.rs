@@ -24,7 +24,7 @@ use jim_widget::protocol::HostEvent;
 use jim_widget::script_widget::ScriptWidget;
 use jim_widget::{WidgetScroll, WidgetTargets};
 
-use crate::projects::{Projects, Sidebar};
+use crate::projects::Sidebar;
 use jim_terminal::MonoFont;
 
 /// Above the radial menu's RADIAL_Z (=600) so a context menu opened on
@@ -158,7 +158,6 @@ fn context_open_close(
     // `Click {id}` (see the Left-pick branch).
     widgets: Query<(&WidgetTargets, Option<&WidgetScroll>)>,
     script_widgets: Query<&ScriptWidget>,
-    _projects: Res<Projects>,
     key_state: Res<ButtonInput<KeyCode>>,
     term_store: Res<jim_terminal::TerminalStore>,
 ) {
@@ -239,6 +238,22 @@ fn context_open_close(
             .map(|(_, _, p)| *p)
             .unwrap_or(false);
 
+        // A docked member has no chrome of its own — its whole surface is
+        // "content" — so a plain right-click anywhere on it offers Undock
+        // (the only way to pop it back out). This takes priority over the
+        // content-region no-op below.
+        if members.get(target).is_ok() {
+            menu.origin = Some(pt);
+            menu.target = Some(target);
+            menu.items = vec![
+                ContextMenuItem::Builtin(ContextAction::Undock),
+                ContextMenuItem::Builtin(ContextAction::Close),
+            ];
+            menu.hovered = None;
+            consumed.0 = true;
+            return;
+        }
+
         // Offer "Move out of canvas" when this pane is gathered into a
         // nested canvas (PaneCanvas != 0).
         let in_canvas = gathered.get(target).map(|c| c.0 != 0).unwrap_or(false);
@@ -311,6 +326,9 @@ fn context_open_close(
             (Some(ContextMenuItem::Builtin(ContextAction::Pin)), Some(e)) => pending.pin.push(e),
             (Some(ContextMenuItem::Builtin(ContextAction::Unpin)), Some(e)) => {
                 pending.unpin.push(e)
+            }
+            (Some(ContextMenuItem::Builtin(ContextAction::Undock)), Some(e)) => {
+                pending.undock.push(e)
             }
             (Some(ContextMenuItem::Builtin(ContextAction::Close)), Some(e)) => {
                 pending.close.push(e)
