@@ -1587,7 +1587,13 @@ fn forward_inputs_to_workers(
     metrics: Res<jim_pane::PaneFontMetrics>,
     mut theme_events: MessageReader<jim_style::ThemeChanged>,
     mut events: MessageReader<ClaudeBusEvent>,
-    mut widgets: Query<(&PaneKindMarker, &PaneRect, &mut ScriptWidget, Option<&Visibility>)>,
+    mut widgets: Query<(
+        &PaneKindMarker,
+        &PaneRect,
+        &mut ScriptWidget,
+        Option<&Visibility>,
+        Option<&jim_pane::PaneChromeOverride>,
+    )>,
 ) {
     // A palette edit only updates the shared theme snapshot; canvas
     // widgets bake theme colors into their frame, so without a nudge
@@ -1619,7 +1625,7 @@ fn forward_inputs_to_workers(
         .collect();
 
     let now = std::time::Instant::now();
-    for (kind, rect, mut w, vis) in &mut widgets {
+    for (kind, rect, mut w, vis, chrome_ov) in &mut widgets {
         if kind.0 != PANE_KIND {
             continue;
         }
@@ -1651,9 +1657,12 @@ fn forward_inputs_to_workers(
         w.was_visible = !is_hidden;
 
         // PaneRect is canvas-units now; pane Transform handles zoom.
+        // Docked members have a slim/zero header (PaneChromeOverride), so
+        // size the content to the real reclaimed area or clicks land a row off.
+        let title_h = jim_pane::override_title_h(chrome_ov);
         let content_size = Vec2::new(
             (rect.size.x - 2.0 * MARGIN).max(0.0),
-            (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0),
+            (rect.size.y - title_h - 2.0 * MARGIN).max(0.0),
         );
         // Send Resize whenever content_size changes, including the
         // very first non-zero size after spawn. The previous guard
@@ -1765,6 +1774,7 @@ fn apply_latest_frames(
         Option<&crate::WidgetHover>,
         Option<&crate::WidgetInputFocus>,
         Option<&Visibility>,
+        Option<&jim_pane::PaneChromeOverride>,
     )>,
     children_q: Query<&Children>,
 ) {
@@ -1778,12 +1788,24 @@ fn apply_latest_frames(
     let frame_start = std::time::Instant::now();
     let mut rendered_any = false;
     let mut deferred = false;
-    for (entity, kind, chrome, rect, mut w, mut targets, mut scroll, hover, input_focus, vis) in
-        &mut q
+    for (
+        entity,
+        kind,
+        chrome,
+        rect,
+        mut w,
+        mut targets,
+        mut scroll,
+        hover,
+        input_focus,
+        vis,
+        chrome_ov,
+    ) in &mut q
     {
         if kind.0 != PANE_KIND {
             continue;
         }
+        let title_h = jim_pane::override_title_h(chrome_ov);
         // Never rebuild a hidden pane's entity subtree. The worker already
         // suppresses renders while hidden, but a frame can still be sitting in
         // `latest_frame` from just before the pane was hidden (the host's
@@ -1814,7 +1836,7 @@ fn apply_latest_frames(
         // subprocess path (`rerender_widgets`).
         let content_size = Vec2::new(
             (rect.size.x - 2.0 * MARGIN).max(0.0),
-            (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0),
+            (rect.size.y - title_h - 2.0 * MARGIN).max(0.0),
         );
         let size_changed = w.last_layout_size != content_size;
         if current_gen == w.applied_frame_gen
@@ -1884,7 +1906,7 @@ fn apply_latest_frames(
                         extent = bottom;
                     }
                 }
-                let content_h = (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0);
+                let content_h = (rect.size.y - title_h - 2.0 * MARGIN).max(0.0);
                 let new_max = (extent + MARGIN - content_h).max(0.0);
                 if (scroll.max_y - new_max).abs() > 0.5 {
                     scroll.max_y = new_max;
@@ -1951,7 +1973,7 @@ fn apply_latest_frames(
                 }
                 let content_size = Vec2::new(
                     (rect.size.x - 2.0 * MARGIN).max(0.0),
-                    (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0),
+                    (rect.size.y - title_h - 2.0 * MARGIN).max(0.0),
                 );
                 let ctx = crate::render::LayoutCtx {
                     font: (pane_font.0.clone()).into(),
