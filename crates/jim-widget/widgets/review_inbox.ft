@@ -1,0 +1,386 @@
+// review_inbox.ft — every local review thread, one inbox.
+//
+// Left: threads grouped by repo (open first, most recent activity on
+// top). Right: the selected thread — full reply chain, reply box,
+// resolve/reopen, [Open diff] (spawns diff.ft focused on the exact
+// file:line), [Open in editor] (jimctl open --line), and — when a live
+// agent session's cwd sits inside the thread's repo — [🔔 notify], which
+// drops a pointer in that agent's bus inbox so it goes and reads the
+// thread via `jimctl review`.
+//
+// Data: `jimctl review list --all-repos` (the store is
+// ~/.jim/reviews/<repo_hash>.json, written by diff.ft, this widget, and
+// agents). Live: reloads on the `review.changed` bus event. The agent
+// roster comes from the retained `agent.hello.<id>` topics.
+//
+// params: { repo (optional filter), project }
+import "host"
+import { rget, pget, ago, jimctl, jimctl_parse, trunc, file_base, spawn_widget,
+         col_text, col_muted, col_accent, col_panel, col_warn, col_err,
+         review_topic, parse_int } from "git"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    threads: [], sel: 0, reply_text: "", status: "", jobs: [], agents: [],
+    show_resolved: false,
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn param(k, d) = pget(params, k, d)
+fn project() = param("project", "")
+fn repo_filter() = param("repo", "")
+
+// ---- data ----
+fn add_job(s, h, kind) = { ..s, jobs: push(s.jobs, { h: h, kind: kind, buf: [] }) }
+
+fn reload() {
+    let mut argv = ["review", "list", "--status", "all"]
+    if repo_filter() != "" { argv = push(push(argv, "--repo"), repo_filter()) }
+    else { argv = push(argv, "--all-repos") }
+    reset!(state, add_job(cur_state(), jimctl(argv), "list"))
+}
+
+fn on_start() { reload() }
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { jobs = push(jobs, { ..j, buf: push(j.buf, line) }) }
+        else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+}
+
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    let mut job = ()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { job = j } else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+    if typeof(job) != "Record" { return }
+    let r = jimctl_parse(join(job.buf, "\n"))
+    if job.kind == "list" {
+        if rget(r, "ok", false) {
+            reset!(state, { ..cur_state(), threads: sort_threads(rget(r, "threads", [])), status: "" })
+        } else {
+            reset!(state, { ..cur_state(), status: rget(r, "error", "list failed") })
+        }
+        request_render()
+    } else {
+        // mutation: review.changed triggers reload, but reload anyway.
+        if not rget(r, "ok", false) {
+            reset!(state, { ..cur_state(), status: rget(r, "error", "write failed") })
+        }
+        reload()
+    }
+}
+
+// Open threads first, then most recently updated.
+fn sort_threads(ts) {
+    let opens = filter(ts, (t) => rget(t, "status", "open") == "open")
+    let dones = filter(ts, (t) => rget(t, "status", "open") != "open")
+    concat(sort_by_updated(opens), sort_by_updated(dones))
+}
+fn sort_by_updated(ts) {
+    // insertion sort by updated_ms desc (lists are small)
+    let mut out = []
+    for t in ts {
+        let u = rget(t, "updated_ms", 0)
+        let mut placed = false
+        let mut next = []
+        for e in out {
+            if not placed and u > rget(e, "updated_ms", 0) {
+                next = push(next, t); placed = true
+            }
+            next = push(next, e)
+        }
+        if not placed { next = push(next, t) }
+        out = next
+    }
+    out
+}
+fn concat(a, b) {
+    let mut out = a
+    for x in b { out = push(out, x) }
+    out
+}
+
+// ---- roster (retained agent.hello.*) ----
+fn on_message(topic, payload, sender) {
+    if topic == review_topic() { reload(); return }
+    if starts_with(topic, "agent.hello.") {
+        let id = slice(topic, 12, len(topic))
+        let s = cur_state()
+        let mut agents = filter(s.agents, (a) => a.id != id)
+        if typeof(payload) == "Record" {
+            agents = push(agents, { id: id, cwd: rget(payload, "cwd", ""),
+                                    label: rget(payload, "label", id) })
+        }
+        reset!(state, { ..s, agents: agents })
+        request_render()
+    }
+}
+
+// Agents whose cwd lives inside `repo` (session working in that repo /
+// worktree).
+fn agents_in(agents, repo) {
+    if repo == "" { return [] }
+    filter(agents, (a) => starts_with(a.cwd, repo))
+}
+
+// ---- selection + actions ----
+fn thread_by_id(s, id) {
+    let mut out = ()
+    for t in s.threads {
+        if rget(t, "id", -1) == id and typeof(out) != "Record" { out = t }
+    }
+    out
+}
+fn sel_thread(s) {
+    let t = thread_by_id(s, s.sel)
+    if typeof(t) == "Record" { t }
+    else if len(s.threads) > 0 { s.threads[0] }
+    else { () }
+}
+
+// Map a thread's base_ref back to diff.ft params.
+fn diff_params_for(t) {
+    let br = rget(t, "base_ref", "working")
+    let repo = rget(t, "repo", "")
+    let base = { repo: repo, focus_file: rget(t, "file", ""), focus_line: rget(t, "line", 0) }
+    if starts_with(br, "range ") {
+        merge(base, { source: "range", arg: slice(br, 6, len(br)) })
+    } else if starts_with(br, "pr ") {
+        merge(base, { source: "pr", arg: slice(br, 3, len(br)) })
+    } else {
+        merge(base, { source: "working" })
+    }
+}
+
+fn do_reply(s) {
+    let t = sel_thread(s)
+    if typeof(t) != "Record" or trim(s.reply_text) == "" { return }
+    let argv = ["review", "reply", "--repo", rget(t, "repo", ""),
+                "--id", str(rget(t, "id", 0)), "--body", trim(s.reply_text),
+                "--author", "user"]
+    reset!(state, add_job({ ..s, reply_text: "" }, jimctl(argv), "mut"))
+    request_render()
+}
+
+fn on_input_change(id, value) {
+    if id == "reply" { reset!(state, { ..cur_state(), reply_text: value }) }
+}
+fn on_input_submit(id, value) {
+    if id == "reply" { do_reply(cur_state()) }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "refresh" { reload(); return }
+    if id == "toggle_resolved" {
+        reset!(state, { ..s, show_resolved: not s.show_resolved })
+        request_render(); return
+    }
+    if id == "reply_go" { do_reply(s); return }
+    if starts_with(id, "sel:") {
+        reset!(state, { ..s, sel: parse_int(slice(id, 4, len(id))) })
+        request_render(); return
+    }
+    let t = sel_thread(s)
+    if typeof(t) != "Record" { return }
+    if id == "resolve" {
+        let resolved = rget(t, "status", "open") == "resolved"
+        let mut argv = ["review", "resolve", "--repo", rget(t, "repo", ""),
+                        "--id", str(rget(t, "id", 0))]
+        if resolved { argv = push(argv, "--reopen") }
+        reset!(state, add_job(s, jimctl(argv), "mut"))
+        return
+    }
+    if id == "open_diff" {
+        spawn_widget("diff.ft", project(), "Diff · " + file_base(rget(t, "file", "")),
+                     diff_params_for(t))
+        return
+    }
+    if id == "open_editor" {
+        let full = rget(t, "repo", "") + "/" + rget(t, "file", "")
+        let mut argv = ["open", full, "--line", str(rget(t, "line", 1))]
+        if project() != "" { argv = push(push(argv, "--project"), project()) }
+        jimctl(argv)
+        return
+    }
+    if starts_with(id, "notify:") {
+        let agent_id = slice(id, 7, len(id))
+        let body = "New review comment on " + rget(t, "file", "") + ":" + str(rget(t, "line", 0)) + " — run `jimctl review show --repo " + rget(t, "repo", "") + " --id " + str(rget(t, "id", 0)) + "` to read it, `jimctl review reply` to answer."
+        jimctl(["msg", "emit", "--topic", "agent.inbox." + agent_id,
+                "--json", to_json({ from: "review_inbox", text: body })])
+        reset!(state, { ..s, status: "notified " + agent_id })
+        request_render()
+        return
+    }
+}
+
+// ---- render ----
+fn author_color(a) = if starts_with(a, "agent:") { col_warn() } else { col_accent() }
+
+fn status_dot(t) {
+    let open = rget(t, "status", "open") == "open"
+    { kind: "text", value: "●", size: 10.0, selectable: false, wrap: false,
+      color: if open { col_warn() } else { col_muted() } }
+}
+
+fn thread_row(t, sel_id) {
+    let id = rget(t, "id", 0)
+    let sel = id == sel_id
+    let base = { padding: { top: 6.0, bottom: 6.0, left: 8.0, right: 8.0 },
+                 radius: "6", width: "100%" }
+    let sty = if sel { merge(base, { background: col_panel() }) } else { base }
+    { kind: "list-item", id: "sel:" + str(id), selected: sel, pad: 0.0, style: sty,
+      children: [ { kind: "vstack", gap: 2.0, children: [
+        { kind: "hstack", gap: 6.0, align: "center", children: [
+            status_dot(t),
+            { kind: "text", value: rget(t, "file", "") + ":" + str(rget(t, "line", 0)),
+              family: "mono", size: 11.5, weight: if sel { "bold" } else { "normal" },
+              color: col_text(), selectable: false },
+        ] },
+        { kind: "text", value: trunc(rget(t, "body", ""), 60), size: 11.0,
+          color: col_muted(), selectable: false },
+      ] } ] }
+}
+
+fn repo_group_head(repo) {
+    { kind: "text", value: file_base(repo), size: 11.0, weight: "bold",
+      color: col_muted(), selectable: false,
+      style: { padding: { top: 6.0, bottom: 2.0, left: 2.0, right: 2.0 } } }
+}
+
+fn left_pane(s) {
+    let mut rows = [
+        { kind: "hstack", gap: 6.0, align: "center", children: [
+            { kind: "text", value: "Threads", size: 11.0, weight: "bold",
+              color: col_muted(), selectable: false, style: { flex_grow: 1.0 } },
+            { kind: "button", id: "toggle_resolved",
+              label: if s.show_resolved { "hide resolved" } else { "show resolved" } },
+        ] },
+    ]
+    let sel_t = sel_thread(s)
+    let sel_id = if typeof(sel_t) == "Record" { rget(sel_t, "id", 0) } else { -1 }
+    let mut last_repo = ""
+    for t in s.threads {
+        if not s.show_resolved and rget(t, "status", "open") != "open" { continue }
+        let repo = rget(t, "repo", "")
+        if repo != last_repo {
+            rows = push(rows, repo_group_head(repo))
+            last_repo = repo
+        }
+        rows = push(rows, thread_row(t, sel_id))
+    }
+    if len(rows) == 1 {
+        rows = push(rows, { kind: "text", value: "No review threads.", size: 11.5,
+                            color: col_muted() })
+    }
+    { kind: "vstack", gap: 3.0,
+      style: { width: "300", min_width: "300", flex_shrink: 0.0,
+               padding: { top: 2.0, bottom: 2.0, left: 0.0, right: 8.0 } },
+      children: rows }
+}
+
+fn bubble(author, body, ts_ms, now) {
+    { kind: "frame", gap: 3.0,
+      style: { background: col_panel(), radius: "8",
+               padding: { top: 8.0, bottom: 8.0, left: 10.0, right: 10.0 } },
+      children: [
+        { kind: "hstack", gap: 6.0, children: [
+            { kind: "text", value: author, size: 10.5, weight: "bold",
+              color: author_color(author), selectable: false },
+            { kind: "text", value: ago(ts_ms, now), size: 10.0, color: col_muted(),
+              selectable: false },
+        ] },
+        { kind: "text", value: body, size: 12.5, color: col_text() },
+      ] }
+}
+
+fn right_pane(s) {
+    let t = sel_thread(s)
+    if typeof(t) != "Record" {
+        return { kind: "vstack", gap: 6.0, style: { flex_grow: 1.0 }, children: [
+            { kind: "text", value: "Select a thread.", color: col_muted() } ] }
+    }
+    let now = time()
+    let resolved = rget(t, "status", "open") == "resolved"
+    let mut head_kids = [
+        { kind: "text", value: rget(t, "file", "") + ":" + str(rget(t, "line", 0)),
+          family: "mono", size: 12.5, weight: "bold", color: col_text(),
+          selectable: false, style: { flex_grow: 1.0 } },
+        { kind: "button", id: "open_diff", label: "Open diff" },
+        { kind: "button", id: "open_editor", label: "Open in editor" },
+        { kind: "button", id: "resolve", label: if resolved { "Reopen" } else { "Resolve" } },
+    ]
+    let mut kids = [
+        { kind: "hstack", gap: 6.0, align: "center", children: head_kids },
+        { kind: "hstack", gap: 6.0, children: [
+            { kind: "text", value: rget(t, "repo", ""), family: "mono", size: 10.0,
+              color: col_muted(), selectable: false },
+            { kind: "text", value: "base: " + rget(t, "base_ref", "working"), size: 10.0,
+              color: col_muted(), selectable: false },
+            { kind: "text", value: if rget(t, "stale", false) { "⚠ line moved since comment" } else { "" },
+              size: 10.0, color: col_warn(), selectable: false },
+        ] },
+    ]
+    // Context snippet anchor
+    let ctx = rget(t, "context_line", "")
+    if ctx != "" {
+        kids = push(kids, { kind: "frame",
+          style: { background: "#10131a", radius: "4",
+                   padding: { top: 4.0, bottom: 4.0, left: 8.0, right: 8.0 } },
+          children: [ { kind: "text", value: ctx, family: "mono", size: 11.5,
+                        color: col_muted(), selectable: false, wrap: false } ] })
+    }
+    kids = push(kids, bubble(rget(t, "author", "user"), rget(t, "body", ""),
+                             rget(t, "created_ms", 0), now))
+    for r in rget(t, "replies", []) {
+        kids = push(kids, bubble(rget(r, "author", ""), rget(r, "body", ""),
+                                 rget(r, "ts_ms", 0), now))
+    }
+    // Notify buttons for live agents in this repo
+    let live = agents_in(s.agents, rget(t, "repo", ""))
+    if len(live) > 0 {
+        let mut notif = [ { kind: "text", value: "live here:", size: 10.5,
+                            color: col_muted(), selectable: false } ]
+        for a in live {
+            notif = push(notif, { kind: "button", id: "notify:" + a.id,
+                                  label: "🔔 " + a.label })
+        }
+        kids = push(kids, { kind: "hstack", gap: 6.0, align: "center", children: notif })
+    }
+    kids = push(kids, { kind: "hstack", gap: 6.0, align: "center", children: [
+        { kind: "textarea", id: "reply", value: s.reply_text, rows: 2,
+          placeholder: "Reply… (⌘/Ctrl+Enter)", style: { flex_grow: 1.0 } },
+        { kind: "button", id: "reply_go", label: "Reply" },
+    ] })
+    { kind: "vstack", gap: 8.0, style: { flex_grow: 1.0, min_width: "0" }, children: kids }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let open_count = len(filter(s.threads, (t) => rget(t, "status", "open") == "open"))
+    let head = { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: "☰ review inbox", size: 13.0, weight: "bold",
+          color: col_text(), selectable: false },
+        { kind: "badge", value: str(open_count) + " open", color: "#243a5e" },
+        { kind: "button", id: "refresh", label: "↻" },
+        { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false },
+    ] }
+    { kind: "vstack", gap: 8.0, pad: 14.0, children: [
+        head,
+        { kind: "divider" },
+        { kind: "hstack", gap: 14.0, align: "start", children: [ left_pane(s), right_pane(s) ] },
+    ] }
+}

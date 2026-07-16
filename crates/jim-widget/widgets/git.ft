@@ -1,0 +1,323 @@
+// git.ft — shared library for the git/GitHub widget suite.
+//
+// The df.ft of git: one place for the contracts every git widget speaks,
+// so diff.ft / stage.ft / repo_hub.ft / branches.ft / review_inbox.ft /
+// ai_work.ft / pr_detail.ft never fork a parser or a color.
+//
+// Contents:
+//   - bus topic builders (git.changed.<id> — widgets NEVER hash paths;
+//     repo_id comes from RepoState payloads via `jimctl git status`)
+//   - the unified-diff parser (extracted from diff.ft)
+//   - diff render helpers (gutter/sign/code cells, tints, row heights)
+//   - CI status dots (extracted from pr_dashboard.ft), relative time,
+//     dirty badges
+//   - `spawn_widget` — the one way a git widget opens another
+//   - `jimctl`/`jimctl_parse` — call the CLI, parse its one-line JSON
+//
+// Self-contained on purpose: only `extern` host fns, no module imports,
+// so any widget can `import { ... } from "git"` without a chain.
+
+// ---- host externs used here ----
+extern fn highlight(code, lang)
+extern fn proc_spawn(cmd, args)
+extern fn theme_get(token)
+extern fn parse_json(s)
+extern fn to_json(v)
+
+// ---- theme colors (same token mapping as df.ft) ----
+fn tc(token, dflt) {
+    let c = theme_get(token)
+    if typeof(c) == "Str" and c != "" { c } else { dflt }
+}
+export fn col_text()   = tc("fg", "#e6e9f0")
+export fn col_muted()  = tc("fg_muted", "#9098a4")
+export fn col_accent() = tc("accent", "#8fe3b0")
+export fn col_panel()  = tc("surface_2", "#12151b")
+export fn col_err()    = tc("err", "#e08a8a")
+export fn col_warn()   = tc("warn", "#e0b066")
+export fn col_ok()     = tc("accent", "#8fe3b0")
+
+// ---- bus topics ----
+// `git.changed.<id>` is a widget→widget announcement ("I just mutated
+// this repo, re-read it if you care"), NOT a host feed: nothing in jim
+// watches git in the background, so a repo's state is only ever read by
+// an open widget asking for it.
+export fn changed_topic(repo_id) = "git.changed." + repo_id
+export fn review_topic() = "review.changed"
+export fn pr_index_topic() = "pr.index"
+
+// ---- small utils ----
+export fn pget(p, k, d) = if typeof(p) == "Record" { unwrap_or(get(p, k), d) } else { d }
+export fn rget(r, k, d) = if typeof(r) == "Record" { unwrap_or(get(r, k), d) } else { d }
+export fn parse_int(s) = to_int(unwrap_or(parse_float(s), 0.0))
+export fn lpad(s, w) {
+    let mut out = s
+    while len(out) < w { out = " " + out }
+    out
+}
+export fn trunc(s, n) = if len(s) > n { slice(s, 0, n) + "…" } else { s }
+export fn file_base(path) {
+    let parts = split(path, "/")
+    let n = len(parts)
+    if n > 0 { parts[n - 1] } else { path }
+}
+export fn lang_for(path) {
+    if ends_with(path, ".rs") { "rust" } else { "" }
+}
+export fn shq(s) = "'" + s + "'"
+
+// Relative time from an epoch-MILLISECONDS stamp against now-seconds.
+export fn ago(ts_ms, now_s) {
+    let d = now_s - ts_ms / 1000.0
+    if d < 0.0 { "now" }
+    else if d < 60.0 { str(to_int(d)) + "s ago" }
+    else if d < 3600.0 { str(to_int(d / 60.0)) + "m ago" }
+    else if d < 86400.0 { str(to_int(d / 3600.0)) + "h ago" }
+    else { str(to_int(d / 86400.0)) + "d ago" }
+}
+
+// ---- jimctl plumbing ----
+// Fire a jimctl call; caller correlates the handle in on_proc_output /
+// on_proc_exit and feeds accumulated stdout to `jimctl_parse`.
+export fn jimctl(args) = proc_spawn("jimctl", args)
+
+// Parse jimctl's one-line JSON reply. Always yields a Record with `ok`
+// (a totally empty/garbled reply becomes { ok:false, error:... } so
+// failures are NEVER silent).
+export fn jimctl_parse(text) {
+    let t = trim(text)
+    if t == "" { return { ok: false, error: "empty reply from jimctl" } }
+    let v = parse_json(t)
+    if typeof(v) == "Record" { v } else { { ok: false, error: "bad reply: " + trunc(t, 120) } }
+}
+
+// ---- spawning sibling widgets (the lsp_explorer pattern) ----
+export fn spawn_widget(script, project, title, p) {
+    let mut argv = ["widget", "--kind", "script_widget", "--title", title]
+    if project != "" { argv = push(push(argv, "--project"), project) }
+    argv = push(push(argv, "--params"), to_json(p))
+    argv = push(argv, script)
+    proc_spawn("jimctl", argv)
+}
+
+// ---- unified-diff parser (extracted verbatim from diff.ft) ----
+// parse_diff(raw) → files[ {old,new,lines,adds,dels} ]
+// `lines` entries: { tag:"hunk"|"ctx"|"add"|"del", text, o, nn, runs }
+export fn strip_diff_path(line) {
+    let p = trim(slice(line, 4, len(line)))
+    if starts_with(p, "a/") or starts_with(p, "b/") { slice(p, 2, len(p)) } else { p }
+}
+
+export fn parse_diff(raw) {
+    let lines = split(raw, "\n")
+    let n = len(lines)
+    let mut files = []
+    let mut have = false
+    let mut f_old = ""
+    let mut f_new = ""
+    let mut f_lines = []
+    let mut adds = 0
+    let mut dels = 0
+    let mut o_no = 0
+    let mut n_no = 0
+    let mut in_hunk = false
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if starts_with(line, "diff --git") {
+            if have { files = push(files, finish_file(f_old, f_new, f_lines, adds, dels)) }
+            have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0; in_hunk = false
+            i = i + 1; continue
+        }
+        if starts_with(line, "--- ") and i + 1 < n and starts_with(lines[i + 1], "+++ ") {
+            if not have { have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0 }
+            f_old = strip_diff_path(line)
+            f_new = strip_diff_path(lines[i + 1])
+            in_hunk = false
+            i = i + 2; continue
+        }
+        if starts_with(line, "@@") {
+            if not have { have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0 }
+            let hh = parse_hunk_header(line)
+            o_no = hh.o
+            n_no = hh.n
+            f_lines = push(f_lines, { tag: "hunk", text: line, o: 0, nn: 0 })
+            in_hunk = true
+            i = i + 1; continue
+        }
+        if in_hunk and have {
+            let c0 = if len(line) > 0 { slice(line, 0, 1) } else { " " }
+            if c0 == "\\" { i = i + 1; continue }
+            let text = if len(line) > 0 { slice(line, 1, len(line)) } else { "" }
+            if c0 == "+" {
+                f_lines = push(f_lines, { tag: "add", text: text, o: 0, nn: n_no })
+                n_no = n_no + 1; adds = adds + 1
+            } else if c0 == "-" {
+                f_lines = push(f_lines, { tag: "del", text: text, o: o_no, nn: 0 })
+                o_no = o_no + 1; dels = dels + 1
+            } else {
+                f_lines = push(f_lines, { tag: "ctx", text: text, o: o_no, nn: n_no })
+                o_no = o_no + 1; n_no = n_no + 1
+            }
+            i = i + 1; continue
+        }
+        i = i + 1
+    }
+    if have { files = push(files, finish_file(f_old, f_new, f_lines, adds, dels)) }
+    files
+}
+
+// "@@ -o,c +n,c @@ section" → { o, n } (1-based start lines)
+export fn parse_hunk_header(line) {
+    let mut o = 1
+    let mut n = 1
+    let parts = split(line, " ")
+    for p in parts {
+        if starts_with(p, "-") {
+            let body = slice(p, 1, len(p))
+            o = parse_int(first_num(body))
+        } else if starts_with(p, "+") {
+            let body = slice(p, 1, len(p))
+            n = parse_int(first_num(body))
+        }
+    }
+    { o: o, n: n }
+}
+export fn first_num(s) {
+    let c = split(s, ",")
+    if len(c) > 0 { c[0] } else { s }
+}
+
+// Resolve syntax runs per display line via ONE highlight() call for each
+// side of the file (old / new blob), then map back to interleaved lines.
+export fn finish_file(old, new, flines, adds, dels) {
+    let lang = lang_for(if new != "" { new } else { old })
+    let mut old_seq = []
+    let mut new_seq = []
+    for l in flines {
+        if l.tag == "ctx" { old_seq = push(old_seq, l.text); new_seq = push(new_seq, l.text) }
+        else if l.tag == "add" { new_seq = push(new_seq, l.text) }
+        else if l.tag == "del" { old_seq = push(old_seq, l.text) }
+    }
+    let old_runs = highlight(join(old_seq, "\n"), lang)
+    let new_runs = highlight(join(new_seq, "\n"), lang)
+    let mut out = []
+    let mut oi = 0
+    let mut ni = 0
+    for l in flines {
+        if l.tag == "hunk" { out = push(out, l); continue }
+        let mut runs = []
+        if l.tag == "ctx" { runs = nth(new_runs, ni); ni = ni + 1; oi = oi + 1 }
+        else if l.tag == "add" { runs = nth(new_runs, ni); ni = ni + 1 }
+        else if l.tag == "del" { runs = nth(old_runs, oi); oi = oi + 1 }
+        out = push(out, { ..l, runs: runs })
+    }
+    { old: old, new: new, lines: out, adds: adds, dels: dels }
+}
+export fn nth(xs, i) = if i >= 0 and i < len(xs) { xs[i] } else { [] }
+
+// ---- diff colors + row primitives (extracted from diff.ft) ----
+export fn kind_color(k) {
+    if k == "keyword" { "#c78fe6" }
+    else if k == "string" { "#a6df99" }
+    else if k == "comment" { "#7b8494" }
+    else if k == "function" { "#8cc7ff" }
+    else if k == "type" { "#f0d18c" }
+    else if k == "constructor" { "#f0d18c" }
+    else if k == "constant" { "#f29e7a" }
+    else if k == "attribute" { "#d9b380" }
+    else if k == "operator" { "#b3bdcc" }
+    else if k == "punctuation" { "#b3bdcc" }
+    else if k == "property" { "#d9d2f2" }
+    else if k == "label" { "#f29e7a" }
+    else if k == "escape" { "#f0bf66" }
+    else { col_text() }
+}
+export fn tint(tag) {
+    if tag == "add" { "#12301d" } else if tag == "del" { "#341a1d" } else { "" }
+}
+export fn sign_color(tag) {
+    if tag == "add" { "#5fcf8a" } else if tag == "del" { "#e08a8a" } else { col_muted() }
+}
+export fn add_color() = "#5fcf8a"
+export fn del_color() = "#e08a8a"
+
+// Fixed row heights shared by every diff-shaped widget so virtualizer
+// math stays exact.
+export fn line_h() = 20.0
+export fn hunk_h() = 20.0
+export fn comment_h() = 46.0
+export fn draft_h() = 124.0
+
+export fn gutter(l) {
+    let on = if l.o > 0 { lpad(str(l.o), 4) } else { "    " }
+    let nn = if l.nn > 0 { lpad(str(l.nn), 4) } else { "    " }
+    { kind: "text", value: on + " " + nn, family: "mono", size: 11.0,
+      color: col_muted(), selectable: false, wrap: false }
+}
+export fn sign_el(l) {
+    let g = if l.tag == "add" { "+" } else if l.tag == "del" { "-" } else { " " }
+    { kind: "text", value: g, family: "mono", size: 12.5, color: sign_color(l.tag),
+      selectable: false, wrap: false }
+}
+export fn code_cell(runs) {
+    let mut kids = []
+    if len(runs) == 0 {
+        kids = [ { kind: "text", value: " ", family: "mono", size: 12.5,
+                   color: col_text(), selectable: false, wrap: false } ]
+    } else {
+        for r in runs {
+            kids = push(kids, { kind: "text", value: r.text, family: "mono", size: 12.5,
+                                color: kind_color(r.kind), selectable: false, wrap: false })
+        }
+    }
+    { kind: "hstack", gap: 0.0, align: "start",
+      style: { flex_shrink: 0.0 },
+      children: kids }
+}
+export fn line_style(tag) {
+    let pad = { top: 1.0, bottom: 1.0, left: 6.0, right: 6.0 }
+    let base = { padding: pad, height: "20", min_height: "20", clip: true }
+    let t = tint(tag)
+    if t == "" { base } else { merge(base, { background: t }) }
+}
+export fn hunk_row(text) {
+    { kind: "frame",
+      style: { background: col_panel(), height: "20", min_height: "20", clip: true,
+               padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+      children: [ { kind: "text", value: text, family: "mono", size: 11.0,
+                    color: col_accent(), selectable: false, wrap: false } ] }
+}
+
+// ---- CI status dots (extracted from pr_dashboard.ft, theme-aware) ----
+export fn dot_glyph(ci) = if ci == "none" { "○" } else { "●" }
+export fn dot_color(ci) {
+    if ci == "pass" { col_ok() }
+    else if ci == "fail" { col_err() }
+    else if ci == "pending" { col_warn() }
+    else { col_muted() }
+}
+
+// ---- repo-state display helpers ----
+// st is a RepoState payload (from `jimctl git status`).
+export fn dirty_badges(st) {
+    let mut out = []
+    let staged = rget(st, "staged", 0)
+    let unstaged = rget(st, "unstaged", 0)
+    let untracked = rget(st, "untracked", 0)
+    let conflicted = rget(st, "conflicted", 0)
+    if staged > 0 { out = push(out, { kind: "badge", value: "S:" + str(staged), color: "#1c4a30" }) }
+    if unstaged > 0 { out = push(out, { kind: "badge", value: "U:" + str(unstaged), color: "#4a3a1f" }) }
+    if untracked > 0 { out = push(out, { kind: "badge", value: "?:" + str(untracked), color: "#33383f" }) }
+    if conflicted > 0 { out = push(out, { kind: "badge", value: "!:" + str(conflicted), color: "#4a1f24" }) }
+    if len(out) == 0 { out = [ { kind: "badge", value: "clean", color: "#1e2632" } ] }
+    out
+}
+export fn ahead_behind(st) {
+    let a = rget(st, "ahead", 0)
+    let b = rget(st, "behind", 0)
+    let mut bits = []
+    if a > 0 { bits = push(bits, "↑" + str(a)) }
+    if b > 0 { bits = push(bits, "↓" + str(b)) }
+    join(bits, " ")
+}

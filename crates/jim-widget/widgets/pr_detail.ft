@@ -1,0 +1,238 @@
+// pr_detail.ft — one pull request, up close.
+//
+// Spawned from pr_dashboard.ft's "Open detail pane" (or directly with
+// params). Tabs:
+//   Description — title/author/branches + the PR body
+//   Checks      — statusCheckRollup rows with pass/fail dots
+//   Comments    — issue comments + review comments; file-anchored review
+//                 comments get [View in diff] (spawns diff.ft on the PR
+//                 diff focused at that file:line)
+// [View full diff] spawns diff.ft with source:"pr".
+//
+// `repo` here is the GitHub "owner/name" (from `gh search prs`), not a
+// local path — every gh call uses --repo, so no cd dance is needed, and
+// diff.ft's pr source gets the --repo flag smuggled through its arg.
+//
+// params: { repo, number, url, project }
+import "host"
+import { rget, pget, ago, trunc, dot_glyph, dot_color, spawn_widget,
+         col_text, col_muted, col_accent, col_panel, col_warn, col_err,
+         parse_int } from "git"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    tab: "desc", pr: (), checks: [], comments: [], status: "loading…",
+    proc: -1, buf: [],
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn param(k, d) = pget(params, k, d)
+fn repo() = param("repo", "")
+fn number() = str(param("number", 0))
+fn project() = param("project", "")
+
+// ---- fetch ----
+fn fetch() {
+    let fields = "title,body,author,baseRefName,headRefName,state,isDraft,url,reviews,comments,statusCheckRollup,additions,deletions,changedFiles"
+    let cmd = "gh pr view " + number() + " --repo " + repo() + " --json " + fields
+    let h = proc_spawn("sh", ["-c", cmd + " 2>/dev/null"])
+    reset!(state, { ..cur_state(), proc: h, buf: [], status: "loading…" })
+    request_render()
+}
+
+fn on_start() { fetch() }
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    if handle == s.proc { reset!(state, { ..s, buf: push(s.buf, line) }) }
+}
+
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    if handle != s.proc { return }
+    let v = parse_json(join(s.buf, "\n"))
+    if typeof(v) != "Record" {
+        reset!(state, { ..s, proc: -1, buf: [],
+                        status: "fetch failed — is `gh` authed for " + repo() + "?" })
+        request_render()
+        return
+    }
+    // Flatten checks
+    let mut checks = []
+    for c in rget(v, "statusCheckRollup", []) {
+        let name = rget(c, "name", rget(c, "context", "check"))
+        let concl = rget(c, "conclusion", rget(c, "state", ""))
+        let st = rget(c, "status", "")
+        let ci = check_verdict(st, concl)
+        checks = push(checks, { name: name, ci: ci, detail: concl })
+    }
+    // Merge issue comments + review threads into one list.
+    let mut comments = []
+    for c in rget(v, "comments", []) {
+        comments = push(comments, {
+            author: rget(rget(c, "author", {}), "login", "?"),
+            body: rget(c, "body", ""), file: "", line: 0,
+            at: rget(c, "createdAt", "") })
+    }
+    for rv in rget(v, "reviews", []) {
+        let body = rget(rv, "body", "")
+        if body != "" {
+            comments = push(comments, {
+                author: rget(rget(rv, "author", {}), "login", "?"),
+                body: body, file: "", line: 0,
+                at: rget(rv, "submittedAt", "") })
+        }
+    }
+    reset!(state, { ..s, proc: -1, buf: [], pr: v, checks: checks,
+                    comments: comments, status: "" })
+    request_render()
+}
+
+fn check_verdict(status, conclusion) {
+    if status != "" and status != "COMPLETED" { "pending" }
+    else if conclusion == "SUCCESS" or conclusion == "SKIPPED" or conclusion == "NEUTRAL" { "pass" }
+    else if conclusion == "PENDING" or conclusion == "EXPECTED" or conclusion == "" { "pending" }
+    else { "fail" }
+}
+
+// ---- clicks ----
+fn on_tab_select(id, tab) {
+    if id == "tab" { reset!(state, { ..cur_state(), tab: tab }); request_render() }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "refresh" { fetch(); return }
+    if id == "browser" {
+        proc_spawn("/usr/bin/open", [param("url", "")])
+        return
+    }
+    if id == "full_diff" {
+        // diff.ft pr source runs `gh pr diff <arg>`; ride --repo through
+        // the arg so no local checkout is needed.
+        spawn_widget("diff.ft", project(), "Diff · PR #" + number(),
+                     { source: "pr", repo: ".", arg: number() + " --repo " + repo() })
+        return
+    }
+}
+
+// ---- render ----
+fn state_badge(pr) {
+    let st = rget(pr, "state", "")
+    let draft = rget(pr, "isDraft", false)
+    if draft { { kind: "badge", value: "draft", color: "#33383f" } }
+    else if st == "OPEN" { { kind: "badge", value: "open", color: "#1c4a30" } }
+    else if st == "MERGED" { { kind: "badge", value: "merged", color: "#3a2a5e" } }
+    else { { kind: "badge", value: lower(st), color: "#4a1f24" } }
+}
+fn lower(s) = s
+
+fn header(s) {
+    let pr = s.pr
+    let title = if typeof(pr) == "Record" { rget(pr, "title", "") } else { "PR #" + number() }
+    let mut row1 = [
+        { kind: "text", value: title, size: 14.0, weight: "bold", color: col_text(),
+          style: { flex_grow: 1.0 } },
+    ]
+    if typeof(pr) == "Record" { row1 = push(row1, state_badge(pr)) }
+    let mut row2 = [
+        { kind: "text", value: repo() + " #" + number(), family: "mono", size: 11.0,
+          color: col_muted(), selectable: false },
+    ]
+    if typeof(pr) == "Record" {
+        let author = rget(rget(pr, "author", {}), "login", "?")
+        let branches = rget(pr, "baseRefName", "") + " ← " + rget(pr, "headRefName", "")
+        let stats = "+" + str(rget(pr, "additions", 0)) + " −" + str(rget(pr, "deletions", 0)) + " · " + str(rget(pr, "changedFiles", 0)) + " files"
+        row2 = push(row2, { kind: "text", value: "by " + author, size: 11.0,
+                            color: col_muted(), selectable: false })
+        row2 = push(row2, { kind: "text", value: branches, family: "mono", size: 11.0,
+                            color: col_accent(), selectable: false })
+        row2 = push(row2, { kind: "text", value: stats, size: 11.0,
+                            color: col_muted(), selectable: false })
+    }
+    row2 = push(row2, { kind: "button", id: "full_diff", label: "View full diff" })
+    row2 = push(row2, { kind: "button", id: "browser", label: "Browser ↗" })
+    row2 = push(row2, { kind: "button", id: "refresh", label: "↻" })
+    { kind: "vstack", gap: 4.0, children: [
+        { kind: "hstack", gap: 8.0, align: "center", children: row1 },
+        { kind: "hstack", gap: 10.0, align: "center", children: row2 },
+    ] }
+}
+
+fn desc_tab(s) {
+    let pr = s.pr
+    let body = if typeof(pr) == "Record" { rget(pr, "body", "") } else { "" }
+    let text = if trim(body) == "" { "(no description)" } else { body }
+    { kind: "frame",
+      style: { background: col_panel(), radius: "8",
+               padding: { top: 10.0, bottom: 10.0, left: 12.0, right: 12.0 } },
+      children: [ { kind: "text", value: text, size: 12.5, color: col_text() } ] }
+}
+
+fn checks_tab(s) {
+    if len(s.checks) == 0 {
+        return { kind: "text", value: "No checks reported.", color: col_muted() }
+    }
+    let mut rows = []
+    for c in s.checks {
+        rows = push(rows, { kind: "hstack", gap: 8.0, align: "center",
+          style: { padding: { top: 4.0, bottom: 4.0, left: 8.0, right: 8.0 } },
+          children: [
+            { kind: "text", value: dot_glyph(c.ci), color: dot_color(c.ci), size: 12.0,
+              selectable: false, wrap: false },
+            { kind: "text", value: c.name, family: "mono", size: 12.0, color: col_text(),
+              selectable: false, style: { flex_grow: 1.0 } },
+            { kind: "text", value: c.detail, size: 10.5, color: col_muted(),
+              selectable: false },
+          ] })
+    }
+    { kind: "vstack", gap: 2.0, children: rows }
+}
+
+fn comments_tab(s) {
+    if len(s.comments) == 0 {
+        return { kind: "text", value: "No comments.", color: col_muted() }
+    }
+    let mut rows = []
+    for c in s.comments {
+        rows = push(rows, { kind: "frame", gap: 3.0,
+          style: { background: col_panel(), radius: "8",
+                   padding: { top: 8.0, bottom: 8.0, left: 10.0, right: 10.0 } },
+          children: [
+            { kind: "hstack", gap: 6.0, children: [
+                { kind: "text", value: c.author, size: 10.5, weight: "bold",
+                  color: col_accent(), selectable: false },
+                { kind: "text", value: c.at, size: 10.0, color: col_muted(),
+                  selectable: false },
+            ] },
+            { kind: "text", value: c.body, size: 12.0, color: col_text() },
+          ] })
+    }
+    { kind: "vstack", gap: 6.0, children: rows }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let mut kids = [
+        header(s),
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "tabs", id: "tab", selected: s.tab, items: [
+                { id: "desc", label: "Description" },
+                { id: "checks", label: "Checks (" + str(len(s.checks)) + ")" },
+                { id: "comments", label: "Comments (" + str(len(s.comments)) + ")" },
+            ] },
+            { kind: "text", value: s.status, size: 11.0, color: col_warn(),
+              selectable: false },
+        ] },
+        { kind: "divider" },
+    ]
+    if s.tab == "desc" { kids = push(kids, desc_tab(s)) }
+    else if s.tab == "checks" { kids = push(kids, checks_tab(s)) }
+    else { kids = push(kids, comments_tab(s)) }
+    { kind: "vstack", gap: 8.0, pad: 14.0, children: kids }
+}

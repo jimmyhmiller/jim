@@ -1,0 +1,336 @@
+// ai_work.ft — what the AI sessions are building, and one-click review.
+//
+// One card per worktree/branch in this project's repo family, correlated
+// with live agent sessions two ways:
+//   1. the `.jim-agent` sidecar (`jimctl git worktree-add --agent`) —
+//      carried in WorktreeInfo.agent_id;
+//   2. the live roster (retained `agent.hello.<id>`): a session whose
+//      cwd sits inside the worktree is shown as ACTIVE there.
+// A worktree with commits but no session is honestly labeled "no active
+// session" — never claimed as AI work without a correlation.
+//
+// [Review] opens diff.ft (branch vs default) so you can leave review
+// threads on the work; [Notify] tells the session a review is waiting
+// (it reads/replies via `jimctl review`). [Message] is a quick one-line
+// direct send to that session's inbox.
+//
+// params: { project, project_root }
+import "host"
+import { rget, pget, ago, spawn_widget, jimctl, jimctl_parse, trunc, file_base,
+         col_text, col_muted, col_accent, col_panel, col_warn,
+         changed_topic, parse_int } from "git"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    repos: [], common: "", agents: [], jobs: [], status: "", pending: [],
+    msg_for: "", msg_text: "", default_branch: "main",
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn param(k, d) = pget(params, k, d)
+fn project() = param("project", "")
+fn project_root() = param("project_root", "")
+
+// ---- repo family intake (same model as repo_hub.ft) ----
+fn upsert_repo(s, st) {
+    let root = rget(st, "root", "")
+    if root == "" { return s }
+    let fam = rget(st, "common_root", root)
+    let mut common = s.common
+    if common == "" { common = fam }
+    if fam != common { return s }
+    let mut out = []
+    let mut found = false
+    for r in s.repos {
+        if rget(r, "root", "") == root { out = push(out, st); found = true }
+        else { out = push(out, r) }
+    }
+    if not found { out = push(out, st) }
+    { ..s, repos: out, common: common }
+}
+
+fn on_message(topic, payload, sender) {
+    // stage.ft / branches.ft announce their mutations here; that is the
+    // only thing that makes us re-run git.
+    if starts_with(topic, "git.changed.") {
+        refresh()
+        return
+    }
+    if starts_with(topic, "agent.hello.") {
+        let id = slice(topic, 12, len(topic))
+        let s = cur_state()
+        let mut agents = filter(s.agents, (a) => a.id != id)
+        if typeof(payload) == "Record" {
+            agents = push(agents, { id: id, cwd: rget(payload, "cwd", ""),
+                                    label: rget(payload, "label", id) })
+        }
+        reset!(state, { ..s, agents: agents })
+        request_render()
+    }
+}
+
+// ---- fetching the family ----
+// No host watcher: we ask for each worktree's own RepoState ourselves.
+// One status per root we haven't asked for; each reply lists the family,
+// so the fan-out closes over itself. `pending` tracks what we ASKED for
+// (git's worktree paths aren't canonicalized, so a reply's `root` may not
+// equal the path we requested — gating on `repos` would loop forever).
+fn add_job(s, h, kind) = { ..s, jobs: push(s.jobs, { h: h, kind: kind, buf: [] }) }
+
+fn asked(s, p) {
+    let mut hit = false
+    for q in s.pending { if q == p { hit = true } }
+    hit
+}
+
+fn fetch_status(s, p) = add_job({ ..s, pending: push(s.pending, p) },
+                                jimctl(["git", "status", "--repo", p]), "status")
+
+fn fan_out(st) {
+    for wt in rget(st, "worktrees", []) {
+        let p = rget(wt, "path", "")
+        let s = cur_state()
+        if p != "" and not asked(s, p) { reset!(state, fetch_status(s, p)) }
+    }
+}
+
+fn refresh() {
+    let root = project_root()
+    if root == "" {
+        reset!(state, { ..cur_state(), status: "no project_root param" })
+        request_render()
+        return
+    }
+    let s = { ..cur_state(), repos: [], common: "", pending: [] }
+    reset!(state, fetch_status(s, root))
+    request_render()
+}
+
+fn on_start() { refresh() }
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { jobs = push(jobs, { ..j, buf: push(j.buf, line) }) }
+        else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+}
+
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    let mut job = ()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { job = j } else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+    if typeof(job) != "Record" { return }
+    let r = jimctl_parse(join(job.buf, "\n"))
+    if job.kind == "status" {
+        if rget(r, "ok", false) {
+            let st = rget(r, "state", {})
+            reset!(state, upsert_repo(cur_state(), st))
+            fan_out(st)
+        } else {
+            reset!(state, { ..cur_state(), status: rget(r, "error", "status failed") })
+        }
+        request_render()
+    }
+}
+
+// ---- the work list ----
+// Union of every worktree across the repo family, deduped by path, each
+// annotated with its owning repo state (if we have one) and any live
+// agents whose cwd is inside it.
+fn work_items(s) {
+    let mut items = []
+    let mut seen = []
+    for r in s.repos {
+        for wt in rget(r, "worktrees", []) {
+            let path = rget(wt, "path", "")
+            if path == "" { continue }
+            let mut dup = false
+            for p in seen { if p == path { dup = true } }
+            if dup { continue }
+            seen = push(seen, path)
+            // The worktree's own RepoState, once its fetch has landed.
+            let mut own = ()
+            for r2 in s.repos {
+                if rget(r2, "root", "") == path { own = r2 }
+            }
+            let live = filter(s.agents, (a) => starts_with(a.cwd, path))
+            items = push(items, { wt: wt, own: own, live: live, path: path })
+        }
+    }
+    items
+}
+
+fn item_at(s, i) {
+    let items = work_items(s)
+    if i >= 0 and i < len(items) { items[i] } else { () }
+}
+
+fn notify_agent(agent_id, text) {
+    jimctl(["msg", "emit", "--topic", "agent.inbox." + agent_id,
+            "--json", to_json({ from: "ai_work", text: text })])
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "refresh" { on_start(); return }
+    if id == "msg_send" {
+        if s.msg_for != "" and trim(s.msg_text) != "" {
+            notify_agent(s.msg_for, trim(s.msg_text))
+            reset!(state, { ..s, msg_for: "", msg_text: "", status: "sent" })
+            request_render()
+        }
+        return
+    }
+    if id == "msg_cancel" {
+        reset!(state, { ..s, msg_for: "", msg_text: "" })
+        request_render()
+        return
+    }
+    let parts = split(id, ":")
+    if len(parts) < 2 { return }
+    let act = parts[0]
+    let it = item_at(s, parse_int(parts[1]))
+    if typeof(it) != "Record" { return }
+    if act == "review" {
+        spawn_widget("diff.ft", project(), "Review · " + file_base(it.path),
+                     { source: "range", repo: it.path,
+                       arg: s.default_branch + " HEAD" })
+        // Tell the live session(s) a review is starting.
+        for a in it.live {
+            notify_agent(a.id, "Jimmy is reviewing your work in " + it.path + " — comments will land in the local review store; check `jimctl review list --repo " + it.path + "` for open threads.")
+        }
+    } else if act == "wdiff" {
+        spawn_widget("diff.ft", project(), "Diff · " + file_base(it.path),
+                     { source: "working", repo: it.path })
+    } else if act == "term" {
+        emit("jim.action", { action: "spawn_pane", kind: "terminal", project: project(),
+                             config: { cwd: it.path } })
+    } else if act == "msg" and len(parts) == 3 {
+        reset!(state, { ..s, msg_for: parts[2], msg_text: "" })
+        request_render()
+    }
+}
+
+fn on_input_change(id, value) {
+    if id == "msg_text" { reset!(state, { ..cur_state(), msg_text: value }) }
+}
+fn on_input_submit(id, value) {
+    if id == "msg_text" { on_click(0.0, 0.0, false, false, "msg_send") }
+}
+
+// ---- render ----
+fn agent_chip(a) {
+    { kind: "badge", value: "⚡ " + a.label, color: "#4a3a1f" }
+}
+
+fn card(s, i, it, now) {
+    let wt = it.wt
+    let branch = rget(wt, "branch", ())
+    let branch_label = if typeof(branch) == "Str" and branch != "" { branch } else { "(detached)" }
+    let sidecar = rget(wt, "agent_id", ())
+
+    let mut head = [
+        { kind: "text", value: file_base(it.path), weight: "bold", size: 13.0,
+          color: col_text(), selectable: false },
+        { kind: "text", value: branch_label, family: "mono", size: 12.0,
+          color: col_accent(), selectable: false },
+    ]
+    if rget(wt, "is_main", false) { head = push(head, { kind: "badge", value: "main", color: "#243a5e" }) }
+    for a in it.live { head = push(head, agent_chip(a)) }
+    if len(it.live) == 0 and typeof(sidecar) == "Str" and sidecar != "" {
+        head = push(head, { kind: "badge", value: "made by " + sidecar + " · no active session",
+                            color: "#33383f" })
+    }
+    if len(it.live) == 0 and (typeof(sidecar) != "Str" or sidecar == "") {
+        head = push(head, { kind: "text", value: "no active session", size: 10.5,
+                            color: col_muted(), selectable: false })
+    }
+
+    let mut lines = [
+        { kind: "hstack", gap: 8.0, align: "center", children: head },
+        { kind: "text", value: it.path, family: "mono", size: 10.0,
+          color: col_muted(), selectable: false },
+    ]
+    if typeof(it.own) == "Record" {
+        let c = rget(it.own, "last_commit", ())
+        if typeof(c) == "Record" {
+            let v = trunc(rget(c, "subject", ""), 64) + " · " + rget(c, "author", "") + " · " + ago(rget(c, "ts_ms", 0), now)
+            lines = push(lines, { kind: "text", value: v, size: 11.0, color: col_muted(),
+                                  selectable: false })
+        }
+        let dirty = rget(it.own, "staged", 0) + rget(it.own, "unstaged", 0) + rget(it.own, "untracked", 0)
+        if dirty > 0 {
+            lines = push(lines, { kind: "text", value: str(dirty) + " uncommitted change(s)",
+                                  size: 10.5, color: col_warn(), selectable: false })
+        }
+    }
+
+    let mut btns = [
+        { kind: "button", id: "review:" + str(i), label: "Review vs " + s.default_branch },
+        { kind: "button", id: "wdiff:" + str(i), label: "Diff" },
+        { kind: "button", id: "term:" + str(i), label: "Terminal" },
+    ]
+    for a in it.live {
+        btns = push(btns, { kind: "button", id: "msg:" + str(i) + ":" + a.id,
+                            label: "Message " + a.label })
+    }
+    lines = push(lines, { kind: "hstack", gap: 6.0, children: btns })
+
+    if s.msg_for != "" {
+        let mut is_ours = false
+        for a in it.live { if a.id == s.msg_for { is_ours = true } }
+        if is_ours {
+            lines = push(lines, { kind: "hstack", gap: 6.0, align: "center", children: [
+                { kind: "input", id: "msg_text", value: s.msg_text,
+                  placeholder: "message to " + s.msg_for + "…", style: { flex_grow: 1.0 } },
+                { kind: "button", id: "msg_send", label: "Send" },
+                { kind: "button", id: "msg_cancel", label: "✕" },
+            ] })
+        }
+    }
+
+    { kind: "frame", gap: 6.0,
+      style: { background: col_panel(), radius: "8",
+               padding: { top: 10.0, bottom: 10.0, left: 12.0, right: 12.0 } },
+      children: lines }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let now = time()
+    let items = work_items(s)
+    let live_total = len(filter(s.agents, (a) => a.cwd != ""))
+    let mut kids = [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "text", value: "⚡ ai work", size: 13.0, weight: "bold",
+              color: col_text(), selectable: false },
+            { kind: "badge", value: str(live_total) + " live session(s)", color: "#243a5e" },
+            { kind: "button", id: "refresh", label: "↻" },
+            { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false },
+        ] },
+        { kind: "divider" },
+    ]
+    if len(items) == 0 {
+        kids = push(kids, { kind: "text", value: "No worktrees discovered yet.",
+                            color: col_muted() })
+    } else {
+        let mut i = 0
+        for it in items {
+            kids = push(kids, card(s, i, it, now))
+            i = i + 1
+        }
+    }
+    { kind: "vstack", gap: 10.0, pad: 14.0, children: kids }
+}

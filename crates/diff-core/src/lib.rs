@@ -265,8 +265,14 @@ const DEFAULT_CONTEXT: usize = 3;
 
 /// Run `git` in `repo` with `args`, returning stdout bytes. On a nonzero
 /// exit, returns `Err` unless `allow_fail` is set (then returns empty).
+///
+/// Read-only invocations ONLY: `--no-optional-locks` stops `status`/`diff`
+/// from taking `index.lock` to write back a refreshed index, which would
+/// both contend with real git operations and look like a `.git` change to
+/// the git watcher.
 fn git_raw(repo: &Path, args: &[&str], allow_fail: bool) -> Result<Vec<u8>, DiffError> {
     let out = Command::new("git")
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -381,6 +387,229 @@ pub fn git_working_tree(repo: &Path) -> Result<DiffSet, DiffError> {
     Ok(DiffSet::from_files(files))
 }
 
+/// Show the contents of the index blob for `path` (`git show :path`).
+fn git_show_index(repo: &Path, path: &str) -> String {
+    git_show(repo, &format!(":{path}"))
+}
+
+/// Parse `--name-status -z` output (`git diff` family) into
+/// `(change, old_path, path)` triples.
+fn parse_name_status(text: &str) -> Vec<(ChangeKind, Option<String>, String)> {
+    let mut fields = text.split('\0').filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    while let Some(status) = fields.next() {
+        let code = status.as_bytes().first().copied().unwrap_or(b'M') as char;
+        let (change, orig, path) = match code {
+            'A' => (ChangeKind::Added, None, fields.next()),
+            'D' => (ChangeKind::Removed, None, fields.next()),
+            'R' | 'C' => {
+                let from = fields.next().map(|s| s.to_string());
+                let to = fields.next();
+                (ChangeKind::Renamed, from, to)
+            }
+            _ => (ChangeKind::Modified, None, fields.next()),
+        };
+        if let Some(path) = path {
+            out.push((change, orig, path.to_string()));
+        }
+    }
+    out
+}
+
+/// Diff HEAD against the index (what `git diff --cached` shows): the
+/// currently staged changes. On an unborn branch every index entry is
+/// reported as Added.
+pub fn git_staged(repo: &Path) -> Result<DiffSet, DiffError> {
+    let inside = git_raw(repo, &["rev-parse", "--is-inside-work-tree"], true)?;
+    if String::from_utf8_lossy(&inside).trim() != "true" {
+        return Err(DiffError::NotARepo(repo.display().to_string()));
+    }
+    let head_ok = git_raw(repo, &["rev-parse", "--verify", "-q", "HEAD"], true)
+        .map(|b| !b.is_empty())
+        .unwrap_or(false);
+
+    let mut files = Vec::new();
+    if head_ok {
+        let raw = git_raw(
+            repo,
+            &["diff", "--cached", "--name-status", "-z", "--find-renames"],
+            false,
+        )?;
+        for (change, orig, path) in parse_name_status(&String::from_utf8_lossy(&raw)) {
+            let old_spec_path = orig.clone().unwrap_or_else(|| path.clone());
+            let old = if change == ChangeKind::Added {
+                String::new()
+            } else {
+                git_show(repo, &format!("HEAD:{old_spec_path}"))
+            };
+            let new = if change == ChangeKind::Removed {
+                String::new()
+            } else {
+                git_show_index(repo, &path)
+            };
+            files.push(file_diff_from_texts(
+                path,
+                orig,
+                change,
+                &old,
+                &new,
+                DEFAULT_CONTEXT,
+            ));
+        }
+    } else {
+        // Unborn HEAD: everything in the index is a staged add.
+        let raw = git_raw(repo, &["ls-files", "-z", "--cached"], false)?;
+        for path in String::from_utf8_lossy(&raw).split('\0').filter(|s| !s.is_empty()) {
+            let new = git_show_index(repo, path);
+            files.push(file_diff_from_texts(
+                path,
+                None,
+                ChangeKind::Added,
+                "",
+                &new,
+                DEFAULT_CONTEXT,
+            ));
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(DiffSet::from_files(files))
+}
+
+/// Diff the index against the working tree (what a bare `git diff`
+/// shows) plus untracked files: everything not yet staged.
+pub fn git_unstaged(repo: &Path) -> Result<DiffSet, DiffError> {
+    let inside = git_raw(repo, &["rev-parse", "--is-inside-work-tree"], true)?;
+    if String::from_utf8_lossy(&inside).trim() != "true" {
+        return Err(DiffError::NotARepo(repo.display().to_string()));
+    }
+    let raw = git_raw(repo, &["diff", "--name-status", "-z", "--find-renames"], false)?;
+    let mut files = Vec::new();
+    for (change, orig, path) in parse_name_status(&String::from_utf8_lossy(&raw)) {
+        let old_spec_path = orig.clone().unwrap_or_else(|| path.clone());
+        let old = if change == ChangeKind::Added {
+            String::new()
+        } else {
+            git_show_index(repo, &old_spec_path)
+        };
+        let new = if change == ChangeKind::Removed {
+            String::new()
+        } else {
+            std::fs::read(repo.join(&path))
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        files.push(file_diff_from_texts(
+            path,
+            orig,
+            change,
+            &old,
+            &new,
+            DEFAULT_CONTEXT,
+        ));
+    }
+
+    // Untracked files are unstaged-by-definition; enumerate them too so a
+    // staging UI can offer them (whole-file only — no index blob to hunk
+    // against).
+    let raw = git_raw(
+        repo,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+        false,
+    )?;
+    for path in String::from_utf8_lossy(&raw).split('\0').filter(|s| !s.is_empty()) {
+        let new = std::fs::read(repo.join(path))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        files.push(file_diff_from_texts(
+            path,
+            None,
+            ChangeKind::Untracked,
+            "",
+            &new,
+            DEFAULT_CONTEXT,
+        ));
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(DiffSet::from_files(files))
+}
+
+/// Number of lines in a file text ("a\nb\n" and "a\nb" are both 2).
+fn line_count(s: &str) -> usize {
+    s.lines().count()
+}
+
+/// Build a minimal, self-contained unified-diff patch containing exactly
+/// one hunk of `file`, suitable for `git apply --cached [-R]`.
+///
+/// Handles the fiddly parts of the unified format: `/dev/null` sides for
+/// adds/removes, zero-count start positions for pure insertions, and
+/// `\ No newline at end of file` markers derived from the stored full
+/// file texts.
+pub fn hunk_patch(file: &FileDiff, hunk: &Hunk) -> String {
+    let old_label = match file.change {
+        ChangeKind::Added | ChangeKind::Untracked => "/dev/null".to_string(),
+        _ => format!("a/{}", file.old_path.as_deref().unwrap_or(&file.path)),
+    };
+    let new_label = match file.change {
+        ChangeKind::Removed => "/dev/null".to_string(),
+        _ => format!("b/{}", file.path),
+    };
+
+    let old_n = hunk.lines.iter().filter(|l| l.old_lineno.is_some()).count();
+    let new_n = hunk.lines.iter().filter(|l| l.new_lineno.is_some()).count();
+    // With a count of 0 the unified format's start means "insert after
+    // this line" (0 = at the top); with lines present it's the first
+    // line's number.
+    let old_start = hunk
+        .lines
+        .iter()
+        .find_map(|l| l.old_lineno)
+        .unwrap_or(hunk.old_start.saturating_sub(1));
+    let new_start = hunk
+        .lines
+        .iter()
+        .find_map(|l| l.new_lineno)
+        .unwrap_or(hunk.new_start.saturating_sub(1));
+
+    let old_total = file.old_text.as_deref().map(line_count).unwrap_or(0);
+    let new_total = file.new_text.as_deref().map(line_count).unwrap_or(0);
+    let old_ends_nl = file
+        .old_text
+        .as_deref()
+        .map(|t| t.is_empty() || t.ends_with('\n'))
+        .unwrap_or(true);
+    let new_ends_nl = file
+        .new_text
+        .as_deref()
+        .map(|t| t.is_empty() || t.ends_with('\n'))
+        .unwrap_or(true);
+
+    let mut out = String::new();
+    out.push_str(&format!("--- {old_label}\n"));
+    out.push_str(&format!("+++ {new_label}\n"));
+    out.push_str(&format!(
+        "@@ -{old_start},{old_n} +{new_start},{new_n} @@\n"
+    ));
+    for line in &hunk.lines {
+        let sign = match line.kind {
+            LineKind::Context => ' ',
+            LineKind::Added => '+',
+            LineKind::Removed => '-',
+        };
+        out.push(sign);
+        out.push_str(&line.text);
+        out.push('\n');
+        let at_old_eof = !old_ends_nl && line.old_lineno == Some(old_total);
+        let at_new_eof = !new_ends_nl && line.new_lineno == Some(new_total);
+        if (line.kind != LineKind::Added && at_old_eof)
+            || (line.kind != LineKind::Removed && at_new_eof)
+        {
+            out.push_str("\\ No newline at end of file\n");
+        }
+    }
+    out
+}
+
 /// Diff between two arbitrary git refs (`git diff <base>..<head>`),
 /// recomputed per-file so the renderer still gets full file text. Files
 /// are enumerated via `git diff --name-status`.
@@ -395,24 +624,9 @@ pub fn git_ref_range(repo: &Path, base: &str, head: &str) -> Result<DiffSet, Dif
         &["diff", "--name-status", "-z", "--find-renames", &range],
         false,
     )?;
-    let text = String::from_utf8_lossy(&raw);
-    let mut fields = text.split('\0').filter(|s| !s.is_empty());
-
     let mut files = Vec::new();
-    while let Some(status) = fields.next() {
-        let code = status.as_bytes().first().copied().unwrap_or(b'M') as char;
-        let (change, orig, path) = match code {
-            'A' => (ChangeKind::Added, None, fields.next()),
-            'D' => (ChangeKind::Removed, None, fields.next()),
-            'R' | 'C' => {
-                let from = fields.next().map(|s| s.to_string());
-                let to = fields.next();
-                (ChangeKind::Renamed, from, to)
-            }
-            _ => (ChangeKind::Modified, None, fields.next()),
-        };
-        let Some(path) = path else { continue };
-        let old_spec_path = orig.as_deref().unwrap_or(path);
+    for (change, orig, path) in parse_name_status(&String::from_utf8_lossy(&raw)) {
+        let old_spec_path = orig.clone().unwrap_or_else(|| path.clone());
         let old = if change == ChangeKind::Added {
             String::new()
         } else {
@@ -502,5 +716,106 @@ mod tests {
         let fd = file_diff_from_texts("x.bin", None, ChangeKind::Modified, "a\0b", "c\0d", 3);
         assert!(fd.binary);
         assert!(fd.hunks.is_empty());
+    }
+
+    #[test]
+    fn hunk_patch_shape() {
+        let old = "a\nb\nc\nd\ne\n";
+        let new = "a\nB\nc\nd\ne\n";
+        let fd = file_diff_from_texts("f.txt", None, ChangeKind::Modified, old, new, 1);
+        assert_eq!(fd.hunks.len(), 1);
+        let p = hunk_patch(&fd, &fd.hunks[0]);
+        assert!(p.starts_with("--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n"));
+        assert!(p.contains("\n-b\n"));
+        assert!(p.contains("\n+B\n"));
+        assert!(!p.contains("No newline"));
+    }
+
+    #[test]
+    fn hunk_patch_no_trailing_newline() {
+        let old = "a\nb";
+        let new = "a\nB";
+        let fd = file_diff_from_texts("f.txt", None, ChangeKind::Modified, old, new, 3);
+        let p = hunk_patch(&fd, &fd.hunks[0]);
+        // Both sides lack a trailing newline; both the '-' and '+' EOF
+        // lines need the marker.
+        assert_eq!(p.matches("\\ No newline at end of file\n").count(), 2);
+    }
+
+    #[test]
+    fn hunk_patch_new_file() {
+        let fd = file_diff_from_texts("n.txt", None, ChangeKind::Added, "", "x\ny\n", 3);
+        let p = hunk_patch(&fd, &fd.hunks[0]);
+        assert!(p.starts_with("--- /dev/null\n+++ b/n.txt\n@@ -0,0 +1,2 @@\n"));
+    }
+
+    /// End-to-end: a hunk_patch built from git_unstaged must apply
+    /// cleanly with `git apply --cached` and stage exactly that hunk.
+    #[test]
+    fn hunk_patch_applies_to_index() {
+        let dir = std::env::temp_dir().join(format!("diff-core-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let body: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
+        std::fs::write(dir.join("f.txt"), body.join("\n") + "\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        // Two well-separated edits -> two hunks; stage only the second.
+        let mut edited = body.clone();
+        edited[2] = "line 3 CHANGED".into();
+        edited[15] = "line 16 CHANGED".into();
+        std::fs::write(dir.join("f.txt"), edited.join("\n") + "\n").unwrap();
+
+        let set = git_unstaged(&dir).unwrap();
+        let fd = &set.files[0];
+        assert_eq!(fd.hunks.len(), 2, "expected two hunks");
+        let patch = hunk_patch(fd, &fd.hunks[1]);
+
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["apply", "--cached", "-"])
+            .stdin(std::process::Stdio::piped())
+            .output_with_stdin(patch.as_bytes());
+        let out = child.take().unwrap();
+        assert!(
+            out.status.success(),
+            "git apply failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let staged = run(&["diff", "--cached"]);
+        assert!(staged.contains("line 16 CHANGED"));
+        assert!(!staged.contains("line 3 CHANGED"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Small helper so the test above can pipe stdin and collect output.
+    trait StdinExt {
+        fn output_with_stdin(&mut self, input: &[u8]) -> Option<std::process::Output>;
+    }
+    impl StdinExt for Command {
+        fn output_with_stdin(&mut self, input: &[u8]) -> Option<std::process::Output> {
+            use std::io::Write;
+            self.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = self.spawn().ok()?;
+            child.stdin.as_mut()?.write_all(input).ok()?;
+            child.wait_with_output().ok()
+        }
     }
 }

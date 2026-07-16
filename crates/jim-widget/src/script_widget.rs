@@ -370,6 +370,13 @@ pub(crate) struct WorkerSlots {
     /// (the default canvas font is monospace) via the `measure_text` /
     /// `char_width` host fns, instead of guessing a per-char ratio.
     pub(crate) font_metrics: Arc<Mutex<(f32, f32)>>,
+    /// Script-requested scroll jump (`set_scroll(y)`). Applied by the
+    /// host together with the NEXT published frame — after `max_y` is
+    /// recomputed for the new content — so a "render then jump to line
+    /// N" sequence clamps against the fresh content height, not the old
+    /// one. `set_scroll` also marks the render dirty, so a request
+    /// always has a frame to ride on.
+    pub(crate) scroll_request: Arc<Mutex<Option<f32>>>,
 }
 
 impl WorkerSlots {
@@ -391,6 +398,7 @@ impl WorkerSlots {
             wants_hover: Arc::new(AtomicBool::new(false)),
             wants_pinch: Arc::new(AtomicBool::new(false)),
             font_metrics: Arc::new(Mutex::new((0.0, 0.0))),
+            scroll_request: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -2092,6 +2100,18 @@ fn apply_latest_frames(
                     scroll.y = new_max;
                 }
             }
+        }
+        // Apply a script-requested scroll jump (`set_scroll`) now that
+        // this frame's content extent — and therefore `max_y` — is fresh.
+        let jump = w
+            .handle
+            .slots
+            .scroll_request
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        if let Some(y) = jump {
+            scroll.y = y.clamp(0.0, scroll.max_y);
         }
         clip_dirty.0 = true;
     }

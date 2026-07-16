@@ -1,0 +1,293 @@
+// repo_hub.ft — "what am I working on": the git overview for a project.
+//
+// One card per repo/worktree touching this project: branch, ahead/behind,
+// dirty badges, last commit, open-PR badge, and buttons into the rest of
+// the suite (Stage / Diff / Branches / terminal).
+//
+// We fetch our own state — there is no host git watcher, so jim runs no
+// git at all unless a widget like this one is open and asks. Sources:
+// `jimctl git status` on open / [Refresh], and a re-fetch when a sibling
+// widget announces a mutation on `git.changed.<repo_id>`.
+//
+// params: { project, project_root }   (project_root host-injected)
+import "host"
+import { rget, pget, ago, dirty_badges, ahead_behind, spawn_widget, jimctl,
+         jimctl_parse, trunc, file_base, col_text, col_muted, col_accent,
+         col_panel, col_warn, dot_glyph, dot_color, changed_topic } from "git"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    repos: [], common: "", status: "", jobs: [], prs: {}, pending: [],
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn param(k, d) = pget(params, k, d)
+fn project() = param("project", "")
+fn project_root() = param("project_root", "")
+
+// ---- repo-state intake ----
+// Keep every state whose common_root matches ours (the main repo and all
+// its worktrees form one family). The first fetched state establishes the
+// family.
+fn upsert_repo(s, st) {
+    let root = rget(st, "root", "")
+    if root == "" { return s }
+    let fam = rget(st, "common_root", root)
+    let mut common = s.common
+    if common == "" { common = fam }
+    if fam != common { return s }
+    let mut out = []
+    let mut found = false
+    for r in s.repos {
+        if rget(r, "root", "") == root { out = push(out, st); found = true }
+        else { out = push(out, r) }
+    }
+    if not found { out = push(out, st) }
+    { ..s, repos: out, common: common, status: "" }
+}
+
+fn on_message(topic, payload, sender) {
+    // The only liveness signal now: stage.ft / branches.ft announce their
+    // own mutations. No mutation, no git.
+    if starts_with(topic, "git.changed.") {
+        refresh()
+    } else if topic == "pr.index" {
+        if typeof(payload) != "Record" { return }
+        reset!(state, { ..cur_state(), prs: payload })
+        request_render()
+    }
+}
+
+// ---- fetching the family ----
+// Each status reply carries the whole worktree family, so we ask once per
+// root we haven't asked for yet and the family closes over itself.
+//
+// `pending` records what we ASKED for and is only cleared by refresh():
+// git reports worktree paths uncanonicalized, so a reply's `root` can
+// differ from the path we requested (/tmp vs /private/tmp). Gating on
+// `repos` instead would never match those and would refetch forever.
+fn asked(s, p) {
+    let mut hit = false
+    for q in s.pending { if q == p { hit = true } }
+    hit
+}
+
+fn fetch_status(s, p) = {
+    ..s, pending: push(s.pending, p),
+    jobs: push(s.jobs, { h: jimctl(["git", "status", "--repo", p]), kind: "status", buf: [] }),
+}
+
+fn fan_out(st) {
+    for wt in rget(st, "worktrees", []) {
+        let p = rget(wt, "path", "")
+        let s = cur_state()
+        if p != "" and not asked(s, p) { reset!(state, fetch_status(s, p)) }
+    }
+}
+
+fn refresh() {
+    let root = project_root()
+    if root == "" {
+        reset!(state, { ..cur_state(), status: "no project_root param" })
+        request_render()
+        return
+    }
+    let s = { ..cur_state(), repos: [], common: "", pending: [], status: "loading…" }
+    reset!(state, fetch_status(s, root))
+    request_render()
+}
+
+fn on_start() { refresh() }
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { jobs = push(jobs, { ..j, buf: push(j.buf, line) }) }
+        else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+}
+
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    let mut job = ()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { job = j } else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+    if typeof(job) != "Record" { return }
+    let r = jimctl_parse(join(job.buf, "\n"))
+    if job.kind == "status" {
+        if rget(r, "ok", false) {
+            let st = rget(r, "state", {})
+            reset!(state, upsert_repo(cur_state(), st))
+            fan_out(st)
+        } else {
+            reset!(state, { ..cur_state(), status: rget(r, "error", "status failed") })
+        }
+        request_render()
+    }
+}
+
+// ---- clicks ----
+fn repo_at(s, i) = if i >= 0 and i < len(s.repos) { s.repos[i] } else { () }
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "refresh" { refresh(); return }
+    let parts = split(id, ":")
+    if len(parts) != 2 { return }
+    let act = parts[0]
+    let r = repo_at(s, to_int(unwrap_or(parse_float(parts[1]), -1.0)))
+    if typeof(r) != "Record" { return }
+    let root = rget(r, "root", "")
+    if act == "stage" {
+        spawn_widget("stage.ft", project(), "Stage · " + file_base(root), { repo: root, project: project() })
+    } else if act == "diff" {
+        spawn_widget("diff.ft", project(), "Diff · " + file_base(root), { source: "working", repo: root })
+    } else if act == "branches" {
+        spawn_widget("branches.ft", project(), "Branches · " + file_base(root), { repo: root, project: project() })
+    } else if act == "aiwork" {
+        spawn_widget("ai_work.ft", project(), "AI Work", { project: project(), project_root: root })
+    } else if act == "term" {
+        emit("jim.action", { action: "spawn_pane", kind: "terminal", project: project(),
+                             config: { cwd: root } })
+    } else if act == "reviews" {
+        spawn_widget("review_inbox.ft", project(), "Reviews", { repo: root, project: project() })
+    }
+}
+
+// ---- render ----
+fn pr_badge(s, r) {
+    let branch = rget(r, "branch", "")
+    if branch == "" { return () }
+    let by_branch = rget(s.prs, "by_branch", {})
+    let pr = rget(by_branch, branch, ())
+    if typeof(pr) != "Record" { return () }
+    let ci = rget(pr, "ci", "none")
+    { kind: "hstack", gap: 4.0, align: "center", children: [
+        { kind: "text", value: dot_glyph(ci), color: dot_color(ci), size: 12.0,
+          selectable: false, wrap: false },
+        { kind: "badge", value: "PR #" + str(rget(pr, "number", 0)), color: "#243a5e" },
+    ] }
+}
+
+fn flags_badge(r) {
+    let mut out = []
+    if rget(r, "merge_in_progress", false) { out = push(out, { kind: "badge", value: "MERGING", color: "#4a1f24" }) }
+    if rget(r, "rebase_in_progress", false) { out = push(out, { kind: "badge", value: "REBASING", color: "#4a1f24" }) }
+    out
+}
+
+fn commit_line(r, now) {
+    let c = rget(r, "last_commit", ())
+    if typeof(c) != "Record" { return () }
+    let v = trunc(rget(c, "subject", ""), 72) + "  · " + rget(c, "author", "") + " · " + ago(rget(c, "ts_ms", 0), now)
+    { kind: "text", value: v, size: 11.0, color: col_muted(), selectable: false }
+}
+
+fn agent_line(r) {
+    let mut names = []
+    for wt in rget(r, "worktrees", []) {
+        let a = rget(wt, "agent_id", ())
+        if typeof(a) == "Str" and a != "" and rget(wt, "path", "") == rget(r, "root", "") {
+            names = push(names, a)
+        }
+    }
+    if len(names) == 0 { () }
+    else {
+        { kind: "text", value: "⚡ agent: " + join(names, ", "), size: 11.0,
+          color: col_warn(), selectable: false }
+    }
+}
+
+fn repo_card(s, i, r, now) {
+    let root = rget(r, "root", "")
+    let branch = rget(r, "branch", "")
+    let branch_label = if branch == "" { "(detached @ " + slice(rget(r, "head_sha", ""), 0, 8) + ")" } else { branch }
+    let ab = ahead_behind(r)
+    let mut head_kids = [
+        { kind: "text", value: file_base(root), weight: "bold", size: 13.0,
+          color: col_text(), selectable: false },
+        { kind: "text", value: branch_label, family: "mono", size: 12.0,
+          color: col_accent(), selectable: false },
+    ]
+    if ab != "" {
+        head_kids = push(head_kids, { kind: "text", value: ab, family: "mono", size: 11.0,
+                                      color: col_muted(), selectable: false })
+    }
+    for b in dirty_badges(r) { head_kids = push(head_kids, b) }
+    for b in flags_badge(r) { head_kids = push(head_kids, b) }
+    let pb = pr_badge(s, r)
+    if typeof(pb) == "Record" { head_kids = push(head_kids, pb) }
+
+    // Sidebar-friendly: two buttons per row so the card works at ~300px
+    // (the hub docks as a real app's left sidebar).
+    let dirty = rget(r, "staged", 0) + rget(r, "unstaged", 0) + rget(r, "untracked", 0)
+    let stage_label = if dirty > 0 { "Stage (" + str(dirty) + ")" } else { "Stage" }
+    let buttons = { kind: "vstack", gap: 4.0, children: [
+        { kind: "hstack", gap: 6.0, children: [
+            { kind: "button", id: "stage:" + str(i), label: stage_label },
+            { kind: "button", id: "diff:" + str(i), label: "Diff" },
+        ] },
+        { kind: "hstack", gap: 6.0, children: [
+            { kind: "button", id: "branches:" + str(i), label: "Branches" },
+            { kind: "button", id: "aiwork:" + str(i), label: "AI Work" },
+        ] },
+        { kind: "hstack", gap: 6.0, children: [
+            { kind: "button", id: "reviews:" + str(i), label: "Reviews" },
+            { kind: "button", id: "term:" + str(i), label: "Terminal" },
+        ] },
+    ] }
+
+    let mut kids = [
+        { kind: "hstack", gap: 8.0, align: "center", children: head_kids },
+        { kind: "text", value: root, family: "mono", size: 10.0, color: col_muted(),
+          selectable: false },
+    ]
+    let cl = commit_line(r, now)
+    if typeof(cl) == "Record" { kids = push(kids, cl) }
+    let al = agent_line(r)
+    if typeof(al) == "Record" { kids = push(kids, al) }
+    kids = push(kids, buttons)
+
+    { kind: "frame", gap: 6.0,
+      style: { background: col_panel(), radius: "8",
+               padding: { top: 10.0, bottom: 10.0, left: 12.0, right: 12.0 } },
+      children: kids }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let now = time()
+    let mut kids = [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "text", value: "◱ repo hub", size: 13.0, weight: "bold",
+              color: col_text(), selectable: false },
+            { kind: "text", value: project(), size: 11.0, color: col_muted(),
+              selectable: false },
+            { kind: "button", id: "refresh", label: "↻" },
+            { kind: "text", value: s.status, size: 11.0, color: col_muted(),
+              selectable: false },
+        ] },
+        { kind: "divider" },
+    ]
+    if len(s.repos) == 0 {
+        kids = push(kids, { kind: "text", value: "No git repo detected for this project yet.",
+                            color: col_muted() })
+    } else {
+        let mut i = 0
+        for r in s.repos {
+            kids = push(kids, repo_card(s, i, r, now))
+            i = i + 1
+        }
+    }
+    { kind: "vstack", gap: 10.0, pad: 14.0, children: kids }
+}

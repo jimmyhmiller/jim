@@ -191,6 +191,9 @@ extern let params
 extern fn request_render()
 extern fn set_animating(on)
 extern fn set_tick_interval(secs)
+// Jump the pane's scroll to y px (applied with the next published frame,
+// clamped to the new content height). For "open at line N" flows.
+extern fn set_scroll(y)
 
 // --- subprocess bridge (UCI engines, language servers, …) ---
 extern fn proc_spawn(cmd)
@@ -1085,6 +1088,18 @@ fn register_host_surface(
     let dirty = slots.render_dirty.clone();
     vm.register0("request_render", move || {
         dirty.store(true, Ordering::Release);
+    });
+    // Scroll jump: applied by the host together with the next published
+    // frame (so it clamps against the new content's max). Marks the
+    // render dirty itself, so a bare `set_scroll` still takes effect.
+    let scroll_req = slots.scroll_request.clone();
+    let scroll_dirty = slots.render_dirty.clone();
+    vm.register1("set_scroll", move |y: f64| {
+        if let Ok(mut g) = scroll_req.lock() {
+            *g = Some(y.max(0.0) as f32);
+        }
+        scroll_dirty.store(true, Ordering::Release);
+        crate::request_main_loop_wakeup();
     });
 
     // ---- logging / misc scalars ----

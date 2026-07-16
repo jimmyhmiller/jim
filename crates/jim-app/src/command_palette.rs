@@ -246,6 +246,28 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     Some(score)
 }
 
+/// Replace the palette query and re-match, as if it had been typed.
+///
+/// Exists for dictation ([`crate::dictation`]), which writes a transcript
+/// into whatever owns the keyboard — and while the palette is open, that's
+/// the palette. It *sets* rather than appends because a live transcript is
+/// revised while you speak: each pass rewrites the whole dictated span.
+/// Only meaningful in [`PaletteMode::Actions`]; the other modes have no
+/// query to edit.
+pub fn set_query(
+    palette: &mut CommandPalette,
+    registry: &ActionRegistry,
+    usage: &PaletteUsage,
+    keymap: &Keymap,
+    query: String,
+) {
+    if palette.mode != PaletteMode::Actions {
+        return;
+    }
+    palette.query = query;
+    refresh_results(palette, registry, usage, keymap);
+}
+
 /// Filter + rank the registry, then append the synthetic "Ask DeepSeek"
 /// row when the query is non-empty. Ranking blends the fuzzy score with a
 /// capped usage bonus so frequently-picked actions float up (and break

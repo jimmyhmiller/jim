@@ -583,6 +583,10 @@ pub struct OpenFileRequest {
     /// Optional window-space top-left for the new pane. `None` means
     /// cascade from the default canvas position.
     pub origin: Option<Vec2>,
+    /// Optional 1-based line to place the cursor on (and scroll to).
+    pub line: Option<u32>,
+    /// Optional 0-based column within `line`.
+    pub column: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1773,10 +1777,16 @@ fn apply_pending_actions(world: &mut World) {
             size: Vec2::new(720.0, 480.0),
             z: next_z,
         };
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "text": text,
             "path": req.path.to_string_lossy(),
         });
+        if let Some(line) = req.line {
+            config["line"] = serde_json::json!(line);
+        }
+        if let Some(column) = req.column {
+            config["column"] = serde_json::json!(column);
+        }
         if let Some(entity) =
             spawn_pane_from_registry(world, "editor", "Editor", rect, Some(project_id), &config)
         {

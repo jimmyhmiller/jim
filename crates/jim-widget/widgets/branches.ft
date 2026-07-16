@@ -1,0 +1,396 @@
+// branches.ft — branches + worktrees browser with safe git actions.
+//
+// Tabs: Branches (checkout / diff-vs / new branch) and Worktrees
+// (open terminal / diff / new worktree / remove). Every mutation goes
+// through `jimctl git ...` (one-line JSON replies — proc stderr is
+// discarded, so raw git failures would be silent). Risky actions are
+// dialog-guarded: checkout with a dirty tree, worktree removal.
+//
+// Live: refreshes on `git.changed.<repo_id>` announced by a sibling git
+// widget, and emits the same after its own mutations. Nothing watches git
+// in the background — an idle widget runs no git.
+//
+// params: { repo, project }
+import "host"
+import { rget, pget, ago, spawn_widget, jimctl, jimctl_parse, trunc,
+         file_base, dirty_badges, col_text, col_muted, col_accent,
+         col_panel, col_err, col_warn, changed_topic, parse_int } from "git"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    tab: "branches", branches: [], worktrees: [], st: {}, repo_id: "",
+    status: "", jobs: [], confirm: (), new_name: "", wt_path: "", wt_branch: "",
+    default_branch: "main",
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn param(k, d) = pget(params, k, d)
+fn repo() = param("repo", param("project_root", "."))
+fn project() = param("project", "")
+
+// ---- jimctl job plumbing ----
+fn add_job(s, h, kind) = { ..s, jobs: push(s.jobs, { h: h, kind: kind, buf: [] }) }
+
+fn refresh() {
+    let mut s = cur_state()
+    s = add_job(s, jimctl(["git", "branches", "--repo", repo()]), "branches")
+    s = add_job(s, jimctl(["git", "worktrees", "--repo", repo()]), "worktrees")
+    s = add_job(s, jimctl(["git", "status", "--repo", repo()]), "status")
+    reset!(state, { ..s, status: "loading…" })
+    request_render()
+}
+
+fn on_start() { refresh() }
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { jobs = push(jobs, { ..j, buf: push(j.buf, line) }) }
+        else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+}
+
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    let mut job = ()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { job = j } else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+    if typeof(job) != "Record" { return }
+    let r = jimctl_parse(join(job.buf, "\n"))
+    handle_reply(job.kind, r)
+}
+
+fn guess_default_branch(branches) {
+    let mut out = "main"
+    for b in branches {
+        let n = rget(b, "name", "")
+        if n == "main" { out = "main" }
+        else if n == "master" and out != "main" { out = "master" }
+    }
+    out
+}
+
+fn handle_reply(kind, r) {
+    let s = cur_state()
+    if not rget(r, "ok", false) {
+        reset!(state, { ..s, status: kind + ": " + rget(r, "error", "failed") })
+        request_render()
+        return
+    }
+    if kind == "branches" {
+        let bs = rget(r, "branches", [])
+        reset!(state, { ..s, branches: bs, status: "", default_branch: guess_default_branch(bs) })
+    } else if kind == "worktrees" {
+        reset!(state, { ..s, worktrees: rget(r, "worktrees", []), status: "" })
+    } else if kind == "status" {
+        let st = rget(r, "state", {})
+        reset!(state, { ..s, st: st, repo_id: rget(st, "repo_id", s.repo_id), status: "" })
+    } else {
+        // A mutation finished: nudge siblings and refresh everything.
+        if s.repo_id != "" { emit(changed_topic(s.repo_id), {}) }
+        refresh()
+        return
+    }
+    request_render()
+}
+
+fn on_message(topic, payload, sender) {
+    let s = cur_state()
+    if s.repo_id != "" and topic == changed_topic(s.repo_id) and sender != my_id() {
+        refresh()
+    }
+}
+
+// ---- mutations ----
+fn dirty_count(s) = rget(s.st, "staged", 0) + rget(s.st, "unstaged", 0)
+
+fn do_checkout(name) {
+    let s = cur_state()
+    reset!(state, add_job({ ..s, confirm: (), status: "checkout " + name + "…" },
+                          jimctl(["git", "checkout", "--repo", repo(), "--ref", name]),
+                          "mut"))
+    request_render()
+}
+
+fn do_new_branch(name) {
+    if trim(name) == "" { return }
+    let s = cur_state()
+    reset!(state, add_job({ ..s, new_name: "", status: "branch " + name + "…" },
+                          jimctl(["git", "checkout", "--repo", repo(), "--ref", trim(name), "--create"]),
+                          "mut"))
+    request_render()
+}
+
+fn do_worktree_add(path, branch) {
+    if trim(path) == "" or trim(branch) == "" { return }
+    let s = cur_state()
+    reset!(state, add_job({ ..s, confirm: (), wt_path: "", wt_branch: "",
+                            status: "worktree add…" },
+                          jimctl(["git", "worktree-add", "--repo", repo(),
+                                  "--path", trim(path), "--branch", trim(branch),
+                                  "--new-branch"]),
+                          "mut"))
+    request_render()
+}
+
+fn do_worktree_rm(path) {
+    let s = cur_state()
+    reset!(state, add_job({ ..s, confirm: (), status: "removing worktree…" },
+                          jimctl(["git", "worktree-rm", "--repo", repo(), "--path", path]),
+                          "mut"))
+    request_render()
+}
+
+// ---- handlers ----
+fn on_tab_select(id, tab) {
+    if id == "tab" { reset!(state, { ..cur_state(), tab: tab }); request_render() }
+}
+
+fn on_input_change(id, value) {
+    let s = cur_state()
+    if id == "new_name" { reset!(state, { ..s, new_name: value }) }
+    else if id == "wt_path" { reset!(state, { ..s, wt_path: value }) }
+    else if id == "wt_branch" { reset!(state, { ..s, wt_branch: value }) }
+}
+fn on_input_submit(id, value) {
+    if id == "new_name" { do_new_branch(value) }
+}
+
+fn on_dialog_close(id) {
+    reset!(state, { ..cur_state(), confirm: () })
+    request_render()
+}
+
+fn branch_at(s, i) = if i >= 0 and i < len(s.branches) { s.branches[i] } else { () }
+fn wt_at(s, i) = if i >= 0 and i < len(s.worktrees) { s.worktrees[i] } else { () }
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "refresh" { refresh(); return }
+    if id == "new_branch" { do_new_branch(s.new_name); return }
+    if id == "confirm_no" { reset!(state, { ..s, confirm: () }); request_render(); return }
+    if id == "confirm_yes" {
+        let c = s.confirm
+        if typeof(c) != "Record" { return }
+        if c.act == "checkout" { do_checkout(c.arg) }
+        else if c.act == "wt_rm" { do_worktree_rm(c.arg) }
+        return
+    }
+    if id == "wt_new" {
+        // Suggest a sibling path next to the repo root.
+        let base = repo() + "-wt"
+        reset!(state, { ..s, confirm: { act: "wt_add", arg: "" },
+                        wt_path: if s.wt_path == "" { base } else { s.wt_path } })
+        request_render()
+        return
+    }
+    if id == "wt_add_go" { do_worktree_add(s.wt_path, s.wt_branch); return }
+    let parts = split(id, ":")
+    if len(parts) != 2 { return }
+    let act = parts[0]
+    let i = parse_int(parts[1])
+    if act == "co" {
+        let b = branch_at(s, i)
+        if typeof(b) != "Record" { return }
+        let name = rget(b, "name", "")
+        if dirty_count(s) > 0 {
+            reset!(state, { ..s, confirm: { act: "checkout", arg: name } })
+            request_render()
+        } else { do_checkout(name) }
+    } else if act == "bdiff" {
+        let b = branch_at(s, i)
+        if typeof(b) != "Record" { return }
+        spawn_widget("diff.ft", project(), "Diff · " + rget(b, "name", ""),
+                     { source: "range", repo: repo(),
+                       arg: s.default_branch + " " + rget(b, "name", "") })
+    } else if act == "wterm" {
+        let wt = wt_at(s, i)
+        if typeof(wt) != "Record" { return }
+        emit("jim.action", { action: "spawn_pane", kind: "terminal", project: project(),
+                             config: { cwd: rget(wt, "path", "") } })
+    } else if act == "wdiff" {
+        let wt = wt_at(s, i)
+        if typeof(wt) != "Record" { return }
+        spawn_widget("diff.ft", project(), "Diff · " + file_base(rget(wt, "path", "")),
+                     { source: "working", repo: rget(wt, "path", "") })
+    } else if act == "wvs" {
+        let wt = wt_at(s, i)
+        if typeof(wt) != "Record" { return }
+        spawn_widget("diff.ft", project(), "Diff · " + file_base(rget(wt, "path", "")),
+                     { source: "range", repo: rget(wt, "path", ""),
+                       arg: s.default_branch + " HEAD" })
+    } else if act == "wrm" {
+        let wt = wt_at(s, i)
+        if typeof(wt) != "Record" { return }
+        reset!(state, { ..s, confirm: { act: "wt_rm", arg: rget(wt, "path", "") } })
+        request_render()
+    }
+}
+
+// ---- render ----
+fn row_style() = { padding: { top: 6.0, bottom: 6.0, left: 8.0, right: 8.0 },
+                   radius: "6", background: col_panel() }
+
+fn branch_row(s, i, b, now) {
+    let name = rget(b, "name", "")
+    let current = rget(b, "current", false)
+    let mut left = [
+        { kind: "text", value: if current { "● " + name } else { name },
+          family: "mono", size: 12.5, weight: if current { "bold" } else { "normal" },
+          color: if current { col_accent() } else { col_text() }, selectable: false },
+    ]
+    let a = rget(b, "ahead", 0)
+    let bh = rget(b, "behind", 0)
+    if a > 0 or bh > 0 {
+        let mut bits = []
+        if a > 0 { bits = push(bits, "↑" + str(a)) }
+        if bh > 0 { bits = push(bits, "↓" + str(bh)) }
+        left = push(left, { kind: "text", value: join(bits, " "), family: "mono",
+                            size: 11.0, color: col_muted(), selectable: false })
+    }
+    if rget(b, "upstream_gone", false) {
+        left = push(left, { kind: "badge", value: "gone", color: "#4a1f24" })
+    }
+    left = push(left, { kind: "text",
+        value: trunc(rget(b, "last_subject", ""), 44) + " · " + ago(rget(b, "last_ts_ms", 0), now),
+        size: 10.5, color: col_muted(), selectable: false })
+
+    let mut right = []
+    if not current {
+        right = push(right, { kind: "button", id: "co:" + str(i), label: "Checkout" })
+    }
+    right = push(right, { kind: "button", id: "bdiff:" + str(i), label: "Diff vs " + s.default_branch })
+
+    { kind: "frame", style: row_style(), children: [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "vstack", gap: 2.0, style: { flex_grow: 1.0 },
+              children: [ { kind: "hstack", gap: 8.0, align: "center", children: left } ] },
+            { kind: "hstack", gap: 6.0, children: right },
+        ] } ] }
+}
+
+fn wt_branch_label(wt) {
+    let b = rget(wt, "branch", ())
+    if typeof(b) == "Str" and b != "" { b } else { "(detached)" }
+}
+
+fn wt_row(s, i, wt) {
+    let path = rget(wt, "path", "")
+    let is_main = rget(wt, "is_main", false)
+    let agent = rget(wt, "agent_id", ())
+    let mut left = [
+        { kind: "text", value: file_base(path), family: "mono", size: 12.5,
+          weight: if is_main { "bold" } else { "normal" }, color: col_text(),
+          selectable: false },
+        { kind: "text", value: wt_branch_label(wt),
+          family: "mono", size: 11.5, color: col_accent(), selectable: false },
+    ]
+    if is_main { left = push(left, { kind: "badge", value: "main", color: "#243a5e" }) }
+    if rget(wt, "locked", false) { left = push(left, { kind: "badge", value: "locked", color: "#4a3a1f" }) }
+    if typeof(agent) == "Str" and agent != "" {
+        left = push(left, { kind: "badge", value: "⚡ " + agent, color: "#4a3a1f" })
+    }
+
+    let mut right = [
+        { kind: "button", id: "wterm:" + str(i), label: "Terminal" },
+        { kind: "button", id: "wdiff:" + str(i), label: "Diff" },
+        { kind: "button", id: "wvs:" + str(i), label: "vs " + s.default_branch },
+    ]
+    if not is_main {
+        right = push(right, { kind: "button", id: "wrm:" + str(i), label: "Remove" })
+    }
+
+    { kind: "frame", style: row_style(), children: [
+        { kind: "vstack", gap: 3.0, children: [
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "vstack", gap: 2.0, style: { flex_grow: 1.0 },
+                  children: [ { kind: "hstack", gap: 8.0, align: "center", children: left } ] },
+                { kind: "hstack", gap: 6.0, children: right },
+            ] },
+            { kind: "text", value: path, family: "mono", size: 10.0,
+              color: col_muted(), selectable: false },
+        ] } ] }
+}
+
+fn confirm_dialog(s) {
+    let c = s.confirm
+    if typeof(c) != "Record" { return () }
+    if c.act == "wt_add" {
+        return { kind: "dialog", id: "dlg", open: true, title: "New worktree", width: 460.0,
+          body: { kind: "vstack", gap: 8.0, children: [
+            { kind: "input", id: "wt_path", value: s.wt_path, placeholder: "worktree path" },
+            { kind: "input", id: "wt_branch", value: s.wt_branch, placeholder: "new branch name" },
+            { kind: "hstack", gap: 8.0, children: [
+                { kind: "button", id: "wt_add_go", label: "Create" },
+                { kind: "button", id: "confirm_no", label: "Cancel" },
+            ] },
+          ] } }
+    }
+    let msg = if c.act == "checkout" {
+        str(dirty_count(s)) + " uncommitted change(s) — checkout " + c.arg + " anyway?"
+    } else {
+        "Remove worktree " + c.arg + "? (uncommitted work there is kept only if git allows)"
+    }
+    { kind: "dialog", id: "dlg", open: true, title: "Are you sure?", width: 420.0,
+      body: { kind: "vstack", gap: 10.0, children: [
+        { kind: "text", value: msg, size: 12.5, color: col_text() },
+        { kind: "hstack", gap: 8.0, children: [
+            { kind: "button", id: "confirm_yes", label: "Yes" },
+            { kind: "button", id: "confirm_no", label: "Cancel" },
+        ] },
+      ] } }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let now = time()
+    let head = { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: "⑂ " + file_base(repo()), size: 13.0, weight: "bold",
+          color: col_text(), selectable: false },
+        { kind: "tabs", id: "tab", selected: s.tab, items: [
+            { id: "branches", label: "Branches (" + str(len(s.branches)) + ")" },
+            { id: "worktrees", label: "Worktrees (" + str(len(s.worktrees)) + ")" },
+        ] },
+        { kind: "button", id: "refresh", label: "↻" },
+        { kind: "text", value: s.status, size: 11.0, color: col_warn(), selectable: false },
+    ] }
+
+    let mut kids = [ head, { kind: "divider" } ]
+
+    if s.tab == "branches" {
+        kids = push(kids, { kind: "hstack", gap: 6.0, align: "center", children: [
+            { kind: "input", id: "new_name", value: s.new_name,
+              placeholder: "new branch name (from HEAD)", style: { flex_grow: 1.0 } },
+            { kind: "button", id: "new_branch", label: "+ Branch" },
+        ] })
+        let mut i = 0
+        for b in s.branches {
+            kids = push(kids, branch_row(s, i, b, now))
+            i = i + 1
+        }
+    } else {
+        kids = push(kids, { kind: "hstack", gap: 6.0, children: [
+            { kind: "button", id: "wt_new", label: "+ Worktree" },
+        ] })
+        let mut i = 0
+        for wt in s.worktrees {
+            kids = push(kids, wt_row(s, i, wt))
+            i = i + 1
+        }
+    }
+
+    let dlg = confirm_dialog(s)
+    if typeof(dlg) == "Record" { kids = push(kids, dlg) }
+
+    { kind: "vstack", gap: 8.0, pad: 14.0, children: kids }
+}

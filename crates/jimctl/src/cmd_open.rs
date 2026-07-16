@@ -5,12 +5,13 @@
 //! (we don't auto-launch it).
 //!
 //! Usage:
-//!     jimctl open <file> [--project <name>]
+//!     jimctl open <file> [--project <name>] [--line N] [--col C]
 //!
 //! Default project is whichever project is currently active in the
 //! running app. `--project NAME` does a case-insensitive match against
 //! the project list; if no project matches the request is silently
-//! dropped (the app logs to stderr).
+//! dropped (the app logs to stderr). `--line`/`--col` place the cursor
+//! (1-based line, 0-based column) and scroll it into view.
 //!
 //! The wire format is duplicated here on purpose: the parent
 //! `jim_app` lib depends on libghostty-vt (a dylib), and a bin
@@ -32,6 +33,10 @@ enum IpcRequest {
         path: PathBuf,
         #[serde(skip_serializing_if = "Option::is_none")]
         project: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        column: Option<u32>,
     },
 }
 
@@ -78,6 +83,8 @@ pub fn run() -> ExitCode {
     let req = IpcRequest::OpenFile {
         path: abs,
         project: args.project,
+        line: args.line,
+        column: args.column,
     };
     let body = match serde_json::to_vec(&req) {
         Ok(b) => b,
@@ -98,12 +105,16 @@ pub fn run() -> ExitCode {
 struct Args {
     path: PathBuf,
     project: Option<String>,
+    line: Option<u32>,
+    column: Option<u32>,
 }
 
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut path: Option<PathBuf> = None;
         let mut project: Option<String> = None;
+        let mut line: Option<u32> = None;
+        let mut column: Option<u32> = None;
         let mut it = crate::sub_args();
         while let Some(arg) = it.next() {
             match arg.as_str() {
@@ -116,6 +127,18 @@ impl Args {
                         it.next()
                             .ok_or_else(|| format!("{} requires a value", arg))?,
                     );
+                }
+                "--line" | "-l" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("{} requires a value", arg))?;
+                    line = Some(v.parse().map_err(|_| format!("bad line number: {}", v))?);
+                }
+                "--col" | "-c" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("{} requires a value", arg))?;
+                    column = Some(v.parse().map_err(|_| format!("bad column: {}", v))?);
                 }
                 other if other.starts_with("--") => {
                     return Err(format!("unknown flag: {}", other));
@@ -131,15 +154,19 @@ impl Args {
         Ok(Self {
             path: path.ok_or("missing <file> argument")?,
             project,
+            line,
+            column,
         })
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "jimctl open <file> [--project NAME]\n\
+        "jimctl open <file> [--project NAME] [--line N] [--col C]\n\
          \n\
          Send <file> to the running terminal-bevy app, which opens it in a\n\
-         new editor pane. Default project is whichever is currently active."
+         new editor pane. Default project is whichever is currently active.\n\
+         --line/--col (1-based line, 0-based column) place the cursor and\n\
+         scroll it into view."
     );
 }

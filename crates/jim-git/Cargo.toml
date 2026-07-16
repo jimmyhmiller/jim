@@ -1,0 +1,17 @@
+[package]
+name = "jim_git"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Repo-state snapshots for the git widget suite. Pure logic; no Bevy, no
+# dylibs, no background anything — `compute_repo_state` runs only when a
+# caller (today: `jimctl git`, on behalf of an open widget) asks for it.
+
+[lib]
+name = "jim_git"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -443,6 +443,27 @@ fn editor_spawn_from_config(world: &mut World, entity: Entity, content_root: Ent
             .entity_mut(entity)
             .insert(EditorFilePath(PathBuf::from(path)));
     }
+    // Optional initial cursor position (`jimctl open --line/--col`):
+    // 1-based line, 0-based column, both clamped to the document.
+    if let Some(line) = config.get("line").and_then(|v| v.as_u64()) {
+        let column = config.get("column").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        if let Some(mut state) = world.get_mut::<EditorStateComp>(entity) {
+            let rope = &state.0.doc;
+            let line_idx = (line as usize)
+                .saturating_sub(1)
+                .min(rope.len_lines().saturating_sub(1));
+            let line_start = rope.line_to_char(line_idx);
+            let line_len = rope.line(line_idx).len_chars();
+            let offset = line_start + column.min(line_len);
+            state.0.selection = Selection::cursor(offset.min(rope.len_chars()));
+        }
+        if let Some(mut scroll) = world.get_mut::<EditorScroll>(entity) {
+            // Seed the target a few rows below the top. Approximate under
+            // soft wrap (layout isn't built yet); close enough to land the
+            // comment/line on screen.
+            scroll.y = ((line as f32) - 9.0).max(0.0) * LINE_HEIGHT;
+        }
+    }
 }
 
 fn editor_snapshot(world: &World, entity: Entity) -> Value {

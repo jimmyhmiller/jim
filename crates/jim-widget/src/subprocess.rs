@@ -102,7 +102,7 @@ fn build_path(
 /// Finder/AppKit-launched `.app` inherits) and the standard third-party tool
 /// dirs ([`extra_tool_dirs`]) appended as a fallback. `None` if the exe dir
 /// can't be determined (then the child just inherits the ambient PATH).
-pub(crate) fn augmented_path() -> Option<std::ffi::OsString> {
+pub fn augmented_path() -> Option<std::ffi::OsString> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
     let current = std::env::var_os("PATH").unwrap_or_default();

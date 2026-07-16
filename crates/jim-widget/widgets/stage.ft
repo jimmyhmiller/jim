@@ -1,0 +1,416 @@
+// stage.ft — interactive staging, `git add -p` as a pane.
+//
+// Two structured diffs per file — index→worktree (unstaged) and
+// HEAD→index (staged) — fetched via `jimctl git diff --mode ...`, shown
+// as hunk stacks with [Stage ↓] / [↑ Unstage] buttons per hunk, whole-
+// file buttons for the cases hunks can't express (untracked / renamed /
+// binary), and a commit bar. Hunks are addressed by their `header`
+// string from the diff JSON; `jimctl git stage-hunk` recomputes the
+// diff server-side and matches the header, so a concurrent edit returns
+// {"error":"stale"} and we just refresh — never a corrupted index.
+//
+// Renders only the selected file (diff.ft's sidebar model); no
+// virtualizer — a single file's hunk stack is small enough.
+//
+// params: { repo, project }
+import "host"
+import { rget, pget, jimctl, jimctl_parse, finish_file, gutter, sign_el,
+         code_cell, line_style, hunk_h, line_h, file_base, parse_int,
+         col_text, col_muted, col_accent, col_panel, col_warn, col_err,
+         add_color, del_color, changed_topic } from "git"
+
+let state = atom(init_state())
+
+fn init_state() = {
+    files: [], file_idx: 0, jobs: [], status: "", commit_msg: "",
+    repo_id: "", u_raw: (), s_raw: (), staged_total: 0,
+}
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn param(k, d) = pget(params, k, d)
+fn repo() = param("repo", param("project_root", "."))
+fn project() = param("project", "")
+
+// ---- data intake ----
+fn add_job(s, h, kind) = { ..s, jobs: push(s.jobs, { h: h, kind: kind, buf: [] }) }
+
+fn refresh() {
+    let mut s = cur_state()
+    s = add_job(s, jimctl(["git", "diff", "--repo", repo(), "--mode", "unstaged"]), "u")
+    s = add_job(s, jimctl(["git", "diff", "--repo", repo(), "--mode", "staged"]), "s")
+    s = add_job(s, jimctl(["git", "status", "--repo", repo()]), "status")
+    reset!(state, { ..s, status: "loading…" })
+    request_render()
+}
+
+fn on_start() { refresh() }
+
+fn on_proc_output(handle, line) {
+    let s = cur_state()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { jobs = push(jobs, { ..j, buf: push(j.buf, line) }) }
+        else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+}
+
+fn on_proc_exit(handle, code) {
+    let s = cur_state()
+    let mut job = ()
+    let mut jobs = []
+    for j in s.jobs {
+        if j.h == handle { job = j } else { jobs = push(jobs, j) }
+    }
+    reset!(state, { ..s, jobs: jobs })
+    if typeof(job) != "Record" { return }
+    let r = jimctl_parse(join(job.buf, "\n"))
+    handle_reply(job.kind, r)
+}
+
+// Convert one jimctl diff-JSON file into the shared render model:
+// flines [{tag, text, o, nn}] via each hunk, then finish_file for
+// syntax runs. Keeps the hunk boundaries: hunks: [{header, start, n}]
+// indexes into the finished lines.
+fn build_side(jf) {
+    let mut flines = []
+    let mut hunk_list = []
+    for hk in rget(jf, "hunks", []) {
+        let header = rget(hk, "header", "@@")
+        hunk_list = push(hunk_list, { header: header, start: len(flines) })
+        flines = push(flines, { tag: "hunk", text: header, o: 0, nn: 0 })
+        for l in rget(hk, "lines", []) {
+            let k = rget(l, "kind", "context")
+            let tag = if k == "added" { "add" } else if k == "removed" { "del" } else { "ctx" }
+            let o = rget(l, "old", ())
+            let nn = rget(l, "new", ())
+            flines = push(flines, {
+                tag: tag, text: rget(l, "text", ""),
+                o: if typeof(o) == "Int" { o } else { 0 },
+                nn: if typeof(nn) == "Int" { nn } else { 0 } })
+        }
+    }
+    let old_path = rget(jf, "old_path", ())
+    let f = finish_file(
+        if typeof(old_path) == "Str" { old_path } else { rget(jf, "path", "") },
+        rget(jf, "path", ""),
+        flines, rget(jf, "added", 0), rget(jf, "removed", 0))
+    { lines: f.lines, hunks: hunk_list, adds: rget(jf, "added", 0),
+      dels: rget(jf, "removed", 0), change: rget(jf, "change", "modified"),
+      binary: rget(jf, "binary", false) }
+}
+
+// Merge the two DiffSets by path into sidebar entries.
+fn merge_sides(u_set, s_set) {
+    let mut by_path = []
+    for jf in rget(u_set, "files", []) {
+        by_path = push(by_path, { path: rget(jf, "path", ""), u: build_side(jf), s: () })
+    }
+    for jf in rget(s_set, "files", []) {
+        let p = rget(jf, "path", "")
+        let side = build_side(jf)
+        let mut found = false
+        let mut out = []
+        for e in by_path {
+            if e.path == p { out = push(out, { ..e, s: side }); found = true }
+            else { out = push(out, e) }
+        }
+        by_path = out
+        if not found { by_path = push(by_path, { path: p, u: (), s: side }) }
+    }
+    by_path
+}
+
+fn rebuild(s) {
+    if typeof(s.u_raw) != "Record" or typeof(s.s_raw) != "Record" { return s }
+    let files = merge_sides(s.u_raw, s.s_raw)
+    let mut staged_total = 0
+    for e in files {
+        if typeof(e.s) == "Record" { staged_total = staged_total + 1 }
+    }
+    let idx = if s.file_idx >= len(files) { 0 } else { s.file_idx }
+    { ..s, files: files, staged_total: staged_total, file_idx: idx, status: "" }
+}
+
+fn handle_reply(kind, r) {
+    let s = cur_state()
+    if not rget(r, "ok", false) {
+        let e = rget(r, "error", "failed")
+        if e == "stale" {
+            reset!(state, { ..s, status: "index changed under us — refreshed" })
+            refresh()
+        } else {
+            reset!(state, { ..s, status: kind + ": " + e })
+            request_render()
+        }
+        return
+    }
+    if kind == "u" {
+        reset!(state, rebuild({ ..s, u_raw: rget(r, "diff", {}) }))
+        request_render()
+    } else if kind == "s" {
+        reset!(state, rebuild({ ..s, s_raw: rget(r, "diff", {}) }))
+        request_render()
+    } else if kind == "status" {
+        let st = rget(r, "state", {})
+        reset!(state, { ..s, repo_id: rget(st, "repo_id", s.repo_id) })
+    } else {
+        // mutation (stage/unstage/commit) succeeded
+        if s.repo_id != "" { emit(changed_topic(s.repo_id), {}) }
+        refresh()
+    }
+}
+
+fn on_message(topic, payload, sender) {
+    let s = cur_state()
+    if s.repo_id != "" and topic == changed_topic(s.repo_id) and sender != my_id() {
+        refresh()
+    }
+}
+
+// ---- actions ----
+fn file_at(s, i) = if i >= 0 and i < len(s.files) { s.files[i] } else { () }
+fn sel_file(s) = file_at(s, s.file_idx)
+
+fn run_mut(args, status_msg) {
+    let s = cur_state()
+    reset!(state, add_job({ ..s, status: status_msg }, jimctl(args), "mut"))
+    request_render()
+}
+
+fn hunk_of(side, j) {
+    if typeof(side) != "Record" { return () }
+    let hs = side.hunks
+    if j >= 0 and j < len(hs) { hs[j] } else { () }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "refresh" { refresh(); return }
+    if id == "commit" { do_commit(); return }
+    if starts_with(id, "file:") {
+        reset!(state, { ..s, file_idx: parse_int(slice(id, 5, len(id))) })
+        request_render(); return
+    }
+    let f = sel_file(s)
+    if typeof(f) != "Record" { return }
+    if id == "stgf" {
+        run_mut(["git", "stage-file", "--repo", repo(), "--file", f.path], "staging " + f.path + "…")
+        return
+    }
+    if id == "ustf" {
+        run_mut(["git", "unstage-file", "--repo", repo(), "--file", f.path], "unstaging " + f.path + "…")
+        return
+    }
+    let parts = split(id, ":")
+    if len(parts) != 2 { return }
+    let j = parse_int(parts[1])
+    if parts[0] == "stg" {
+        let hk = hunk_of(f.u, j)
+        if typeof(hk) != "Record" { return }
+        run_mut(["git", "stage-hunk", "--repo", repo(), "--file", f.path,
+                 "--hunk-header", hk.header], "staging hunk…")
+    } else if parts[0] == "ust" {
+        let hk = hunk_of(f.s, j)
+        if typeof(hk) != "Record" { return }
+        run_mut(["git", "unstage-hunk", "--repo", repo(), "--file", f.path,
+                 "--hunk-header", hk.header], "unstaging hunk…")
+    }
+}
+
+fn do_commit() {
+    let s = cur_state()
+    let msg = trim(s.commit_msg)
+    if msg == "" { reset!(state, { ..s, status: "commit message is empty" }); request_render(); return }
+    if s.staged_total == 0 { reset!(state, { ..s, status: "nothing staged" }); request_render(); return }
+    let h = proc_spawn("git", ["-C", repo(), "commit", "-m", msg])
+    reset!(state, add_job({ ..s, commit_msg: "", status: "committing…" }, h, "commit_raw"))
+    request_render()
+}
+
+fn on_input_change(id, value) {
+    if id == "msg" { reset!(state, { ..cur_state(), commit_msg: value }) }
+}
+fn on_input_submit(id, value) {
+    if id == "msg" { do_commit() }
+}
+
+// `git commit` isn't jimctl (no JSON reply) — treat exit as done.
+// (handled via on_proc_exit finding job kind "commit_raw" → the buf is
+// raw git output; success or failure, refresh shows the truth and the
+// output rides status.)
+
+// ---- render ----
+fn side_hunks(side, prefix, act_label) {
+    if typeof(side) != "Record" { return [] }
+    let mut out = []
+    let mut hi = 0
+    let n = len(side.lines)
+    let mut i = 0
+    while i < n {
+        let l = side.lines[i]
+        if l.tag == "hunk" {
+            out = push(out, { kind: "hstack", gap: 8.0, align: "center",
+              style: { background: col_panel(), radius: "4",
+                       padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
+              children: [
+                { kind: "text", value: l.text, family: "mono", size: 11.0,
+                  color: col_accent(), selectable: false, wrap: false,
+                  style: { flex_grow: 1.0 } },
+                { kind: "button", id: prefix + ":" + str(hi), label: act_label },
+              ] })
+            hi = hi + 1
+        } else {
+            out = push(out, { kind: "frame", style: line_style(l.tag),
+              children: [ { kind: "hstack", gap: 8.0, align: "start",
+                            children: [ gutter(l), sign_el(l), code_cell(l.runs) ] } ] })
+        }
+        i = i + 1
+    }
+    out
+}
+
+fn section_head(label, count_label, btn_id, btn_label) {
+    let mut kids = [
+        { kind: "text", value: label, size: 12.0, weight: "bold", color: col_text(),
+          selectable: false },
+        { kind: "text", value: count_label, size: 11.0, color: col_muted(),
+          selectable: false, style: { flex_grow: 1.0 } },
+    ]
+    if btn_id != "" { kids = push(kids, { kind: "button", id: btn_id, label: btn_label }) }
+    { kind: "hstack", gap: 8.0, align: "center", children: kids }
+}
+
+fn whole_file_note(f) {
+    let ch = f_change(f)
+    if ch == "untracked" { "untracked file — stage adds the whole file" }
+    else if ch == "renamed" { "renamed — staged/unstaged as a whole file" }
+    else if f_binary(f) { "binary file — no hunks" }
+    else { "" }
+}
+fn f_change(f) {
+    if typeof(f.u) == "Record" { f.u.change }
+    else if typeof(f.s) == "Record" { f.s.change }
+    else { "modified" }
+}
+fn f_binary(f) {
+    if typeof(f.u) == "Record" { f.u.binary }
+    else if typeof(f.s) == "Record" { f.s.binary }
+    else { false }
+}
+fn hunkable(f) {
+    let ch = f_change(f)
+    not f_binary(f) and ch != "untracked" and ch != "renamed"
+}
+
+fn file_body(f) {
+    let mut kids = []
+    let note = whole_file_note(f)
+    if note != "" {
+        kids = push(kids, { kind: "text", value: note, size: 11.0, color: col_warn(),
+                            selectable: false })
+    }
+    // Unstaged side
+    if typeof(f.u) == "Record" {
+        let cnt = "+" + str(f.u.adds) + " −" + str(f.u.dels)
+        kids = push(kids, section_head("Unstaged", cnt, "stgf", "Stage file"))
+        if hunkable(f) { for el in side_hunks(f.u, "stg", "Stage ↓") { kids = push(kids, el) } }
+    }
+    if typeof(f.u) == "Record" and typeof(f.s) == "Record" {
+        kids = push(kids, { kind: "divider" })
+    }
+    // Staged side
+    if typeof(f.s) == "Record" {
+        let cnt = "+" + str(f.s.adds) + " −" + str(f.s.dels)
+        kids = push(kids, section_head("Staged", cnt, "ustf", "Unstage file"))
+        if hunkable(f) { for el in side_hunks(f.s, "ust", "↑ Unstage") { kids = push(kids, el) } }
+    }
+    if len(kids) == 0 {
+        kids = [ { kind: "text", value: "nothing here", color: col_muted() } ]
+    }
+    { kind: "vstack", gap: 4.0, style: { flex_grow: 1.0, min_width: "0" }, children: kids }
+}
+
+fn file_row(i, e, sel) {
+    let u_badge = if typeof(e.u) == "Record" { "U:" + str(len(e.u.hunks)) } else { "" }
+    let s_badge = if typeof(e.s) == "Record" { "S:" + str(len(e.s.hunks)) } else { "" }
+    let mut stat = []
+    if s_badge != "" { stat = push(stat, { kind: "text", value: s_badge, family: "mono",
+        size: 10.0, color: add_color(), selectable: false }) }
+    if u_badge != "" { stat = push(stat, { kind: "text", value: u_badge, family: "mono",
+        size: 10.0, color: col_warn(), selectable: false }) }
+    let sty = if sel {
+        { padding: { top: 5.0, bottom: 5.0, left: 8.0, right: 8.0 }, radius: "6",
+          width: "100%", background: col_panel() }
+    } else {
+        { padding: { top: 5.0, bottom: 5.0, left: 8.0, right: 8.0 }, radius: "6",
+          width: "100%" }
+    }
+    { kind: "list-item", id: "file:" + str(i), selected: sel, pad: 0.0, style: sty,
+      children: [ { kind: "vstack", gap: 1.0, children: [
+        { kind: "text", value: file_base(e.path), family: "mono", size: 12.0,
+          weight: if sel { "bold" } else { "normal" }, color: col_text(),
+          selectable: false },
+        { kind: "hstack", gap: 6.0, children: stat },
+      ] } ] }
+}
+
+fn sidebar(s, idx) {
+    let mut rows = [ { kind: "text", value: "Files (" + str(len(s.files)) + ")",
+        size: 11.0, weight: "bold", color: col_muted(), selectable: false } ]
+    let mut i = 0
+    for e in s.files {
+        rows = push(rows, file_row(i, e, i == idx))
+        i = i + 1
+    }
+    { kind: "vstack", gap: 3.0,
+      style: { width: "230", min_width: "230", flex_shrink: 0.0,
+               padding: { top: 2.0, bottom: 2.0, left: 0.0, right: 6.0 } },
+      children: rows }
+}
+
+fn commit_bar(s) {
+    let mut kids = [
+        { kind: "textarea", id: "msg", value: s.commit_msg, rows: 2,
+          placeholder: "Commit message… (⌘/Ctrl+Enter to commit staged)",
+          style: { flex_grow: 1.0 } },
+    ]
+    if s.staged_total > 0 {
+        kids = push(kids, { kind: "button", id: "commit",
+                            label: "Commit staged (" + str(s.staged_total) + ")" })
+    } else {
+        kids = push(kids, { kind: "text", value: "nothing staged", size: 11.0,
+                            color: col_muted(), selectable: false })
+    }
+    { kind: "hstack", gap: 8.0, align: "center", children: kids }
+}
+
+fn render(w, h) {
+    let s = cur_state()
+    let head = { kind: "hstack", gap: 8.0, align: "center", children: [
+        { kind: "text", value: "± stage", size: 13.0, weight: "bold", color: col_text(),
+          selectable: false },
+        { kind: "text", value: file_base(repo()), size: 11.0, color: col_muted(),
+          selectable: false },
+        { kind: "button", id: "refresh", label: "↻" },
+        { kind: "text", value: s.status, size: 11.0, color: col_warn(), selectable: false },
+    ] }
+    let mut kids = [ head, { kind: "divider" } ]
+    if len(s.files) == 0 {
+        kids = push(kids, { kind: "text", value: "Working tree clean — nothing to stage.",
+                            color: col_muted() })
+    } else {
+        let idx = if s.file_idx >= len(s.files) or s.file_idx < 0 { 0 } else { s.file_idx }
+        let f = s.files[idx]
+        kids = push(kids, { kind: "hstack", gap: 14.0, align: "start",
+            style: { flex_grow: 1.0 },
+            children: [ sidebar(s, idx), file_body(f) ] })
+    }
+    kids = push(kids, { kind: "divider" })
+    kids = push(kids, commit_bar(s))
+    { kind: "vstack", gap: 8.0, pad: 14.0, children: kids }
+}

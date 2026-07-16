@@ -1,0 +1,17 @@
+[package]
+name = "jim_review"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Local code-review thread store (~/.jim/reviews/<repo_hash>.json).
+# Pure serde + std — a leaf crate shared by jimctl (CLI surface for
+# humans + agents) and any future native pane.
+
+[lib]
+name = "jim_review"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

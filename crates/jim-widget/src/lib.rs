@@ -4164,6 +4164,11 @@ fn handle_widget_input_typing(
             match &ev.logical_key {
                 Key::Character(s) => {
                     // Skip control combos; only insert the literal char.
+                    // ⌘/^ chords are app shortcuts (⌘⇧D, ⌘⇧M, …) — without
+                    // this a focused input swallows their letter as text.
+                    if submit_modifier {
+                        continue;
+                    }
                     let prev = focus.value.chars().take(focus.caret).collect::<String>();
                     let after: String = focus.value.chars().skip(focus.caret).collect();
                     focus.value = format!("{}{}{}", prev, s.as_str(), after);

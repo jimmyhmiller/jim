@@ -2,8 +2,11 @@
 //
 // Renders a UNIFIED DIFF (the one format git diff, `gh pr diff`, GitHub `.diff`
 // downloads, and `diff -u` all share) with syntax highlighting, line numbers,
-// add/del tinting, a unified or side-by-side view, and inline review comments
-// persisted to ~/.jim/reviews/<id>.json.
+// add/del tinting, a unified or side-by-side view, and inline review
+// THREADS from the shared local review store (`jimctl review`, see
+// jim-review) — the same threads review_inbox.ft shows and Claude
+// sessions read/reply to via `jimctl review list/reply`. Live-updates on
+// the `review.changed` bus topic.
 //
 // Sources (params.source, or the toolbar buttons):
 //   working  — `git -C <repo> diff`            (unstaged working tree)
@@ -12,12 +15,16 @@
 //   file     — read a .diff/.patch file              (arg = path)
 //   pipe     — receive diff text on bus topic params.in  ({text} or {diff})
 //
-// params: { source, repo, arg, in, id, view }   (all optional)
+// params: { source, repo, arg, in, view, focus_file, focus_line }   (all optional)
 //
 // Syntax color comes from the host `highlight(code, lang)` fn (tree-sitter);
 // the pane scrolls, so a big diff is just a tall stack.
 import "host"
 import { col_text, col_muted, col_accent, col_panel } from "df"
+import { parse_diff, kind_color, tint, sign_color, gutter, sign_el, code_cell,
+         line_style, hunk_row, line_h, hunk_h, comment_h, draft_h,
+         lpad, parse_int, file_base, jimctl, jimctl_parse, rget,
+         review_topic, ago } from "git"
 
 let state = atom(init_state())
 
@@ -25,6 +32,7 @@ fn init_state() = {
     raw: "", files: [], source: "working", repo: "", arg: "",
     view: "unified", status: "", proc: -1, cat: [], file_idx: 0,
     comments: [], draft_key: "", draft_text: "", last_render_sy: 0.0,
+    focus_line: 0, rv_proc: -1, rv_cat: [], mut_proc: -1, mut_cat: [],
 }
 
 fn cur_state() {
@@ -35,182 +43,37 @@ fn cur_state() {
 // ---- params ----
 fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
 fn in_topic()  = param("in", "")
-fn review_id() = param("id", "scratch")
-fn review_file() = "~/.jim/reviews/" + review_id() + ".json"
 
 // ---- small utils ----
-fn lpad(s, w) {
-    let mut out = s
-    while len(out) < w { out = " " + out }
-    out
-}
-fn lang_for(path) {
-    if ends_with(path, ".rs") { "rust" } else { "" }
-}
-// to_int only converts numbers, not strings; parse via parse_float (Result).
-fn parse_int(s) = to_int(unwrap_or(parse_float(s), 0.0))
+// Diff parsing, row primitives, and colors all live in git.ft now —
+// shared with stage.ft and the rest of the git suite.
 
-// Fixed row heights — every diff row is forced to these so the virtualizer's
-// math is exact (see window_rows). Comments/draft add estimated extra height.
-fn line_h() = 20.0
-fn hunk_h() = 20.0
-fn comment_h() = 46.0
-fn draft_h() = 124.0
-fn strip_diff_path(line) {
-    // "--- a/foo" / "+++ b/foo" / "--- /dev/null"
-    let p = trim(slice(line, 4, len(line)))
-    if starts_with(p, "a/") or starts_with(p, "b/") { slice(p, 2, len(p)) } else { p }
-}
-
-// ---- unified-diff parser → files[ {old,new,lines,adds,dels} ] ----
-// `lines` entries: { tag:"hunk"|"ctx"|"add"|"del", text, o, nn, runs }
-fn parse_diff(raw) {
-    let lines = split(raw, "\n")
-    let n = len(lines)
-    let mut files = []
-    let mut have = false
-    let mut f_old = ""
-    let mut f_new = ""
-    let mut f_lines = []
-    let mut adds = 0
-    let mut dels = 0
-    let mut o_no = 0
-    let mut n_no = 0
-    let mut in_hunk = false
-    let mut i = 0
-    while i < n {
-        let line = lines[i]
-        if starts_with(line, "diff --git") {
-            if have { files = push(files, finish_file(f_old, f_new, f_lines, adds, dels)) }
-            have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0; in_hunk = false
-            i = i + 1; continue
-        }
-        if starts_with(line, "--- ") and i + 1 < n and starts_with(lines[i + 1], "+++ ") {
-            if not have { have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0 }
-            f_old = strip_diff_path(line)
-            f_new = strip_diff_path(lines[i + 1])
-            in_hunk = false
-            i = i + 2; continue
-        }
-        if starts_with(line, "@@") {
-            if not have { have = true; f_old = ""; f_new = ""; f_lines = []; adds = 0; dels = 0 }
-            let hh = parse_hunk_header(line)
-            o_no = hh.o
-            n_no = hh.n
-            f_lines = push(f_lines, { tag: "hunk", text: line, o: 0, nn: 0 })
-            in_hunk = true
-            i = i + 1; continue
-        }
-        if in_hunk and have {
-            let c0 = if len(line) > 0 { slice(line, 0, 1) } else { " " }
-            if c0 == "\\" { i = i + 1; continue }
-            let text = if len(line) > 0 { slice(line, 1, len(line)) } else { "" }
-            if c0 == "+" {
-                f_lines = push(f_lines, { tag: "add", text: text, o: 0, nn: n_no })
-                n_no = n_no + 1; adds = adds + 1
-            } else if c0 == "-" {
-                f_lines = push(f_lines, { tag: "del", text: text, o: o_no, nn: 0 })
-                o_no = o_no + 1; dels = dels + 1
-            } else {
-                f_lines = push(f_lines, { tag: "ctx", text: text, o: o_no, nn: n_no })
-                o_no = o_no + 1; n_no = n_no + 1
-            }
-            i = i + 1; continue
-        }
-        i = i + 1
-    }
-    if have { files = push(files, finish_file(f_old, f_new, f_lines, adds, dels)) }
-    files
-}
-
-// "@@ -o,c +n,c @@ section" → { o, n } (1-based start lines)
-fn parse_hunk_header(line) {
-    let mut o = 1
-    let mut n = 1
-    let parts = split(line, " ")
-    for p in parts {
-        if starts_with(p, "-") {
-            let body = slice(p, 1, len(p))
-            o = parse_int(first_num(body))
-        } else if starts_with(p, "+") {
-            let body = slice(p, 1, len(p))
-            n = parse_int(first_num(body))
-        }
-    }
-    { o: o, n: n }
-}
-fn first_num(s) {
-    let c = split(s, ",")
-    if len(c) > 0 { c[0] } else { s }
-}
-
-// Resolve syntax runs per display line via ONE highlight() call for each side
-// of the file (old / new blob), then map back to the interleaved lines.
-fn finish_file(old, new, flines, adds, dels) {
-    let lang = lang_for(if new != "" { new } else { old })
-    let mut old_seq = []
-    let mut new_seq = []
-    for l in flines {
-        if l.tag == "ctx" { old_seq = push(old_seq, l.text); new_seq = push(new_seq, l.text) }
-        else if l.tag == "add" { new_seq = push(new_seq, l.text) }
-        else if l.tag == "del" { old_seq = push(old_seq, l.text) }
-    }
-    let old_runs = highlight(join(old_seq, "\n"), lang)
-    let new_runs = highlight(join(new_seq, "\n"), lang)
-    let mut out = []
-    let mut oi = 0
-    let mut ni = 0
-    for l in flines {
-        if l.tag == "hunk" { out = push(out, l); continue }
-        let mut runs = []
-        if l.tag == "ctx" { runs = nth(new_runs, ni); ni = ni + 1; oi = oi + 1 }
-        else if l.tag == "add" { runs = nth(new_runs, ni); ni = ni + 1 }
-        else if l.tag == "del" { runs = nth(old_runs, oi); oi = oi + 1 }
-        out = push(out, { ..l, runs: runs })
-    }
-    { old: old, new: new, lines: out, adds: adds, dels: dels }
-}
-fn nth(xs, i) = if i >= 0 and i < len(xs) { xs[i] } else { [] }
-
-// ---- colors ----
-fn kind_color(k) {
-    if k == "keyword" { "#c78fe6" }
-    else if k == "string" { "#a6df99" }
-    else if k == "comment" { "#7b8494" }
-    else if k == "function" { "#8cc7ff" }
-    else if k == "type" { "#f0d18c" }
-    else if k == "constructor" { "#f0d18c" }
-    else if k == "constant" { "#f29e7a" }
-    else if k == "attribute" { "#d9b380" }
-    else if k == "operator" { "#b3bdcc" }
-    else if k == "punctuation" { "#b3bdcc" }
-    else if k == "property" { "#d9d2f2" }
-    else if k == "label" { "#f29e7a" }
-    else if k == "escape" { "#f0bf66" }
-    else { col_text() }
-}
-fn tint(tag) {
-    if tag == "add" { "#12301d" } else if tag == "del" { "#341a1d" } else { "" }
-}
-fn sign_color(tag) {
-    if tag == "add" { "#5fcf8a" } else if tag == "del" { "#e08a8a" } else { col_muted() }
-}
-
-// ---- comments (array of { key, text, ts }) ----
+// ---- review threads (shared store via `jimctl review`) ----
+// s.comments holds threads: { id, file, line, status, author, body,
+// replies:[{author,body,ts_ms}], ... }. A line shows the threads whose
+// (file, line) anchor matches its new-side number (old-side for pure
+// deletions). Writes go through `jimctl review add/resolve`; the
+// resulting `review.changed` bus event triggers the reload, so every
+// diff/inbox pane converges without manual refresh.
 fn line_key(file, l) {
     let p = if file.new != "" { file.new } else { file.old }
     if l.tag == "del" { p + ":-" + str(l.o) } else { p + ":" + str(l.nn) }
 }
-fn comments_for(comments, key) = filter(comments, (c) => c.key == key)
+
+fn line_no_of(l) = if l.tag == "del" { l.o } else { l.nn }
+fn file_path_of(file) = if file.new != "" { file.new } else { file.old }
+
+fn threads_for(comments, file, l) {
+    let p = file_path_of(file)
+    let n = line_no_of(l)
+    filter(comments, (t) => rget(t, "file", "") == p and rget(t, "line", -1) == n)
+}
 
 fn load_comments() {
-    let r = read_file(review_file())
-    if r.ok and trim(r.text) != "" {
-        let arr = parse_json(r.text)
-        if typeof(arr) == "List" { reset!(state, { ..cur_state(), comments: arr }) }
-    }
+    let s = cur_state()
+    let h = jimctl(["review", "list", "--repo", repo_arg(s), "--status", "all"])
+    reset!(state, { ..cur_state(), rv_proc: h, rv_cat: [] })
 }
-fn save_comments(comments) { write_file(review_file(), to_json(comments)) }
 
 // ---- sources ----
 // Default the repo to the spawning project's root (host injects it as
@@ -271,8 +134,37 @@ fn set_diff(raw) {
     let st = if len(files) == 0 { "no changes" } else {
         str(len(files)) + " files  +" + str(adds) + " −" + str(dels)
     }
-    reset!(state, { ..s, raw: raw, files: files, proc: -1, cat: [], status: st, file_idx: 0 })
+    // focus_file / focus_line params: preselect the file and jump the
+    // scroll to the line (the "open this review comment in a diff" flow
+    // from review_inbox.ft / pr_detail.ft).
+    let ff = param("focus_file", "")
+    let fl = to_int(unwrap_or(parse_float(str(param("focus_line", 0))), 0.0))
+    let mut idx = 0
+    if ff != "" {
+        let mut i = 0
+        for f in files {
+            if f.new == ff or f.old == ff { idx = i }
+            i = i + 1
+        }
+    }
+    reset!(state, { ..s, raw: raw, files: files, proc: -1, cat: [], status: st,
+                    file_idx: idx, focus_line: fl })
+    if fl > 0 and idx < len(files) { scroll_to_line(files[idx], fl) }
     request_render()
+}
+
+// Jump the pane scroll so new-side line `fl` of `f` sits ~1/3 down the
+// viewport. Header offset (toolbar + file head) is an estimate; the row
+// math below it is exact for the unified view.
+fn scroll_to_line(f, fl) {
+    let mut y = 0.0
+    for l in f.lines {
+        if l.tag != "hunk" and (l.nn == fl or (l.nn == 0 and l.o == fl)) {
+            set_scroll(max(0.0, y + 120.0 - canvas_h * 0.33))
+            return
+        }
+        y = y + (if l.tag == "hunk" { hunk_h() } else { line_h() })
+    }
 }
 
 // ---- handlers ----
@@ -293,14 +185,48 @@ fn on_start() {
 fn on_proc_output(handle, line) {
     let s = cur_state()
     if handle == s.proc { reset!(state, { ..s, cat: push(s.cat, line) }) }
+    else if handle == s.rv_proc { reset!(state, { ..s, rv_cat: push(s.rv_cat, line) }) }
+    else if handle == s.mut_proc { reset!(state, { ..s, mut_cat: push(s.mut_cat, line) }) }
 }
 fn on_proc_exit(handle, code) {
     let s = cur_state()
-    if handle != s.proc { return }
-    set_diff(join(s.cat, "\n"))
+    if handle == s.proc { set_diff(join(s.cat, "\n")); return }
+    if handle == s.rv_proc {
+        let r = jimctl_parse(join(s.rv_cat, "\n"))
+        if rget(r, "ok", false) {
+            reset!(state, { ..s, comments: rget(r, "threads", []), rv_proc: -1, rv_cat: [] })
+        } else {
+            reset!(state, { ..s, rv_proc: -1, rv_cat: [],
+                            status: "reviews: " + rget(r, "error", "failed") })
+        }
+        request_render()
+        return
+    }
+    if handle == s.mut_proc {
+        let r = jimctl_parse(join(s.mut_cat, "\n"))
+        if not rget(r, "ok", false) {
+            reset!(state, { ..s, mut_proc: -1, mut_cat: [],
+                            status: "review write: " + rget(r, "error", "failed") })
+            request_render()
+        } else {
+            reset!(state, { ..s, mut_proc: -1, mut_cat: [] })
+            // review.changed will trigger the reload; also reload now in
+            // case the bus event raced past us.
+            load_comments()
+        }
+        return
+    }
 }
 
 fn on_message(topic, payload, sender) {
+    if topic == review_topic() {
+        // Someone (us via jimctl, another pane, an agent) changed the
+        // review store. Reload unconditionally — one cheap jimctl call;
+        // path-matching the payload's canonical repo against our maybe-
+        // relative repo arg isn't worth the false negatives.
+        load_comments()
+        return
+    }
     if sender == my_id() { return }
     if in_topic() == "" or topic != in_topic() { return }
     let t = unwrap_or(get(payload, "text"), unwrap_or(get(payload, "diff"), ""))
@@ -331,15 +257,41 @@ fn on_scroll(y) {
     if abs(y - s.last_render_sy) > canvas_h * 0.3 { request_render() }
 }
 
+// base_ref recorded on new threads mirrors the diff source.
+fn base_ref_of(s) {
+    if s.source == "range" { "range " + trim(s.arg) }
+    else if s.source == "pr" { "pr " + trim(s.arg) }
+    else { "working" }
+}
+
+// draft_key is "path:line" ("-line" = old side); split from the RIGHT
+// since paths can contain ':' only pathologically, but line is always
+// the last segment.
+fn key_parts(key) {
+    let parts = split(key, ":")
+    let n = len(parts)
+    if n < 2 { return () }
+    let line_s = parts[n - 1]
+    let path = join(slice(parts, 0, n - 1), ":")
+    let ln = parse_int(line_s)
+    { path: path, line: if ln < 0 { 0 - ln } else { ln } }
+}
+
 fn save_draft() {
     let s = cur_state()
     if s.draft_key == "" or trim(s.draft_text) == "" {
         reset!(state, { ..s, draft_key: "", draft_text: "" }); request_render(); return
     }
-    let c = { key: s.draft_key, text: trim(s.draft_text), ts: round(time()) }
-    let next = push(s.comments, c)
-    save_comments(next)
-    reset!(state, { ..s, comments: next, draft_key: "", draft_text: "" })
+    let kp = key_parts(s.draft_key)
+    if typeof(kp) != "Record" {
+        reset!(state, { ..s, draft_key: "", draft_text: "", status: "bad comment key" })
+        request_render(); return
+    }
+    let h = jimctl(["review", "add", "--repo", repo_arg(s),
+                    "--file", kp.path, "--line", str(kp.line),
+                    "--body", trim(s.draft_text),
+                    "--base-ref", base_ref_of(s), "--author", "user"])
+    reset!(state, { ..s, mut_proc: h, mut_cat: [], draft_key: "", draft_text: "" })
     request_render()
 }
 
@@ -367,6 +319,18 @@ fn on_click(x, y, shift, cmd, id) {
     }
     if id == "save_cmt" { save_draft(); return }
     if id == "cancel_cmt" { reset!(state, { ..s, draft_key: "", draft_text: "" }); request_render(); return }
+    if starts_with(id, "rv_res:") {
+        let tid = slice(id, 7, len(id))
+        // Toggle: look the thread up to decide resolve vs reopen.
+        let mut resolved = false
+        for t in s.comments {
+            if str(rget(t, "id", 0)) == tid { resolved = rget(t, "status", "open") == "resolved" }
+        }
+        let mut argv = ["review", "resolve", "--repo", repo_arg(s), "--id", tid]
+        if resolved { argv = push(argv, "--reopen") }
+        reset!(state, { ..s, mut_proc: jimctl(argv), mut_cat: [] })
+        return
+    }
     if starts_with(id, "cmt:") {
         let key = slice(id, 4, len(id))
         let nk = if s.draft_key == key { "" } else { key }
@@ -376,63 +340,41 @@ fn on_click(x, y, shift, cmd, id) {
 }
 
 // ---- rendering ----
-// gutter + sign use wrap:false so their min-content equals their full width.
-// That makes them NON-shrinkable in the row's flex: when a long code line
-// overflows, the row no longer squeezes the gutter/sign (which used to pull
-// the code cell leftward and mangle the indentation).
-fn gutter(l) {
-    let on = if l.o > 0 { lpad(str(l.o), 4) } else { "    " }
-    let nn = if l.nn > 0 { lpad(str(l.nn), 4) } else { "    " }
-    { kind: "text", value: on + " " + nn, family: "mono", size: 11.0,
-      color: col_muted(), selectable: false, wrap: false }
-}
-fn sign_el(l) {
-    let g = if l.tag == "add" { "+" } else if l.tag == "del" { "-" } else { " " }
-    { kind: "text", value: g, family: "mono", size: 12.5, color: sign_color(l.tag),
-      selectable: false, wrap: false }
-}
-fn code_cell(runs) {
-    let mut kids = []
-    if len(runs) == 0 {
-        kids = [ { kind: "text", value: " ", family: "mono", size: 12.5,
-                   color: col_text(), selectable: false, wrap: false } ]
-    } else {
-        for r in runs {
-            kids = push(kids, { kind: "text", value: r.text, family: "mono", size: 12.5,
-                                color: kind_color(r.kind), selectable: false, wrap: false })
-        }
-    }
-    // wrap:false on each run keeps every code line on ONE visual line (its
-    // min- and max-content width both equal the full line), so a long line
-    // can't be squeezed into a taller wrapped box that overflows the fixed
-    // 20px row and overlaps the next. Long lines extend right and clip at the
-    // pane edge. flex_shrink:0 belts-and-suspenders the same intent.
-    { kind: "hstack", gap: 0.0, align: "start",
-      style: { flex_shrink: 0.0 },
-      children: kids }
-}
-fn line_style(tag) {
-    let pad = { top: 1.0, bottom: 1.0, left: 6.0, right: 6.0 }
-    // Force a fixed row height so the virtualizer's offset math is exact.
-    // clip:true makes the row a clip boundary. The renderer truncates each
-    // (monospace) text run to this row's box width, so a long code line is
-    // physically cut at the green's right edge — contained, and resize-safe
-    // (every re-render re-truncates to the current width).
-    let base = { padding: pad, height: "20", min_height: "20", clip: true }
-    let t = tint(tag)
-    if t == "" { base } else { merge(base, { background: t }) }
-}
+// Row primitives (gutter/sign/code cells, row styles) come from git.ft.
 
-fn comment_view(c) {
-    { kind: "frame", gap: 2.0,
+fn author_color(a) = if starts_with(a, "agent:") { "#e0b066" } else { col_accent() }
+
+fn thread_view(t) {
+    let resolved = rget(t, "status", "open") == "resolved"
+    let author = rget(t, "author", "user")
+    let now = time()
+    let mut kids = [
+        { kind: "hstack", gap: 6.0, align: "center", children: [
+            { kind: "text", value: author, size: 10.5, weight: "bold",
+              color: author_color(author), selectable: false },
+            { kind: "text", value: ago(rget(t, "updated_ms", 0), now), size: 10.0,
+              color: col_muted(), selectable: false },
+            { kind: "text", value: if rget(t, "stale", false) { "(line moved)" } else { "" },
+              size: 10.0, color: col_muted(), selectable: false,
+              style: { flex_grow: 1.0 } },
+            { kind: "button", id: "rv_res:" + str(rget(t, "id", 0)),
+              label: if resolved { "Reopen" } else { "Resolve" } },
+        ] },
+        { kind: "text", value: rget(t, "body", ""), size: 12.5,
+          color: if resolved { col_muted() } else { col_text() } },
+    ]
+    for r in rget(t, "replies", []) {
+        kids = push(kids, { kind: "hstack", gap: 6.0, align: "start", children: [
+            { kind: "text", value: "↳ " + rget(r, "author", ""), size: 10.5,
+              color: author_color(rget(r, "author", "")), selectable: false, wrap: false },
+            { kind: "text", value: rget(r, "body", ""), size: 12.0, color: col_text() },
+        ] })
+    }
+    { kind: "frame", gap: 4.0,
       style: { background: col_panel(), radius: "6",
                margin: { top: 2.0, bottom: 2.0, left: 60.0, right: 8.0 },
                padding: { top: 6.0, bottom: 6.0, left: 10.0, right: 10.0 } },
-      children: [
-        { kind: "text", value: c.text, size: 12.5, color: col_text() },
-        { kind: "text", value: "comment · t=" + str(c.ts), size: 10.0, color: col_muted(),
-          selectable: false },
-      ] }
+      children: kids }
 }
 fn draft_view(s) {
     { kind: "vstack", gap: 4.0,
@@ -449,20 +391,18 @@ fn draft_view(s) {
 
 fn uline(file, l, s) {
     if l.tag == "hunk" {
-        { kind: "frame",
-          style: { background: col_panel(), height: "20", min_height: "20", clip: true,
-                   padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
-          children: [ { kind: "text", value: l.text, family: "mono", size: 11.0,
-                        color: col_accent(), selectable: false, wrap: false } ] }
+        hunk_row(l.text)
     } else {
         let key = line_key(file, l)
         let row = { kind: "hstack", gap: 8.0, align: "start",
                     children: [ gutter(l), sign_el(l), code_cell(l.runs) ] }
+        let focused = s.focus_line > 0 and (l.nn == s.focus_line or (l.nn == 0 and l.o == s.focus_line))
+        let sty = if focused { merge(line_style(l.tag), { background: "#2b3a52" }) } else { line_style(l.tag) }
         let li = { kind: "list-item", id: "cmt:" + key, selected: false, pad: 0.0,
-                   style: line_style(l.tag), children: [row] }
-        let cs = comments_for(s.comments, key)
+                   style: sty, children: [row] }
+        let ts = threads_for(s.comments, file, l)
         let mut kids = [li]
-        for c in cs { kids = push(kids, comment_view(c)) }
+        for t in ts { kids = push(kids, thread_view(t)) }
         if s.draft_key == key { kids = push(kids, draft_view(s)) }
         if len(kids) == 1 { li } else { { kind: "vstack", gap: 0.0, children: kids } }
     }
@@ -513,10 +453,7 @@ fn side_cell(l) {
 }
 fn sline(row) {
     if row.kind == "hunk" {
-        { kind: "frame", style: { background: col_panel(), height: "20", min_height: "20",
-            padding: { top: 2.0, bottom: 2.0, left: 6.0, right: 6.0 } },
-          children: [ { kind: "text", value: row.h.text, family: "mono", size: 11.0,
-                        color: col_accent(), selectable: false, wrap: false } ] }
+        hunk_row(row.h.text)
     } else {
         { kind: "hstack", gap: 1.0, align: "stretch",
           style: { height: "20", min_height: "20" },
@@ -569,7 +506,11 @@ fn file_block(f, s, sy, vh) {
             heights = push(heights, hunk_h())
         } else {
             let key = line_key(f, r)
-            let cbump = to_float(len(comments_for(s.comments, key))) * comment_h()
+            // Each thread ≈ one comment block + one row per reply.
+            let mut cbump = 0.0
+            for t in threads_for(s.comments, f, r) {
+                cbump = cbump + comment_h() + to_float(len(rget(t, "replies", []))) * 18.0 + 16.0
+            }
             let dbump = if s.draft_key == key { draft_h() } else { 0.0 }
             heights = push(heights, line_h() + cbump + dbump)
         }
@@ -633,11 +574,6 @@ fn toolbar(s) {
 // lives in the normal scroll flow (the host has one scroll offset per
 // pane), so it scrolls with the body on long files; scroll back to the
 // top to pick another.
-fn file_base(path) {
-    let parts = split(path, "/")
-    let n = len(parts)
-    if n > 0 { parts[n - 1] } else { path }
-}
 fn file_row_style(sel) {
     let base = { padding: { top: 5.0, bottom: 5.0, left: 8.0, right: 8.0 },
                  radius: "6", width: "100%" }

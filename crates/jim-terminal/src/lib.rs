@@ -426,7 +426,13 @@ fn terminal_spawn_from_config(
         .and_then(|v| v.as_u64())
         .unwrap_or_else(|| terminal_id_allocator(world));
     let replay_bytes = scrollback_path(session_id).and_then(|p| std::fs::read(&p).ok());
-    let initial_cwd = terminal_initial_cwd(world, entity);
+    // A config-supplied cwd (e.g. "open terminal at this worktree" from
+    // the git widgets via spawn_pane) beats the project-default resolver.
+    let initial_cwd = config
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| terminal_initial_cwd(world, entity));
     populate_terminal_pane(
         world,
         entity,

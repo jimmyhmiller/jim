@@ -66,6 +66,17 @@ dirs use hyphens (`crates/jim-app`).
   deliver to widgets, publishes their emits); the old `widget_message`
   action on `~/.jim/socket` is a thin GUI→daemon forwarder. See
   CHANNELS.md / AGENTS-ON-THE-BUS.md.
+- `crates/jim-git` — repo-state snapshots (`compute_repo_state` →
+  `RepoState`) + narrow debounced `.git` watching. Feeds the GUI's
+  `git_watcher` plugin (retained bus topics `git.repo.<hash16>` global +
+  `git.status` per-project) and `jimctl git` (queries, safe mutations,
+  hunk-level stage/unstage à la `git add -p`). `crates/jim-review` —
+  local code-review thread store (`~/.jim/reviews/<repo_hash>.json`),
+  surfaced via `jimctl review` (+ `review.changed` bus events); agents
+  read/reply with it. Widget suite: `git.ft` (shared lib) + `repo_hub` /
+  `branches` / `stage` / `review_inbox` / `ai_work` / `pr_detail` +
+  evolved `diff.ft` / `pr_dashboard.ft`; preset
+  `scripts/github-workspace.sh`.
 - `crates/jim-style`, `crates/glaze` — per-project styling + the Glaze
   shader/style language. `crates/jim-diff`/`diff-core` — diff pane +
   model. `crates/jim-inference` — classifier prompts + `style-muse`.

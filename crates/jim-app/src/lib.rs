@@ -34,6 +34,7 @@ pub mod context_menu;
 pub mod cube;
 pub mod debug_bar;
 pub mod diagnostics;
+pub mod dictation;
 pub mod drawer;
 pub mod expose;
 pub mod fps;
@@ -220,6 +221,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(radial::RadialPlugin)
             .add_plugins(command_palette::CommandPalettePlugin)
             .add_plugins(screenshot_consent::ScreenshotConsentPlugin)
+            .add_plugins(dictation::DictationPlugin)
             .add_plugins(drawer::DrawerPlugin)
             .add_plugins(run_button::RunButtonPlugin)
             .add_plugins(jim_whiteboard::WhiteboardPlugin)
@@ -738,7 +740,12 @@ fn drain_ipc_open_requests(
             stream: mut _stream,
         } = msg;
         match req {
-            ipc::IpcRequest::OpenFile { path, project } => {
+            ipc::IpcRequest::OpenFile {
+                path,
+                project,
+                line,
+                column,
+            } => {
                 let target = match project {
                     Some(name) => OpenProjectTarget::ByName(name),
                     None => OpenProjectTarget::Active,
@@ -747,6 +754,8 @@ fn drain_ipc_open_requests(
                     path,
                     project: target,
                     origin: None,
+                    line,
+                    column,
                 });
             }
             ipc::IpcRequest::SpawnWidget {
@@ -1275,6 +1284,8 @@ fn drain_file_picks(
             path,
             project: OpenProjectTarget::Active,
             origin: None,
+            line: None,
+            column: None,
         });
     }
 }
@@ -2206,6 +2217,7 @@ fn maintain_winit_mode_for_animation(
     // While the trace recorder is capturing it reads the span ring each tick;
     // it needs a steady ~10Hz reactive wake (not full Continuous) to advance.
     trace_recorder: Option<Res<jim_flame::TraceRecorder>>,
+    dictation: Res<dictation::Dictation>,
     mut settings: ResMut<bevy::winit::WinitSettings>,
     time: Res<Time>,
     mut pin_watch: ResMut<diagnostics::ContinuousWatch>,
@@ -2263,7 +2275,11 @@ fn maintain_winit_mode_for_animation(
         // source, like the prism — deliberately excluded from the
         // transient-pin warning below) and while it settles/closes.
         || expose.active
-        || expose.continuous_cooldown > 0;
+        || expose.continuous_cooldown > 0
+        // Push-to-talk dictation: the capture's idle watchdog kills a
+        // stream nobody polls within ~2s, so the reactive baseline would
+        // cut the user off mid-sentence. See `Dictation::needs_frames`.
+        || dictation.needs_frames();
     // NOTE: an open command palette is deliberately NOT a Continuous source.
     // It only needs its DeepSeek worker result polled promptly; pinning full
     // 60fps for that is wasteful. Below it instead tightens the *reactive*
@@ -2299,6 +2315,9 @@ fn maintain_winit_mode_for_animation(
     }
     if prism.continuous_cooldown > 0 {
         transient_reasons.push("prism-cooldown".into());
+    }
+    if dictation.is_transcribing() {
+        transient_reasons.push("dictation-whisper".into());
     }
     if transient_reasons.is_empty() {
         pin_watch.held_secs = 0.0;
@@ -2359,7 +2378,11 @@ fn maintain_winit_mode_for_animation(
     // hangs the moment the user clicks away. The other continuous
     // sources are decorative and don't need unfocused frames, so only an
     // animating widget escalates the unfocused mode.
-    let unfocused_target = if widget_animating {
+    // Dictation escalates the unfocused mode too: click away mid-clip and
+    // the low-power floor (60s) would otherwise leave the transcript
+    // sitting in its channel — the pane would look wedged in "Transcribing…"
+    // until you came back. It resolves in seconds either way.
+    let unfocused_target = if widget_animating || dictation.needs_frames() {
         bevy::winit::UpdateMode::Continuous
     } else if let Some(iv) = widget_tick_min {
         // Keep slow pollers ticking while unfocused too, but no faster

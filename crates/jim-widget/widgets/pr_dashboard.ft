@@ -47,14 +47,17 @@
 // in widget state; opening a PR — or "Mark all read" — re-baselines it.
 // The baseline survives app restarts.
 import "host"
+import { col_text, col_muted, col_accent, col_err, col_warn } from "df"
 
 // ---------------------------------------------------------------- colors
-fn c_text()  = "#cfd2d8"
-fn c_muted() = "#9098a4"
-fn c_new()   = "#8fe3b0"
+// Theme-reactive (df tokens) — a theme switch recolors the dashboard
+// live instead of leaving stale hex.
+fn c_text()  = col_text()
+fn c_muted() = col_muted()
+fn c_new()   = col_accent()
 fn c_newpr() = "#8fb7ff"
-fn c_warn()  = "#e0b066"
-fn c_err()   = "#e08a8a"
+fn c_warn()  = col_warn()
+fn c_err()   = col_err()
 fn c_rail()  = "#5b626e"
 
 // ---------------------------------------------------------------- helpers
@@ -198,7 +201,12 @@ fn repo_maps(prs, meta, repo) {
     for p in prs {
         if p.repo == repo {
             let m = mget(meta, p.url)
-            if typeof(m) == "Record" {
+            // Skip degenerate PRs whose head == base: old cross-fork PRs
+            // report the fork's branch under the same name as the base
+            // (`master` -> `master`), which used to make the PR its own
+            // stack parent — root_of/chain_down then looped, rendering
+            // the same PR 64 times.
+            if typeof(m) == "Record" and m.head != m.base {
                 h = assoc(h, m.head, p.url)
                 b = assoc(b, m.base, p.url)
             }
@@ -207,27 +215,40 @@ fn repo_maps(prs, meta, repo) {
     { h: h, b: b }
 }
 
-fn is_stacked(maps, m0) =
-    typeof(m0) == "Record" and (has(maps.h, m0.base) or has(maps.b, m0.head))
+// A PR is stacked only when some OTHER PR owns the linked branch — a
+// degenerate head==base PR must not count itself as its parent/child.
+fn is_stacked_for(maps, m0, url) {
+    if typeof(m0) != "Record" { return false }
+    let parent = unwrap_or(get(maps.h, m0.base), "")
+    let child = unwrap_or(get(maps.b, m0.head), "")
+    (parent != "" and parent != url) or (child != "" and child != url)
+}
 
 // Bottom-of-stack url (follow base -> the PR whose head == that base).
+// Cycle-safe: stops the moment it would revisit a url, so a topology
+// loop can never walk forever (or return a url "rooted" mid-cycle).
 fn root_of(meta, maps, url) {
     let mut cur = url
+    let mut visited = [url]
     let mut guard = 0
     while guard < 64 {
         let m = mget(meta, cur)
         if typeof(m) != "Record" { return cur }
-        if has(maps.h, m.base) {
-            cur = unwrap_or(get(maps.h, m.base), cur)
-            guard = guard + 1
-        } else {
-            return cur
-        }
+        let nx = unwrap_or(get(maps.h, m.base), "")
+        if nx == "" or nx == cur { return cur }
+        let mut seen = false
+        for v in visited { if v == nx { seen = true } }
+        if seen { return cur }
+        visited = push(visited, nx)
+        cur = nx
+        guard = guard + 1
     }
     cur
 }
 
-// Ordered chain from the root: [bottom, …, top].
+// Ordered chain from the root: [bottom, …, top]. Cycle-safe: a url can
+// appear in the chain once — this is what turned a head==base PR into
+// 64 duplicate rows before repo_maps/root_of grew their own guards.
 fn chain_down(meta, maps, rooturl) {
     let mut chain = [rooturl]
     let mut cur = rooturl
@@ -235,15 +256,14 @@ fn chain_down(meta, maps, rooturl) {
     while guard < 64 {
         let m = mget(meta, cur)
         if typeof(m) != "Record" { return chain }
-        if has(maps.b, m.head) {
-            let nx = unwrap_or(get(maps.b, m.head), "")
-            if nx == "" { return chain }
-            chain = push(chain, nx)
-            cur = nx
-            guard = guard + 1
-        } else {
-            return chain
-        }
+        let nx = unwrap_or(get(maps.b, m.head), "")
+        if nx == "" or nx == cur { return chain }
+        let mut seen = false
+        for v in chain { if v == nx { seen = true } }
+        if seen { return chain }
+        chain = push(chain, nx)
+        cur = nx
+        guard = guard + 1
     }
     chain
 }
@@ -331,6 +351,27 @@ fn kick_meta_staged(s) {
     { ..s, meta_procs: mp, stage_meta: {}, stage_out: len(s.stage_prs) }
 }
 
+// Compact PR summary for the rest of the git suite (repo_hub badges a
+// repo with its PR + CI dot, branches.ft can badge branches) — retained
+// on `pr.index` so late-spawned widgets get it immediately. Numbers,
+// titles, and CI only; bodies/comments stay on-demand (bus discipline).
+fn emit_pr_index(prs, meta) {
+    let mut by_branch = {}
+    let mut by_repo = {}
+    for pr in prs {
+        let m = mget(meta, pr.url)
+        let ci = if typeof(m) == "Record" { get_or(m, "ci", "none") } else { "none" }
+        let head = if typeof(m) == "Record" { get_or(m, "head", "") } else { "" }
+        let entry = { number: pr.number, title: pr.title, url: pr.url,
+                      repo: pr.repo, ci: ci, head: head, draft: pr.draft }
+        if head != "" { by_branch = assoc(by_branch, head, entry) }
+        let mut lst = unwrap_or(get(by_repo, pr.repo), [])
+        if typeof(lst) != "List" { lst = [] }
+        by_repo = assoc(by_repo, pr.repo, push(lst, entry))
+    }
+    emit_retained("pr.index", { by_branch: by_branch, by_repo: by_repo })
+}
+
 // Promote the staging buffers to the live view in one shot, then clear
 // staging and (re)baseline unseen PRs.
 fn swap_in(s) {
@@ -340,6 +381,7 @@ fn swap_in(s) {
                    stage_prs: [], stage_meta: {}, stage_out: 0, meta_procs: {} }
     ns = seed_seen(ns)
     if ns.cfg.track_since_my_comment and ns.me != "" { ns = kick_enrich(ns) }
+    emit_pr_index(ns.prs, ns.meta)
     ns
 }
 
@@ -468,7 +510,11 @@ fn on_proc_output(handle, line) {
             return
         }
         if typeof(m) == "Record" {
-            reset!(state, { ..s, meta: assoc(s.meta, url, m) })
+            let nm = assoc(s.meta, url, m)
+            reset!(state, { ..s, meta: nm })
+            // Last outstanding meta on the initial (non-staged) load →
+            // publish the index for repo_hub/branches badges.
+            if len(nm) >= len(s.prs) { emit_pr_index(s.prs, nm) }
             request_render()
         }
         return
@@ -526,6 +572,21 @@ fn on_click(x, y, shift, cmd, id) {
     }
     if starts(id, "copy::") {
         clipboard_set(slice(id, 6, len(id)))
+        return
+    }
+    if starts(id, "detail::") {
+        let url = slice(id, 8, len(id))
+        let pr = find_pr(s.prs, url)
+        if typeof(pr) == "Record" {
+            let mut argv = ["widget", "--kind", "script_widget",
+                            "--title", "PR #" + str(pr.number) + " · " + pr.repo]
+            let proj = get_or(params, "project", "")
+            if proj != "" { argv = push(push(argv, "--project"), proj) }
+            argv = push(push(argv, "--params"),
+                        to_json({ repo: pr.repo, number: pr.number, url: pr.url }))
+            argv = push(argv, "pr_detail.ft")
+            proc_spawn("jimctl", argv)
+        }
         return
     }
 
@@ -588,6 +649,7 @@ fn activity(s, pr) {
 
 fn pr_context(url) = [
     { label: "Open in browser", id: "open::" + url },
+    { label: "Open detail pane", id: "detail::" + url },
     { label: "Mark read",       id: "read::" + url },
     { label: "Copy URL",        id: "copy::" + url },
 ]
@@ -719,7 +781,7 @@ fn render(w, h) {
     for pr in s.prs {
         let maps = unwrap_or(get(repomaps, pr.repo), { h: {}, b: {} })
         let m0 = mget(s.meta, pr.url)
-        let stacked = show_stack and is_stacked(maps, m0)
+        let stacked = show_stack and is_stacked_for(maps, m0, pr.url)
         let key = if stacked { "stk::" + root_of(s.meta, maps, pr.url) } else { "solo::" + pr.url }
         if not has(seen_keys, key) {
             seen_keys = assoc(seen_keys, key, true)

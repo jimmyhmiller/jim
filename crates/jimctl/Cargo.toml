@@ -10,6 +10,9 @@ serde_json = "1"
 jim_daemon = { path = "../jim-daemon" }
 jim_bus = { path = "../jim-bus" }
 jim_lsp = { path = "../jim-lsp" }
+jim_git = { path = "../jim-git" }
+jim_review = { path = "../jim-review" }
+diff_core = { path = "../diff-core" }
 libc = "0.2"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 

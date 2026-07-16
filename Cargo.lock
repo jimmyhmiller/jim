@@ -4112,12 +4112,14 @@ dependencies = [
  "claude-bus-bevy",
  "editor_core",
  "funct",
+ "hound",
  "image",
  "jim_bus",
  "jim_daemon",
  "jim_editor",
  "jim_emacs",
  "jim_flame",
+ "jim_git",
  "jim_inference",
  "jim_pane",
  "jim_style",
@@ -4135,6 +4137,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "ureq",
  "whiteboard-core",
 ]
 
@@ -4226,6 +4229,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "jim_git"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "jim_inference"
 version = "0.1.0"
 dependencies = [
@@ -4256,6 +4267,14 @@ dependencies = [
  "serde",
  "serde_json",
  "skrifa 0.39.0",
+]
+
+[[package]]
+name = "jim_review"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -4347,9 +4366,12 @@ dependencies = [
 name = "jimctl"
 version = "0.1.0"
 dependencies = [
+ "diff_core",
  "jim_bus",
  "jim_daemon",
+ "jim_git",
  "jim_lsp",
+ "jim_review",
  "libc",
  "serde",
  "serde_json",

@@ -40,6 +40,12 @@ pub enum IpcRequest {
         path: PathBuf,
         #[serde(default)]
         project: Option<String>,
+        /// Optional 1-based line to place the cursor on (and scroll to).
+        #[serde(default)]
+        line: Option<u32>,
+        /// Optional 0-based column within `line`.
+        #[serde(default)]
+        column: Option<u32>,
     },
     /// `tbwidget [--title T] [--cwd D] [--project P] -- <cmd> [args...]` —
     /// spawn a new widget pane running `cmd`. When `args` is non-empty

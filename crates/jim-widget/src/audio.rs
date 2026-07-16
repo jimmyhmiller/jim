@@ -28,7 +28,7 @@
 //! - `audio_status()` → string (last error, or "saved → <path>")
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -80,7 +80,22 @@ struct AudioState {
     /// hasn't been polled within [`IDLE_WATCHDOG`], so a widget that vanishes
     /// mid-recording can't leave the mic on. See [`touch_keepalive`].
     last_poll: Mutex<Instant>,
+    /// True between a [`record_stop`] request and the controller actually
+    /// finishing the WAV. See [`wait_until_finalized`].
+    finalizing: AtomicBool,
+    /// Raw mono PCM for consumers that need the samples themselves rather
+    /// than an envelope — live dictation re-transcribes the clip while it's
+    /// still being spoken, so it can't wait for the WAV. Off by default:
+    /// gated by `pcm_tap` so the recorder/podcast widgets, which only want
+    /// levels, don't pay to buffer it. See [`set_pcm_tap`] / [`take_pcm`].
+    pcm: Mutex<Vec<f32>>,
+    pcm_tap: AtomicBool,
+    pcm_rate: AtomicU32,
 }
+
+/// Hard bound on the un-drained PCM tap (~150s at 48kHz, ~28MB). A consumer
+/// that stops draining drops the OLDEST audio rather than growing forever.
+const MAX_PCM_SAMPLES: usize = 48_000 * 150;
 
 static AUDIO: OnceLock<Arc<AudioState>> = OnceLock::new();
 
@@ -101,6 +116,10 @@ fn state() -> &'static Arc<AudioState> {
             recording: AtomicBool::new(false),
             status: Mutex::new(String::new()),
             last_poll: Mutex::new(Instant::now()),
+            finalizing: AtomicBool::new(false),
+            pcm: Mutex::new(Vec::new()),
+            pcm_tap: AtomicBool::new(false),
+            pcm_rate: AtomicU32::new(0),
         });
         let controller = st.clone();
         // The controller thread owns the !Send cpal stream for its whole
@@ -144,6 +163,10 @@ fn state() -> &'static Arc<AudioState> {
                                 let p = finish(a);
                                 set_status(&controller, format!("saved → {p}"));
                             }
+                            // Cleared unconditionally: the watchdog may have
+                            // already finalized this clip, leaving nothing to
+                            // take — a waiter must not hang on that.
+                            controller.finalizing.store(false, Ordering::Release);
                         }
                         Err(RecvTimeoutError::Timeout) => {
                             // Watchdog: the owning widget hasn't polled the
@@ -226,6 +249,68 @@ fn finish(a: Active) -> String {
     path
 }
 
+/// Feed the raw-PCM tap, mixing interleaved channels down to mono.
+///
+/// Called from the realtime audio callback, so it does no allocation beyond
+/// the `Vec` push and bails immediately when the tap is off. cpal always
+/// delivers whole frames, so mixing per callback never splits a frame.
+fn tap_pcm(st: &AudioState, samples: impl Iterator<Item = f32>, channels: u16) {
+    if !st.pcm_tap.load(Ordering::Relaxed) {
+        return;
+    }
+    let ch = channels.max(1) as usize;
+    let Ok(mut g) = st.pcm.lock() else { return };
+    if ch == 1 {
+        g.extend(samples);
+    } else {
+        let mut sum = 0.0f32;
+        let mut n = 0usize;
+        for s in samples {
+            sum += s;
+            n += 1;
+            if n == ch {
+                g.push(sum / ch as f32);
+                sum = 0.0;
+                n = 0;
+            }
+        }
+    }
+    if g.len() > MAX_PCM_SAMPLES {
+        let excess = g.len() - MAX_PCM_SAMPLES;
+        g.drain(..excess);
+    }
+}
+
+/// Turn the raw-PCM tap on/off. Enabling clears any stale audio, so a
+/// consumer always starts from the moment it asked.
+pub fn set_pcm_tap(on: bool) {
+    let st = state();
+    st.pcm_tap.store(on, Ordering::Release);
+    if let Ok(mut g) = st.pcm.lock() {
+        g.clear();
+        if !on {
+            g.shrink_to_fit();
+        }
+    }
+}
+
+/// Drain the mono PCM captured since the last call. Empty unless
+/// [`set_pcm_tap`] is on.
+pub fn take_pcm() -> Vec<f32> {
+    let st = state();
+    touch_keepalive(st);
+    st.pcm
+        .lock()
+        .map(|mut g| std::mem::take(&mut *g))
+        .unwrap_or_default()
+}
+
+/// Sample rate of the tapped audio, or 0 if nothing has been captured yet.
+/// It's the device's native rate — the tap does not resample.
+pub fn pcm_rate() -> u32 {
+    state().pcm_rate.load(Ordering::Acquire)
+}
+
 /// Find an input device by exact name, falling back to the default input.
 fn find_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
     if !name.is_empty() {
@@ -279,6 +364,9 @@ fn start_stream(
     if let Ok(mut g) = st.levels.lock() {
         g.clear();
     }
+    // Publish the device rate before any callback fires — a PCM consumer
+    // needs it to interpret the samples it drains.
+    st.pcm_rate.store(sample_rate, Ordering::Release);
 
     let samples_per_level =
         ((sample_rate as f32 * channels as f32) / LEVELS_PER_SEC).max(1.0) as usize;
@@ -315,6 +403,7 @@ fn start_stream(
                                 }
                             }
                         }
+                        tap_pcm(&lv, data.iter().copied(), channels);
                         for &s in data {
                             acc_sq += s * s;
                             acc_n += 1;
@@ -349,6 +438,7 @@ fn start_stream(
                                 }
                             }
                         }
+                        tap_pcm(&lv, data.iter().map(|&s| s as f32 / 32768.0), channels);
                         for &s in data {
                             let f = s as f32 / 32768.0;
                             acc_sq += f * f;
@@ -385,6 +475,11 @@ fn start_stream(
                                 }
                             }
                         }
+                        tap_pcm(
+                            &lv,
+                            data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0),
+                            channels,
+                        );
                         for &s in data {
                             let f = (s as f32 - 32768.0) / 32768.0;
                             acc_sq += f * f;
@@ -481,11 +576,38 @@ pub fn record_start(device: &str, path: &str, dual: bool) -> bool {
 pub fn record_stop() -> bool {
     let st = state();
     st.recording.store(false, Ordering::Release);
-    st.cmd
+    st.finalizing.store(true, Ordering::Release);
+    let sent = st
+        .cmd
         .lock()
         .ok()
         .map(|tx| tx.send(AudioCmd::Stop).is_ok())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !sent {
+        // Nobody will clear it — don't strand a waiter.
+        st.finalizing.store(false, Ordering::Release);
+    }
+    sent
+}
+
+/// Block until a [`record_stop`] has actually finished writing the WAV.
+/// Returns false on timeout.
+///
+/// [`record_stop`] only *asks* the controller to stop; `finish` drops the
+/// stream and writes the WAV header on the controller thread a moment
+/// later. Anything that then READS the file (ffmpeg, whisper) must wait for
+/// this first, or it can catch a clip whose header still claims zero
+/// samples. Blocking — call it off the main thread.
+pub fn wait_until_finalized(timeout: Duration) -> bool {
+    let st = state();
+    let deadline = Instant::now() + timeout;
+    while st.finalizing.load(Ordering::Acquire) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
 }
 
 /// Drain and return all envelope samples accumulated since the last call.

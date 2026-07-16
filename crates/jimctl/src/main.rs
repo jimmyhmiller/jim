@@ -12,6 +12,7 @@
 use std::process::ExitCode;
 
 mod agent_bus;
+mod project_resolve;
 mod cmd_agent;
 mod cmd_channel;
 mod cmd_mcp;
@@ -19,6 +20,7 @@ mod cmd_codex;
 mod cmd_pi;
 mod cmd_close;
 mod cmd_dock;
+mod cmd_git;
 mod cmd_inbox;
 mod cmd_inject;
 mod cmd_issue;
@@ -27,6 +29,7 @@ mod cmd_memory;
 mod cmd_msg;
 mod cmd_open;
 mod cmd_project;
+mod cmd_review;
 mod cmd_suggest;
 mod cmd_trace;
 mod cmd_widget;
@@ -50,6 +53,8 @@ fn main() -> ExitCode {
         Some("inbox") => cmd_inbox::run(),
         Some("project") => cmd_project::run(),
         Some("suggest") => cmd_suggest::run(),
+        Some("git") => cmd_git::run(),
+        Some("review") => cmd_review::run(),
         Some("msg") => cmd_msg::run(),
         Some("close") => cmd_close::run(),
         Some("dock") => cmd_dock::run(),
@@ -97,6 +102,8 @@ fn usage() {
          \tinbox ...                      push to / read a project's inbox\n\
          \tproject ...                    project operations\n\
          \tsuggest ...                    park a pane in the suggestion drawer\n\
+         \tgit ...                        git queries + safe mutations + hunk staging (JSON out)\n\
+         \treview ...                     local code-review threads (list/add/reply/resolve)\n\
          \tmsg <topic> <body>             publish on the widget message bus\n\
          \tclose ...                      close a pane\n\
          \tdock --project P [--title T ...]  snap panes into a dock (sidebar+main)\n\
