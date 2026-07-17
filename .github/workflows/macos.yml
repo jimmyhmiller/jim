@@ -15,8 +15,19 @@ on:
 
 jobs:
   build:
-    # macos-latest is Apple Silicon (arm64) — the only arch we ship.
-    runs-on: macos-latest
+    # Pinned to macOS 15 Arm64 (Apple Silicon — the only arch we ship), NOT
+    # macos-latest. `macos-latest` has rolled to macOS 26 (Tahoe), whose only
+    # installed SDKs are macOS 26.x. zig 0.15.2 — the version ghostty pins
+    # EXACTLY (src/build/zig.zig requireZig accepts 0.15.x only, patch >= 2, so
+    # 0.16 is rejected) — mishandles the macOS 26 native target: it emits a
+    # broken libSystem stub and the zig *build runner* itself fails to link
+    # (undefined _abort/_free/_dispatch_*/... from build_zcu.o). Earlier green
+    # runs on macos-26 only survived by restoring a cached target/; the first
+    # clean rebuild (c98acbb, a target/ cache miss) exposed the break. macOS 15
+    # ships the newest SDK zig 0.15.2 links cleanly, is still arm64, and the
+    # resulting binary runs on macOS 26. Revisit when ghostty (and its zig pin)
+    # gains macOS 26 support.
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v4
