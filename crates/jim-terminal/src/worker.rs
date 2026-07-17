@@ -1358,15 +1358,41 @@ fn extract_screen_selection(
                 .unwrap_or(' ');
             line.push(ch);
         }
-        // Trim trailing whitespace — terminals pad rows with spaces and
-        // copying a screenful of those is annoying. Leading spaces
-        // (indentation) are preserved.
-        out.push_str(line.trim_end());
-        if row != last {
+        // A soft-wrapped row is the same logical line continuing onto the
+        // next one — the terminal broke it to fit the width, the program
+        // never emitted a newline there. Copying one in would corrupt the
+        // text (a wrapped path or command comes back unrunnable), so the
+        // rows get joined instead. Its trailing spaces are real content
+        // mid-line, so they survive the trim too.
+        let wrapped = row_is_wrapped(terminal, row);
+        if wrapped {
+            out.push_str(&line);
+        } else {
+            // Trim trailing whitespace — terminals pad rows with spaces and
+            // copying a screenful of those is annoying. Leading spaces
+            // (indentation) are preserved.
+            out.push_str(line.trim_end());
+        }
+        if row != last && !wrapped {
             out.push('\n');
         }
     }
     out
+}
+
+/// Whether `row` is soft-wrapped: its logical line continues on the next
+/// row rather than ending there. Any failure to read the flag reports
+/// "not wrapped", which degrades to the old newline-per-row behaviour.
+fn row_is_wrapped(terminal: &libghostty_vt::Terminal<'static, 'static>, row: i64) -> bool {
+    terminal
+        .grid_ref(Point::Screen(PointCoordinate {
+            x: 0,
+            y: row as u32,
+        }))
+        .ok()
+        .and_then(|g| g.row().ok())
+        .and_then(|r| r.is_wrapped().ok())
+        .unwrap_or(false)
 }
 
 /// Marker type for OwnedFd round-trip if needed elsewhere.
@@ -1428,6 +1454,16 @@ fn publish_command_executed(session_id: u64, command: &str, exit_code: i32, cwd:
     );
 }
 
+/// Report a disk error without `eprintln!`, which panics if the stderr
+/// write itself fails. Every caller below reports an error whose most
+/// likely cause — a full disk — is also what makes stderr unwritable, so
+/// `eprintln!` here panics the worker thread precisely when it is trying
+/// to tell us the disk is full.
+fn log_disk_err(args: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{}", args);
+}
+
 /// Append-only writer for a per-terminal scrollback log. Bytes written
 /// here are exactly what was fed to `vt_write`, so the next launch can
 /// `vt_write` them straight into a fresh Terminal to recover scrollback.
@@ -1447,7 +1483,7 @@ impl ScrollbackLogWriter {
         if let Some(parent) = path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
-            eprintln!("[worker] mkdir {}: {}", parent.display(), e);
+            log_disk_err(format_args!("[worker] mkdir {}: {}", parent.display(), e));
             return None;
         }
         let file = match OpenOptions::new()
@@ -1457,7 +1493,7 @@ impl ScrollbackLogWriter {
         {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("[worker] open {}: {}", path.display(), e);
+                log_disk_err(format_args!("[worker] open {}: {}", path.display(), e));
                 return None;
             }
         };
@@ -1470,7 +1506,11 @@ impl ScrollbackLogWriter {
 
     fn append(&mut self, bytes: &[u8]) {
         if let Err(e) = self.file.write_all(bytes) {
-            eprintln!("[worker] log write {}: {}", self.path.display(), e);
+            log_disk_err(format_args!(
+                "[worker] log write {}: {}",
+                self.path.display(),
+                e
+            ));
             return;
         }
         self.bytes_since_check = self.bytes_since_check.saturating_add(bytes.len() as u64);
@@ -1504,7 +1544,11 @@ impl ScrollbackLogWriter {
         })() {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("[worker] log read-tail {}: {}", path.display(), e);
+                log_disk_err(format_args!(
+                    "[worker] log read-tail {}: {}",
+                    path.display(),
+                    e
+                ));
                 return;
             }
         };
@@ -1516,13 +1560,64 @@ impl ScrollbackLogWriter {
             std::fs::rename(&tmp_path, path)
         })();
         if let Err(e) = write_result {
-            eprintln!("[worker] log rotate {}: {}", path.display(), e);
+            log_disk_err(format_args!("[worker] log rotate {}: {}", path.display(), e));
             return;
         }
 
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(f) => self.file = f,
-            Err(e) => eprintln!("[worker] log reopen {}: {}", path.display(), e),
+            Err(e) => log_disk_err(format_args!("[worker] log reopen {}: {}", path.display(), e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libghostty_vt::{Terminal, TerminalOptions};
+
+    /// Build a terminal `cols` wide and feed it `data`.
+    fn term_with(cols: u16, data: &str) -> Terminal<'static, 'static> {
+        let mut t = Terminal::new(TerminalOptions {
+            cols,
+            rows: 24,
+            max_scrollback: 0,
+        })
+        .expect("terminal must construct");
+        t.vt_write(data.as_bytes());
+        t
+    }
+
+    /// A line longer than the width soft-wraps; copying it back must not
+    /// invent a newline at the wrap point.
+    #[test]
+    fn wrapped_line_copies_without_newline() {
+        // 30 chars into a 10-wide terminal => 3 rows, no real newline.
+        let t = term_with(10, "abcdefghijklmnopqrstuvwxyz0123");
+        assert!(row_is_wrapped(&t, 0), "row 0 must be flagged soft-wrapped");
+        assert!(row_is_wrapped(&t, 1), "row 1 must be flagged soft-wrapped");
+        assert!(!row_is_wrapped(&t, 2), "last row must not be flagged");
+        let text = extract_screen_selection(&t, (0, 0), (9, 2));
+        assert_eq!(text, "abcdefghijklmnopqrstuvwxyz0123");
+    }
+
+    /// A real newline from the program is still a newline.
+    #[test]
+    fn hard_newline_is_preserved() {
+        let t = term_with(10, "abc\r\ndef");
+        assert!(!row_is_wrapped(&t, 0));
+        let text = extract_screen_selection(&t, (0, 0), (9, 1));
+        assert_eq!(text, "abc\ndef");
+    }
+
+    /// Trailing pad spaces are trimmed on an unwrapped row, but spaces
+    /// mid-logical-line (i.e. on a wrapped row) are real content.
+    #[test]
+    fn wrapped_row_keeps_interior_spaces() {
+        // "ab" + 8 spaces fills row 0 exactly and wraps; "cd" lands on row 1.
+        let t = term_with(10, "ab        cd");
+        assert!(row_is_wrapped(&t, 0));
+        let text = extract_screen_selection(&t, (0, 0), (9, 1));
+        assert_eq!(text, "ab        cd");
     }
 }

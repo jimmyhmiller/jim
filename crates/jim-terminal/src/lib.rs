@@ -550,8 +550,8 @@ pub fn populate_terminal_pane(
         PtySize {
             cols,
             rows,
-            cell_width_px: cell_width as u16,
-            cell_height_px: LINE_HEIGHT as u16,
+            cell_width_px: cell_width.round() as u16,
+            cell_height_px: LINE_HEIGHT.round() as u16,
         },
         SCROLLBACK_LINES,
         scrollback_path(session_id),
@@ -719,8 +719,8 @@ fn handle_resize(
         data.worker.send(WorkerMsg::Resize {
             cols,
             rows,
-            cell_w_px: metrics.cell_width as u32,
-            cell_h_px: LINE_HEIGHT as u32,
+            cell_w_px: metrics.cell_width.round() as u32,
+            cell_h_px: LINE_HEIGHT.round() as u32,
         });
     }
 }
@@ -1430,8 +1430,16 @@ fn handle_terminal_mouse_report(
     let sup = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);
 
     let canvas_pt = viewport.window_to_canvas(win_pt);
-    let cell_w = metrics.cell_width.round().max(1.0) as u16;
-    let cell_h = LINE_HEIGHT.round().max(1.0) as u16;
+    // The encoder's cell size is integral, but the rendered cell is not
+    // (SF Mono at 14px advances 8.654px). Rounding the cell size alone
+    // would make the encoder's `x / cell_w` disagree with the grid the
+    // user sees, drifting a further column left every ~26 columns. So
+    // round the cell size and rescale the position into that same space.
+    let cell_w = metrics.cell_width.round().max(1.0);
+    let cell_h = LINE_HEIGHT.round().max(1.0);
+    let scale = Vec2::new(cell_w / metrics.cell_width, cell_h / LINE_HEIGHT);
+    let cell_w = cell_w as u16;
+    let cell_h = cell_h as u16;
     let any_button = REPORT_BUTTONS.iter().any(|(b, _)| buttons.pressed(*b));
 
     // Hit-test against ALL panes (respecting z-order) so a widget sitting
@@ -1458,7 +1466,7 @@ fn handle_terminal_mouse_report(
         let Some((_, rect)) = all_panes.iter().find(|(e, _)| *e == pane) else {
             return;
         };
-        let local = jim_pane::pt_to_content_local(canvas_pt, rect);
+        let local = jim_pane::pt_to_content_local(canvas_pt, rect) * scale;
         if let Some(data) = store.map.get(&pane) {
             data.worker.send(WorkerMsg::Mouse {
                 action,

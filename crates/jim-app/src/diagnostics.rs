@@ -637,6 +637,13 @@ fn diag_log_path() -> Option<PathBuf> {
 /// stderr. Each line is written with a single `write_all`, so concurrent
 /// writes from the heartbeat thread and the sampler stay line-atomic
 /// under `O_APPEND`.
+///
+/// Every write here ignores its error, including the stderr mirror. That
+/// is load-bearing, not laziness: this runs inside the panic hook, and
+/// `eprint!` *panics* if the stderr write fails (e.g. ENOSPC). A panicking
+/// panic hook is a double panic, which aborts the process — so a disk-full
+/// `eprintln!` on any worker thread would take the whole GUI down instead
+/// of just that thread.
 pub(crate) fn append_log(line: &str) {
     let epoch_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -655,7 +662,7 @@ pub(crate) fn append_log(line: &str) {
             let _ = f.write_all(full.as_bytes());
         }
     }
-    eprint!("{}", full);
+    let _ = std::io::stderr().write_all(full.as_bytes());
 }
 
 /// Route any unwinding panic into the diagnostics log before the default
