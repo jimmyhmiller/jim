@@ -213,7 +213,7 @@ fn copy_paste_keys(
     focused: Res<FocusedPane>,
     owner: Res<jim_pane::KeyboardOwner>,
     store: Res<TerminalStore>,
-    sels: Query<&TerminalSelection>,
+    mut sels: Query<&mut TerminalSelection>,
     kinds: Query<&PaneKindMarker>,
     clip: Res<ClipboardState>,
 ) {
@@ -234,7 +234,16 @@ fn copy_paste_keys(
     let cmd = mods.pressed(KeyCode::SuperLeft) || mods.pressed(KeyCode::SuperRight);
     if !cmd {
         // Drain so we don't carry the events into a future Cmd-down frame.
-        events.read().for_each(|_| {});
+        // If a C press slipped through here, the Super modifier wasn't seen
+        // as held this frame — surface that instead of silently dropping it.
+        events.read().for_each(|ev| {
+            if ev.state.is_pressed() && matches!(ev.key_code, KeyCode::KeyC | KeyCode::KeyV) {
+                eprintln!(
+                    "[termcopy] {:?} pressed but Super not detected as held this frame",
+                    ev.key_code
+                );
+            }
+        });
         return;
     }
     for ev in events.read() {
@@ -243,15 +252,29 @@ fn copy_paste_keys(
         }
         match ev.key_code {
             KeyCode::KeyC => {
-                let Some(target) = focused.0 else { continue };
-                let Ok(sel) = sels.get(target) else { continue };
+                let Some(target) = focused.0 else {
+                    eprintln!("[termcopy] Cmd+C: no focused pane");
+                    continue;
+                };
+                let Ok(sel) = sels.get(target) else {
+                    eprintln!("[termcopy] Cmd+C: focused pane {target:?} has no TerminalSelection");
+                    continue;
+                };
                 if !sel.is_active() {
+                    eprintln!(
+                        "[termcopy] Cmd+C: selection not active (anchor={:?} head={:?})",
+                        sel.anchor, sel.head
+                    );
                     continue;
                 }
                 let Some((start, end)) = sel.normalised() else {
+                    eprintln!("[termcopy] Cmd+C: normalised() returned None despite is_active");
                     continue;
                 };
-                let Some(data) = store.map.get(&target) else { continue };
+                let Some(data) = store.map.get(&target) else {
+                    eprintln!("[termcopy] Cmd+C: no TerminalStore entry for {target:?}");
+                    continue;
+                };
                 // Read the selected text off the worker's `Terminal`,
                 // which owns the full scrollback — the visible snapshot
                 // only holds the on-screen grid, so a selection that
@@ -265,13 +288,50 @@ fn copy_paste_keys(
                     end,
                     reply: reply_tx,
                 });
-                let Ok(text) = reply_rx.recv_timeout(Duration::from_millis(500)) else {
-                    continue;
+                let text = match reply_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!(
+                            "[termcopy] Cmd+C: worker ExtractText reply failed ({e:?}) for \
+                             start={start:?} end={end:?}"
+                        );
+                        continue;
+                    }
                 };
-                if let Ok(mut guard) = clip.clipboard.lock()
-                    && let Some(c) = guard.as_mut()
-                {
-                    let _ = c.set_text(text);
+                eprintln!(
+                    "[termcopy] Cmd+C: extracted {} chars (start={start:?} end={end:?})",
+                    text.chars().count()
+                );
+                let copied = match clip.clipboard.lock() {
+                    Ok(mut guard) => match guard.as_mut() {
+                        Some(c) => match c.set_text(text) {
+                            Ok(()) => {
+                                eprintln!("[termcopy] Cmd+C: clipboard set OK");
+                                true
+                            }
+                            Err(e) => {
+                                eprintln!("[termcopy] Cmd+C: clipboard set_text failed: {e}");
+                                false
+                            }
+                        },
+                        None => {
+                            eprintln!(
+                                "[termcopy] Cmd+C: clipboard unavailable (arboard init failed at startup)"
+                            );
+                            false
+                        }
+                    },
+                    Err(_) => {
+                        eprintln!("[termcopy] Cmd+C: clipboard mutex poisoned");
+                        false
+                    }
+                };
+                // Deselect once the text is safely on the clipboard —
+                // matches the "copy then the highlight goes away" gesture.
+                // We only clear on success so a failed/timed-out copy leaves
+                // the selection intact to retry.
+                if copied && let Ok(mut sel) = sels.get_mut(target) {
+                    sel.clear();
                 }
             }
             KeyCode::KeyV => {

@@ -691,6 +691,13 @@ pub struct PaneContentPressed {
     /// True if shift was held — kinds use this to extend a selection
     /// rather than start a new one.
     pub shift: bool,
+    /// True if the "force local selection" modifier was held at press
+    /// time (Fn on macOS — see [`ForceLocalSelect`]). Kinds that
+    /// normally hand the click to a mouse-tracking child (a terminal
+    /// running a TUI) should instead start a local text selection, the
+    /// same override `shift` grants. Lets the user click-drag to select
+    /// even while the app has grabbed the mouse.
+    pub force_local: bool,
     /// True iff this press was routed via the pinned-pane path
     /// (i.e. the pane has [`PanePinned`] and the click landed inside
     /// one of its [`PaneHotZones`]). When set, focus + raise + drag
@@ -700,6 +707,18 @@ pub struct PaneContentPressed {
     /// placing a caret.
     pub pinned: bool,
 }
+
+/// "Force local text selection" modifier state, updated once per frame
+/// by the host from the authoritative OS view (on macOS the Fn key via
+/// `NSEventModifierFlagFunction`; there is no reliable winit `KeyCode`
+/// for it). When `true`, a content press over a mouse-tracking child
+/// (e.g. a terminal running a TUI that grabbed the mouse) starts a
+/// local text selection instead of being reported to the child —
+/// mirroring the classic terminal "hold Fn/Option to select" gesture.
+/// Defaults `false`; hosts that don't set it simply never enable the
+/// override (users can still hold Shift).
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct ForceLocalSelect(pub bool);
 
 /// Fired every frame the mouse moves while the left button is held
 /// after a content-area press. `local_pt` may be outside the content
@@ -797,6 +816,7 @@ impl Plugin for PanePlugin {
             .init_resource::<PaneViewport>()
             .init_resource::<PaneZoom>()
             .init_resource::<PaneCursorOverride>()
+            .init_resource::<ForceLocalSelect>()
             .insert_resource(PaneLayerAllocator::with_reserved(
                 self.reserved_layers.iter().copied(),
             ))
@@ -1837,6 +1857,9 @@ struct PaneMouseAux<'w, 's> {
         With<PaneTag>,
     >,
     hot_zones: Query<'w, 's, &'static PaneHotZones>,
+    /// "Hold Fn to select locally" modifier (see [`ForceLocalSelect`]);
+    /// packed here to keep `handle_pane_mouse` under the 16-arg ceiling.
+    force_local: Res<'w, ForceLocalSelect>,
 }
 
 fn handle_pane_mouse(
@@ -2024,6 +2047,7 @@ fn handle_pane_mouse(
                         window_pt: pt,
                         local_pt: pt_to_content_local_th(cur, &rect, title_h),
                         shift,
+                        force_local: aux.force_local.0,
                         pinned: false,
                     });
                     *mode = PaneMouseMode::ContentDrag {
@@ -2089,6 +2113,7 @@ fn handle_pane_mouse(
                 window_pt: pt,
                 local_pt: local,
                 shift,
+                force_local: aux.force_local.0,
                 pinned: true,
             });
             *mode = PaneMouseMode::ContentDrag {

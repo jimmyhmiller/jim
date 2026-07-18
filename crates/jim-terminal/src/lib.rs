@@ -1284,16 +1284,21 @@ fn handle_terminal_content_press(
         if kind.0 != PANE_KIND {
             continue;
         }
-        // If the child grabbed the mouse (any tracking mode), a plain
-        // click is reported to it by `handle_terminal_mouse_report`, not
-        // turned into a local text selection. Shift is the escape hatch:
-        // Shift+drag always selects locally, matching xterm.
-        if mouse_tracking_of(&store, ev.pane) && !ev.shift {
-            continue;
-        }
-        // Clear any other terminal's selection.
+        // Any press in a terminal tears down the existing selection —
+        // matching xterm / macOS Terminal, where a click deselects. This
+        // runs BEFORE the mouse-tracking gate below so even a plain click
+        // that gets reported to the child (a TUI that grabbed the mouse)
+        // still clears the highlight instead of leaving it stuck.
         for mut sel in &mut selections {
             sel.clear();
+        }
+        // If the child grabbed the mouse (any tracking mode), a plain
+        // click is reported to it by `handle_terminal_mouse_report`, not
+        // turned into a local text selection. Shift and Fn are the escape
+        // hatches: Shift+drag or Fn+drag always selects locally, matching
+        // xterm / macOS Terminal's "hold Fn to select" gesture.
+        if mouse_tracking_of(&store, ev.pane) && !ev.shift && !ev.force_local {
+            continue;
         }
         let Ok(rect) = rects.get(ev.pane) else { continue };
         let viewport_cell =
@@ -1404,6 +1409,7 @@ fn handle_terminal_mouse_report(
     metrics: Res<MonoMetrics>,
     viewport: Res<jim_pane::PaneViewport>,
     store: Res<TerminalStore>,
+    force_local: Res<jim_pane::ForceLocalSelect>,
     panes: Query<(Entity, &PaneRect, &PaneKindMarker, &Visibility)>,
     mut state: Local<MouseReportState>,
 ) {
@@ -1424,7 +1430,12 @@ fn handle_terminal_mouse_report(
         return;
     }
 
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    // Shift or Fn (see `jim_pane::ForceLocalSelect`) both force local text
+    // selection, so a press under either never starts an app mouse-report
+    // gesture — the same override the content-press selection path honors.
+    let shift = keys.pressed(KeyCode::ShiftLeft)
+        || keys.pressed(KeyCode::ShiftRight)
+        || force_local.0;
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
     let sup = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);

@@ -469,18 +469,25 @@ impl Plugin for AppShellPlugin {
                     route_emacs_open_requests,
                 ),
             )
+            // Focus-state + modifier reconciliation run in PreUpdate, right
+            // after Bevy's input systems have drained this frame's raw
+            // events, and BEFORE any Update consumer reads its keys — the
+            // terminal crate's `handle_keyboard`, the Cmd+C/Cmd+V clipboard
+            // system, and jim-pane's Shift/Fn-to-select gate all live in
+            // Update, in other plugins. Doing it here (not in Update) is what
+            // makes the corrected modifier state authoritative the same frame:
+            // an Update-ordered fix could land after those consumers and drop
+            // the keystroke. `track_app_focus` runs first so its focus-flip
+            // `release_all` can't clobber the reconcile that follows it.
+            .add_systems(
+                PreUpdate,
+                (track_app_focus, reconcile_macos_modifiers)
+                    .chain()
+                    .after(bevy::input::InputSystems),
+            )
             .add_systems(
                 Update,
                 (
-                    // Focus-state + modifier reconciliation run before the
-                    // terminal crate's `handle_keyboard` (in
-                    // `jim_terminal::TerminalPlugin`) so a stuck Cmd (e.g. a
-                    // swallowed Cmd-up from a system shortcut) doesn't drop
-                    // this frame's keys. The reconciliation self-heals each
-                    // frame, so cross-plugin ordering being best-effort is
-                    // fine.
-                    track_app_focus,
-                    reconcile_macos_modifiers,
                     handle_scroll,
                     apply_bell_pulse,
                     apply_claude_notification_pulse,
@@ -1522,36 +1529,80 @@ fn track_app_focus(
 /// release it — otherwise every terminal keystroke after the stuck
 /// modifier gets silently dropped by handle_keyboard's gate.
 #[cfg(target_os = "macos")]
-fn reconcile_macos_modifiers(mut keys: ResMut<ButtonInput<KeyCode>>) {
+fn reconcile_macos_modifiers(
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut force_local: ResMut<jim_pane::ForceLocalSelect>,
+) {
     use objc2_app_kit::{NSEvent, NSEventModifierFlags};
 
     let flags = unsafe { NSEvent::modifierFlags_class() };
     let want = |mask: NSEventModifierFlags| flags.contains(mask);
 
-    let cmd = want(NSEventModifierFlags::NSEventModifierFlagCommand);
-    let shift = want(NSEventModifierFlags::NSEventModifierFlagShift);
-    let ctrl = want(NSEventModifierFlags::NSEventModifierFlagControl);
-    let alt = want(NSEventModifierFlags::NSEventModifierFlagOption);
-
-    let pairs = [
-        (cmd, KeyCode::SuperLeft),
-        (cmd, KeyCode::SuperRight),
-        (shift, KeyCode::ShiftLeft),
-        (shift, KeyCode::ShiftRight),
-        (ctrl, KeyCode::ControlLeft),
-        (ctrl, KeyCode::ControlRight),
-        (alt, KeyCode::AltLeft),
-        (alt, KeyCode::AltRight),
+    // Authoritatively mirror the OS modifier state into Bevy's
+    // ButtonInput. winit on macOS drops modifier press/release events
+    // often enough (Cmd+Tab, Spotlight, other system shortcuts, and
+    // plain event races) that `pressed(Super*)` / `pressed(Shift*)` can
+    // be wrong in BOTH directions — stuck on, OR a press that never
+    // registered. This used to only heal the stuck-on case; the
+    // stuck-off case silently broke Cmd+C / Cmd+V (the `if cmd { return }`
+    // gate in `handle_keyboard` never fired, and the clipboard system
+    // saw no Cmd) and Shift-to-select-locally. NSEvent's modifierFlags
+    // is the ground truth, so each frame we press what the OS reports
+    // down and release what it reports up. Runs in PreUpdate after
+    // InputSystems so every Update consumer sees the corrected state the
+    // same frame it reads its keys.
+    let groups = [
+        (
+            want(NSEventModifierFlags::NSEventModifierFlagCommand),
+            KeyCode::SuperLeft,
+            KeyCode::SuperRight,
+        ),
+        (
+            want(NSEventModifierFlags::NSEventModifierFlagShift),
+            KeyCode::ShiftLeft,
+            KeyCode::ShiftRight,
+        ),
+        (
+            want(NSEventModifierFlags::NSEventModifierFlagControl),
+            KeyCode::ControlLeft,
+            KeyCode::ControlRight,
+        ),
+        (
+            want(NSEventModifierFlags::NSEventModifierFlagOption),
+            KeyCode::AltLeft,
+            KeyCode::AltRight,
+        ),
     ];
-    for (os_held, code) in pairs {
-        if !os_held && keys.pressed(code) {
-            keys.release(code);
+    for (os_held, left, right) in groups {
+        let bevy_held = keys.pressed(left) || keys.pressed(right);
+        if os_held && !bevy_held {
+            // OS says held but Bevy missed the press — synthesize it on
+            // the left side so every `pressed(left) || pressed(right)`
+            // check sees the modifier.
+            keys.press(left);
+        } else if !os_held {
+            // OS says up — clear whichever side Bevy still thinks is down.
+            if keys.pressed(left) {
+                keys.release(left);
+            }
+            if keys.pressed(right) {
+                keys.release(right);
+            }
         }
     }
+
+    // Fn has no reliable winit `KeyCode`, so read it straight from the OS
+    // and publish it for jim-pane's "hold Fn to select locally over a
+    // mouse-tracking child" gesture.
+    force_local.0 = want(NSEventModifierFlags::NSEventModifierFlagFunction);
 }
 
 #[cfg(not(target_os = "macos"))]
-fn reconcile_macos_modifiers() {}
+fn reconcile_macos_modifiers(mut force_local: ResMut<jim_pane::ForceLocalSelect>) {
+    // No Fn-modifier concept off macOS; keep the override disabled so
+    // Shift stays the only local-select escape hatch.
+    force_local.0 = false;
+}
 
 /// Cached whole-app focus state, maintained by the NSWorkspace activation
 /// observers on macOS (`install_app_focus_observers`). `track_app_focus`
