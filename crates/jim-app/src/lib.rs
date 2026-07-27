@@ -407,6 +407,15 @@ impl Plugin for AppShellPlugin {
             radial_icon: None,
             default_keys: &[],
             run: ActionRun::Custom(action_set_project_cwd_from_focused),
+        })
+        .add_action(Action {
+            id: "config.install_notify",
+            title: "Install Stop Notification Setup",
+            category: "Config",
+            keywords: &["notification", "bell", "pulse", "stop", "hook", "settings", "claude"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(action_install_claude_notify),
         });
         app
             .add_systems(
@@ -1900,6 +1909,117 @@ fn action_set_project_cwd_from_focused(ctx: &mut actions::ActionCtx) {
         "[set-cwd] project={} default_cwd={:?} changed={}",
         project_id, cwd, changed
     );
+}
+
+/// Palette action: merge the "pulse jim when Claude Code stops" setup
+/// into `~/.claude/settings.json`. Same idempotent merge as
+/// `scripts/install-claude-notify.sh`, but embedded so it works on any
+/// machine `jim` is installed on with no repo checkout. Adds a `Stop`
+/// hook that writes a BEL to `/dev/tty` (jim's `on_bell` → pane pulse)
+/// and sets `preferredNotifChannel = "terminal_bell"`. Reports the
+/// outcome into the active project's inbox.
+fn action_install_claude_notify(ctx: &mut actions::ActionCtx) {
+    let world = &mut ctx.world;
+    let result = install_claude_notify();
+    let (subject, body) = match &result {
+        Ok(msg) => (Some("Notify setup installed".to_string()), msg.clone()),
+        Err(e) => (Some("Notify setup FAILED".to_string()), e.clone()),
+    };
+    eprintln!("[install-notify] {body}");
+    if let Some(active) = world.resource::<Projects>().active {
+        let _ = inbox::append_message(active, "jim", subject, body);
+    }
+}
+
+/// The actual settings.json merge. Returns a human summary on success or
+/// an error string. Idempotent: re-running never duplicates the hook.
+fn install_claude_notify() -> Result<String, String> {
+    use std::path::PathBuf;
+    const BELL: &str = "printf '\\a' > /dev/tty 2>/dev/null || true";
+
+    let home = std::env::var("HOME").map_err(|_| "no HOME env".to_string())?;
+    let path = PathBuf::from(&home).join(".claude/settings.json");
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+    }
+
+    let existed = path.exists();
+    let raw = if existed {
+        std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?
+    } else {
+        "{}".to_string()
+    };
+    let mut data: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {path:?}: {e}"))?;
+    let obj = data
+        .as_object_mut()
+        .ok_or_else(|| "settings.json is not a JSON object".to_string())?;
+
+    // 1. Notification channel.
+    obj.insert(
+        "preferredNotifChannel".to_string(),
+        serde_json::Value::String("terminal_bell".to_string()),
+    );
+
+    // 2. Stop-hook BEL command (idempotent).
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "hooks is not an object".to_string())?;
+    let stop = hooks
+        .entry("Stop")
+        .or_insert_with(|| serde_json::json!([]));
+    if !stop.is_array() {
+        *stop = serde_json::json!([]);
+    }
+    let stop = stop.as_array_mut().unwrap();
+
+    // Strip any prior copy of our BEL command from every group so a
+    // re-run can't accumulate duplicates.
+    for group in stop.iter_mut() {
+        if let Some(hs) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            hs.retain(|h| h.get("command").and_then(|c| c.as_str()) != Some(BELL));
+        }
+    }
+    // Ensure at least one group, then append the BEL command to it.
+    if stop.is_empty() {
+        stop.push(serde_json::json!({ "hooks": [] }));
+    }
+    let first_hooks = stop[0]
+        .as_object_mut()
+        .ok_or_else(|| "Stop[0] is not an object".to_string())?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| "Stop[0].hooks is not an array".to_string())?;
+    first_hooks.push(serde_json::json!({ "type": "command", "command": BELL }));
+
+    // Back up the prior file before overwriting.
+    let mut backup_note = String::new();
+    if existed {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = path.with_extension(format!("json.bak.{ts}"));
+        if std::fs::write(&backup, &raw).is_ok() {
+            backup_note = format!(" (backup: {})", backup.display());
+        }
+    }
+
+    let mut out = serde_json::to_string_pretty(&data)
+        .map_err(|e| format!("serialize: {e}"))?;
+    out.push('\n');
+    std::fs::write(&path, out.as_bytes())
+        .map_err(|e| format!("write {path:?}: {e}"))?;
+
+    Ok(format!(
+        "Installed Stop-bell + terminal_bell into {}{}. Restart Claude Code (new session) for the Stop hook to take effect.",
+        path.display(),
+        backup_note
+    ))
 }
 
 /// Clears the active project's unread count whenever the OS window is
