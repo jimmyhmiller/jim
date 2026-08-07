@@ -44,14 +44,14 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 
 use jim_pane::{PaneFont, PaneFontMetrics, PaneRegistry};
+use jim_widget::WidgetTargets;
 use jim_widget::protocol::{Align, Border, Edges, Element, Shadow, Style, Weight};
 use jim_widget::render::{self, LayoutCtx, WidgetPalette};
-use jim_widget::WidgetTargets;
 
+use crate::MENU_OVERLAY_LAYER;
 use crate::actions::{ActionInvocations, ActionRegistry, Keymap};
 use crate::agent::{self, AgentMsg};
 use crate::projects::Projects;
-use crate::MENU_OVERLAY_LAYER;
 
 /// Z within the overlay layer — above the drawer (550) and radial (600).
 const PALETTE_Z: f32 = 700.0;
@@ -413,7 +413,12 @@ fn palette_input(
     }
 }
 
-fn open(palette: &mut CommandPalette, registry: &ActionRegistry, usage: &PaletteUsage, keymap: &Keymap) {
+fn open(
+    palette: &mut CommandPalette,
+    registry: &ActionRegistry,
+    usage: &PaletteUsage,
+    keymap: &Keymap,
+) {
     palette.open = true;
     palette.mode = PaletteMode::Actions;
     palette.query.clear();
@@ -502,7 +507,10 @@ fn assemble_context(projects: &Projects, pane_registry: &PaneRegistry) -> String
         s.push_str(&format!("Known projects: {}\n", names.join(", ")));
     }
     let kinds: Vec<&str> = pane_registry.iter().map(|k| k.kind).collect();
-    s.push_str(&format!("Pane kinds (for 'kind' args): {}\n", kinds.join(", ")));
+    s.push_str(&format!(
+        "Pane kinds (for 'kind' args): {}\n",
+        kinds.join(", ")
+    ));
     s
 }
 
@@ -695,7 +703,10 @@ fn actions_children(palette: &CommandPalette) -> Vec<Element> {
         children.push(text_muted("no matching actions", 14.0));
     }
     for (i, row) in palette.results.iter().take(MAX_ROWS).enumerate() {
-        let hint = row.keybind.clone().unwrap_or_else(|| row.category.to_string());
+        let hint = row
+            .keybind
+            .clone()
+            .unwrap_or_else(|| row.category.to_string());
         children.push(list_row(
             row.id,
             &row.title,

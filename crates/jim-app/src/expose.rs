@@ -267,8 +267,19 @@ fn drive_expose_toggle(
     // A spread pane matches both, so they must share access via a ParamSet.
     mut panes_set: ParamSet<(
         Query<
-            (Entity, &PaneRect, &PaneProject, Option<&PaneCanvas>, Option<&PaneSnapId>),
-            (With<PaneTag>, Without<PanePinned>, Without<PaneScreenAnchored>, Without<PaneClosing>),
+            (
+                Entity,
+                &PaneRect,
+                &PaneProject,
+                Option<&PaneCanvas>,
+                Option<&PaneSnapId>,
+            ),
+            (
+                With<PaneTag>,
+                Without<PanePinned>,
+                Without<PaneScreenAnchored>,
+                Without<PaneClosing>,
+            ),
         >,
         Query<(Entity, &mut PaneRect, &PaneVisualScale, &ExposeSlot)>,
     )>,
@@ -299,10 +310,15 @@ fn drive_expose_toggle(
         let targets =
             compute_expose_layout(&items, &viewport, region.as_deref(), windows.single().ok());
         for (idx, (e, target_pos, target_scale)) in targets.into_iter().enumerate() {
-            let Some((_, r, _)) = items.iter().find(|(pe, ..)| *pe == e) else { continue };
+            let Some((_, r, _)) = items.iter().find(|(pe, ..)| *pe == e) else {
+                continue;
+            };
             let start_pos = r.pos;
             commands.entity(e).insert((
-                ExposeSlot { home: start_pos, base_scale: target_scale },
+                ExposeSlot {
+                    home: start_pos,
+                    base_scale: target_scale,
+                },
                 PaneVisualScale(1.0),
                 ExposeAnim {
                     start_pos,
@@ -326,7 +342,10 @@ fn drive_expose_toggle(
         // Bring the selected pane to the front of the z-stack (what a
         // normal focusing click does) so it returns home on top.
         let mut returning = panes_set.p1();
-        let max_z = returning.iter().map(|(_, r, _, _)| r.z).fold(0.0_f32, f32::max);
+        let max_z = returning
+            .iter()
+            .map(|(_, r, _, _)| r.z)
+            .fold(0.0_f32, f32::max);
         for (e, mut rect, vscale, slot) in returning.iter_mut() {
             if focus_target == Some(e) && rect.z < max_z {
                 rect.z = max_z + 1.0;
@@ -498,7 +517,9 @@ fn expose_input(
 
     if buttons.just_pressed(MouseButton::Left) {
         let Ok(win) = windows.single() else { return };
-        let Some(cursor) = win.cursor_position() else { return };
+        let Some(cursor) = win.cursor_position() else {
+            return;
+        };
         if let Some(e) =
             pane_at_cursor(cursor, &viewport, panes.iter().map(|(e, r, v)| (e, r, v.0)))
         {
@@ -531,8 +552,15 @@ impl Plugin for ExposePlugin {
                 title: "Toggle Exposé",
                 category: "View",
                 keywords: &[
-                    "expose", "exposé", "overview", "windows", "spread", "grid",
-                    "mission control", "tile", "arrange",
+                    "expose",
+                    "exposé",
+                    "overview",
+                    "windows",
+                    "spread",
+                    "grid",
+                    "mission control",
+                    "tile",
+                    "arrange",
                 ],
                 radial_icon: Some("▦"),
                 default_keys: const { &[KeyChord::cmd_shift(KeyCode::KeyE)] },

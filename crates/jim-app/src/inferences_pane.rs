@@ -155,10 +155,7 @@ fn pump_into_panes(
     }
 }
 
-fn sync_visuals(
-    mut panes: Query<&mut InferencesPane>,
-    mut texts: Query<&mut Text2d>,
-) {
+fn sync_visuals(mut panes: Query<&mut InferencesPane>, mut texts: Query<&mut Text2d>) {
     for mut pane in &mut panes {
         if !pane.dirty {
             continue;
@@ -189,7 +186,10 @@ fn format_cwd_changed(ev: &ClaudeBusEvent) -> Option<String> {
 
 fn format_suggestion(ev: &ClaudeBusEvent) -> Option<String> {
     let v: Value = serde_json::from_str(&ev.payload_json).ok()?;
-    let good = v.get("good_default").and_then(|g| g.as_bool()).unwrap_or(false);
+    let good = v
+        .get("good_default")
+        .and_then(|g| g.as_bool())
+        .unwrap_or(false);
     let conf = v.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
     let project = v
         .get("project_name")

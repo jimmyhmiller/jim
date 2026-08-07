@@ -51,8 +51,8 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver};
 
 use jim_pane::{KeyboardOwner, PaneRegistry};
 
@@ -72,24 +72,50 @@ pub struct KeyChord {
 
 impl KeyChord {
     pub const fn cmd(key: KeyCode) -> Self {
-        Self { cmd: true, shift: false, alt: false, ctrl: false, key }
+        Self {
+            cmd: true,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            key,
+        }
     }
     pub const fn cmd_shift(key: KeyCode) -> Self {
-        Self { cmd: true, shift: true, alt: false, ctrl: false, key }
+        Self {
+            cmd: true,
+            shift: true,
+            alt: false,
+            ctrl: false,
+            key,
+        }
     }
     /// No modifiers — the typical second chord in a sequence (e.g. the
     /// `C` in `⌘K C`).
     pub const fn plain(key: KeyCode) -> Self {
-        Self { cmd: false, shift: false, alt: false, ctrl: false, key }
+        Self {
+            cmd: false,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            key,
+        }
     }
 
     /// Human-readable hint shown in the palette (e.g. `⌘⇧T`).
     pub fn label(&self) -> String {
         let mut s = String::new();
-        if self.ctrl { s.push('⌃'); }
-        if self.alt { s.push('⌥'); }
-        if self.shift { s.push('⇧'); }
-        if self.cmd { s.push('⌘'); }
+        if self.ctrl {
+            s.push('⌃');
+        }
+        if self.alt {
+            s.push('⌥');
+        }
+        if self.shift {
+            s.push('⇧');
+        }
+        if self.cmd {
+            s.push('⌘');
+        }
         s.push_str(key_name(self.key));
         s
     }
@@ -117,14 +143,23 @@ impl KeyChord {
                 }
             }
         }
-        Some(KeyChord { cmd, shift, alt, ctrl, key: key? })
+        Some(KeyChord {
+            cmd,
+            shift,
+            alt,
+            ctrl,
+            key: key?,
+        })
     }
 }
 
 /// Parse a whitespace-separated chord sequence (e.g. `"cmd+k c"`). Returns
 /// `None` if empty or any chord fails to parse.
 pub fn parse_sequence(s: &str) -> Option<Vec<KeyChord>> {
-    let v: Vec<KeyChord> = s.split_whitespace().map(KeyChord::parse).collect::<Option<_>>()?;
+    let v: Vec<KeyChord> = s
+        .split_whitespace()
+        .map(KeyChord::parse)
+        .collect::<Option<_>>()?;
     (!v.is_empty()).then_some(v)
 }
 
@@ -140,7 +175,14 @@ fn is_modifier_key(k: KeyCode) -> bool {
     use KeyCode::*;
     matches!(
         k,
-        SuperLeft | SuperRight | ShiftLeft | ShiftRight | AltLeft | AltRight | ControlLeft | ControlRight
+        SuperLeft
+            | SuperRight
+            | ShiftLeft
+            | ShiftRight
+            | AltLeft
+            | AltRight
+            | ControlLeft
+            | ControlRight
     )
 }
 
@@ -148,14 +190,42 @@ fn is_modifier_key(k: KeyCode) -> bool {
 fn parse_key(s: &str) -> Option<KeyCode> {
     use KeyCode::*;
     Some(match s {
-        "a" => KeyA, "b" => KeyB, "c" => KeyC, "d" => KeyD, "e" => KeyE,
-        "f" => KeyF, "g" => KeyG, "h" => KeyH, "i" => KeyI, "j" => KeyJ,
-        "k" => KeyK, "l" => KeyL, "m" => KeyM, "n" => KeyN, "o" => KeyO,
-        "p" => KeyP, "q" => KeyQ, "r" => KeyR, "s" => KeyS, "t" => KeyT,
-        "u" => KeyU, "v" => KeyV, "w" => KeyW, "x" => KeyX, "y" => KeyY,
+        "a" => KeyA,
+        "b" => KeyB,
+        "c" => KeyC,
+        "d" => KeyD,
+        "e" => KeyE,
+        "f" => KeyF,
+        "g" => KeyG,
+        "h" => KeyH,
+        "i" => KeyI,
+        "j" => KeyJ,
+        "k" => KeyK,
+        "l" => KeyL,
+        "m" => KeyM,
+        "n" => KeyN,
+        "o" => KeyO,
+        "p" => KeyP,
+        "q" => KeyQ,
+        "r" => KeyR,
+        "s" => KeyS,
+        "t" => KeyT,
+        "u" => KeyU,
+        "v" => KeyV,
+        "w" => KeyW,
+        "x" => KeyX,
+        "y" => KeyY,
         "z" => KeyZ,
-        "0" => Digit0, "1" => Digit1, "2" => Digit2, "3" => Digit3, "4" => Digit4,
-        "5" => Digit5, "6" => Digit6, "7" => Digit7, "8" => Digit8, "9" => Digit9,
+        "0" => Digit0,
+        "1" => Digit1,
+        "2" => Digit2,
+        "3" => Digit3,
+        "4" => Digit4,
+        "5" => Digit5,
+        "6" => Digit6,
+        "7" => Digit7,
+        "8" => Digit8,
+        "9" => Digit9,
         "\\" | "backslash" => Backslash,
         "=" | "equal" | "plus" => Equal,
         "-" | "minus" => Minus,
@@ -176,17 +246,55 @@ fn parse_key(s: &str) -> Option<KeyCode> {
 fn key_name(key: KeyCode) -> &'static str {
     use KeyCode::*;
     match key {
-        KeyA => "A", KeyB => "B", KeyC => "C", KeyD => "D", KeyE => "E",
-        KeyF => "F", KeyG => "G", KeyH => "H", KeyI => "I", KeyJ => "J",
-        KeyK => "K", KeyL => "L", KeyM => "M", KeyN => "N", KeyO => "O",
-        KeyP => "P", KeyQ => "Q", KeyR => "R", KeyS => "S", KeyT => "T",
-        KeyU => "U", KeyV => "V", KeyW => "W", KeyX => "X", KeyY => "Y",
-        KeyZ => "Z", Backslash => "\\",
-        Digit0 => "0", Digit1 => "1", Digit2 => "2", Digit3 => "3", Digit4 => "4",
-        Digit5 => "5", Digit6 => "6", Digit7 => "7", Digit8 => "8", Digit9 => "9",
-        Equal => "=", Minus => "-", BracketLeft => "[", BracketRight => "]",
-        Space => "Space", Enter => "⏎", Tab => "⇥", Escape => "Esc",
-        ArrowUp => "↑", ArrowDown => "↓", ArrowLeft => "←", ArrowRight => "→",
+        KeyA => "A",
+        KeyB => "B",
+        KeyC => "C",
+        KeyD => "D",
+        KeyE => "E",
+        KeyF => "F",
+        KeyG => "G",
+        KeyH => "H",
+        KeyI => "I",
+        KeyJ => "J",
+        KeyK => "K",
+        KeyL => "L",
+        KeyM => "M",
+        KeyN => "N",
+        KeyO => "O",
+        KeyP => "P",
+        KeyQ => "Q",
+        KeyR => "R",
+        KeyS => "S",
+        KeyT => "T",
+        KeyU => "U",
+        KeyV => "V",
+        KeyW => "W",
+        KeyX => "X",
+        KeyY => "Y",
+        KeyZ => "Z",
+        Backslash => "\\",
+        Digit0 => "0",
+        Digit1 => "1",
+        Digit2 => "2",
+        Digit3 => "3",
+        Digit4 => "4",
+        Digit5 => "5",
+        Digit6 => "6",
+        Digit7 => "7",
+        Digit8 => "8",
+        Digit9 => "9",
+        Equal => "=",
+        Minus => "-",
+        BracketLeft => "[",
+        BracketRight => "]",
+        Space => "Space",
+        Enter => "⏎",
+        Tab => "⇥",
+        Escape => "Esc",
+        ArrowUp => "↑",
+        ArrowDown => "↓",
+        ArrowLeft => "←",
+        ArrowRight => "→",
         _ => "?",
     }
 }
@@ -412,7 +520,10 @@ pub struct ActionInvocations(pub Vec<ActionInvocation>);
 
 impl ActionInvocations {
     pub fn request(&mut self, id: impl Into<String>, origin: Option<Vec2>) {
-        self.0.push(ActionInvocation { id: id.into(), origin });
+        self.0.push(ActionInvocation {
+            id: id.into(),
+            origin,
+        });
     }
 }
 
@@ -556,7 +667,10 @@ fn apply_actions_manifest(world: &mut World) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(m) => m,
             Err(e) => {
-                warn!("[actions] {}: invalid JSON ({e}); keeping current actions", path.display());
+                warn!(
+                    "[actions] {}: invalid JSON ({e}); keeping current actions",
+                    path.display()
+                );
                 return;
             }
         },
@@ -567,7 +681,9 @@ fn apply_actions_manifest(world: &mut World) {
     let old_ids = std::mem::take(&mut world.resource_mut::<RuntimeActions>().ids);
     if !old_ids.is_empty() {
         let refs: Vec<&str> = old_ids.iter().copied().collect();
-        world.resource_mut::<ActionRegistry>().unregister_many(&refs);
+        world
+            .resource_mut::<ActionRegistry>()
+            .unregister_many(&refs);
     }
     world.resource_mut::<RuntimeActions>().configs.clear();
 
@@ -587,11 +703,13 @@ fn apply_actions_manifest(world: &mut World) {
         // script recompiles).
         let id: &'static str = Box::leak(m.id.clone().into_boxed_str());
         let title: &'static str = Box::leak(m.title.into_boxed_str());
-        let category: &'static str =
-            Box::leak(m.category.unwrap_or_else(|| "Widgets".to_string()).into_boxed_str());
+        let category: &'static str = Box::leak(
+            m.category
+                .unwrap_or_else(|| "Widgets".to_string())
+                .into_boxed_str(),
+        );
         let kind: &'static str = Box::leak(m.kind.into_boxed_str());
-        let radial_icon: Option<&'static str> =
-            m.icon.map(|s| &*Box::leak(s.into_boxed_str()));
+        let radial_icon: Option<&'static str> = m.icon.map(|s| &*Box::leak(s.into_boxed_str()));
         let keywords: &'static [&'static str] = Box::leak(
             m.keywords
                 .into_iter()
@@ -633,7 +751,11 @@ fn apply_actions_manifest(world: &mut World) {
     // manifest ones, so a reload drops + re-derives them cleanly.
     let mut discovered = 0usize;
     for w in discover_widget_actions(&declared_scripts) {
-        if world.resource::<ActionRegistry>().get(w.id.as_str()).is_some() {
+        if world
+            .resource::<ActionRegistry>()
+            .get(w.id.as_str())
+            .is_some()
+        {
             continue; // id already taken by a built-in / pane / manifest action
         }
         discovered += 1;
@@ -649,9 +771,14 @@ fn apply_actions_manifest(world: &mut World) {
             keywords,
             radial_icon: None,
             default_keys: &[],
-            run: ActionRun::SpawnConfigured { kind: "script_widget" },
+            run: ActionRun::SpawnConfigured {
+                kind: "script_widget",
+            },
         });
-        new_configs.insert(id, serde_json::json!({ "script": w.script, "title": w.title }));
+        new_configs.insert(
+            id,
+            serde_json::json!({ "script": w.script, "title": w.title }),
+        );
         new_ids.push(id);
     }
     eprintln!("[actions] auto-registered {discovered} widget action(s) from ~/.jim/widgets");
@@ -680,7 +807,9 @@ struct DiscoveredWidget {
 /// the manifest. "Spawnable" = the script defines a `render` function (this
 /// filters out library modules like `df.ft` / `host.ft`). Sorted by title for
 /// a stable palette order.
-fn discover_widget_actions(declared_scripts: &std::collections::HashSet<String>) -> Vec<DiscoveredWidget> {
+fn discover_widget_actions(
+    declared_scripts: &std::collections::HashSet<String>,
+) -> Vec<DiscoveredWidget> {
     let Some(dir) = jim_widget::script_widget::widgets_dir() else {
         return Vec::new();
     };
@@ -747,7 +876,10 @@ fn setup_actions_watcher(world: &mut World) {
     }
     if !path.exists() {
         if let Err(e) = std::fs::write(&path, DEFAULT_ACTIONS_MANIFEST) {
-            warn!("[actions] couldn't write default manifest {}: {e}", path.display());
+            warn!(
+                "[actions] couldn't write default manifest {}: {e}",
+                path.display()
+            );
         }
     }
 
@@ -839,7 +971,12 @@ impl Plugin for ActionsPlugin {
             // (`~/.jim/actions.json`) on top + start its watcher.
             .add_systems(
                 PostStartup,
-                (generate_pane_spawn_actions, rebuild_keymap, setup_actions_watcher).chain(),
+                (
+                    generate_pane_spawn_actions,
+                    rebuild_keymap,
+                    setup_actions_watcher,
+                )
+                    .chain(),
             )
             .add_systems(Update, poll_actions_watcher)
             .add_systems(Update, dispatch_action_keybinds.in_set(ActionProducerSet))
@@ -920,7 +1057,13 @@ fn dispatch_action_keybinds(
         if !ev.state.is_pressed() || is_modifier_key(ev.key_code) {
             continue;
         }
-        let chord = KeyChord { cmd, shift, alt, ctrl, key: ev.key_code };
+        let chord = KeyChord {
+            cmd,
+            shift,
+            alt,
+            ctrl,
+            key: ev.key_code,
+        };
         let mut candidate = pending.chords.clone();
         candidate.push(chord);
 
@@ -968,7 +1111,10 @@ pub fn run_requested_actions(world: &mut World) {
                     });
             }
             ActionRun::Custom(f) => {
-                let mut ctx = ActionCtx { world, origin: inv.origin };
+                let mut ctx = ActionCtx {
+                    world,
+                    origin: inv.origin,
+                };
                 f(&mut ctx);
             }
             ActionRun::SpawnConfigured { kind } => {
@@ -1006,10 +1152,7 @@ mod tests {
             KeyChord::parse("cmd+shift+t"),
             Some(KeyChord::cmd_shift(KeyCode::KeyT))
         );
-        assert_eq!(
-            KeyChord::parse("CMD+O"),
-            Some(KeyChord::cmd(KeyCode::KeyO))
-        );
+        assert_eq!(KeyChord::parse("CMD+O"), Some(KeyChord::cmd(KeyCode::KeyO)));
         // modifier aliases + a symbol key
         assert_eq!(
             KeyChord::parse("ctrl+\\"),
@@ -1021,7 +1164,16 @@ mod tests {
                 key: KeyCode::Backslash,
             })
         );
-        assert_eq!(KeyChord::parse("opt+="), Some(KeyChord { cmd: false, shift: false, alt: true, ctrl: false, key: KeyCode::Equal }));
+        assert_eq!(
+            KeyChord::parse("opt+="),
+            Some(KeyChord {
+                cmd: false,
+                shift: false,
+                alt: true,
+                ctrl: false,
+                key: KeyCode::Equal
+            })
+        );
     }
 
     #[test]
@@ -1034,7 +1186,10 @@ mod tests {
     #[test]
     fn parses_sequences() {
         let seq = parse_sequence("cmd+k c").unwrap();
-        assert_eq!(seq, vec![KeyChord::cmd(KeyCode::KeyK), KeyChord::plain(KeyCode::KeyC)]);
+        assert_eq!(
+            seq,
+            vec![KeyChord::cmd(KeyCode::KeyK), KeyChord::plain(KeyCode::KeyC)]
+        );
         assert_eq!(parse_sequence("   "), None);
         assert!(parse_sequence("cmd+k bogus").is_none()); // any bad chord fails the whole seq
     }
@@ -1080,7 +1235,9 @@ mod tests {
             keywords: &[],
             radial_icon: Some("♟"),
             default_keys: &[],
-            run: ActionRun::SpawnConfigured { kind: "script_widget" },
+            run: ActionRun::SpawnConfigured {
+                kind: "script_widget",
+            },
         });
         let cfg = serde_json::json!({ "script": "chess.ft", "title": "Chess" });
         world
@@ -1102,10 +1259,7 @@ mod tests {
 
     #[test]
     fn matches_exact_and_prefix() {
-        let km = keymap_with(&[
-            ("a.single", "cmd+o"),
-            ("a.seq", "cmd+k c"),
-        ]);
+        let km = keymap_with(&[("a.single", "cmd+o"), ("a.seq", "cmd+k c")]);
         let cmd_o = vec![KeyChord::cmd(KeyCode::KeyO)];
         let cmd_k = vec![KeyChord::cmd(KeyCode::KeyK)];
         let cmd_k_c = vec![KeyChord::cmd(KeyCode::KeyK), KeyChord::plain(KeyCode::KeyC)];

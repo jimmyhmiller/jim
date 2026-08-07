@@ -34,12 +34,12 @@ use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::{Add, Remove};
 use bevy::ecs::observer::On;
 
-use jim_pane::{churn, prof, trace};
 use jim_pane::{PaneProject, PaneTitle};
+use jim_pane::{churn, prof, trace};
 
-use crate::projects::Projects;
-use jim_terminal::{MonoFont, FONT_SIZE};
 use crate::MENU_OVERLAY_LAYER;
+use crate::projects::Projects;
+use jim_terminal::{FONT_SIZE, MonoFont};
 
 const MARGIN: f32 = 8.0;
 // Above context_menu's MENU_Z (700) so the meter doesn't get hidden
@@ -159,10 +159,9 @@ impl Plugin for FpsOverlayPlugin {
             }
         });
         for idx in 0..STAGE_NAMES.len() {
-            app.add_systems(
-                ProfMark(idx as u8),
-                move |mut c: ResMut<StageClock>| stage_record(&mut c, idx),
-            );
+            app.add_systems(ProfMark(idx as u8), move |mut c: ResMut<StageClock>| {
+                stage_record(&mut c, idx)
+            });
         }
 
         // `TBPROF=1` collects the per-pane/subsystem breakdown headlessly
@@ -284,8 +283,7 @@ fn collect_profile(
 /// the IPC handler and the per-frame capture system share is what makes the
 /// threshold live-adjustable (`jimctl trace --ms N`) without a restart. Seeded
 /// lazily from `JIMTRACE_MS` (default 50) on first touch.
-static TRACE_THRESHOLD_BITS: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static TRACE_THRESHOLD_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static TRACE_THRESHOLD_INIT: std::sync::Once = std::sync::Once::new();
 
 fn init_trace_threshold() {
@@ -538,7 +536,11 @@ fn capture_slow_frame(
         frame,
         active_ms,
         uncovered_ms,
-        if active_ms > 0.0 { uncovered_ms / active_ms as f64 * 100.0 } else { 0.0 },
+        if active_ms > 0.0 {
+            uncovered_ms / active_ms as f64 * 100.0
+        } else {
+            0.0
+        },
         span_count,
         churn_spawned,
         churn_despawned,
@@ -784,7 +786,11 @@ fn update_prof_panel(
     lines.push(format!(
         "PROFILER   frame {:.2} ms  ({:.0} fps)",
         frame_ms,
-        if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 },
+        if frame_ms > 0.0 {
+            1000.0 / frame_ms
+        } else {
+            0.0
+        },
     ));
     // Name the remainder by frame length. A short frame with a big
     // remainder is the present-wait (compositor syncing to refresh); a long
@@ -1083,10 +1089,7 @@ fn update_cpu_graph(
     font: Option<Res<MonoFont>>,
     mut graph: ResMut<CpuGraph>,
     mut bars_q: Query<(&mut Sprite, &mut Transform), With<CpuBar>>,
-    mut label_q: Query<
-        (&mut Text2d, &mut Transform),
-        (With<CpuGraphLabel>, Without<CpuBar>),
-    >,
+    mut label_q: Query<(&mut Text2d, &mut Transform), (With<CpuGraphLabel>, Without<CpuBar>)>,
 ) {
     // Keep a running wall clock even while disabled so the first sample
     // after re-enabling differences against a fresh interval, not a stale
@@ -1292,11 +1295,7 @@ fn sum_render_gpu(diagnostics: &bevy::diagnostic::DiagnosticsStore) -> f32 {
             cpu += v as f32;
         }
     }
-    if gpu > 0.0 {
-        gpu
-    } else {
-        cpu
-    }
+    if gpu > 0.0 { gpu } else { cpu }
 }
 
 /// End-of-frame: fold the just-collected frame into the history ring,
@@ -1382,11 +1381,11 @@ const SEGS_PER_BAR: usize = 6;
 /// is orange so the usual dominant stage pops.
 fn stage_color(i: usize) -> Color {
     match i {
-        0 => Color::srgb(0.4, 0.8, 0.8),  // First — teal
-        1 => Color::srgb(0.45, 0.6, 1.0), // PreUpdate — blue
-        2 => Color::srgb(0.3, 0.85, 0.45),// Update — green
-        3 => Color::srgb(1.0, 0.65, 0.3), // PostUpdate — orange
-        _ => Color::srgb(0.75, 0.5, 0.9), // Last — purple
+        0 => Color::srgb(0.4, 0.8, 0.8),   // First — teal
+        1 => Color::srgb(0.45, 0.6, 1.0),  // PreUpdate — blue
+        2 => Color::srgb(0.3, 0.85, 0.45), // Update — green
+        3 => Color::srgb(1.0, 0.65, 0.3),  // PostUpdate — orange
+        _ => Color::srgb(0.75, 0.5, 0.9),  // Last — purple
     }
 }
 
@@ -1471,7 +1470,12 @@ fn update_chart(
         Vec2::new(p.x - win_w * 0.5, win_h * 0.5 - p.y)
     });
     let over_chart = cursor
-        .map(|c| c.x >= left - 4.0 && c.x <= right + 4.0 && c.y >= bottom - 4.0 && c.y <= bottom + CHART_H + 4.0)
+        .map(|c| {
+            c.x >= left - 4.0
+                && c.x <= right + 4.0
+                && c.y >= bottom - 4.0
+                && c.y <= bottom + CHART_H + 4.0
+        })
         .unwrap_or(false);
     let hovered: Option<usize> = if over_chart && n > 0 {
         let c = cursor.unwrap();
@@ -1503,7 +1507,11 @@ fn update_chart(
                 sp.color = Color::srgba(1.0, 1.0, 1.0, 0.18);
                 sp.custom_size = Some(Vec2::new(CHART_W, 1.0));
                 tx.translation = Vec3::new(left, y, Z - 2.0);
-                *vis = if refms <= peak { Visibility::Visible } else { Visibility::Hidden };
+                *vis = if refms <= peak {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
             }
         }
     }
@@ -1517,19 +1525,28 @@ fn update_chart(
         } else {
             None
         };
-        let is_hover = hovered.map(|h| h == n.wrapping_sub(1 + from_right)).unwrap_or(false);
+        let is_hover = hovered
+            .map(|h| h == n.wrapping_sub(1 + from_right))
+            .unwrap_or(false);
         let segs = [
             (sample.map(|s| s.stages[0]).unwrap_or(0.0), stage_color(0)),
             (sample.map(|s| s.stages[1]).unwrap_or(0.0), stage_color(1)),
             (sample.map(|s| s.stages[2]).unwrap_or(0.0), stage_color(2)),
             (sample.map(|s| s.stages[3]).unwrap_or(0.0), stage_color(3)),
             (sample.map(|s| s.stages[4]).unwrap_or(0.0), stage_color(4)),
-            (sample.map(|s| s.remainder()).unwrap_or(0.0), col_remainder()),
+            (
+                sample.map(|s| s.remainder()).unwrap_or(0.0),
+                col_remainder(),
+            ),
         ];
         let mut acc = 0.0f32;
         for (si, (val, color)) in segs.into_iter().enumerate() {
-            let Some(&e) = chart.segs.get(slot * SEGS_PER_BAR + si) else { continue };
-            let Ok((mut sp, mut tx, mut vis)) = sprites.get_mut(e) else { continue };
+            let Some(&e) = chart.segs.get(slot * SEGS_PER_BAR + si) else {
+                continue;
+            };
+            let Ok((mut sp, mut tx, mut vis)) = sprites.get_mut(e) else {
+                continue;
+            };
             if sample.is_none() || val <= 0.0 {
                 *vis = Visibility::Hidden;
                 acc += val.max(0.0);
@@ -1606,7 +1623,13 @@ fn build_detail(
     projects: Option<&Projects>,
 ) -> String {
     let rem = s.remainder();
-    let pct = |v: f32| if s.total > 0.0 { v / s.total * 100.0 } else { 0.0 };
+    let pct = |v: f32| {
+        if s.total > 0.0 {
+            v / s.total * 100.0
+        } else {
+            0.0
+        }
+    };
 
     let top_pane_label = if s.top_pane_bits != 0 {
         let e = Entity::from_bits(s.top_pane_bits);
@@ -1679,7 +1702,11 @@ fn build_detail(
         s.panes,
         top_pane_label,
         s.systop,
-        if s.top_sys.is_empty() { "—" } else { s.top_sys },
+        if s.top_sys.is_empty() {
+            "—"
+        } else {
+            s.top_sys
+        },
         s.top_sys_ms,
         s.churn_spawned,
         s.churn_despawned,
@@ -1728,7 +1755,9 @@ fn ensure_chart(commands: &mut Commands, chart: &mut ProfChart, font: &MonoFont)
         chart.background = Some(spawn_sprite(commands, Anchor::BOTTOM_LEFT));
     }
     if chart.reflines.len() != 2 {
-        chart.reflines = (0..2).map(|_| spawn_sprite(commands, Anchor::BOTTOM_LEFT)).collect();
+        chart.reflines = (0..2)
+            .map(|_| spawn_sprite(commands, Anchor::BOTTOM_LEFT))
+            .collect();
     }
     if chart.segs.len() != HIST_LEN * SEGS_PER_BAR {
         chart.segs = (0..HIST_LEN * SEGS_PER_BAR)

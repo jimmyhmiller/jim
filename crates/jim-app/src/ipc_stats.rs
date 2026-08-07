@@ -75,7 +75,14 @@ pub fn publish_ipc_stats(
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (
-            accepted, completed, parse_errors, timeouts, read_errors, busy, queued, newest,
+            accepted,
+            completed,
+            parse_errors,
+            timeouts,
+            read_errors,
+            busy,
+            queued,
+            newest,
         )
             .hash(&mut h);
         h.finish()

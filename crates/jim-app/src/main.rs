@@ -22,15 +22,10 @@ fn main() {
         return;
     }
     if first.as_deref() == Some("--daemon") {
-        let session_id: u64 = args
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "usage: terminal --daemon <session_id> <program> [args...]"
-                );
-                std::process::exit(2);
-            });
+        let session_id: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+            eprintln!("usage: terminal --daemon <session_id> <program> [args...]");
+            std::process::exit(2);
+        });
         let command: Vec<String> = args.collect();
         if command.is_empty() {
             eprintln!("terminal --daemon: missing program to run");
@@ -64,62 +59,62 @@ fn main() {
     // run, if we recorded one. First run / missing-or-corrupt file →
     // hard-coded defaults.
     let saved = jim_app::window_geometry::load();
-    let (init_w, init_h) = saved
-        .map(|g| (g.w, g.h))
-        .unwrap_or((1200, 760));
+    let (init_w, init_h) = saved.map(|g| (g.w, g.h)).unwrap_or((1200, 760));
     let init_position = saved
         .map(|g| WindowPosition::At(IVec2::new(g.x, g.y)))
         .unwrap_or(WindowPosition::default());
-    app.add_plugins(DefaultPlugins
-        // Cap the Bevy compute task pool at 2 threads. Profiling a live
-        // session showed the six default Compute Task Pool threads burning
-        // ~195s cumulative CPU vs ~33s on the main thread: the multithreaded
-        // executor's per-frame fan-out / park / work-steal across ~100 tiny
-        // systems costs roughly 6× the actual work, because a frame here is
-        // only ~1-2ms of real work. Fewer worker threads means far less
-        // park/wake/steal churn. io / async-compute keep their small defaults
-        // (their policies are untouched). `TaskPoolThreadAssignmentPolicy`
-        // has no `Default`, so all fields are spelled out.
-        .set(bevy::app::TaskPoolPlugin {
-            task_pool_options: bevy::app::TaskPoolOptions {
-                compute: bevy::app::TaskPoolThreadAssignmentPolicy {
-                    min_threads: 1,
-                    max_threads: 2,
-                    percent: 1.0,
-                    on_thread_spawn: None,
-                    on_thread_destroy: None,
+    app.add_plugins(
+        DefaultPlugins
+            // Cap the Bevy compute task pool at 2 threads. Profiling a live
+            // session showed the six default Compute Task Pool threads burning
+            // ~195s cumulative CPU vs ~33s on the main thread: the multithreaded
+            // executor's per-frame fan-out / park / work-steal across ~100 tiny
+            // systems costs roughly 6× the actual work, because a frame here is
+            // only ~1-2ms of real work. Fewer worker threads means far less
+            // park/wake/steal churn. io / async-compute keep their small defaults
+            // (their policies are untouched). `TaskPoolThreadAssignmentPolicy`
+            // has no `Default`, so all fields are spelled out.
+            .set(bevy::app::TaskPoolPlugin {
+                task_pool_options: bevy::app::TaskPoolOptions {
+                    compute: bevy::app::TaskPoolThreadAssignmentPolicy {
+                        min_threads: 1,
+                        max_threads: 2,
+                        percent: 1.0,
+                        on_thread_spawn: None,
+                        on_thread_destroy: None,
+                    },
+                    ..default()
                 },
+            })
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Jim".into(),
+                    resolution: (init_w, init_h).into(),
+                    position: init_position,
+                    ..default()
+                }),
+                // Survive closing the laptop lid / display sleep. On macOS that
+                // removes the monitor; bevy_winit then despawns the `Monitor`
+                // entity, and because `Monitor` is the `linked_spawn` target of the
+                // window's `OnMonitor` relationship, the despawn CASCADES and takes
+                // the primary window with it (confirmed by backtrace). With the
+                // default `ExitCondition::OnAllClosed`, the now-windowless app sees
+                // zero windows and sends `AppExit`, quitting cleanly (status 0, no
+                // crash) on every sleep.
+                //
+                // We can't reliably stop the cascade from the relationship side, so
+                // instead we (1) never auto-exit and (2) respawn the primary window
+                // the moment it's lost — see
+                // `window_geometry::respawn_primary_window_on_loss`. `DontExit` also
+                // means the window's red close button no longer quits the app; quit
+                // via Cmd-Q (a separate NSApp path), which still works.
+                exit_condition: bevy::window::ExitCondition::DontExit,
+                // Don't despawn the window on a close *request* either, so the red
+                // button is inert rather than triggering a despawn→respawn flicker.
+                close_when_requested: false,
                 ..default()
-            },
-        })
-        .set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "Jim".into(),
-            resolution: (init_w, init_h).into(),
-            position: init_position,
-            ..default()
-        }),
-        // Survive closing the laptop lid / display sleep. On macOS that
-        // removes the monitor; bevy_winit then despawns the `Monitor`
-        // entity, and because `Monitor` is the `linked_spawn` target of the
-        // window's `OnMonitor` relationship, the despawn CASCADES and takes
-        // the primary window with it (confirmed by backtrace). With the
-        // default `ExitCondition::OnAllClosed`, the now-windowless app sees
-        // zero windows and sends `AppExit`, quitting cleanly (status 0, no
-        // crash) on every sleep.
-        //
-        // We can't reliably stop the cascade from the relationship side, so
-        // instead we (1) never auto-exit and (2) respawn the primary window
-        // the moment it's lost — see
-        // `window_geometry::respawn_primary_window_on_loss`. `DontExit` also
-        // means the window's red close button no longer quits the app; quit
-        // via Cmd-Q (a separate NSApp path), which still works.
-        exit_condition: bevy::window::ExitCondition::DontExit,
-        // Don't despawn the window on a close *request* either, so the red
-        // button is inert rather than triggering a despawn→respawn flicker.
-        close_when_requested: false,
-        ..default()
-    }));
+            }),
+    );
     // Run the Update schedule single-threaded. Same measurement as the
     // compute-pool cap above: with ~100 tiny systems and ~1-2ms of real
     // per-frame work, the multithreaded executor's per-system scheduling
@@ -204,7 +199,10 @@ fn import_login_shell_env() {
             return;
         }
         Err(e) => {
-            eprintln!("[shell-env] could not run {}: {}; keeping inherited env", shell, e);
+            eprintln!(
+                "[shell-env] could not run {}: {}; keeping inherited env",
+                shell, e
+            );
             return;
         }
     };
@@ -253,7 +251,5 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }

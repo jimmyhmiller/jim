@@ -14,16 +14,16 @@ use bevy::prelude::*;
 use bevy::sprite_render::ColorMaterial;
 
 use jim_pane::{
-    InputConsumed, PaneChrome, PaneInputSuppressed, PaneKindMarker, PaneRect, PaneScreenAnchored,
-    PaneTag, PaneViewport, MARGIN, TITLE_H,
+    InputConsumed, MARGIN, PaneChrome, PaneInputSuppressed, PaneKindMarker, PaneRect,
+    PaneScreenAnchored, PaneTag, PaneViewport, TITLE_H,
 };
 
+use whiteboard_core::Point;
 use whiteboard_core::element::{ElementId, ElementKind};
 use whiteboard_core::interaction::{InputEvent, Modifiers, PointerButton, Tool};
-use whiteboard_core::Point;
 
-use jim_whiteboard::render::{render_scene_into, WbRendered};
-use jim_whiteboard::{new_editor, CanvasDrawActive, ToolStyle, WbEditor, WbToolState};
+use jim_whiteboard::render::{WbRendered, render_scene_into};
+use jim_whiteboard::{CanvasDrawActive, ToolStyle, WbEditor, WbToolState, new_editor};
 
 /// A drawing tool (paints) vs. a manipulation tool (select/pan). Only drawing
 /// tools claim presses over empty pane area; select/eraser only claim a press
@@ -121,7 +121,9 @@ fn update_suppression(
                 .and_then(|w| w.cursor_position())
                 .and_then(|c| pane_under_cursor(&panes, viewport.window_to_canvas(c)))
                 .and_then(|(pane, local)| {
-                    anno.editors.get(&pane).map(|ed| ed.scene().topmost_at(local).is_some())
+                    anno.editors
+                        .get(&pane)
+                        .map(|ed| ed.scene().topmost_at(local).is_some())
                 })
                 .unwrap_or(false)
         });
@@ -245,8 +247,7 @@ fn annotation_input(
             return;
         }
         editor.set_tool(style.tool);
-        let before: HashSet<ElementId> =
-            editor.scene().iter_live().map(|e| e.id.clone()).collect();
+        let before: HashSet<ElementId> = editor.scene().iter_live().map(|e| e.id.clone()).collect();
         editor.handle(InputEvent::PointerDown {
             pos,
             button: PointerButton::Primary,
@@ -330,7 +331,14 @@ fn render_annotations(
         if let Some(editor) = anno.editors.get(&pane) {
             // Overlay shows the selection box / marquee for annotation editing.
             let scene = editor.render_with_overlay();
-            render_scene_into(&scene, root, &font.0, &mut meshes, &mut materials, &mut commands);
+            render_scene_into(
+                &scene,
+                root,
+                &font.0,
+                &mut meshes,
+                &mut materials,
+                &mut commands,
+            );
         }
     }
 }
@@ -370,7 +378,10 @@ fn annotation_keyboard(
 ) {
     use bevy::input::keyboard::Key as BKey;
     let focused_kind = focused.0.and_then(|e| pane_kinds.get(e).ok()).map(|k| k.0);
-    let owns = matches!(focused_kind, None | Some(jim_whiteboard::toolbar::PANE_KIND));
+    let owns = matches!(
+        focused_kind,
+        None | Some(jim_whiteboard::toolbar::PANE_KIND)
+    );
     if !canvas_active.0 || !owns {
         key_events.clear();
         return;
@@ -387,7 +398,9 @@ fn annotation_keyboard(
             continue;
         }
         for &pane in &panes {
-            let Some(editor) = anno.editors.get_mut(&pane) else { continue };
+            let Some(editor) = anno.editors.get_mut(&pane) else {
+                continue;
+            };
             let changed = match &ev.logical_key {
                 BKey::Backspace | BKey::Delete => editor.delete_selection(),
                 BKey::Escape => {
@@ -416,11 +429,18 @@ mod tests {
 
     #[test]
     fn content_rect_excludes_title_and_margins() {
-        let rect = PaneRect { pos: Vec2::new(100.0, 50.0), size: Vec2::new(400.0, 300.0), z: 1.0 };
+        let rect = PaneRect {
+            pos: Vec2::new(100.0, 50.0),
+            size: Vec2::new(400.0, 300.0),
+            z: 1.0,
+        };
         let (origin, size) = content_rect_canvas(&rect);
         // Content starts MARGIN in and below the title band.
         assert_eq!(origin, Vec2::new(100.0 + MARGIN, 50.0 + TITLE_H + MARGIN));
-        assert_eq!(size, Vec2::new(400.0 - 2.0 * MARGIN, 300.0 - TITLE_H - 2.0 * MARGIN));
+        assert_eq!(
+            size,
+            Vec2::new(400.0 - 2.0 * MARGIN, 300.0 - TITLE_H - 2.0 * MARGIN)
+        );
         // A cursor at the content top-left maps to local (0,0).
         let cursor_canvas = origin;
         let local = cursor_canvas - origin;

@@ -14,8 +14,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use bevy::camera::visibility::RenderLayers;
-use bevy::input::keyboard::{Key as BKey, KeyboardInput};
 use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key as BKey, KeyboardInput};
 use bevy::prelude::*;
 use bevy::sprite_render::ColorMaterial;
 
@@ -24,16 +24,16 @@ use jim_pane::{
     PaneViewportReaders,
 };
 
-use whiteboard_core::element::{apply_bound_endpoints, update_bound_arrow, Element, ElementKind};
+use whiteboard_core::element::{Element, ElementKind, apply_bound_endpoints, update_bound_arrow};
 use whiteboard_core::interaction::{
     InputEvent, Key as WbKey, Modifiers, PointerButton, Tool, Viewport as WbViewport,
 };
 use whiteboard_core::render::Color as WbColor;
 use whiteboard_core::{ElementId, Point, Vec2 as WbVec2};
 
-use jim_whiteboard::render::{render_scene_into_layer, WbRendered};
+use jim_whiteboard::render::{WbRendered, render_scene_into_layer};
 use jim_whiteboard::{
-    new_editor, CanvasDrawActive, CanvasEdit, ClearCanvasRequested, WbEditor, WbToolState, ZOrder,
+    CanvasDrawActive, CanvasEdit, ClearCanvasRequested, WbEditor, WbToolState, ZOrder, new_editor,
 };
 
 use crate::projects::Projects;
@@ -375,8 +375,7 @@ fn background_input(
             return;
         }
         board.set_tool(ts.tool);
-        let before: HashSet<ElementId> =
-            board.scene().iter_live().map(|e| e.id.clone()).collect();
+        let before: HashSet<ElementId> = board.scene().iter_live().map(|e| e.id.clone()).collect();
         board.handle(InputEvent::PointerDown {
             pos,
             button: PointerButton::Primary,
@@ -523,7 +522,12 @@ fn sync_pane_proxies(
     mut boards: ResMut<BackgroundBoards>,
     mut state: ResMut<BgState>,
     panes: Query<
-        (Entity, &PaneRect, Option<&Visibility>, Has<PaneScreenAnchored>),
+        (
+            Entity,
+            &PaneRect,
+            Option<&Visibility>,
+            Has<PaneScreenAnchored>,
+        ),
         With<PaneTag>,
     >,
 ) {
@@ -579,8 +583,7 @@ fn sync_pane_proxies(
                 moved = true;
             }
         } else {
-            let mut el =
-                Element::new(id.clone(), 1, *x, *y, *w, *h, ElementKind::Rectangle);
+            let mut el = Element::new(id.clone(), 1, *x, *y, *w, *h, ElementKind::Rectangle);
             el.locked = true;
             el.opacity = 0.0;
             el.stroke_color = WbColor::TRANSPARENT;
@@ -604,13 +607,12 @@ fn sync_pane_proxies(
             };
             if let Some(el) = board.scene_mut().get_mut(&aid) {
                 let origin = Point::new(el.x, el.y);
-                let changed = if let ElementKind::Arrow(ref mut d) | ElementKind::Line(ref mut d) =
-                    el.kind
-                {
-                    apply_bound_endpoints(d, origin, endpoints)
-                } else {
-                    false
-                };
+                let changed =
+                    if let ElementKind::Arrow(ref mut d) | ElementKind::Line(ref mut d) = el.kind {
+                        apply_bound_endpoints(d, origin, endpoints)
+                    } else {
+                        false
+                    };
                 if changed {
                     // Keep the arrow's bbox in sync with its moved endpoint.
                     whiteboard_core::element::resync_linear_box(el);
@@ -661,7 +663,10 @@ fn background_keyboard(
     // focused pane (a terminal/editor/whiteboard pane owns its own keys).
     let focused_kind: Option<&'static str> =
         focused.0.and_then(|e| pane_kinds.get(e).ok()).map(|k| k.0);
-    let owns_keys = matches!(focused_kind, None | Some(jim_whiteboard::toolbar::PANE_KIND));
+    let owns_keys = matches!(
+        focused_kind,
+        None | Some(jim_whiteboard::toolbar::PANE_KIND)
+    );
     if !canvas_active.0 || !owns_keys {
         key_events.clear();
         return;
@@ -696,7 +701,10 @@ fn background_keyboard(
                 _ => None,
             };
             if let Some(k) = wk {
-                if board.handle(InputEvent::KeyDown { key: k, mods }).needs_redraw() {
+                if board
+                    .handle(InputEvent::KeyDown { key: k, mods })
+                    .needs_redraw()
+                {
                     changed = true;
                 }
             }
@@ -862,7 +870,7 @@ impl Plugin for WhiteboardBackgroundPlugin {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_canvas_press, tool_claims_surface, tool_for_char, CanvasPress};
+    use super::{CanvasPress, decide_canvas_press, tool_claims_surface, tool_for_char};
     use whiteboard_core::interaction::Tool;
 
     // Args, in order: (canvas_active, tool_claims_surface, over_toolbar,

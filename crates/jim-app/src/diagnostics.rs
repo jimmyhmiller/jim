@@ -33,10 +33,10 @@ use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
+use crate::MENU_OVERLAY_LAYER;
 use jim_terminal::term_material::TermMaterial;
 use jim_terminal::worker::SnapCell;
-use jim_terminal::{MonoFont, TerminalStore, FONT_SIZE};
-use crate::MENU_OVERLAY_LAYER;
+use jim_terminal::{FONT_SIZE, MonoFont, TerminalStore};
 
 /// How often both recorders sample. 5 s keeps the log small (a full day
 /// is a few MB) while still catching a runaway that doubles in minutes.
@@ -193,14 +193,16 @@ pub fn process_cpu_time_ns() -> Option<u64> {
 fn spawn_footprint_heartbeat() {
     let _ = std::thread::Builder::new()
         .name("mem-heartbeat".into())
-        .spawn(|| loop {
-            std::thread::sleep(SAMPLE_INTERVAL);
-            if let Some(fp) = phys_footprint_bytes() {
-                append_log(&format!(
-                    "[mem-hb] footprint={}B ({:.2} GiB)",
-                    fp,
-                    fp as f64 / GIB
-                ));
+        .spawn(|| {
+            loop {
+                std::thread::sleep(SAMPLE_INTERVAL);
+                if let Some(fp) = phys_footprint_bytes() {
+                    append_log(&format!(
+                        "[mem-hb] footprint={}B ({:.2} GiB)",
+                        fp,
+                        fp as f64 / GIB
+                    ));
+                }
             }
         });
 }
@@ -291,7 +293,10 @@ fn sample_memory(world: &mut World, mut st: Local<DiagState>) {
             let dt = now.duration_since(prev_at).as_secs_f64().max(0.001);
             let dmib = (fp as f64 - prev as f64) / MIB;
             rate_mib_min = dmib / dt * 60.0;
-            format!(" d={:+.1}MiB/{:.0}s ({:+.2}MiB/min)", dmib, dt, rate_mib_min)
+            format!(
+                " d={:+.1}MiB/{:.0}s ({:+.2}MiB/min)",
+                dmib, dt, rate_mib_min
+            )
         }
         _ => String::new(),
     };
@@ -435,7 +440,11 @@ fn update_warning_overlay(
     } else {
         Color::srgb(1.0, 0.8, 0.2)
     };
-    let size = if crit { FONT_SIZE * 1.6 } else { FONT_SIZE * 1.2 };
+    let size = if crit {
+        FONT_SIZE * 1.6
+    } else {
+        FONT_SIZE * 1.2
+    };
     // ASCII only — the mono font has no warning glyph (would render tofu).
     let text = format!(
         "MEMORY HIGH: {:.1} GiB ({:+.0} MiB/min)",

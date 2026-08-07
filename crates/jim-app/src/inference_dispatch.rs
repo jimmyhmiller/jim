@@ -35,8 +35,8 @@ use jim_inference::llm::LlmConfig;
 
 use crate::drawer::Drawer;
 use crate::projects::Projects;
-use jim_terminal::TerminalSession;
 use jim_pane::PaneProject;
+use jim_terminal::TerminalSession;
 
 pub struct InferenceDispatchPlugin;
 
@@ -242,18 +242,12 @@ const MAX_COMMAND_LEN: usize = 400;
 /// every keystroke. Edit freely as the toolset grows.
 const COMMAND_RUNNERS: &[&str] = &[
     // Rust
-    "cargo",
-    // Node / JS / TS
-    "npm", "pnpm", "yarn", "bun", "node", "deno", "npx",
-    // Python
-    "python", "python3", "pytest", "uv",
-    // Clojure
-    "clojure", "clj", "bb", "lein",
-    // Beagle
-    "beag",
-    // Go / Zig / Swift
-    "go", "zig", "swift",
-    // generic build drivers
+    "cargo", // Node / JS / TS
+    "npm", "pnpm", "yarn", "bun", "node", "deno", "npx", // Python
+    "python", "python3", "pytest", "uv", // Clojure
+    "clojure", "clj", "bb", "lein", // Beagle
+    "beag", // Go / Zig / Swift
+    "go", "zig", "swift", // generic build drivers
     "make", "just", "cmake", "ninja", "gradle", "mvn",
 ];
 
@@ -431,7 +425,10 @@ fn run_command_classification(
         std::process::id(),
         &payload,
     ) {
-        warn!("[inference-dispatch] failed to publish command suggestion: {}", e);
+        warn!(
+            "[inference-dispatch] failed to publish command suggestion: {}",
+            e
+        );
     }
 }
 
@@ -479,7 +476,13 @@ fn consume_command_suggestions(
             "cwd": payload.cwd,
         });
         let reason = (!payload.reason.is_empty()).then_some(payload.reason);
-        drawer.push("run-button".to_string(), payload.title, reason, config, project_id);
+        drawer.push(
+            "run-button".to_string(),
+            payload.title,
+            reason,
+            config,
+            project_id,
+        );
     }
 }
 

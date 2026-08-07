@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use bevy::asset::{embedded_path, AssetPath};
+use bevy::asset::{AssetPath, embedded_path};
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{Camera, ClearColorConfig, RenderTarget};
 use bevy::image::Image;
@@ -96,7 +96,9 @@ pub struct SkyMaterial {
 
 impl Material for SkyMaterial {
     fn fragment_shader() -> ShaderRef {
-        ShaderRef::Path(AssetPath::from_path_buf(embedded_path!("sky.wgsl")).with_source("embedded"))
+        ShaderRef::Path(
+            AssetPath::from_path_buf(embedded_path!("sky.wgsl")).with_source("embedded"),
+        )
     }
 }
 
@@ -119,13 +121,14 @@ pub struct FloorMaterial {
 
 impl Material for FloorMaterial {
     fn fragment_shader() -> ShaderRef {
-        ShaderRef::Path(AssetPath::from_path_buf(embedded_path!("floor.wgsl")).with_source("embedded"))
+        ShaderRef::Path(
+            AssetPath::from_path_buf(embedded_path!("floor.wgsl")).with_source("embedded"),
+        )
     }
     fn alpha_mode(&self) -> AlphaMode {
         AlphaMode::Blend
     }
 }
-
 
 // ---------- Runtime-tunable params (hot-reloaded from funct) ----------
 
@@ -194,7 +197,10 @@ fn cube_ft_path() -> Option<std::path::PathBuf> {
 type JsonMap = serde_json::Map<String, serde_json::Value>;
 
 fn json_f32(map: &JsonMap, key: &str, default: f32) -> f32 {
-    map.get(key).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default)
+    map.get(key)
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(default)
 }
 
 /// Read a 3-element funct array (e.g. `[0.1, 0.2, 0.3]`) into a Vec3.
@@ -202,7 +208,12 @@ fn json_vec3(map: &JsonMap, key: &str, default: Vec3) -> Vec3 {
     let Some(arr) = map.get(key).and_then(|v| v.as_array()) else {
         return default;
     };
-    let f = |i: usize, d: f32| arr.get(i).and_then(|x| x.as_f64()).map(|v| v as f32).unwrap_or(d);
+    let f = |i: usize, d: f32| {
+        arr.get(i)
+            .and_then(|x| x.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(d)
+    };
     Vec3::new(f(0, default.x), f(1, default.y), f(2, default.z))
 }
 
@@ -225,13 +236,17 @@ fn load_cube_params(
             let _ = std::fs::write(&path, CUBE_FT_TEMPLATE);
         }
     }
-    let Ok(meta) = std::fs::metadata(&path) else { return };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return;
+    };
     let Ok(mtime) = meta.modified() else { return };
     if *last_mtime == Some(mtime) {
         return;
     }
     *last_mtime = Some(mtime);
-    let Ok(src) = std::fs::read_to_string(&path) else { return };
+    let Ok(src) = std::fs::read_to_string(&path) else {
+        return;
+    };
     let mut vm = funct::Funct::new();
     match vm.eval(&src).map_err(|e| e.to_string()).and_then(|v| {
         v.to_json()
@@ -595,11 +610,25 @@ fn overview_apply(
                     // owns reverting this when the overview closes.
                     winit.focused_mode = bevy::winit::UpdateMode::Continuous;
                     build(
-                        &mut prism, &projects, &mut focus, &params, &canvas_view, &pane_viewport,
+                        &mut prism,
+                        &projects,
+                        &mut focus,
+                        &params,
+                        &canvas_view,
+                        &pane_viewport,
                         sidebar.width,
-                        window, &panes, &mut images, &mut meshes, &mut materials,
-                        &mut sky_materials, &mut floor_materials, &mut commands, &mut flat_cams,
-                        &style_state, &preset_registry, style_data_dir.as_deref(),
+                        window,
+                        &panes,
+                        &mut images,
+                        &mut meshes,
+                        &mut materials,
+                        &mut sky_materials,
+                        &mut floor_materials,
+                        &mut commands,
+                        &mut flat_cams,
+                        &style_state,
+                        &preset_registry,
+                        style_data_dir.as_deref(),
                     );
                 }
             }
@@ -786,7 +815,8 @@ fn build(
     // would cross-render onto each other's faces (across projects), so
     // assert uniqueness here where the cube relies on it.
     let mut by_project: BTreeMap<u64, Vec<(Entity, PaneRect, bool, usize)>> = BTreeMap::new();
-    let mut seen_layers: std::collections::HashMap<usize, Entity> = std::collections::HashMap::new();
+    let mut seen_layers: std::collections::HashMap<usize, Entity> =
+        std::collections::HashMap::new();
     for (e, rect, proj, pinned, layer, canvas) in panes.iter() {
         // The cube shows each project's ROOT canvas only. Panes gathered
         // into a nested canvas (PaneCanvas != 0) are hidden inside their
@@ -801,7 +831,10 @@ fn build(
                 layer.0
             );
         }
-        by_project.entry(proj.0).or_default().push((e, *rect, pinned, layer.0));
+        by_project
+            .entry(proj.0)
+            .or_default()
+            .push((e, *rect, pinned, layer.0));
     }
 
     // Only switchable (non-parked) projects get a face — the prism is a
@@ -827,7 +860,11 @@ fn build(
     };
 
     let root = commands
-        .spawn((Transform::default(), Visibility::Visible, Name::new("prism_root")))
+        .spawn((
+            Transform::default(),
+            Visibility::Visible,
+            Name::new("prism_root"),
+        ))
         .id();
 
     prism.face_angle.clear();
@@ -845,7 +882,11 @@ fn build(
     let reflect_root = if reflect_on {
         Some(
             commands
-                .spawn((Transform::default(), Visibility::Visible, Name::new("prism_reflect")))
+                .spawn((
+                    Transform::default(),
+                    Visibility::Visible,
+                    Name::new("prism_reflect"),
+                ))
                 .id(),
         )
     } else {
@@ -953,7 +994,11 @@ fn build(
         let view = canvas_view.state_for((pid, 0));
 
         let mut ordered: Vec<&(Entity, PaneRect, bool, usize)> = plist.iter().collect();
-        ordered.sort_by(|a, b| a.1.z.partial_cmp(&b.1.z).unwrap_or(std::cmp::Ordering::Equal));
+        ordered.sort_by(|a, b| {
+            a.1.z
+                .partial_cmp(&b.1.z)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Pinned panes are the anchored background — they lie flat on the
         // face (no float). Only unpinned panes pop out, stacked by z.
@@ -1295,11 +1340,7 @@ fn despawn_cube(prism: &mut Prism, commands: &mut Commands, images: &mut Assets<
 fn suppress_window_pane_cams(
     prism: Res<Prism>,
     projects: Res<Projects>,
-    panes: Query<(
-        &PaneProject,
-        &PaneRect,
-        Has<jim_pane::PaneScreenAnchored>,
-    )>,
+    panes: Query<(&PaneProject, &PaneRect, Has<jim_pane::PaneScreenAnchored>)>,
     windows: Query<&Window>,
     region: Option<Res<jim_pane::PaneCanvasRegion>>,
     viewport: Option<Res<jim_pane::PaneViewport>>,
@@ -1356,11 +1397,7 @@ fn suppress_window_pane_cams(
 
 /// Advance the sky shader's time uniform so the nebula drifts and stars
 /// twinkle. Cheap; only touches the one material while the prism is up.
-fn animate_sky(
-    prism: Res<Prism>,
-    time: Res<Time>,
-    mut sky_materials: ResMut<Assets<SkyMaterial>>,
-) {
+fn animate_sky(prism: Res<Prism>, time: Res<Time>, mut sky_materials: ResMut<Assets<SkyMaterial>>) {
     let _t_prof = jim_pane::prof::sys_span("cube_animate_sky");
     if !prism.active {
         return;

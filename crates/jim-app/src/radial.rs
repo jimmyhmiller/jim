@@ -28,7 +28,7 @@ use bevy::sprite::Anchor;
 use bevy::sprite_render::{ColorMaterial, MeshMaterial2d};
 use bevy::text::LineHeight;
 
-use jim_pane::{topmost_pane_at, InputConsumed, PaneRect, PaneTag};
+use jim_pane::{InputConsumed, PaneRect, PaneTag, topmost_pane_at};
 
 use crate::actions::{ActionInvocations, ActionRegistry};
 use crate::projects::Sidebar;
@@ -331,7 +331,9 @@ pub fn radial_open_close(
 fn radial_hover(windows: Query<&Window>, mut menu: ResMut<RadialMenu>) {
     let Some(center) = menu.center else { return };
     let Ok(window) = windows.single() else { return };
-    let Some(pt) = window.cursor_position() else { return };
+    let Some(pt) = window.cursor_position() else {
+        return;
+    };
     let local = pt - center;
     let n = menu.item_count();
     let new_hover = hit_test(local, n);

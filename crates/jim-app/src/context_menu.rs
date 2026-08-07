@@ -17,8 +17,8 @@ use bevy::sprite::Anchor;
 use bevy::text::LineHeight;
 
 use jim_pane::{
-    pt_to_content_local, region_at, topmost_pane_at, InputConsumed, PaneRect, PaneRegion, PaneTag,
-    PanePinned, PaneViewportReaders, PendingPaneActions,
+    InputConsumed, PanePinned, PaneRect, PaneRegion, PaneTag, PaneViewportReaders,
+    PendingPaneActions, pt_to_content_local, region_at, topmost_pane_at,
 };
 use jim_widget::protocol::HostEvent;
 use jim_widget::script_widget::ScriptWidget;
@@ -223,8 +223,7 @@ fn context_open_close(
         // etc.), not to our per-pane menu. Yield without consuming so
         // jim_terminal's report system forwards it. Shift is the escape
         // hatch — Shift+right-click still opens this menu.
-        let shift = key_state.pressed(KeyCode::ShiftLeft)
-            || key_state.pressed(KeyCode::ShiftRight);
+        let shift = key_state.pressed(KeyCode::ShiftLeft) || key_state.pressed(KeyCode::ShiftRight);
         if !shift && jim_terminal::pane_mouse_tracking(&term_store, target) {
             return;
         }

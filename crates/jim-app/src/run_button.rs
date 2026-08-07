@@ -35,22 +35,22 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use bevy::text::{LineHeight, TextBounds};
 use jim_pane::{
-    focus_text_input, spawn_text_input, FocusedTextInput, PaneContentNoClip, PaneContentPressed,
-    PaneHotZones, PaneKindMarker, PaneKindSpec, PaneProject, PaneRect, PaneRegistry, PaneTag,
-    PaneTitle, TextInput, TextInputEvent, TextInputStyle,
+    FocusedTextInput, PaneContentNoClip, PaneContentPressed, PaneHotZones, PaneKindMarker,
+    PaneKindSpec, PaneProject, PaneRect, PaneRegistry, PaneTag, PaneTitle, TextInput,
+    TextInputEvent, TextInputStyle, focus_text_input, spawn_text_input,
 };
 use serde_json::Value;
 
 use crate::projects::Projects;
-use jim_terminal::{MonoFont, MonoMetrics, FONT_SIZE};
+use jim_terminal::{FONT_SIZE, MonoFont, MonoMetrics};
 
 pub const PANE_KIND: &str = "run-button";
 
@@ -728,7 +728,13 @@ fn hit_play_button(local: Vec2) -> bool {
 }
 
 fn hit_save_button(local: Vec2, content_w: f32) -> bool {
-    hit_rect(local, save_btn_x(content_w), SAVE_BTN_Y, SAVE_BTN_W, SAVE_BTN_H)
+    hit_rect(
+        local,
+        save_btn_x(content_w),
+        SAVE_BTN_Y,
+        SAVE_BTN_W,
+        SAVE_BTN_H,
+    )
 }
 
 fn hit_title_input_row(local: Vec2, content_w: f32) -> bool {
@@ -937,8 +943,7 @@ fn handle_form_press(
 
     if hit_title_input_row(local, content_w) {
         if let Ok(mut ti) = text_inputs.get_mut(chrome.title_input) {
-            let local_x =
-                (local.x - (FORM_PAD_X + FORM_LABEL_W + FORM_INPUT_PAD_X)).max(0.0);
+            let local_x = (local.x - (FORM_PAD_X + FORM_LABEL_W + FORM_INPUT_PAD_X)).max(0.0);
             jim_pane::click_to_caret(&mut ti, local_x);
         }
         focus_text_input(commands, focused, [], Some(chrome.title_input));
@@ -947,8 +952,7 @@ fn handle_form_press(
 
     if hit_command_input_row(local, content_w) {
         if let Ok(mut ti) = text_inputs.get_mut(chrome.command_input) {
-            let local_x =
-                (local.x - (FORM_PAD_X + FORM_LABEL_W + FORM_INPUT_PAD_X)).max(0.0);
+            let local_x = (local.x - (FORM_PAD_X + FORM_LABEL_W + FORM_INPUT_PAD_X)).max(0.0);
             jim_pane::click_to_caret(&mut ti, local_x);
         }
         focus_text_input(commands, focused, [], Some(chrome.command_input));
@@ -957,8 +961,7 @@ fn handle_form_press(
 
     if hit_cwd_input_row(local, content_w) {
         if let Ok(mut ti) = text_inputs.get_mut(chrome.cwd_input) {
-            let local_x =
-                (local.x - (FORM_PAD_X + FORM_LABEL_W + FORM_INPUT_PAD_X)).max(0.0);
+            let local_x = (local.x - (FORM_PAD_X + FORM_LABEL_W + FORM_INPUT_PAD_X)).max(0.0);
             jim_pane::click_to_caret(&mut ti, local_x);
         }
         focus_text_input(commands, focused, [], Some(chrome.cwd_input));
@@ -1062,19 +1065,9 @@ fn handle_text_input_events(
                 }
                 if *entity == chrome.title_input {
                     // Tab-like: jump to command input.
-                    focus_text_input(
-                        &mut commands,
-                        &mut focused,
-                        [],
-                        Some(chrome.command_input),
-                    );
+                    focus_text_input(&mut commands, &mut focused, [], Some(chrome.command_input));
                 } else if *entity == chrome.command_input {
-                    focus_text_input(
-                        &mut commands,
-                        &mut focused,
-                        [],
-                        Some(chrome.cwd_input),
-                    );
+                    focus_text_input(&mut commands, &mut focused, [], Some(chrome.cwd_input));
                 } else {
                     commit_form(
                         &mut rb,
@@ -1124,9 +1117,7 @@ fn find_pane_for_input(
     input: Entity,
 ) -> Option<Entity> {
     for (pane, _, chrome) in rbs.iter() {
-        if chrome.title_input == input
-            || chrome.command_input == input
-            || chrome.cwd_input == input
+        if chrome.title_input == input || chrome.command_input == input || chrome.cwd_input == input
         {
             return Some(pane);
         }
@@ -1297,7 +1288,11 @@ fn sync_run_button_visual(
         let show_output = rb.output_expanded && !rb.output.is_empty() && !is_small;
 
         // --- Form visibility ---
-        let form_vis = if draft { Visibility::Inherited } else { Visibility::Hidden };
+        let form_vis = if draft {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
         for e in [
             chrome.title_label,
             chrome.title_input,
@@ -1398,7 +1393,11 @@ fn sync_run_button_visual(
             t.0 = rb.command.clone();
         }
 
-        let toggle_glyph = if show_output { "\u{25BE} Details" } else { "\u{25B8} Details" };
+        let toggle_glyph = if show_output {
+            "\u{25BE} Details"
+        } else {
+            "\u{25B8} Details"
+        };
         if let Ok(mut t) = text_q.get_mut(chrome.details_toggle) {
             if t.0 != toggle_glyph {
                 t.0 = toggle_glyph.into();
@@ -1507,9 +1506,7 @@ fn scroll_run_button_output(
 
     let visible_rects: Vec<(Entity, PaneRect)> = panes_q
         .iter()
-        .filter(|(_, _, vis, kind)| {
-            kind.0 == PANE_KIND && !matches!(vis, Some(Visibility::Hidden))
-        })
+        .filter(|(_, _, vis, kind)| kind.0 == PANE_KIND && !matches!(vis, Some(Visibility::Hidden)))
         .map(|(e, r, _, _)| (e, *r))
         .collect();
     let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &visible_rects)

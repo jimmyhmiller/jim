@@ -48,11 +48,7 @@ impl Drop for LogDumper {
     fn drop(&mut self) {
         let log = self.dir.join("daemon.log");
         if let Ok(s) = std::fs::read_to_string(&log) {
-            eprintln!(
-                "\n--- daemon.log @ {} ---\n{}\n---",
-                log.display(),
-                s
-            );
+            eprintln!("\n--- daemon.log @ {} ---\n{}\n---", log.display(), s);
         } else {
             eprintln!("\n--- no daemon.log at {} ---", log.display());
         }
@@ -116,7 +112,11 @@ fn reattach_replays_history() {
         DaemonMessage::Output(b) => String::from_utf8_lossy(b).contains("hello-replay"),
         _ => false,
     });
-    assert!(saw_first, "expected first client to see echo. {:?}", frames1);
+    assert!(
+        saw_first,
+        "expected first client to see echo. {:?}",
+        frames1
+    );
 
     // Detach (drop the connection) — daemon survives.
     drop(c1);
@@ -144,11 +144,7 @@ fn reattach_replays_history() {
     }
     assert!(saw_replay_start, "no ReplayStart in {:?}", frames2);
     assert!(saw_replay_end, "no ReplayEnd in {:?}", frames2);
-    assert!(
-        saw_replayed_output,
-        "history not replayed in {:?}",
-        frames2
-    );
+    assert!(saw_replayed_output, "history not replayed in {:?}", frames2);
 
     // Kill so the test doesn't leave a daemon running.
     c2.send(&jim_terminal::daemon_proto::ClientMessage::Kill);

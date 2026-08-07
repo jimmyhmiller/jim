@@ -55,10 +55,7 @@ pub fn setup_isolated_daemon_env() -> DaemonTestEnv {
         std::env::set_var("HOME", home.path());
         std::env::set_var("TERMINAL_BEVY_DAEMON_BIN", &daemon_bin);
         std::env::set_var("TERMINAL_BEVY_RUNTIME_DIR", &runtime_dir);
-        std::env::set_var(
-            "TERMINAL_DAEMON_LOG",
-            home.path().join("daemon.log"),
-        );
+        std::env::set_var("TERMINAL_DAEMON_LOG", home.path().join("daemon.log"));
     }
 
     DaemonTestEnv { home, runtime_dir }

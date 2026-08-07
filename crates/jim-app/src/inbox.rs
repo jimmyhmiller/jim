@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use jim_pane::{
-    content_area, PaneContentPressed, PaneFont, PaneHotZones, PaneKindSpec,
-    PaneRect, PaneRegistry, PaneTitle,
+    PaneContentPressed, PaneFont, PaneHotZones, PaneKindSpec, PaneRect, PaneRegistry, PaneTitle,
+    content_area,
 };
 
 use crate::projects::Projects;
@@ -193,7 +193,10 @@ pub fn append_message(
         read: false,
     };
     let line = serde_json::to_string(&msg).unwrap_or_default();
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
     f.write_all(line.as_bytes())?;
     f.write_all(b"\n")?;
     Ok(id)
@@ -210,7 +213,10 @@ pub fn forward_to_claude(project_id: u64, msg: &InboxMessage) -> std::io::Result
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.jsonl", project_id));
     let line = serde_json::to_string(msg).unwrap_or_default();
-    let mut f = fs::OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
     f.write_all(line.as_bytes())?;
     f.write_all(b"\n")?;
     Ok(())
@@ -322,21 +328,19 @@ fn inbox_snapshot(world: &World, entity: Entity) -> Value {
 /// Periodically re-read each loaded project's inbox file. If mtime
 /// changed (an external writer appended) we reload and mark all panes
 /// for that project dirty.
-fn poll_disk(
-    mut store: ResMut<InboxStore>,
-    mut panes: Query<&mut InboxPane>,
-) {
+fn poll_disk(mut store: ResMut<InboxStore>, mut panes: Query<&mut InboxPane>) {
     let pids: Vec<u64> = store.loaded.iter().copied().collect();
     for pid in pids {
-        let Some(path) = inbox_path(pid) else { continue };
+        let Some(path) = inbox_path(pid) else {
+            continue;
+        };
         let mtime = fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         let prev = store.by_project.get(&pid).and_then(|i| i.last_seen_mtime);
         if mtime != prev {
             let messages = read_messages(pid);
             if let Some(inbox) = store.by_project.get_mut(&pid) {
                 // Preserve expanded set for ids still present.
-                let still: HashSet<u64> =
-                    messages.iter().map(|m| m.id).collect();
+                let still: HashSet<u64> = messages.iter().map(|m| m.id).collect();
                 inbox.expanded.retain(|id| still.contains(id));
                 inbox.messages = messages;
                 inbox.last_seen_mtime = mtime;
@@ -421,8 +425,12 @@ fn update_inbox_hot_zones(
         }
     }
     for (size, child_of) in &hits {
-        let Some(&(pane, scroll)) = by_root.get(&child_of.0) else { continue };
-        let Ok(mut z) = zones_q.get_mut(pane) else { continue };
+        let Some(&(pane, scroll)) = by_root.get(&child_of.0) else {
+            continue;
+        };
+        let Ok(mut z) = zones_q.get_mut(pane) else {
+            continue;
+        };
         let origin = Vec2::new(size.local_origin.x, size.local_origin.y - scroll);
         z.push(Rect::from_corners(origin, origin + size.size));
     }
@@ -455,7 +463,9 @@ fn scroll_inbox(
         return;
     }
     let Ok(win) = windows.single() else { return };
-    let Some(pt) = win.cursor_position() else { return };
+    let Some(pt) = win.cursor_position() else {
+        return;
+    };
     let pt_canvas = viewport.window_to_canvas(pt);
     let all_rects: Vec<(Entity, PaneRect)> = all_panes
         .iter()
@@ -677,11 +687,7 @@ fn rebuild_rows(
             Anchor::CENTER,
             TextLayout::no_wrap(),
             jim_pane::PaneContentNoClip,
-            Transform::from_xyz(
-                mark_x + mark_w * 0.5,
-                -(mark_y + ACTION_BTN_H * 0.5),
-                0.2,
-            ),
+            Transform::from_xyz(mark_x + mark_w * 0.5, -(mark_y + ACTION_BTN_H * 0.5), 0.2),
         ));
         // Show/hide-read toggle, just left of "Mark all read". Only shown
         // when there's something to toggle (read messages exist, or we're
@@ -781,7 +787,9 @@ fn rebuild_rows(
                 Transform::from_xyz(ROW_PAD_X, -(y + ROW_H * 0.5), 0.1),
             ));
             pane.content_height = y + ROW_H;
-            pane.scroll = pane.scroll.clamp(0.0, (pane.content_height - content_size.y).max(0.0));
+            pane.scroll = pane
+                .scroll
+                .clamp(0.0, (pane.content_height - content_size.y).max(0.0));
             continue;
         }
 
@@ -916,48 +924,47 @@ fn rebuild_rows(
                 let actions_y = y;
                 let btn_h = ACTION_BTN_H;
                 let mut bx = body_x;
-                let mk_btn =
-                    |commands: &mut Commands,
-                     parent: Entity,
-                     x: f32,
-                     y: f32,
-                     w: f32,
-                     label: &str,
-                     hit: InboxHit,
-                     color: Color| {
-                        commands.spawn((
-                            InboxRowEntity,
-                            ChildOf(parent),
-                            Sprite {
-                                color: color.with_alpha(0.14),
-                                custom_size: Some(Vec2::new(w, btn_h)),
-                                ..default()
-                            },
-                            Anchor::TOP_LEFT,
-                            Transform::from_xyz(x, -y, 0.1),
-                            hit,
-                            HitSize {
-                                local_origin: Vec2::new(x, y),
-                                size: Vec2::new(w, btn_h),
-                            },
-                        ));
-                        commands.spawn((
-                            InboxRowEntity,
-                            ChildOf(parent),
-                            Text2d::new(label.to_string()),
-                            TextFont {
-                                font: (font.0.clone()).into(),
-                                font_size: FontSize::Px(SMALL_FONT_SIZE),
-                                ..default()
-                            },
-                            LineHeight::Px(btn_h),
-                            TextColor(color),
-                            Anchor::CENTER,
-                            TextLayout::no_wrap(),
-                            jim_pane::PaneContentNoClip,
-                            Transform::from_xyz(x + w * 0.5, -(y + btn_h * 0.5), 0.2),
-                        ));
-                    };
+                let mk_btn = |commands: &mut Commands,
+                              parent: Entity,
+                              x: f32,
+                              y: f32,
+                              w: f32,
+                              label: &str,
+                              hit: InboxHit,
+                              color: Color| {
+                    commands.spawn((
+                        InboxRowEntity,
+                        ChildOf(parent),
+                        Sprite {
+                            color: color.with_alpha(0.14),
+                            custom_size: Some(Vec2::new(w, btn_h)),
+                            ..default()
+                        },
+                        Anchor::TOP_LEFT,
+                        Transform::from_xyz(x, -y, 0.1),
+                        hit,
+                        HitSize {
+                            local_origin: Vec2::new(x, y),
+                            size: Vec2::new(w, btn_h),
+                        },
+                    ));
+                    commands.spawn((
+                        InboxRowEntity,
+                        ChildOf(parent),
+                        Text2d::new(label.to_string()),
+                        TextFont {
+                            font: (font.0.clone()).into(),
+                            font_size: FontSize::Px(SMALL_FONT_SIZE),
+                            ..default()
+                        },
+                        LineHeight::Px(btn_h),
+                        TextColor(color),
+                        Anchor::CENTER,
+                        TextLayout::no_wrap(),
+                        jim_pane::PaneContentNoClip,
+                        Transform::from_xyz(x + w * 0.5, -(y + btn_h * 0.5), 0.2),
+                    ));
+                };
                 // Send to Claude
                 mk_btn(
                     &mut commands,

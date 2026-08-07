@@ -18,23 +18,23 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver};
 
 use bevy::input::keyboard::KeyboardInput;
 use bevy::input::mouse::MouseButton;
 use bevy::prelude::*;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use bevy::sprite::Anchor;
 use bevy::text::{LineHeight, TextBounds};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use jim_pane::{
-    content_area, focus_text_input, pt_to_content_local, spawn_text_input,
-    spawn_text_input_multiline, FocusedPane, FocusedTextInput, InputConsumed, PaneContentNoClip,
-    PaneContentPressed, PaneFont, PaneFontMetrics, PaneHotZones, PaneKindSpec, PaneRect,
-    PaneRegistry, PaneTag, PaneTitle, TextInput, TextInputEvent, TextInputStyle,
+    FocusedPane, FocusedTextInput, InputConsumed, PaneContentNoClip, PaneContentPressed, PaneFont,
+    PaneFontMetrics, PaneHotZones, PaneKindSpec, PaneRect, PaneRegistry, PaneTag, PaneTitle,
+    TextInput, TextInputEvent, TextInputStyle, content_area, focus_text_input, pt_to_content_local,
+    spawn_text_input, spawn_text_input_multiline,
 };
 
 use crate::projects::Projects;
@@ -331,7 +331,10 @@ fn poll_issues_watcher(watcher: Option<Res<IssuesWatcher>>, mut store: ResMut<Is
     if changed.is_empty() {
         return;
     }
-    eprintln!("[issues] hot-reloaded projects {:?} from external edit", changed);
+    eprintln!(
+        "[issues] hot-reloaded projects {:?} from external edit",
+        changed
+    );
     store.relayout.extend(changed);
 }
 
@@ -534,7 +537,9 @@ fn issues_spawn(world: &mut World, entity: Entity, _content_root: Entity, config
     });
     // Ensure this project's issues are loaded so the first rebuild
     // has data to show.
-    world.resource_mut::<IssuesStore>().ensure_loaded(project_id);
+    world
+        .resource_mut::<IssuesStore>()
+        .ensure_loaded(project_id);
 }
 
 fn issues_snapshot(world: &World, entity: Entity) -> Value {
@@ -762,10 +767,7 @@ fn handle_text_input_events(
             }
         };
         // Find which pane owns this input.
-        let Some(mut pane) = panes
-            .iter_mut()
-            .find(|p| p.edit_input == Some(entity))
-        else {
+        let Some(mut pane) = panes.iter_mut().find(|p| p.edit_input == Some(entity)) else {
             continue;
         };
         let project_id = pane.project_id;
@@ -929,18 +931,20 @@ fn update_issues_hot_zones(
     mut zones_q: Query<&mut PaneHotZones>,
     hits: Query<(&HitSize, &ChildOf), With<IssueHit>>,
 ) {
-    let by_root: std::collections::HashMap<Entity, Entity> = panes
-        .iter()
-        .map(|(e, c)| (c.content_root, e))
-        .collect();
+    let by_root: std::collections::HashMap<Entity, Entity> =
+        panes.iter().map(|(e, c)| (c.content_root, e)).collect();
     for (e, _) in panes.iter() {
         if let Ok(mut z) = zones_q.get_mut(e) {
             z.clear();
         }
     }
     for (size, child_of) in &hits {
-        let Some(&pane) = by_root.get(&child_of.0) else { continue };
-        let Ok(mut z) = zones_q.get_mut(pane) else { continue };
+        let Some(&pane) = by_root.get(&child_of.0) else {
+            continue;
+        };
+        let Ok(mut z) = zones_q.get_mut(pane) else {
+            continue;
+        };
         z.push(Rect::from_corners(
             size.local_origin,
             size.local_origin + size.size,
@@ -1278,7 +1282,13 @@ fn spawn_issue_block(
         },
     ));
     // Checkbox border (1px outline using 4 thin sprites).
-    spawn_outline(commands, parent, Vec2::new(cb_x, cb_y), Vec2::splat(CHECKBOX_SIZE), cb_color);
+    spawn_outline(
+        commands,
+        parent,
+        Vec2::new(cb_x, cb_y),
+        Vec2::splat(CHECKBOX_SIZE),
+        cb_color,
+    );
     // Checkbox glyph when done.
     if issue.done {
         commands.spawn((
@@ -1293,7 +1303,11 @@ fn spawn_issue_block(
             LineHeight::Px(CHECKBOX_SIZE),
             TextColor(Color::WHITE),
             Anchor::CENTER,
-            Transform::from_xyz(cb_x + CHECKBOX_SIZE * 0.5, -(cb_y + CHECKBOX_SIZE * 0.5), 0.3),
+            Transform::from_xyz(
+                cb_x + CHECKBOX_SIZE * 0.5,
+                -(cb_y + CHECKBOX_SIZE * 0.5),
+                0.3,
+            ),
         ));
     }
 
@@ -1696,13 +1710,7 @@ fn spawn_row_bg(
 
 /// Spawn a 1px outline frame using four thin sprites — gives us a
 /// hollow rectangle without needing a custom material.
-fn spawn_outline(
-    commands: &mut Commands,
-    parent: Entity,
-    origin: Vec2,
-    size: Vec2,
-    color: Color,
-) {
+fn spawn_outline(commands: &mut Commands, parent: Entity, origin: Vec2, size: Vec2, color: Color) {
     // top
     commands.spawn((
         IssueRowEntity,
@@ -1794,9 +1802,11 @@ fn spawn_inline_input(
         // already grew to the new wrapped height. The input's own wrap
         // width is fixed at spawn — a pane resize mid-edit won't re-wrap
         // until the edit ends, which is acceptable.
-        commands
-            .entity(existing)
-            .insert(Transform::from_xyz(origin.x + 4.0, -(origin.y + 2.0), 0.2));
+        commands.entity(existing).insert(Transform::from_xyz(
+            origin.x + 4.0,
+            -(origin.y + 2.0),
+            0.2,
+        ));
         pane.edit_input = Some(existing);
         pane.edit_target_built = Some(target);
         return;
@@ -1885,8 +1895,16 @@ mod tests {
         let mut f = ProjectIssuesFile {
             next_id: 2,
             issues: vec![
-                Issue { id: 20, title: "a".into(), ..Default::default() },
-                Issue { id: 7, title: "b".into(), ..Default::default() },
+                Issue {
+                    id: 20,
+                    title: "a".into(),
+                    ..Default::default()
+                },
+                Issue {
+                    id: 7,
+                    title: "b".into(),
+                    ..Default::default()
+                },
             ],
         };
         let id = push_issue(&mut f, "c".into(), String::new());
@@ -1905,15 +1923,27 @@ mod tests {
             1,
             ProjectIssuesFile {
                 next_id: 3,
-                issues: vec![Issue { id: 2, title: "local edit".into(), ..Default::default() }],
+                issues: vec![Issue {
+                    id: 2,
+                    title: "local edit".into(),
+                    ..Default::default()
+                }],
             },
         );
         // Hand-merge the way reload_from_disk does for a dirty project.
         let disk = ProjectIssuesFile {
             next_id: 4,
             issues: vec![
-                Issue { id: 2, title: "stale disk copy".into(), ..Default::default() },
-                Issue { id: 3, title: "external add".into(), ..Default::default() },
+                Issue {
+                    id: 2,
+                    title: "stale disk copy".into(),
+                    ..Default::default()
+                },
+                Issue {
+                    id: 3,
+                    title: "external add".into(),
+                    ..Default::default()
+                },
             ],
         };
         let mem = store.by_project.get_mut(&1).unwrap();

@@ -50,8 +50,8 @@ use bevy::sprite::Anchor;
 use serde::{Deserialize, Serialize};
 
 use jim_pane::{
-    InputConsumed, PaneCanvasRegion, PaneChrome, PaneInputBlockZones, PaneProject, PaneRect,
-    PaneTag, PaneDoubleClicked,
+    InputConsumed, PaneCanvasRegion, PaneChrome, PaneDoubleClicked, PaneInputBlockZones,
+    PaneProject, PaneRect, PaneTag,
 };
 
 use crate::projects::{Projects, Sidebar};
@@ -220,7 +220,12 @@ impl Plugin for CanvasPlugin {
             .init_resource::<PanPresetStep>()
             .add_systems(
                 Update,
-                (handle_pan_zoom_input, cycle_config_hotkey, jump_to_double_clicked_pane).chain(),
+                (
+                    handle_pan_zoom_input,
+                    cycle_config_hotkey,
+                    jump_to_double_clicked_pane,
+                )
+                    .chain(),
             )
             // PaneViewport must be published BEFORE pane-bevy's
             // position_panes / handle_pane_mouse / per-pane camera sync
@@ -288,7 +293,9 @@ pub fn zoom_active(world: &mut World, factor: f32) {
             None => return,
         }
     };
-    let canvas = world.resource::<crate::canvas_pane::CanvasNav>().level(active);
+    let canvas = world
+        .resource::<crate::canvas_pane::CanvasNav>()
+        .level(active);
     let mut view = world.resource_mut::<CanvasView>();
     let state = view.state_mut((active, canvas));
     let before = unproject_pos(center, state, origin);
@@ -304,7 +311,9 @@ pub fn zoom_reset_active(world: &mut World) {
     let Some(active) = world.resource::<Projects>().active else {
         return;
     };
-    let canvas = world.resource::<crate::canvas_pane::CanvasNav>().level(active);
+    let canvas = world
+        .resource::<crate::canvas_pane::CanvasNav>()
+        .level(active);
     let mut view = world.resource_mut::<CanvasView>();
     let state = view.state_mut((active, canvas));
     state.zoom = 1.0;
@@ -511,8 +520,7 @@ fn handle_pan_zoom_input(
             // Viewport-pan vertical: two-finger swipe up = view moves up
             // (panes appear to scroll down on screen). Horizontal keeps
             // the "drag canvas with fingers" sign.
-            let pan_delta = Vec2::new(-wheel_total.x, -wheel_total.y)
-                * config.trackpad_sensitivity
+            let pan_delta = Vec2::new(-wheel_total.x, -wheel_total.y) * config.trackpad_sensitivity
                 / state.zoom.max(0.0001);
             state.pan += pan_delta;
             state.clamp_pan();
@@ -563,9 +571,7 @@ fn handle_pan_zoom_input(
 
     if let Some(kind) = drag.active {
         let still_held = match kind {
-            PanDragKind::LeftEmpty | PanDragKind::SpaceLeft => {
-                buttons.pressed(MouseButton::Left)
-            }
+            PanDragKind::LeftEmpty | PanDragKind::SpaceLeft => buttons.pressed(MouseButton::Left),
             PanDragKind::Middle => buttons.pressed(MouseButton::Middle),
         };
         if !still_held {
@@ -613,7 +619,9 @@ fn jump_to_double_clicked_pane(
 ) {
     const JUMP_MARGIN: f32 = 24.0;
     for ev in events.read() {
-        let Ok((rect, proj, canvas, is_tile)) = panes.get(ev.pane) else { continue };
+        let Ok((rect, proj, canvas, is_tile)) = panes.get(ev.pane) else {
+            continue;
+        };
         // Double-clicking a nested-canvas tile descends into it (handled
         // by `canvas_pane`), so don't also yank the view around here.
         if is_tile {
@@ -621,7 +629,9 @@ fn jump_to_double_clicked_pane(
         }
         // Pane belongs to its own project (most cases) or the active
         // one if it's project-less.
-        let Some(pid) = proj.map(|p| p.0).or(projects.active) else { continue };
+        let Some(pid) = proj.map(|p| p.0).or(projects.active) else {
+            continue;
+        };
         let state = view.state_mut((pid, canvas.map_or(0, |c| c.0)));
         // Only jump when zoomed away from native. At zoom 1 the pane is
         // already at full size, so a double-click shouldn't yank the
@@ -757,7 +767,12 @@ fn sync_origin_indicators(
     if !init.0 {
         init.0 = true;
         let dark = Color::srgba(0.0, 0.0, 0.0, 0.0);
-        for edge in [OriginEdge::Top, OriginEdge::Bottom, OriginEdge::Left, OriginEdge::Right] {
+        for edge in [
+            OriginEdge::Top,
+            OriginEdge::Bottom,
+            OriginEdge::Left,
+            OriginEdge::Right,
+        ] {
             for rank in 0..ORIGIN_STRIP_LAYERS {
                 commands.spawn((
                     OriginStripLayer { edge, rank },
@@ -791,11 +806,9 @@ fn sync_origin_indicators(
     let view_w = canvas_w / zoom;
     let view_h = win_h / zoom;
     let depth_left = (pan.x.max(0.0) / ORIGIN_SATURATE_AT).min(1.0);
-    let depth_right =
-        ((-(pan.x + view_w)).max(0.0) / ORIGIN_SATURATE_AT).min(1.0);
+    let depth_right = ((-(pan.x + view_w)).max(0.0) / ORIGIN_SATURATE_AT).min(1.0);
     let depth_top = (pan.y.max(0.0) / ORIGIN_SATURATE_AT).min(1.0);
-    let depth_bottom =
-        ((-(pan.y + view_h)).max(0.0) / ORIGIN_SATURATE_AT).min(1.0);
+    let depth_bottom = ((-(pan.y + view_h)).max(0.0) / ORIGIN_SATURATE_AT).min(1.0);
 
     // Theme-driven base color. We pull from `PANE_SHADOW_COLOR` because
     // it's already a soft dark across every preset (and inverts for
@@ -818,8 +831,7 @@ fn sync_origin_indicators(
         let falloff = (1.0 - rank_t).powf(1.5); // ease-out so the inner
         // layers fade faster than linear; gives a softer gradient feel.
         let alpha = (directional * ORIGIN_PEAK_INTENSITY * falloff).clamp(0.0, 1.0);
-        let want_color =
-            Color::srgba(base_rgb.0, base_rgb.1, base_rgb.2, alpha);
+        let want_color = Color::srgba(base_rgb.0, base_rgb.1, base_rgb.2, alpha);
         if sprite.color != want_color {
             sprite.color = want_color;
         }
@@ -842,7 +854,10 @@ fn sync_origin_indicators(
             ),
             OriginEdge::Right => (
                 Vec2::new(layer_thickness, win_h),
-                Vec2::new(world_canvas_left + canvas_w - inset - layer_thickness, world_top),
+                Vec2::new(
+                    world_canvas_left + canvas_w - inset - layer_thickness,
+                    world_top,
+                ),
             ),
         };
         if sprite.custom_size != Some(size) {

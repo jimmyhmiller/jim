@@ -31,7 +31,7 @@ use jim_pane::{PaneKindMarker, PaneKindSpec, PaneRect, PaneRegistry, PaneTitle};
 use serde_json::Value;
 
 use crate::graph_view::{self, GEdge, GNode, GraphModel, GraphPalette, GraphView, NodeStatus};
-use jim_terminal::{MonoFont, FONT_SIZE};
+use jim_terminal::{FONT_SIZE, MonoFont};
 
 pub const PANE_KIND: &str = "workflow-graph";
 
@@ -338,7 +338,9 @@ fn build_model(dir: &Path) -> GraphModel {
         return GraphModel {
             caption: format!(
                 "workflow-graph: watching {} (no agents yet)",
-                dir.file_name().map(|s| s.to_string_lossy()).unwrap_or_default()
+                dir.file_name()
+                    .map(|s| s.to_string_lossy())
+                    .unwrap_or_default()
             ),
             ..default()
         };

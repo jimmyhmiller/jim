@@ -65,7 +65,13 @@ struct Turn {
 /// Run the agent loop to completion, streaming events to `tx`. Blocking —
 /// spawn on a dedicated thread. Returns when the model finishes, errors, or
 /// `cancel` is set.
-pub fn run(cfg: LlmConfig, system: String, goal: String, tx: Sender<AgentMsg>, cancel: Arc<AtomicBool>) {
+pub fn run(
+    cfg: LlmConfig,
+    system: String,
+    goal: String,
+    tx: Sender<AgentMsg>,
+    cancel: Arc<AtomicBool>,
+) {
     let mut messages = vec![Msg::system(system), Msg::user(format!("User goal: {goal}"))];
 
     for _ in 0..MAX_STEPS {

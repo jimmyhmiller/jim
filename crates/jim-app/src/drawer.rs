@@ -48,7 +48,7 @@ use bevy::text::LineHeight;
 use jim_pane::{InputConsumed, PaneRegistry};
 use serde::{Deserialize, Serialize};
 
-use crate::projects::{kind_to_static, NewPaneRequest, PendingActions, Projects, Sidebar};
+use crate::projects::{NewPaneRequest, PendingActions, Projects, Sidebar, kind_to_static};
 use jim_terminal::MonoFont;
 
 /// Drawer sits above the sidebar but below the radial / context menus,
@@ -196,7 +196,13 @@ fn drawer_load(mut drawer: ResMut<Drawer>) {
         Ok(p) => {
             // Guard next_id against hand-edited / stale files so a fresh
             // push can never collide with a loaded id.
-            let max_id = p.items.iter().map(|s| s.id).max().map(|m| m + 1).unwrap_or(0);
+            let max_id = p
+                .items
+                .iter()
+                .map(|s| s.id)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
             drawer.next_id = p.next_id.max(max_id);
             drawer.items = p.items;
         }
@@ -382,7 +388,9 @@ fn drawer_input(
         return;
     }
     let Ok(window) = windows.single() else { return };
-    let Some(pt) = window.cursor_position() else { return };
+    let Some(pt) = window.cursor_position() else {
+        return;
+    };
 
     let view = project_view(&drawer.items, &projects);
     let layout = compute_layout(
@@ -640,7 +648,12 @@ fn drawer_render(
         .map(|p| p.name.as_str());
     let header_text = match (proj_name, view.elsewhere) {
         (Some(name), 0) => format!("SUGGESTIONS · {} · {}", name, view.rows.len()),
-        (Some(name), n) => format!("SUGGESTIONS · {} · {} (+{} elsewhere)", name, view.rows.len(), n),
+        (Some(name), n) => format!(
+            "SUGGESTIONS · {} · {} (+{} elsewhere)",
+            name,
+            view.rows.len(),
+            n
+        ),
         (None, 0) => format!("SUGGESTIONS · {}", view.rows.len()),
         (None, n) => format!("SUGGESTIONS · {} (+{} elsewhere)", view.rows.len(), n),
     };
@@ -660,7 +673,10 @@ fn drawer_render(
         overlay.clone(),
     ));
     let hint = "cmd+J  ·  esc to close";
-    let hint_p = w2w(layout.left + layout.width - PAD, layout.top_y + HEADER_H * 0.5);
+    let hint_p = w2w(
+        layout.left + layout.width - PAD,
+        layout.top_y + HEADER_H * 0.5,
+    );
     commands.spawn((
         DrawerEntity,
         Text2d::new(hint),
@@ -684,7 +700,10 @@ fn drawer_render(
         } else {
             "nothing parked here yet"
         };
-        let p = w2w(layout.left + layout.width * 0.5, layout.top_y + HEADER_H + PAD + 20.0);
+        let p = w2w(
+            layout.left + layout.width * 0.5,
+            layout.top_y + HEADER_H + PAD + 20.0,
+        );
         commands.spawn((
             DrawerEntity,
             Text2d::new(msg),

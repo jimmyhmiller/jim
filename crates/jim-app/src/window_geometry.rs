@@ -144,7 +144,10 @@ pub fn fit_window_to_monitor(
         monitor.physical_height,
         top_inset,
     );
-    eprintln!("[window-geom] restored window to {:?} (monitor {}x{})", fitted, monitor.physical_width, monitor.physical_height);
+    eprintln!(
+        "[window-geom] restored window to {:?} (monitor {}x{})",
+        fitted, monitor.physical_width, monitor.physical_height
+    );
     window
         .resolution
         .set_physical_resolution(fitted.w, fitted.h);
@@ -280,10 +283,7 @@ pub fn quit_on_close_request(
 ) {
     // Only the primary window's close button quits; a stray close request
     // for any other (transient) window must not take the whole app down.
-    if requested
-        .read()
-        .any(|ev| primaries.contains(ev.window))
-    {
+    if requested.read().any(|ev| primaries.contains(ev.window)) {
         exit.write(AppExit::Success);
     }
 }
@@ -296,7 +296,12 @@ mod tests {
     // wider-than-fits at the saved x so its right edge ran off-screen.
     #[test]
     fn right_resized_window_keeps_width_by_shifting_left() {
-        let g = WindowGeometry { x: 442, y: 78, w: 3228, h: 2328 };
+        let g = WindowGeometry {
+            x: 442,
+            y: 78,
+            w: 3228,
+            h: 2328,
+        };
         let f = fit_to_monitor(g, 0, 0, 3456, 2234, 0);
         // Width fits (3228 <= 3456) → preserved, not shrunk.
         assert_eq!(f.w, 3228, "width preserved");
@@ -310,13 +315,23 @@ mod tests {
 
     #[test]
     fn already_fitting_window_is_unchanged() {
-        let g = WindowGeometry { x: 100, y: 100, w: 1200, h: 800 };
+        let g = WindowGeometry {
+            x: 100,
+            y: 100,
+            w: 1200,
+            h: 800,
+        };
         assert_eq!(fit_to_monitor(g, 0, 0, 3456, 2234, 0), g);
     }
 
     #[test]
     fn top_inset_pushes_window_below_menu_bar() {
-        let g = WindowGeometry { x: 0, y: 0, w: 1000, h: 3000 };
+        let g = WindowGeometry {
+            x: 0,
+            y: 0,
+            w: 1000,
+            h: 3000,
+        };
         let f = fit_to_monitor(g, 0, 0, 3456, 2234, 76);
         assert_eq!(f.y, 76, "y clamped below the reserved menu-bar inset");
         assert_eq!(f.h, 2234 - 76, "height clamped to the usable area");
@@ -325,7 +340,12 @@ mod tests {
     #[test]
     fn respects_nonzero_monitor_origin() {
         // Secondary monitor to the right of the primary.
-        let g = WindowGeometry { x: 5000, y: 50, w: 800, h: 600 };
+        let g = WindowGeometry {
+            x: 5000,
+            y: 50,
+            w: 800,
+            h: 600,
+        };
         let f = fit_to_monitor(g, 3456, 0, 1920, 1080, 0);
         assert!(f.x >= 3456 && f.x + f.w as i32 <= 3456 + 1920);
     }

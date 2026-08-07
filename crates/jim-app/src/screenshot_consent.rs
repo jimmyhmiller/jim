@@ -23,12 +23,12 @@ use std::path::PathBuf;
 use bevy::camera::visibility::RenderLayers;
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 
 use jim_pane::{InputConsumed, PaneFont, PaneFontMetrics};
+use jim_widget::WidgetTargets;
 use jim_widget::protocol::{Align, Border, Edges, Element, Shadow, Style, Weight};
 use jim_widget::render::{self, LayoutCtx, WidgetPalette};
-use jim_widget::WidgetTargets;
 
 use crate::MENU_OVERLAY_LAYER;
 
@@ -217,7 +217,15 @@ fn render_consent(world: &mut World) {
     let mut targets = WidgetTargets::default();
     {
         let mut commands = world.commands();
-        render::render(&mut commands, &ctx, &mut targets, &el, Vec2::ZERO, TOAST_W, 0.0);
+        render::render(
+            &mut commands,
+            &ctx,
+            &mut targets,
+            &el,
+            Vec2::ZERO,
+            TOAST_W,
+            0.0,
+        );
     }
     world.flush();
     stamp_layer(world, root, MENU_OVERLAY_LAYER);
@@ -258,11 +266,24 @@ fn build_toast(world: &World) -> Element {
     let queued = c.queue.len();
 
     let mut header_row = vec![
-        frame_grow(vec![text("📸 Screenshot requested", "fg", 15.0, Weight::Bold)]),
+        frame_grow(vec![text(
+            "📸 Screenshot requested",
+            "fg",
+            15.0,
+            Weight::Bold,
+        )]),
         text("✕", "fg_muted", 15.0, Weight::Bold),
     ];
     if queued > 1 {
-        header_row.insert(1, text(&format!("+{} more  ", queued - 1), "fg_muted", 12.0, Weight::Normal));
+        header_row.insert(
+            1,
+            text(
+                &format!("+{} more  ", queued - 1),
+                "fg_muted",
+                12.0,
+                Weight::Normal,
+            ),
+        );
     }
 
     let footer = format!("click to capture now · ✕ to skip · auto in {left}s");
@@ -276,7 +297,10 @@ fn build_toast(world: &World) -> Element {
                 pad: 0.0,
                 align: Align::Center,
                 children: header_row,
-                style: Some(Style { width: Some("100%".into()), ..Default::default() }),
+                style: Some(Style {
+                    width: Some("100%".into()),
+                    ..Default::default()
+                }),
             },
             text(&reason, "fg_muted", 13.0, Weight::Normal),
             text(&footer, "accent", 12.0, Weight::Normal),
@@ -284,10 +308,16 @@ fn build_toast(world: &World) -> Element {
         style: Some(Style {
             background: Some("surface_2".into()),
             radius: Some("radius_lg".into()),
-            border: Some(Border { color: "accent".into(), width: 1.0 }),
+            border: Some(Border {
+                color: "accent".into(),
+                width: 1.0,
+            }),
             padding: Some(Edges::all(14.0)),
             width: Some(format!("{}", TOAST_W as i32)),
-            shadow: Some(Shadow { token: Some("shadow_lg".into()), ..Default::default() }),
+            shadow: Some(Shadow {
+                token: Some("shadow_lg".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
     }
@@ -310,7 +340,10 @@ fn frame_grow(children: Vec<Element>) -> Element {
         gap: 0.0,
         pad: 0.0,
         children,
-        style: Some(Style { flex_grow: Some(1.0), ..Default::default() }),
+        style: Some(Style {
+            flex_grow: Some(1.0),
+            ..Default::default()
+        }),
     }
 }
 

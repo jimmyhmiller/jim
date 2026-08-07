@@ -162,10 +162,7 @@ fn pump_into_panes(
 /// system because `Text2d` lives on a child entity (not the pane
 /// entity), and Bevy's borrow rules make it cleaner to do it after
 /// mutating the buffer.
-fn sync_visuals(
-    mut panes: Query<&mut ClaudeEventsPane>,
-    mut texts: Query<&mut Text2d>,
-) {
+fn sync_visuals(mut panes: Query<&mut ClaudeEventsPane>, mut texts: Query<&mut Text2d>) {
     for mut pane in &mut panes {
         if !pane.dirty {
             continue;
@@ -193,10 +190,7 @@ fn format_event_line(ev: &ClaudeBusEvent) -> String {
         format!("T{}", ev.terminal_session_id)
     };
     let hint = payload_hint(&ev.kind, &ev.payload_json);
-    format!(
-        "{:>5} {:<18} {:<4} {}",
-        ev.seq, ev.kind, sess, hint
-    )
+    format!("{:>5} {:<18} {:<4} {}", ev.seq, ev.kind, sess, hint)
 }
 
 /// Per-kind one-liner extracted from the payload. Parses on demand —

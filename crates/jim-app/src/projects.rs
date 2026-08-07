@@ -36,15 +36,15 @@ use bevy::text::LineHeight;
 use serde::{Deserialize, Serialize};
 
 use jim_pane::{
-    spawn_pane_from_registry, FocusedPane, PaneKindMarker, PanePinned, PaneProject, PaneRect,
-    PaneRegistry, PaneSnapshot, PaneTag, PaneTitle, MIN_PANE_SIZE,
+    FocusedPane, MIN_PANE_SIZE, PaneKindMarker, PanePinned, PaneProject, PaneRect, PaneRegistry,
+    PaneSnapshot, PaneTag, PaneTitle, spawn_pane_from_registry,
 };
 
 use jim_terminal::TerminalSession;
 
 use jim_editor::EditorFilePath;
 
-use jim_terminal::{MonoFont, MonoMetrics, FONT_SIZE};
+use jim_terminal::{FONT_SIZE, MonoFont, MonoMetrics};
 
 pub const SIDEBAR_DEFAULT_WIDTH: f32 = 220.0;
 pub const SIDEBAR_MIN_WIDTH: f32 = 160.0;
@@ -274,7 +274,9 @@ pub struct Projects {
 
 impl Projects {
     fn from_persisted(p: PersistedState) -> Self {
-        let next_id = p.next_id.max(p.projects.iter().map(|p| p.id + 1).max().unwrap_or(1));
+        let next_id = p
+            .next_id
+            .max(p.projects.iter().map(|p| p.id + 1).max().unwrap_or(1));
         let legacy_max_session = p
             .terminals
             .iter()
@@ -296,7 +298,12 @@ impl Projects {
         // Guard the canvas counter against hand-edited / legacy saves the
         // same way as terminals: never hand out an id a restored tile or
         // gathered pane already uses.
-        let panes_max_canvas = p.panes.iter().map(|pane| pane.canvas + 1).max().unwrap_or(0);
+        let panes_max_canvas = p
+            .panes
+            .iter()
+            .map(|pane| pane.canvas + 1)
+            .max()
+            .unwrap_or(0);
         let tiles_max_canvas = p
             .panes
             .iter()
@@ -309,7 +316,12 @@ impl Projects {
             .next_canvas_id
             .max(panes_max_canvas.max(tiles_max_canvas))
             .max(1);
-        let panes_max_snap = p.panes.iter().map(|pane| pane.snap_id + 1).max().unwrap_or(0);
+        let panes_max_snap = p
+            .panes
+            .iter()
+            .map(|pane| pane.snap_id + 1)
+            .max()
+            .unwrap_or(0);
         let next_snap_id = p.next_snap_id.max(panes_max_snap).max(1);
         Self {
             list: p.projects,
@@ -741,10 +753,7 @@ impl Plugin for ProjectsPlugin {
     }
 }
 
-fn load_or_seed_projects(
-    mut commands: Commands,
-    mut pending: ResMut<PendingActions>,
-) {
+fn load_or_seed_projects(mut commands: Commands, mut pending: ResMut<PendingActions>) {
     let persisted = load_persisted();
     let sidebar_width = persisted
         .sidebar_width
@@ -859,8 +868,7 @@ fn sidebar_layout(
     let palette = sidebar_palette(&theme);
 
     let dims_changed = last_dims.0 != Some(dims);
-    let mut needs_rebuild =
-        projects.layout_dirty || dims_changed || theme.is_changed();
+    let mut needs_rebuild = projects.layout_dirty || dims_changed || theme.is_changed();
     if existing.iter().next().is_none() {
         needs_rebuild = true;
     }
@@ -942,11 +950,7 @@ fn sidebar_layout(
             ..default()
         },
         Anchor::TOP_LEFT,
-        Transform::from_xyz(
-            world_left_edge,
-            world_top_edge - HEADER_H,
-            SIDEBAR_Z + 0.05,
-        ),
+        Transform::from_xyz(world_left_edge, world_top_edge - HEADER_H, SIDEBAR_Z + 0.05),
     ));
 
     // Project rows. Hidden projects are skipped unless `show_hidden` is
@@ -1076,9 +1080,8 @@ fn sidebar_layout(
             let char_advance = metrics.cell_width * (TEXT_FONT_SIZE / FONT_SIZE);
             let caret_w = 2.0;
             let caret_h = 16.0;
-            let caret_x = world_left_edge
-                + ROW_PAD_X
-                + renaming.buffer.chars().count() as f32 * char_advance;
+            let caret_x =
+                world_left_edge + ROW_PAD_X + renaming.buffer.chars().count() as f32 * char_advance;
             let caret_top_y = row_top_world - (ROW_H - caret_h) * 0.5;
             commands.spawn((
                 SidebarEntity,
@@ -1156,11 +1159,7 @@ fn sidebar_layout(
                 LineHeight::Px(line_h),
                 TextColor(palette.text_faint),
                 Anchor::TOP_LEFT,
-                Transform::from_xyz(
-                    delete_x_world + 6.0,
-                    row_top_world - pad_y,
-                    SIDEBAR_Z + 0.2,
-                ),
+                Transform::from_xyz(delete_x_world + 6.0, row_top_world - pad_y, SIDEBAR_Z + 0.2),
             ));
         }
 
@@ -1563,13 +1562,16 @@ fn apply_pending_actions(world: &mut World) {
     // through the same close path as a close-button click.
     for (project_id, kind_filter, title_filter) in actions.close_panes {
         let targets: Vec<Entity> = {
-            let mut q = world
-                .query::<(Entity, &PaneProject, &PaneKindMarker, &jim_pane::PaneTitle, &PaneTag)>();
+            let mut q = world.query::<(
+                Entity,
+                &PaneProject,
+                &PaneKindMarker,
+                &jim_pane::PaneTitle,
+                &PaneTag,
+            )>();
             q.iter(world)
                 .filter(|(_, m, _, _, _)| m.0 == project_id)
-                .filter(|(_, _, k, _, _)| {
-                    kind_filter.as_deref().map_or(true, |want| k.0 == want)
-                })
+                .filter(|(_, _, k, _, _)| kind_filter.as_deref().map_or(true, |want| k.0 == want))
                 .filter(|(_, _, _, t, _)| {
                     title_filter
                         .as_ref()
@@ -1626,7 +1628,10 @@ fn apply_pending_actions(world: &mut World) {
                 .collect()
         };
         let members: Vec<Entity> = if titles.is_empty() {
-            rows.iter().filter(|(_, _, free)| *free).map(|(e, _, _)| *e).collect()
+            rows.iter()
+                .filter(|(_, _, free)| *free)
+                .map(|(e, _, _)| *e)
+                .collect()
         } else {
             let mut picked: Vec<Entity> = Vec::new();
             for want in &titles {
@@ -1751,11 +1756,7 @@ fn apply_pending_actions(world: &mut World) {
         let text = match std::fs::read_to_string(&req.path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!(
-                    "[open_file] read {} failed: {}",
-                    req.path.display(),
-                    e
-                );
+                eprintln!("[open_file] read {} failed: {}", req.path.display(), e);
                 continue;
             }
         };
@@ -1857,20 +1858,25 @@ fn restore_pane(world: &mut World, snap: PaneSnapshot) {
         // (no component needed); a non-zero id confines the pane to the
         // canvas tile that owns it until the user descends into it.
         if snap.canvas != 0 {
-            world.entity_mut(e).insert(jim_pane::PaneCanvas(snap.canvas));
+            world
+                .entity_mut(e)
+                .insert(jim_pane::PaneCanvas(snap.canvas));
         }
         // Restore the stable thumbnail id so the tile can find this
         // (now-hidden) pane's saved snapshot PNG.
         if snap.snap_id != 0 {
-            world.entity_mut(e).insert(jim_pane::PaneSnapId(snap.snap_id));
+            world
+                .entity_mut(e)
+                .insert(jim_pane::PaneSnapId(snap.snap_id));
         }
         // Defer dock relinking: stamp the group id/slot so
         // `link_restored_docks` can rebuild Dock/DockMember once every
         // pane in the group has spawned (spawn order is unspecified).
         if let Some(group) = snap.dock_group {
-            world
-                .entity_mut(e)
-                .insert(jim_pane::PendingDockLink { group, slot: snap.dock_slot });
+            world.entity_mut(e).insert(jim_pane::PendingDockLink {
+                group,
+                slot: snap.dock_slot,
+            });
         }
     }
 }
@@ -1917,9 +1923,7 @@ fn cascade_pos(sidebar_width: f32, n: usize) -> Vec2 {
 pub fn resolve_project(target: &OpenProjectTarget, projects: &Projects) -> Option<u64> {
     match target {
         OpenProjectTarget::Active => projects.active,
-        OpenProjectTarget::ById(id) => {
-            projects.list.iter().any(|p| p.id == *id).then_some(*id)
-        }
+        OpenProjectTarget::ById(id) => projects.list.iter().any(|p| p.id == *id).then_some(*id),
         OpenProjectTarget::ByName(name) => projects
             .list
             .iter()
@@ -2050,9 +2054,11 @@ fn refocus_on_project_change(
         .max_by(|a, b| {
             let a_term = a.2.0 == jim_terminal::PANE_KIND;
             let b_term = b.2.0 == jim_terminal::PANE_KIND;
-            a_term
-                .cmp(&b_term)
-                .then(a.3.z.partial_cmp(&b.3.z).unwrap_or(std::cmp::Ordering::Equal))
+            a_term.cmp(&b_term).then(
+                a.3.z
+                    .partial_cmp(&b.3.z)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         })
         .map(|(e, _, _, _)| e);
 
@@ -2222,9 +2228,7 @@ struct InferenceSuggestionPayload {
 
 // ---------- Persistence flush ----------
 
-fn save_if_dirty(
-    world: &mut World,
-) {
+fn save_if_dirty(world: &mut World) {
     // While Exposé is open the panes are displaced into a transient grid
     // (or animating back). Never persist that layout — panes always tween
     // back to their exact original rects, so once the grid closes the next
@@ -2316,27 +2320,32 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
     };
     let snapshots: Vec<PaneSnapshot> = entries
         .into_iter()
-        .filter_map(|(entity, kind, project_id, rect, pinned, canvas, snap_id)| {
-            let snap_fn = world.resource::<PaneRegistry>().get(&kind).map(|s| s.snapshot)?;
-            let config = (snap_fn)(world, entity);
-            let (dock_group, dock_slot) = dock_info
-                .get(&entity)
-                .map(|(g, s)| (Some(*g), *s))
-                .unwrap_or((None, 0));
-            Some(PaneSnapshot {
-                kind,
-                project_id,
-                pos: [rect.pos.x, rect.pos.y],
-                size: [rect.size.x, rect.size.y],
-                z: rect.z,
-                config,
-                pinned,
-                canvas,
-                snap_id,
-                dock_group,
-                dock_slot,
-            })
-        })
+        .filter_map(
+            |(entity, kind, project_id, rect, pinned, canvas, snap_id)| {
+                let snap_fn = world
+                    .resource::<PaneRegistry>()
+                    .get(&kind)
+                    .map(|s| s.snapshot)?;
+                let config = (snap_fn)(world, entity);
+                let (dock_group, dock_slot) = dock_info
+                    .get(&entity)
+                    .map(|(g, s)| (Some(*g), *s))
+                    .unwrap_or((None, 0));
+                Some(PaneSnapshot {
+                    kind,
+                    project_id,
+                    pos: [rect.pos.x, rect.pos.y],
+                    size: [rect.size.x, rect.size.y],
+                    z: rect.z,
+                    config,
+                    pinned,
+                    canvas,
+                    snap_id,
+                    dock_group,
+                    dock_slot,
+                })
+            },
+        )
         .collect();
     snapshots
 }
@@ -2405,8 +2414,7 @@ fn sidebar_resize_drag(
     }
 
     if resize.active && buttons.pressed(MouseButton::Left) {
-        let new_width =
-            (pt.x - resize.grab_offset_x).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+        let new_width = (pt.x - resize.grab_offset_x).clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
         if (new_width - sidebar.width).abs() > 0.5 {
             sidebar.width = new_width;
             projects.layout_dirty = true;
@@ -2516,8 +2524,8 @@ fn project_drag(
         if visible_len == 0 {
             return;
         }
-        let target_slot = (((pt.y - HEADER_H) / ROW_H).floor() as i64)
-            .clamp(0, visible_len as i64 - 1) as usize;
+        let target_slot =
+            (((pt.y - HEADER_H) / ROW_H).floor() as i64).clamp(0, visible_len as i64 - 1) as usize;
         if reorder_visible(&mut projects, id, target_slot) {
             projects.layout_dirty = true;
             drag.dirty_pending = true;

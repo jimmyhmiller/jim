@@ -138,7 +138,11 @@ fn layer_slot_counts(nodes: &[GNode]) -> Vec<u32> {
 /// Unscaled top-left of a node, in content "screen" coords (x right, y
 /// down), with each layer centered horizontally against the widest one.
 fn node_top_left(node: &GNode, slot_counts: &[u32], widest_w: f32) -> Vec2 {
-    let slots = slot_counts.get(node.col as usize).copied().unwrap_or(1).max(1);
+    let slots = slot_counts
+        .get(node.col as usize)
+        .copied()
+        .unwrap_or(1)
+        .max(1);
     let layer_w = slots as f32 * NODE_W + (slots.saturating_sub(1)) as f32 * SLOT_GAP;
     let x0 = (widest_w - layer_w) * 0.5;
     let x = x0 + node.row as f32 * (NODE_W + SLOT_GAP);
@@ -237,9 +241,10 @@ pub fn render(
 
     // Edges (under nodes).
     for edge in &model.edges {
-        let (Some(from), Some(to)) =
-            (bot_mid.get(edge.from.as_str()), top_mid.get(edge.to.as_str()))
-        else {
+        let (Some(from), Some(to)) = (
+            bot_mid.get(edge.from.as_str()),
+            top_mid.get(edge.to.as_str()),
+        ) else {
             continue;
         };
         let a = place(*from, 0.05).truncate();

@@ -91,7 +91,12 @@ fn open_bindgroups(mut s: ResMut<RenderTraceState>) {
     s.bindgroups = trace::begin();
 }
 fn close_bindgroups(mut s: ResMut<RenderTraceState>) {
-    trace::end(s.bindgroups.take(), "render.prepare.bindgroups", "render", 0);
+    trace::end(
+        s.bindgroups.take(),
+        "render.prepare.bindgroups",
+        "render",
+        0,
+    );
 }
 fn open_queue(mut s: ResMut<RenderTraceState>) {
     s.queue = trace::begin();

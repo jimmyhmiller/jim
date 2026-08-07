@@ -20,7 +20,7 @@ use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -342,8 +342,8 @@ pub fn socket_path() -> Option<PathBuf> {
 /// tiny local unix-socket send; the request lands on the next frame.
 pub fn dispatch_local(req: &IpcRequest) -> std::io::Result<()> {
     use std::io::Write as _;
-    let path = socket_path()
-        .ok_or_else(|| std::io::Error::other("no socket path ($HOME unset)"))?;
+    let path =
+        socket_path().ok_or_else(|| std::io::Error::other("no socket path ($HOME unset)"))?;
     let mut stream = UnixStream::connect(path)?;
     let bytes = serde_json::to_vec(req)
         .map_err(|e| std::io::Error::other(format!("serialize ipc request: {e}")))?;
@@ -414,7 +414,12 @@ pub type IpcMetricsHandle = Arc<IpcMetrics>;
 impl IpcMetrics {
     fn record(&self, action: String, outcome: &'static str, dur_ms: u64) {
         if let Ok(mut q) = self.recent.lock() {
-            q.push_front(IpcEvent { ts_ms: now_ms(), action, outcome, dur_ms });
+            q.push_front(IpcEvent {
+                ts_ms: now_ms(),
+                action,
+                outcome,
+                dur_ms,
+            });
             while q.len() > RECENT_CAP {
                 q.pop_back();
             }
