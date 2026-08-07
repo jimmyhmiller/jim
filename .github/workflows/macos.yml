@@ -15,28 +15,25 @@ on:
 
 jobs:
   build:
-    # Pinned to macOS 15 Arm64 (Apple Silicon — the only arch we ship), NOT
-    # macos-latest. `macos-latest` has rolled to macOS 26 (Tahoe), whose only
-    # installed SDKs are macOS 26.x. zig 0.15.2 — the version ghostty pins
-    # EXACTLY (src/build/zig.zig requireZig accepts 0.15.x only, patch >= 2, so
-    # 0.16 is rejected) — mishandles the macOS 26 native target: it emits a
-    # broken libSystem stub and the zig *build runner* itself fails to link
-    # (undefined _abort/_free/_dispatch_*/... from build_zcu.o). Earlier green
-    # runs on macos-26 only survived by restoring a cached target/; the first
-    # clean rebuild (c98acbb, a target/ cache miss) exposed the break. macOS 15
-    # ships the newest SDK zig 0.15.2 links cleanly, is still arm64, and the
-    # resulting binary runs on macOS 26. Revisit when ghostty (and its zig pin)
-    # gains macOS 26 support.
-    runs-on: macos-15
+    # macos-latest (currently macOS 26 Tahoe, Apple Silicon — the only arch we
+    # ship). We were pinned to macos-15 because zig 0.15.2 mishandled the macOS
+    # 26 native target (broken libSystem stub; the zig build runner itself
+    # failed to link). ghostty moved to zig 0.16.0 on 2026-07-21, and 0.16
+    # handles the macOS 26 SDK cleanly — our libghostty-rs fork vendors that
+    # ghostty rev (see Cargo.toml [patch.crates-io]), so macos-latest builds
+    # again. Verified with a clean local build on macOS 26 (Darwin 25.x).
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      # libghostty-vt-sys compiles vendored ghostty with zig; the version
-      # must match what the pinned libghostty-rs rev expects (see Cargo.toml).
+      # libghostty-vt-sys compiles vendored ghostty with zig; the version must
+      # match what the pinned libghostty-rs rev expects. Our fork bumped the
+      # vendored ghostty to a zig-0.16 rev, so this must be 0.16.0 (see the
+      # [patch.crates-io] note in Cargo.toml).
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       # Rust toolchain comes from rust-toolchain.toml (channel 1.95.0) — the
       # preinstalled rustup honors it automatically on the first cargo call.

@@ -93,10 +93,24 @@ com.jimmyhmiller.terminal-bevy`) is FROZEN despite the rename — changing
 it would lose the Dock pin. Same for the `TERMINAL_BEVY_*` runtime env
 vars and the `/tmp/.terminal-bevy` socket dir.
 
-## libghostty-vt patch
+## libghostty-vt patch (fork) + zig 0.16
 
-`Cargo.toml` pins `libghostty-vt` / `libghostty-vt-sys` to a git rev of
-`Uzaaft/libghostty-rs` that includes the zig optimize-mode fix (upstream
-`3378f0b`). Without it, vendored ghostty builds default to zig Debug,
-which makes `vt_write` 100x+ slower. Crates.io 0.1.1 predates the fix,
-so the patch has to stay until upstream cuts a new release.
+`Cargo.toml` pins `libghostty-vt` / `libghostty-vt-sys` to our fork
+`jimmyhmiller/libghostty-rs` (branch `ghostty-zig-0.16`). The fork is
+`Uzaaft/libghostty-rs` at rev `d9dbd94` (which carries the zig
+optimize-mode fix, upstream `3378f0b` — without it vendored ghostty
+builds default to zig Debug and `vt_write` is 100x+ slower) plus ONE
+change: it bumps the vendored `GHOSTTY_COMMIT` (in the sys crate's
+`build.rs`) to a ghostty-master rev that requires **zig 0.16.0**.
+ghostty went 0.15.2 → 0.16.0 on 2026-07-21; the VT C API (`vt.h`) is
+unchanged, so the `d9dbd94` bindings compile/link against it as-is
+(verified: full workspace build + 17/17 `vt_replay` runtime tests).
+
+**Build requirement: zig 0.16.0 on PATH.** Local install lives at
+`~/.local/zig-0.16.0` with `~/.local/bin/zig` symlinked to it
+(`~/.local/zig-0.15.2` kept for rollback). CI uses `mlugg/setup-zig`
+`0.16.0` on `macos-latest` (0.16 handles the macOS 26 SDK; 0.15.2 did
+not, which is why CI was pinned to macos-15 before).
+
+Retire the fork and return to a plain `Uzaaft/libghostty-rs` pin once
+upstream bumps its own vendored ghostty past the zig-0.16 migration.
