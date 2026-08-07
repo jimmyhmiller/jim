@@ -32,6 +32,9 @@ hound = "3"
 nix = { version = "0.31", features = ["term", "fs", "signal", "process", "user", "ioctl", "poll"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Preserve users' existing ~/.codex/config.toml formatting while the
+# notification installer adds Codex's built-in turn-complete BEL settings.
+toml_edit = "0.25"
 # Hot-reloadable runtime tuning for the project-prism (cube.rs):
 # ~/.jim/cube.ft is evaluated to a params map.
 funct = "0.1"

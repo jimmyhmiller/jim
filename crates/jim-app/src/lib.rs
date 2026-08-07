@@ -45,11 +45,12 @@ pub mod issues_pane;
 /// callers can continue to write `jim_app::daemon_proto::*`.
 pub use jim_daemon::proto as daemon_proto;
 pub mod ipc;
+mod notify_setup;
+pub mod pane_annotation;
 pub mod projects;
 pub mod radial;
-pub mod run_button;
-pub mod pane_annotation;
 pub mod render_trace;
+pub mod run_button;
 pub mod screenshot_consent;
 pub mod tools;
 pub mod whiteboard_bg;
@@ -424,10 +425,19 @@ impl Plugin for AppShellPlugin {
             id: "config.install_notify",
             title: "Install Stop Notification Setup",
             category: "Config",
-            keywords: &["notification", "bell", "pulse", "stop", "hook", "settings", "claude"],
+            keywords: &[
+                "notification",
+                "bell",
+                "pulse",
+                "stop",
+                "hook",
+                "settings",
+                "claude",
+                "codex",
+            ],
             radial_icon: None,
             default_keys: &[],
-            run: ActionRun::Custom(action_install_claude_notify),
+            run: ActionRun::Custom(action_install_notify),
         });
         app.add_systems(
             Startup,
@@ -2035,19 +2045,22 @@ fn action_set_project_cwd_from_focused(ctx: &mut actions::ActionCtx) {
     );
 }
 
-/// Palette action: merge the "pulse jim when Claude Code stops" setup
-/// into `~/.claude/settings.json`. Same idempotent merge as
-/// `scripts/install-claude-notify.sh`, but embedded so it works on any
-/// machine `jim` is installed on with no repo checkout. Adds a `Stop`
-/// hook that writes a BEL to `/dev/tty` (jim's `on_bell` → pane pulse)
-/// and sets `preferredNotifChannel = "terminal_bell"`. Reports the
-/// outcome into the active project's inbox.
-fn action_install_claude_notify(ctx: &mut actions::ActionCtx) {
+/// Palette action: configure both Claude Code and Codex to emit a BEL when
+/// a turn completes. Reports both outcomes into the active project's inbox.
+fn action_install_notify(ctx: &mut actions::ActionCtx) {
     let world = &mut ctx.world;
-    let result = install_claude_notify();
-    let (subject, body) = match &result {
-        Ok(msg) => (Some("Notify setup installed".to_string()), msg.clone()),
-        Err(e) => (Some("Notify setup FAILED".to_string()), e.clone()),
+    let claude = install_claude_notify();
+    let codex = notify_setup::install_codex_notify();
+    let succeeded = claude.is_ok() && codex.is_ok();
+    let body = format!(
+        "Claude: {}\nCodex: {}",
+        claude.as_deref().unwrap_or_else(|e| e),
+        codex.as_deref().unwrap_or_else(|e| e),
+    );
+    let subject = if succeeded {
+        Some("Notify setup installed".to_string())
+    } else {
+        Some("Notify setup partially failed".to_string())
     };
     eprintln!("[install-notify] {body}");
     if let Some(active) = world.resource::<Projects>().active {
