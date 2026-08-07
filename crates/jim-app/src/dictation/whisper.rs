@@ -28,6 +28,10 @@ use std::time::{Duration, Instant};
 const IDLE_SHUTDOWN: Duration = Duration::from_secs(600);
 /// How long to wait for the model to load and the port to accept.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
+/// A live pass should normally take well under three seconds. Without an
+/// HTTP timeout, one wedged whisper request blocks the sole dictation worker
+/// forever while the microphone visibly keeps recording.
+const INFERENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Running {
     child: Child,
@@ -43,7 +47,10 @@ struct Running {
 static SERVER: Mutex<Option<Running>> = Mutex::new(None);
 
 fn model_path() -> Option<std::path::PathBuf> {
-    Some(std::path::PathBuf::from(std::env::var("HOME").ok()?).join(".jim/models/ggml-large-v3-turbo.bin"))
+    Some(
+        std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".jim/models/ggml-large-v3-turbo.bin"),
+    )
 }
 
 /// Transcribe mono `samples` captured at `rate` Hz. Blocking — call from a
@@ -55,7 +62,35 @@ fn model_path() -> Option<std::path::PathBuf> {
 pub fn transcribe(samples: &[f32], rate: u32) -> Result<String, String> {
     let port = ensure_running()?;
     let wav = encode_wav(samples, rate)?;
-    post_inference(port, wav)
+    match post_inference(port, &wav) {
+        Ok(text) => Ok(text),
+        Err(first) => {
+            eprintln!(
+                "[whisper] inference failed on port {port}; replacing server and retrying: {first}"
+            );
+            discard_server(port);
+            let retry_port = ensure_running()?;
+            post_inference(retry_port, &wav)
+                .map_err(|retry| format!("{first}; retry failed: {retry}"))
+        }
+    }
+}
+
+/// Remove a server that failed an inference, but only if it is still the
+/// instance that served that request. Killing it also interrupts any stuck
+/// inference before the retry starts a clean process.
+fn discard_server(port: u16) {
+    let Ok(mut g) = SERVER.lock() else { return };
+    if g.as_ref().is_some_and(|r| r.port == port) {
+        if let Some(mut r) = g.take() {
+            eprintln!(
+                "[whisper] killing failed server: pid={} port={}",
+                r.child.id(), r.port
+            );
+            let _ = r.child.kill();
+            let _ = r.child.wait();
+        }
+    }
 }
 
 /// Kill the server if it hasn't been used in a while. Called every frame
@@ -69,6 +104,10 @@ pub fn idle_shutdown() {
     };
     if idle {
         if let Some(mut r) = g.take() {
+            eprintln!(
+                "[whisper] idle shutdown: pid={} port={}",
+                r.child.id(), r.port
+            );
             let _ = r.child.kill();
             let _ = r.child.wait();
         }
@@ -79,6 +118,10 @@ pub fn idle_shutdown() {
 pub fn shutdown() {
     let Ok(mut g) = SERVER.lock() else { return };
     if let Some(mut r) = g.take() {
+        eprintln!(
+            "[whisper] app shutdown: pid={} port={}",
+            r.child.id(), r.port
+        );
         let _ = r.child.kill();
         let _ = r.child.wait();
     }
@@ -111,7 +154,9 @@ fn ensure_running() -> Result<u16, String> {
         }
         // Either the one just spawned, or one another caller is still
         // starting — both cases just wait for the same port below.
-        g.as_ref().map(|r| r.port).ok_or("whisper server vanished")?
+        g.as_ref()
+            .map(|r| r.port)
+            .ok_or("whisper server vanished")?
     };
 
     wait_ready(port)?;
@@ -154,6 +199,7 @@ fn spawn_server() -> Result<Running, String> {
     let child = cmd
         .spawn()
         .map_err(|e| format!("whisper-server failed to launch: {e} (is it installed?)"))?;
+    eprintln!("[whisper] server spawned: pid={} port={port}", child.id());
     Ok(Running {
         child,
         port,
@@ -199,8 +245,7 @@ fn wait_ready(port: u16) -> Result<(), String> {
 /// whisper-server binds — but the alternative (a hardcoded port) collides
 /// with a second Jim, or a leftover server, every time.
 fn free_port() -> Result<u16, String> {
-    let l = std::net::TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("no free port: {e}"))?;
+    let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("no free port: {e}"))?;
     l.local_addr()
         .map(|a| a.port())
         .map_err(|e| format!("no local addr: {e}"))
@@ -229,7 +274,7 @@ fn encode_wav(samples: &[f32], rate: u32) -> Result<Vec<u8>, String> {
 /// POST the clip to `/inference` as multipart/form-data and return the
 /// plain-text transcript. Hand-rolled because ureq 2 has no multipart
 /// builder and this needs exactly two fields.
-fn post_inference(port: u16, wav: Vec<u8>) -> Result<String, String> {
+fn post_inference(port: u16, wav: &[u8]) -> Result<String, String> {
     const BOUNDARY: &str = "----jimdictation7f3a1c";
     let mut body: Vec<u8> = Vec::with_capacity(wav.len() + 512);
     body.extend_from_slice(
@@ -239,7 +284,7 @@ fn post_inference(port: u16, wav: Vec<u8>) -> Result<String, String> {
         )
         .as_bytes(),
     );
-    body.extend_from_slice(&wav);
+    body.extend_from_slice(wav);
     body.extend_from_slice(
         format!(
             "\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n\
@@ -248,7 +293,13 @@ fn post_inference(port: u16, wav: Vec<u8>) -> Result<String, String> {
         .as_bytes(),
     );
 
-    let resp = ureq::post(&format!("http://127.0.0.1:{port}/inference"))
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(2))
+        .timeout_write(INFERENCE_TIMEOUT)
+        .timeout_read(INFERENCE_TIMEOUT)
+        .build();
+    let resp = agent
+        .post(&format!("http://127.0.0.1:{port}/inference"))
         .set(
             "Content-Type",
             &format!("multipart/form-data; boundary={BOUNDARY}"),

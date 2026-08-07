@@ -278,7 +278,7 @@ impl Plugin for AppShellPlugin {
             category: "View",
             keywords: &["color", "oklch", "palette"],
             radial_icon: None,
-            default_keys: const { &[KeyChord::cmd_shift(KeyCode::KeyT)] },
+            default_keys: &[],
             run: ActionRun::Custom(action_open_theme_editor),
         })
         .add_action(Action {

@@ -1364,6 +1364,36 @@ pub fn pane_mouse_tracking(store: &TerminalStore, entity: Entity) -> bool {
     mouse_tracking_of(store, entity)
 }
 
+/// What a caller needs to know before writing a *revisable* preview into a
+/// terminal — see [`terminal_write_state`].
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalWriteState {
+    /// True when the child looks like a line editor: bracketed paste on,
+    /// normal screen, no mouse grab. That combination is what makes a
+    /// backspace delete exactly one character we previously wrote — a
+    /// full-screen TUI would interpret the same byte as a command.
+    pub revisable: bool,
+    /// Cursor cell, if visible. A caller that remembers where its own last
+    /// write left the cursor can compare against this to notice that
+    /// someone else (the user, or the child's own output) wrote since.
+    pub cursor: Option<(u16, u16)>,
+    /// Snapshot generation, so "nothing has happened" is distinguishable
+    /// from "something happened that landed the cursor back where it was".
+    pub generation: u64,
+}
+
+/// Read [`TerminalWriteState`] for `entity`, or `None` if it isn't a live
+/// terminal pane.
+pub fn terminal_write_state(store: &TerminalStore, entity: Entity) -> Option<TerminalWriteState> {
+    let data = store.map.get(&entity)?;
+    let g = data.worker.snapshot.lock().expect("snapshot lock");
+    Some(TerminalWriteState {
+        revisable: g.bracketed_paste && !g.alt_screen && !g.mouse_tracking,
+        cursor: g.cursor,
+        generation: g.generation,
+    })
+}
+
 /// `(mouse_tracking, mouse_motion)` for `entity`'s terminal. `mouse_motion`
 /// is true only when the child asked for drag/hover reports (DECSET
 /// 1002/1003), so the main thread can avoid shipping motion in the common

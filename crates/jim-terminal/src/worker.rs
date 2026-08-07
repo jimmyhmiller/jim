@@ -181,6 +181,15 @@ pub struct GridSnapshot {
     /// bare hover). Lets the main thread skip shipping motion events for
     /// the common press/release-only (1000) case.
     pub mouse_motion: bool,
+    /// True while the child is on the alternate screen (DECSET 47 / 1047 /
+    /// 1049) — i.e. a full-screen TUI (vim, less, htop) painting the whole
+    /// grid itself rather than a line editor appending to it.
+    pub alt_screen: bool,
+    /// True when the child enabled bracketed paste (DECSET 2004). Read as
+    /// "this child is a line editor that treats inserted text as text":
+    /// shells and Claude Code set it, `cat` and raw TUIs don't. Dictation
+    /// uses it to decide whether it may write a revisable preview.
+    pub bracketed_paste: bool,
 }
 
 /// A mouse gesture phase, mirroring libghostty's `mouse::Action` but
@@ -375,6 +384,8 @@ impl WorkerHandle {
             viewport_offset: 0,
             mouse_tracking: false,
             mouse_motion: false,
+            alt_screen: false,
+            bracketed_paste: false,
         }));
         let snapshot_w = snapshot.clone();
         let bell_count = Arc::new(AtomicU64::new(0));
@@ -834,13 +845,7 @@ fn worker_loop(
                         let up = lines > 0;
                         let mouse_tracking =
                             terminal.is_mouse_tracking().unwrap_or(false);
-                        let alt_screen = terminal
-                            .mode(Mode::ALT_SCREEN_SAVE)
-                            .unwrap_or(false)
-                            || terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
-                            || terminal
-                                .mode(Mode::ALT_SCREEN_LEGACY)
-                                .unwrap_or(false);
+                        let alt_screen = alt_screen_of(&mut terminal);
                         if mouse_tracking {
                             // Forward the wheel to the child. Clamp the
                             // cell to the grid so the report is in-bounds.
@@ -1117,6 +1122,14 @@ fn worker_loop(
     }
 }
 
+/// True when the child is on the alternate screen, under any of the three
+/// DECSET spellings (47 legacy, 1047 save, 1049 save+clear).
+fn alt_screen_of(terminal: &mut libghostty_vt::Terminal<'static, 'static>) -> bool {
+    terminal.mode(Mode::ALT_SCREEN_SAVE).unwrap_or(false)
+        || terminal.mode(Mode::ALT_SCREEN).unwrap_or(false)
+        || terminal.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
+}
+
 fn publish_snapshot(
     terminal: &mut libghostty_vt::Terminal<'static, 'static>,
     render_state: &mut RenderState<'static>,
@@ -1128,13 +1141,16 @@ fn publish_snapshot(
     prev_cols: u16,
     prev_rows: u16,
 ) -> (u16, u16, bool) {
-    // Mouse tracking mode is toggled by escape sequences that don't dirty
-    // the grid, so read it up front and reconcile it on *every* publish
-    // path — including the clean early-return below — or the main thread
-    // would keep seeing a stale value after an app enables/disables it.
+    // These modes are toggled by escape sequences that don't dirty the
+    // grid, so read them up front and reconcile on *every* publish path —
+    // including the clean early-return below — or the main thread would
+    // keep seeing a stale value after an app enables/disables one. A shell
+    // enabling bracketed paste at its prompt is exactly this case.
     let mouse_tracking = terminal.is_mouse_tracking().unwrap_or(false);
     let mouse_motion = terminal.mode(Mode::BUTTON_MOUSE).unwrap_or(false)
         || terminal.mode(Mode::ANY_MOUSE).unwrap_or(false);
+    let alt_screen = alt_screen_of(terminal);
+    let bracketed_paste = terminal.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
 
     let snap = match render_state.update(terminal) {
         Ok(s) => s,
@@ -1151,10 +1167,14 @@ fn publish_snapshot(
         if g.child_alive != child_alive
             || g.mouse_tracking != mouse_tracking
             || g.mouse_motion != mouse_motion
+            || g.alt_screen != alt_screen
+            || g.bracketed_paste != bracketed_paste
         {
             g.child_alive = child_alive;
             g.mouse_tracking = mouse_tracking;
             g.mouse_motion = mouse_motion;
+            g.alt_screen = alt_screen;
+            g.bracketed_paste = bracketed_paste;
             g.generation = g.generation.wrapping_add(1);
             published = true;
         }
@@ -1302,6 +1322,8 @@ fn publish_snapshot(
     g.viewport_offset = terminal.scrollbar().map(|s| s.offset).unwrap_or(0);
     g.mouse_tracking = mouse_tracking;
     g.mouse_motion = mouse_motion;
+    g.alt_screen = alt_screen;
+    g.bracketed_paste = bracketed_paste;
     g.generation = g.generation.wrapping_add(1);
     (cols, rows, true)
 }

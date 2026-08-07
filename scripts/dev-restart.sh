@@ -76,6 +76,20 @@ KILL=$(ps -ax -o pid,command \
            && $0 !~ /jim-daemon/ \
            && $0 !~ /bus-daemon/ { print $1 }')
 if [ -n "$KILL" ]; then
+    # whisper-server is a normal child process, not one of Jim's persistent
+    # daemons. macOS reparents it to PID 1 if the GUI is killed first, so old
+    # restarts used to accumulate ~1GB orphan servers. Reap direct Whisper
+    # children while their owning GUI PID is still available.
+    WHISPER_KILL=""
+    for gui_pid in $KILL; do
+        children=$(ps -ax -o pid=,ppid=,comm= \
+            | awk -v parent="$gui_pid" '$2 == parent && $3 ~ /whisper-server$/ { print $1 }')
+        WHISPER_KILL="$WHISPER_KILL $children"
+    done
+    if [ -n "$(echo "$WHISPER_KILL" | tr -d ' ')" ]; then
+        echo "[dev-restart] killing GUI-owned whisper server(s):$WHISPER_KILL"
+        kill $WHISPER_KILL 2>/dev/null || true
+    fi
     echo "[dev-restart] killing existing GUI(s): $KILL"
     kill $KILL 2>/dev/null || true
     # Give them a beat to release the socket before the new instance binds.
