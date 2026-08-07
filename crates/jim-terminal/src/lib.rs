@@ -36,9 +36,11 @@ use jim_pane::{
 use serde_json::Value;
 
 pub mod atlas;
+pub(crate) mod base64;
 pub mod command_watch;
 pub mod daemon_client;
 pub mod osc7;
+pub mod osc52;
 pub mod pty;
 pub mod selection;
 pub mod term_material;

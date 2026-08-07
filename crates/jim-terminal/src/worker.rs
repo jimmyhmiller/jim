@@ -573,6 +573,12 @@ fn worker_loop(
     // feed the command-suggestion classifier. Same byte stream, same
     // replay suppression as OSC 7.
     let mut cmd_watch = crate::command_watch::CommandWatcher::default();
+    // OSC 52 clipboard writes (`\e]52;c;<base64>\a`) — how programs that
+    // can't reach the pasteboard themselves (Claude Code, vim over ssh,
+    // tmux copy-pipe) ask the terminal to copy for them. Same byte
+    // stream, same replay suppression: re-running a prior session's
+    // copies on restart would silently clobber the user's clipboard.
+    let mut osc52 = crate::osc52::Osc52Watcher::default();
     let session_id = client.session_id();
 
     let mut render_state = RenderState::new().expect("RenderState");
@@ -724,6 +730,14 @@ fn worker_loop(
                                         exit_code,
                                         last_published_cwd.as_deref(),
                                     );
+                                });
+                                osc52.feed(&bytes, |text| {
+                                    let n = text.len();
+                                    if crate::osc52::set_system_clipboard(&text) {
+                                        eprintln!("[osc52] copied {n} bytes to clipboard");
+                                    } else {
+                                        eprintln!("[osc52] clipboard write failed ({n} bytes)");
+                                    }
                                 });
                             }
                             output_bytes += bytes.len() as u64;

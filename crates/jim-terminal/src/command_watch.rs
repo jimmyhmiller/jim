@@ -145,7 +145,7 @@ impl CommandWatcher {
         };
         match kind {
             "C" => {
-                if let Some(cmd) = base64_decode(rest).and_then(|b| String::from_utf8(b).ok()) {
+                if let Some(cmd) = crate::base64::decode(rest).and_then(|b| String::from_utf8(b).ok()) {
                     let cmd = cmd.trim().to_string();
                     self.pending = (!cmd.is_empty()).then_some(cmd);
                 }
@@ -159,47 +159,6 @@ impl CommandWatcher {
             _ => {}
         }
     }
-}
-
-/// Minimal standard-alphabet base64 decoder (no deps). Ignores
-/// whitespace; returns None on invalid input.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let mut quad = [0u8; 4];
-    let mut n = 0;
-    for &c in s.as_bytes() {
-        if c == b'=' || c.is_ascii_whitespace() {
-            continue;
-        }
-        quad[n] = val(c)?;
-        n += 1;
-        if n == 4 {
-            out.push((quad[0] << 2) | (quad[1] >> 4));
-            out.push((quad[1] << 4) | (quad[2] >> 2));
-            out.push((quad[2] << 6) | quad[3]);
-            n = 0;
-        }
-    }
-    match n {
-        0 => {}
-        2 => out.push((quad[0] << 2) | (quad[1] >> 4)),
-        3 => {
-            out.push((quad[0] << 2) | (quad[1] >> 4));
-            out.push((quad[1] << 4) | (quad[2] >> 2));
-        }
-        _ => return None, // n == 1 is impossible for valid base64
-    }
-    Some(out)
 }
 
 #[cfg(test)]

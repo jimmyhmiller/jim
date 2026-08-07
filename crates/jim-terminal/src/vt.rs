@@ -149,6 +149,10 @@ pub fn register_all_handlers(
                         DeviceAttributeFeature::COLUMNS_132,
                         DeviceAttributeFeature::SELECTIVE_ERASE,
                         DeviceAttributeFeature::ANSI_COLOR,
+                        // `52` — we honour OSC 52 clipboard writes (see
+                        // `crate::osc52`). Programs that probe DA1 before
+                        // using OSC 52 need to see it here.
+                        DeviceAttributeFeature::CLIPBOARD,
                     ],
                 ),
                 secondary: SecondaryDeviceAttributes {
