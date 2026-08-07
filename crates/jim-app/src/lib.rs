@@ -13,23 +13,20 @@ use std::path::PathBuf;
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 
-use jim_pane::{
-    AnimatedChromePane, ChromeAnimates, PaneKindMarker, PanePlugin, PaneRect, PaneTag,
-};
+use jim_pane::{AnimatedChromePane, ChromeAnimates, PaneKindMarker, PanePlugin, PaneRect, PaneTag};
 use serde_json::Value;
 
 use jim_terminal::worker::WorkerMsg;
 use jim_terminal::{
-    pt_to_cell, BellPulse, MonoMetrics, TerminalSession, TerminalStore, LINE_HEIGHT,
-    PANE_KIND,
+    BellPulse, LINE_HEIGHT, MonoMetrics, PANE_KIND, TerminalSession, TerminalStore, pt_to_cell,
 };
 
 pub mod actions;
 pub mod agent;
 pub mod canvas;
 pub mod canvas_pane;
-pub mod command_palette;
 pub mod claude_events_pane;
+pub mod command_palette;
 pub mod context_menu;
 pub mod cube;
 pub mod debug_bar;
@@ -39,8 +36,8 @@ pub mod drawer;
 pub mod expose;
 pub mod fps;
 pub mod graph_view;
-pub mod inference_dispatch;
 pub mod inbox;
+pub mod inference_dispatch;
 pub mod inferences_pane;
 pub mod ipc_stats;
 pub mod issues_pane;
@@ -145,16 +142,18 @@ impl Plugin for AppShellPlugin {
         app.insert_resource(jim_terminal::TerminalIdAllocator(Box::new(|world| {
             world.resource_mut::<Projects>().allocate_terminal_id()
         })));
-        app.insert_resource(jim_terminal::TerminalInitialCwd(Box::new(|world, entity| {
-            world
-                .get::<ProjectMembership>(entity)
-                .map(|m| m.0)
-                .and_then(|pid| {
-                    world
-                        .get_resource::<Projects>()
-                        .and_then(|p| p.default_cwd_of(pid).map(str::to_string))
-                })
-        })));
+        app.insert_resource(jim_terminal::TerminalInitialCwd(Box::new(
+            |world, entity| {
+                world
+                    .get::<ProjectMembership>(entity)
+                    .map(|m| m.0)
+                    .and_then(|pid| {
+                        world
+                            .get_resource::<Projects>()
+                            .and_then(|p| p.default_cwd_of(pid).map(str::to_string))
+                    })
+            },
+        )));
         app.insert_resource(jim_terminal::TerminalDirtyHook(Box::new(|world| {
             world.resource_mut::<Projects>().terminals_dirty = true;
         })));
@@ -174,12 +173,16 @@ impl Plugin for AppShellPlugin {
             let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
             app.insert_non_send_resource(FilePickChannel { tx, rx });
         }
+        // Same shape for the Save As sheet a scratch editor pane needs
+        // (see `start_save_as_dialogs` / `drain_save_as_results`).
+        {
+            let (tx, rx) = std::sync::mpsc::channel::<(Entity, PathBuf)>();
+            app.insert_non_send_resource(SaveAsChannel { tx, rx });
+        }
         app.insert_resource(ClearColor(Color::srgb(0.072, 0.075, 0.085)))
             .insert_resource(AppFocused::default())
             .insert_resource(bevy::winit::WinitSettings {
-                focused_mode: bevy::winit::UpdateMode::reactive(
-                    std::time::Duration::from_secs(5),
-                ),
+                focused_mode: bevy::winit::UpdateMode::reactive(std::time::Duration::from_secs(5)),
                 unfocused_mode: bevy::winit::UpdateMode::reactive_low_power(
                     std::time::Duration::from_secs(60),
                 ),
@@ -262,6 +265,15 @@ impl Plugin for AppShellPlugin {
             radial_icon: None,
             default_keys: const { &[KeyChord::cmd(KeyCode::KeyO)] },
             run: ActionRun::Custom(action_open_file),
+        })
+        .add_action(Action {
+            id: "file.new_markdown",
+            title: "New Markdown Document",
+            category: "File",
+            keywords: &["md", "markdown", "note", "doc", "scratch", "wysiwyg"],
+            radial_icon: None,
+            default_keys: const { &[KeyChord::cmd(KeyCode::KeyK), KeyChord::plain(KeyCode::KeyM)] },
+            run: ActionRun::Custom(action_new_markdown),
         })
         .add_action(Action {
             id: "view.dev_panel",
@@ -417,96 +429,97 @@ impl Plugin for AppShellPlugin {
             default_keys: &[],
             run: ActionRun::Custom(action_install_claude_notify),
         });
-        app
-            .add_systems(
-                Startup,
-                (
-                    setup_camera,
-                    // Runs after the terminal crate's `setup_terminal_font`
-                    // so its `PaneFont` / `PaneFontMetrics` (the themed
-                    // JetBrains mono used by every cosmic-text pane)
-                    // deterministically replace the terminal's SF Mono
-                    // defaults as a matched pair. Without the ordering, only
-                    // one of the two resources might win and the caret grid
-                    // would drift from the rendered text.
-                    jim_editor::setup_editor_font.after(jim_terminal::setup_terminal_font),
-                    setup_ipc_listener,
-                    request_microphone_access,
-                    // Register NSWorkspace activation observers so
-                    // `track_app_focus` reads a cached atomic instead of
-                    // making a synchronous XPC `frontmostApplication` call
-                    // every frame. See `install_app_focus_observers`.
-                    install_app_focus_observers,
-                ),
+        app.add_systems(
+            Startup,
+            (
+                setup_camera,
+                // Runs after the terminal crate's `setup_terminal_font`
+                // so its `PaneFont` / `PaneFontMetrics` (the themed
+                // JetBrains mono used by every cosmic-text pane)
+                // deterministically replace the terminal's SF Mono
+                // defaults as a matched pair. Without the ordering, only
+                // one of the two resources might win and the caret grid
+                // would drift from the rendered text.
+                jim_editor::setup_editor_font.after(jim_terminal::setup_terminal_font),
+                setup_ipc_listener,
+                request_microphone_access,
+                // Register NSWorkspace activation observers so
+                // `track_app_focus` reads a cached atomic instead of
+                // making a synchronous XPC `frontmostApplication` call
+                // every frame. See `install_app_focus_observers`.
+                install_app_focus_observers,
+            ),
+        )
+        .add_systems(
+            Update,
+            (
+                mirror_active_project_to_style,
+                maintain_project_themes,
+                mirror_focus_to_style,
+                maintain_winit_mode_for_animation,
+                sync_canvas_clear_color,
+                window_geometry::fit_window_to_monitor,
+                window_geometry::save_on_change,
+                sync_wake_throttle_to_power,
+            ),
+        )
+        // Survive lid-close / display-sleep: when the monitor goes away
+        // the primary window is despawned by a `linked_spawn` cascade;
+        // paired with `ExitCondition::DontExit` (main.rs) we respawn it
+        // immediately so the app stays alive and visible on wake.
+        // See `window_geometry::respawn_primary_window_on_loss`.
+        .add_observer(window_geometry::respawn_primary_window_on_loss)
+        // …but a deliberate close request (red button / Cmd-W) should
+        // still quit. That request never fires on the lid-close cascade,
+        // so honoring it here doesn't undo the survival behavior above.
+        .add_systems(Update, window_geometry::quit_on_close_request)
+        .add_systems(PostStartup, release_os_focus)
+        // Single keyboard-ownership authority, before every Update
+        // consumer reads it.
+        .add_systems(PreUpdate, compute_keyboard_owner)
+        .add_systems(Update, debug_fps_log)
+        .add_systems(Update, debug_layer_cameras)
+        .add_systems(Update, ipc_stats::publish_ipc_stats)
+        .add_systems(
+            Update,
+            (
+                drain_ipc_open_requests,
+                drain_file_picks,
+                start_save_as_dialogs,
+                drain_save_as_results,
+                dispatch_bus_actions,
+                route_emacs_open_requests,
+            ),
+        )
+        // Focus-state + modifier reconciliation run in PreUpdate, right
+        // after Bevy's input systems have drained this frame's raw
+        // events, and BEFORE any Update consumer reads its keys — the
+        // terminal crate's `handle_keyboard`, the Cmd+C/Cmd+V clipboard
+        // system, and jim-pane's Shift/Fn-to-select gate all live in
+        // Update, in other plugins. Doing it here (not in Update) is what
+        // makes the corrected modifier state authoritative the same frame:
+        // an Update-ordered fix could land after those consumers and drop
+        // the keystroke. `track_app_focus` runs first so its focus-flip
+        // `release_all` can't clobber the reconcile that follows it.
+        .add_systems(
+            PreUpdate,
+            (track_app_focus, reconcile_macos_modifiers)
+                .chain()
+                .after(bevy::input::InputSystems),
+        )
+        .add_systems(
+            Update,
+            (
+                handle_scroll,
+                apply_bell_pulse,
+                apply_claude_notification_pulse,
+                clear_active_unread,
+                sync_dock_badge,
             )
-            .add_systems(
-                Update,
-                (
-                    mirror_active_project_to_style,
-                    maintain_project_themes,
-                    mirror_focus_to_style,
-                    maintain_winit_mode_for_animation,
-                    sync_canvas_clear_color,
-                    window_geometry::fit_window_to_monitor,
-                    window_geometry::save_on_change,
-                    sync_wake_throttle_to_power,
-                ),
-            )
-            // Survive lid-close / display-sleep: when the monitor goes away
-            // the primary window is despawned by a `linked_spawn` cascade;
-            // paired with `ExitCondition::DontExit` (main.rs) we respawn it
-            // immediately so the app stays alive and visible on wake.
-            // See `window_geometry::respawn_primary_window_on_loss`.
-            .add_observer(window_geometry::respawn_primary_window_on_loss)
-            // …but a deliberate close request (red button / Cmd-W) should
-            // still quit. That request never fires on the lid-close cascade,
-            // so honoring it here doesn't undo the survival behavior above.
-            .add_systems(Update, window_geometry::quit_on_close_request)
-            .add_systems(PostStartup, release_os_focus)
-            // Single keyboard-ownership authority, before every Update
-            // consumer reads it.
-            .add_systems(PreUpdate, compute_keyboard_owner)
-            .add_systems(Update, debug_fps_log)
-            .add_systems(Update, debug_layer_cameras)
-            .add_systems(Update, ipc_stats::publish_ipc_stats)
-            .add_systems(
-                Update,
-                (
-                    drain_ipc_open_requests,
-                    drain_file_picks,
-                    dispatch_bus_actions,
-                    route_emacs_open_requests,
-                ),
-            )
-            // Focus-state + modifier reconciliation run in PreUpdate, right
-            // after Bevy's input systems have drained this frame's raw
-            // events, and BEFORE any Update consumer reads its keys — the
-            // terminal crate's `handle_keyboard`, the Cmd+C/Cmd+V clipboard
-            // system, and jim-pane's Shift/Fn-to-select gate all live in
-            // Update, in other plugins. Doing it here (not in Update) is what
-            // makes the corrected modifier state authoritative the same frame:
-            // an Update-ordered fix could land after those consumers and drop
-            // the keystroke. `track_app_focus` runs first so its focus-flip
-            // `release_all` can't clobber the reconcile that follows it.
-            .add_systems(
-                PreUpdate,
-                (track_app_focus, reconcile_macos_modifiers)
-                    .chain()
-                    .after(bevy::input::InputSystems),
-            )
-            .add_systems(
-                Update,
-                (
-                    handle_scroll,
-                    apply_bell_pulse,
-                    apply_claude_notification_pulse,
-                    clear_active_unread,
-                    sync_dock_badge,
-                )
-                    .chain(),
-            )
-            .init_resource::<TerminalCwds>()
-            .add_systems(Update, track_terminal_cwds);
+                .chain(),
+        )
+        .init_resource::<TerminalCwds>()
+        .add_systems(Update, track_terminal_cwds);
     }
 }
 
@@ -518,10 +531,7 @@ fn setup_camera(mut commands: Commands) {
     // for pane chrome + non-pane scene content, and uses layers 1.. for
     // each per-pane camera. Making the main camera's layer explicit
     // matches the contract documented in `pane-bevy/src/camera.rs`.
-    commands.spawn((
-        Camera2d,
-        bevy::camera::visibility::RenderLayers::layer(0),
-    ));
+    commands.spawn((Camera2d, bevy::camera::visibility::RenderLayers::layer(0)));
 
     // Whiteboard overlay camera — renders only `WHITEBOARD_OVERLAY_LAYER` at
     // an order above every per-pane camera, so the canvas drawing paints ON
@@ -634,7 +644,7 @@ fn request_microphone_access() {}
 /// report AC, i.e. prefer display responsiveness over the battery saving.
 #[cfg(target_os = "macos")]
 fn power_on_ac() -> bool {
-    use std::ffi::{c_char, c_void, CStr};
+    use std::ffi::{CStr, c_char, c_void};
 
     // CFTypeRef / CFStringRef are opaque pointers. `IOPSCopyPowerSourcesInfo`
     // returns a +1 CFDictionary we must `CFRelease`; the string from
@@ -870,10 +880,7 @@ fn drain_ipc_open_requests(
                 expose.pending_toggle = true;
             }
             ipc::IpcRequest::ActivateProject { project } => {
-                match projects::resolve_project(
-                    &OpenProjectTarget::ByName(project),
-                    &projects,
-                ) {
+                match projects::resolve_project(&OpenProjectTarget::ByName(project), &projects) {
                     Some(id) => projects.set_active(id),
                     None => eprintln!("[ipc] activate_project: no matching project"),
                 }
@@ -992,9 +999,7 @@ fn drain_ipc_open_requests(
                     Some(k) => k,
                     None if command.is_some() => "run-button".to_string(),
                     None => {
-                        eprintln!(
-                            "[ipc] suggest_pane: need --kind or --command; dropping"
-                        );
+                        eprintln!("[ipc] suggest_pane: need --kind or --command; dropping");
                         continue;
                     }
                 };
@@ -1032,12 +1037,10 @@ fn drain_ipc_open_requests(
                 // its owning project; otherwise leave it unscoped
                 // (global — shows in every project's drawer).
                 let project_id = match &project {
-                    Some(name) => {
-                        projects::resolve_project(
-                            &OpenProjectTarget::ByName(name.clone()),
-                            &projects,
-                        )
-                    }
+                    Some(name) => projects::resolve_project(
+                        &OpenProjectTarget::ByName(name.clone()),
+                        &projects,
+                    ),
                     None => from_cwd
                         .as_deref()
                         .and_then(|c| projects::project_for_cwd(c, &projects)),
@@ -1052,7 +1055,11 @@ fn drain_ipc_open_requests(
                 // the user is mid-task.
                 screenshot_consent.request(path, reason);
             }
-            ipc::IpcRequest::CloseProjectPanes { project, kind, titles } => {
+            ipc::IpcRequest::CloseProjectPanes {
+                project,
+                kind,
+                titles,
+            } => {
                 let target = match project.as_deref() {
                     Some("active") | None => OpenProjectTarget::Active,
                     Some(name) => OpenProjectTarget::ByName(name.to_string()),
@@ -1063,7 +1070,13 @@ fn drain_ipc_open_requests(
                 };
                 pending.close_panes.push((project_id, kind, titles));
             }
-            ipc::IpcRequest::DockPanes { project, titles, template, empty, slots } => {
+            ipc::IpcRequest::DockPanes {
+                project,
+                titles,
+                template,
+                empty,
+                slots,
+            } => {
                 let target = match project.as_deref() {
                     Some("active") | None => OpenProjectTarget::Active,
                     Some(name) => OpenProjectTarget::ByName(name.to_string()),
@@ -1076,7 +1089,13 @@ fn drain_ipc_open_requests(
                     .dock_panes
                     .push((project_id, titles, template, empty, slots));
             }
-            ipc::IpcRequest::WidgetMessage { project, topic, payload, retain, sender } => {
+            ipc::IpcRequest::WidgetMessage {
+                project,
+                topic,
+                payload,
+                retain,
+                sender,
+            } => {
                 // `"global"`/`"*"` → the global channel (`None`), delivered
                 // to every widget; otherwise resolve a project id.
                 let project = match project.as_deref() {
@@ -1086,8 +1105,7 @@ fn drain_ipc_open_requests(
                             Some("active") | None => OpenProjectTarget::Active,
                             Some(name) => OpenProjectTarget::ByName(name.to_string()),
                         };
-                        let Some(project_id) = projects::resolve_project(&target, &projects)
-                        else {
+                        let Some(project_id) = projects::resolve_project(&target, &projects) else {
                             eprintln!("[ipc] widget_message: no matching project");
                             continue;
                         };
@@ -1306,6 +1324,124 @@ fn drain_file_picks(
     }
 }
 
+/// `file.new_markdown` action. Spawns an editor pane in WYSIWYG markdown
+/// mode with no file behind it — a scratch note. Its text rides along in
+/// the pane snapshot, so it survives a restart unsaved; ⌘S runs Save As
+/// (see [`start_save_as_dialogs`]) and gives it a real path.
+fn action_new_markdown(ctx: &mut actions::ActionCtx) {
+    let Some(active) = ctx.world.resource::<Projects>().active else {
+        return;
+    };
+    let origin = ctx.origin;
+    ctx.world
+        .resource_mut::<PendingActions>()
+        .new_panes
+        .push(NewPaneRequest {
+            kind: "editor",
+            project_id: active,
+            origin,
+            size: None,
+            config: serde_json::json!({
+                "markdown": true,
+                "title": "Untitled.md",
+                "text": "",
+            }),
+        });
+}
+
+/// Channel the async Save As dialog delivers `(pane, chosen path)` back
+/// on. Mirrors [`FilePickChannel`]; NonSend for the same reason (both
+/// mpsc ends are `!Sync`, both touchpoints are main-thread).
+struct SaveAsChannel {
+    tx: std::sync::mpsc::Sender<(Entity, PathBuf)>,
+    rx: std::sync::mpsc::Receiver<(Entity, PathBuf)>,
+}
+
+/// Drain the editor's pathless-⌘S queue and begin one native Save As
+/// sheet per pane. Async (not blocking) for the same re-entrancy reason
+/// spelled out on [`action_open_file`].
+fn start_save_as_dialogs(
+    mut requests: ResMut<jim_editor::SaveAsRequests>,
+    channel: Option<NonSend<SaveAsChannel>>,
+    panes: Query<(Option<&jim_pane::PaneTitle>, Option<&ProjectMembership>)>,
+    projects: Res<Projects>,
+) {
+    if requests.0.is_empty() {
+        return;
+    }
+    let Some(channel) = channel else {
+        // Nobody can run a dialog — don't let the queue grow unbounded.
+        requests.0.clear();
+        return;
+    };
+    for entity in std::mem::take(&mut requests.0) {
+        let Ok((title, membership)) = panes.get(entity) else {
+            continue; // pane closed before we got here
+        };
+        // Seed the sheet with the pane's title (the scratch doc's only
+        // name) and the project's default directory when it has one.
+        let file_name = title
+            .map(|t| t.0.clone())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| "Untitled.md".to_string());
+        let dir = membership
+            .and_then(|m| projects.default_cwd_of(m.0))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let fut = rfd::AsyncFileDialog::new()
+            .set_directory(dir)
+            .set_file_name(file_name)
+            .set_title("Save as")
+            .save_file();
+        let tx = channel.tx.clone();
+        bevy::tasks::IoTaskPool::get()
+            .spawn(async move {
+                if let Some(handle) = fut.await {
+                    let _ = tx.send((entity, handle.path().to_path_buf()));
+                }
+            })
+            .detach();
+    }
+}
+
+/// Write a scratch pane's buffer to the path the user picked and attach
+/// it, so the pane is file-backed from now on (plain ⌘S, and the path —
+/// not the text — is what a restart restores it from).
+fn drain_save_as_results(
+    mut commands: Commands,
+    channel: Option<NonSend<SaveAsChannel>>,
+    mut panes: Query<(
+        &jim_editor::EditorStateComp,
+        Option<&mut jim_pane::PaneTitle>,
+    )>,
+    mut projects: ResMut<Projects>,
+) {
+    let Some(channel) = channel else { return };
+    while let Ok((entity, path)) = channel.rx.try_recv() {
+        let Ok((state, title)) = panes.get_mut(entity) else {
+            eprintln!(
+                "[editor] save as {}: pane is gone; not writing",
+                path.display()
+            );
+            continue;
+        };
+        if let Err(e) = std::fs::write(&path, state.0.doc.to_string()) {
+            eprintln!("[editor] save as {} failed: {}", path.display(), e);
+            continue;
+        }
+        eprintln!("[editor] saved {}", path.display());
+        if let Some(mut title) = title {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                title.0 = name.to_string();
+            }
+        }
+        commands
+            .entity(entity)
+            .insert(jim_editor::EditorFilePath(path));
+        // Re-persist the pane list so the new path survives a restart.
+        projects.terminals_dirty = true;
+    }
+}
 
 /// Mouse-wheel scrolls the terminal under the cursor (in the active
 /// project). Pixel-mode events (trackpads) accumulate a fractional line
@@ -1321,10 +1457,7 @@ fn handle_scroll(
     metrics: Res<MonoMetrics>,
     keys: Res<ButtonInput<KeyCode>>,
     all_panes: Query<(Entity, &PaneRect, Option<&Visibility>), With<PaneTag>>,
-    terminals: Query<
-        (Entity, Option<&ProjectMembership>, &PaneKindMarker),
-        With<PaneTag>,
-    >,
+    terminals: Query<(Entity, Option<&ProjectMembership>, &PaneKindMarker), With<PaneTag>>,
 ) {
     // Cmd+scroll is reserved for canvas pan (see canvas.rs). Drain the
     // events so they don't accumulate, but don't act on them.
@@ -1370,8 +1503,7 @@ fn handle_scroll(
         .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
         .map(|(e, r, _)| (e, *r))
         .collect();
-    let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &all_rects)
-    else {
+    let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &all_rects) else {
         return;
     };
     // Only consume the wheel if that topmost pane is a VT-grid pane
@@ -1431,11 +1563,7 @@ fn handle_scroll(
 /// spuriously even while the app is backgrounded. Polling
 /// `NSApplication.isActive` each frame matches what the user actually
 /// perceives as "looking at us". Logs every transition while diagnosing.
-fn debug_fps_log(
-    time: Res<Time>,
-    mut frames: Local<u64>,
-    mut last: Local<f64>,
-) {
+fn debug_fps_log(time: Res<Time>, mut frames: Local<u64>, mut last: Local<f64>) {
     if std::env::var("FPS_LOG").is_err() {
         return;
     }
@@ -1483,12 +1611,11 @@ fn debug_layer_cameras(
         }
         let mut cams: Vec<String> = Vec::new();
         for (ce, cam, rl, gt) in &cameras {
-            if rl.intersects(&bevy::camera::visibility::RenderLayers::from_layers(&[layer.0])) {
+            if rl.intersects(&bevy::camera::visibility::RenderLayers::from_layers(&[
+                layer.0,
+            ])) {
                 let s = gt.compute_transform().scale;
-                cams.push(format!(
-                    "{ce:?}(order={},scale={:.3})",
-                    cam.order, s.x
-                ));
+                cams.push(format!("{ce:?}(order={},scale={:.3})", cam.order, s.x));
             }
         }
         report.push_str(&format!(
@@ -1504,10 +1631,7 @@ fn debug_layer_cameras(
     }
 }
 
-fn track_app_focus(
-    mut focused: ResMut<AppFocused>,
-    mut keys: ResMut<ButtonInput<KeyCode>>,
-) {
+fn track_app_focus(mut focused: ResMut<AppFocused>, mut keys: ResMut<ButtonInput<KeyCode>>) {
     // Read the cached focus state maintained by the NSWorkspace activation
     // observers (`install_app_focus_observers`). This used to call
     // `current_app_active()` directly — a synchronous XPC round-trip to
@@ -1968,9 +2092,7 @@ fn install_claude_notify() -> Result<String, String> {
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .ok_or_else(|| "hooks is not an object".to_string())?;
-    let stop = hooks
-        .entry("Stop")
-        .or_insert_with(|| serde_json::json!([]));
+    let stop = hooks.entry("Stop").or_insert_with(|| serde_json::json!([]));
     if !stop.is_array() {
         *stop = serde_json::json!([]);
     }
@@ -2009,11 +2131,9 @@ fn install_claude_notify() -> Result<String, String> {
         }
     }
 
-    let mut out = serde_json::to_string_pretty(&data)
-        .map_err(|e| format!("serialize: {e}"))?;
+    let mut out = serde_json::to_string_pretty(&data).map_err(|e| format!("serialize: {e}"))?;
     out.push('\n');
-    std::fs::write(&path, out.as_bytes())
-        .map_err(|e| format!("write {path:?}: {e}"))?;
+    std::fs::write(&path, out.as_bytes()).map_err(|e| format!("write {path:?}: {e}"))?;
 
     Ok(format!(
         "Installed Stop-bell + terminal_bell into {}{}. Restart Claude Code (new session) for the Stop hook to take effect.",
@@ -2026,10 +2146,7 @@ fn install_claude_notify() -> Result<String, String> {
 /// focused — that's the moment "the user is looking at it" becomes
 /// true. Runs every frame; the no-op fast path inside `clear_unread`
 /// (returns false when count was already zero) keeps the cost free.
-fn clear_active_unread(
-    app_focused: Res<AppFocused>,
-    mut projects: ResMut<Projects>,
-) {
+fn clear_active_unread(app_focused: Res<AppFocused>, mut projects: ResMut<Projects>) {
     if !app_focused.0 {
         return;
     }
@@ -2159,8 +2276,7 @@ fn maintain_project_themes(
         // Project set or a preset changed — rebuild the whole cache and
         // drop entries for projects that no longer exist.
         *last_sig = sig;
-        let keep: std::collections::HashSet<u64> =
-            projects.list.iter().map(|p| p.id).collect();
+        let keep: std::collections::HashSet<u64> = projects.list.iter().map(|p| p.id).collect();
         themes.retain_projects(&keep);
         for p in &projects.list {
             themes.set(
@@ -2351,10 +2467,7 @@ fn compute_keyboard_owner(
 /// Track the active theme's `canvas_bg` token in `ClearColor` so a
 /// preset switch retones the void around the dust shader (visible at
 /// pane rounded-corners + during the windex sweep).
-fn sync_canvas_clear_color(
-    theme: Res<jim_style::Theme>,
-    mut clear: ResMut<ClearColor>,
-) {
+fn sync_canvas_clear_color(theme: Res<jim_style::Theme>, mut clear: ResMut<ClearColor>) {
     if !theme.is_changed() {
         return;
     }
@@ -2569,12 +2682,7 @@ fn maintain_winit_mode_for_animation(
     }
 }
 
-/// Cmd+Shift+T opens the live theme editor (a funct widget). OkLCh
-/// steppers per color token; click to focus a token, then ± each
-/// of L / C / h. Writes propagate to the active preset's `theme.ft`
-/// via the bridge; notify watcher reloads it and the rest of the
-/// app retones the same frame.
-/// `view.theme_editor` action (Cmd+Shift+T). Opens the live theme editor
+/// `view.theme_editor` action. Opens the live theme editor
 /// (a funct widget): OkLCh steppers per color token that write back to the
 /// active preset's `theme.ft`. Dedups like the dev panel.
 fn action_open_theme_editor(ctx: &mut actions::ActionCtx) {

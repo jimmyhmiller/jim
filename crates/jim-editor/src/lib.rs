@@ -158,6 +158,14 @@ pub struct EditorMetrics {
     pub cell_width: f32,
 }
 
+/// Editor panes whose ⌘S found no [`EditorFilePath`] (a scratch document,
+/// e.g. one opened by the "New Markdown Document" action). This crate
+/// can't own a native file dialog, so it just queues the entity; the host
+/// (`jim-app`) drains this, runs Save As, writes the buffer, and attaches
+/// the resulting `EditorFilePath`. Nobody draining it = ⌘S stays a no-op.
+#[derive(Resource, Default)]
+pub struct SaveAsRequests(pub Vec<Entity>);
+
 // ---------- Plugins ----------
 
 pub struct EditorEmbedPlugin;
@@ -166,6 +174,7 @@ impl Plugin for EditorEmbedPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(highlight::HighlightPlugin)
             .init_resource::<FocusedEmbeddedEditor>()
+            .init_resource::<SaveAsRequests>()
             .init_resource::<markdown::MdDebugViz>()
             .add_systems(
                 Update,
@@ -281,6 +290,7 @@ impl Plugin for HeadlessEditorPlugin {
         app.init_resource::<FocusedPane>()
             .init_resource::<jim_pane::KeyboardOwner>()
             .init_resource::<jim_pane::PaneZoom>()
+            .init_resource::<SaveAsRequests>()
             .add_systems(Update, handle_input);
     }
 }
@@ -443,6 +453,24 @@ fn editor_spawn_from_config(world: &mut World, entity: Entity, content_root: Ent
             .entity_mut(entity)
             .insert(EditorFilePath(PathBuf::from(path)));
     }
+    // Explicit markdown mode for pathless (scratch) documents — the
+    // "New Markdown Document" action and restored snapshots of one.
+    // `detect_markdown_mode` only fires for panes that HAVE a file path,
+    // and it skips anything that already carries `MarkdownMode`, so this
+    // wins for path-backed panes too (a snapshot always records the
+    // effective state).
+    if let Some(enabled) = config.get("markdown").and_then(|v| v.as_bool()) {
+        world
+            .entity_mut(entity)
+            .insert(MarkdownMode { enabled, raw: false });
+    }
+    // Optional pane-title override (a scratch doc has no filename to
+    // show, so the caller names it).
+    if let Some(title) = config.get("title").and_then(|v| v.as_str()) {
+        if let Some(mut t) = world.get_mut::<jim_pane::PaneTitle>(entity) {
+            t.0 = title.to_string();
+        }
+    }
     // Optional initial cursor position (`jimctl open --line/--col`):
     // 1-based line, 0-based column, both clamped to the document.
     if let Some(line) = config.get("line").and_then(|v| v.as_u64()) {
@@ -478,6 +506,15 @@ fn editor_snapshot(world: &World, entity: Entity) -> Value {
             "path".into(),
             Value::String(path.0.to_string_lossy().into()),
         );
+    } else if let Some(title) = world.get::<jim_pane::PaneTitle>(entity) {
+        // Pathless (scratch) doc: the title is the only name it has.
+        obj.insert("title".into(), Value::String(title.0.clone()));
+    }
+    // Persist the effective markdown state so a restored pane comes back
+    // in the same view — a pathless markdown scratch doc has no `.md`
+    // extension for `detect_markdown_mode` to find.
+    if let Some(md) = world.get::<MarkdownMode>(entity) {
+        obj.insert("markdown".into(), Value::Bool(md.enabled));
     }
     Value::Object(obj)
 }
@@ -1170,6 +1207,7 @@ fn handle_input(
         ),
         With<PaneTag>,
     >,
+    mut save_as: ResMut<SaveAsRequests>,
 ) {
     let zoom = pane_zoom.0;
     let Some(target) = focused.0 else {
@@ -1314,7 +1352,14 @@ fn handle_input(
                             }
                         }
                     }
-                    None => eprintln!("[editor] save: no file path for this pane"),
+                    // Scratch document: ask the host for a Save As
+                    // destination. It writes the buffer and attaches the
+                    // path, so the next ⌘S saves in place.
+                    None => {
+                        if !save_as.0.contains(&target) {
+                            save_as.0.push(target);
+                        }
+                    }
                 }
                 Some(None)
             }
