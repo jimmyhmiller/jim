@@ -140,6 +140,11 @@ fn state() -> &'static Arc<AudioState> {
                     };
                     match rx.recv_timeout(timeout) {
                         Ok(AudioCmd::Start { device, path, dual }) => {
+                            eprintln!(
+                                "[audio] start requested: device={:?} path={} dual={dual}",
+                                if device.is_empty() { "<default>" } else { &device },
+                                path
+                            );
                             // Tear down any prior take first.
                             if let Some(a) = active.take() {
                                 finish(a);
@@ -147,17 +152,23 @@ fn state() -> &'static Arc<AudioState> {
                             touch_keepalive(&controller);
                             match start_stream(&controller, &device, &path, dual) {
                                 Ok(a) => {
+                                    eprintln!("[audio] capture started: path={path}");
                                     active = Some(a);
                                     controller.recording.store(true, Ordering::Release);
                                     set_status(&controller, format!("● recording → {path}"));
                                 }
                                 Err(e) => {
+                                    eprintln!("[audio] capture failed to start: {e}");
                                     controller.recording.store(false, Ordering::Release);
                                     set_status(&controller, format!("error: {e}"));
                                 }
                             }
                         }
                         Ok(AudioCmd::Stop) => {
+                            eprintln!(
+                                "[audio] stop requested: stream_active={}",
+                                active.is_some()
+                            );
                             controller.recording.store(false, Ordering::Release);
                             if let Some(a) = active.take() {
                                 let p = finish(a);
@@ -340,6 +351,10 @@ fn start_stream(
     let config: cpal::StreamConfig = supported.config();
     let channels = config.channels;
     let sample_rate = config.sample_rate.0;
+    eprintln!(
+        "[audio] input configured: device={:?} rate={sample_rate}Hz channels={channels} format={sample_format:?}",
+        device.name().unwrap_or_else(|_| "<unknown>".into())
+    );
 
     // "Both channels": a mono input written as stereo (each sample to L and
     // R) so playback isn't stuck in the left speaker. Only meaningful for a
