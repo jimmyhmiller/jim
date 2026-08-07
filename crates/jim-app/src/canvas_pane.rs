@@ -34,16 +34,16 @@ use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy::sprite::Anchor;
 use bevy::text::LineHeight;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use jim_pane::{
-    content_area, FocusedPane, InputConsumed, KeyboardOwner, PaneCanvas, PaneChrome,
-    PaneDoubleClicked, PaneFont, PaneFontMetrics, PaneInputBlockZones, PaneKindSpec, PaneProject,
-    PaneRect, PaneRegistry, PaneSnapId, PaneTag, PaneTitle, PaneViewport, PaneWindowDragReleased,
+    FocusedPane, InputConsumed, KeyboardOwner, PaneCanvas, PaneChrome, PaneDoubleClicked, PaneFont,
+    PaneFontMetrics, PaneInputBlockZones, PaneKindSpec, PaneProject, PaneRect, PaneRegistry,
+    PaneSnapId, PaneTag, PaneTitle, PaneViewport, PaneWindowDragReleased, content_area,
 };
 
-use crate::projects::{Projects, Sidebar};
 use crate::MENU_OVERLAY_LAYER;
+use crate::projects::{Projects, Sidebar};
 
 pub const PANE_KIND: &str = "canvas";
 
@@ -224,7 +224,10 @@ fn canvas_spawn(world: &mut World, entity: Entity, _content_root: Entity, config
 }
 
 fn canvas_snapshot(world: &World, entity: Entity) -> Value {
-    let canvas_id = world.get::<CanvasPane>(entity).map(|c| c.canvas_id).unwrap_or(0);
+    let canvas_id = world
+        .get::<CanvasPane>(entity)
+        .map(|c| c.canvas_id)
+        .unwrap_or(0);
     let name = world
         .get::<PaneTitle>(entity)
         .map(|t| t.0.clone())
@@ -330,7 +333,13 @@ fn capture_and_ascend(
     mut flow: ResMut<ThumbFlow>,
     mut nav: ResMut<CanvasNav>,
     mut focused: ResMut<FocusedPane>,
-    members: Query<(Entity, &PaneRect, &PaneProject, &PaneCanvas, Option<&PaneSnapId>)>,
+    members: Query<(
+        Entity,
+        &PaneRect,
+        &PaneProject,
+        &PaneCanvas,
+        Option<&PaneSnapId>,
+    )>,
 ) {
     let Some((project, wait, depth)) = flow
         .pending
@@ -425,7 +434,9 @@ fn pane_window_crop(
 
 /// Screenshot observer: crop the captured window to each pane's rect and
 /// write its `pane-<snap_id>.png`.
-fn save_pane_thumbs(crops: Vec<(PathBuf, u32, u32, u32, u32)>) -> impl FnMut(On<ScreenshotCaptured>) {
+fn save_pane_thumbs(
+    crops: Vec<(PathBuf, u32, u32, u32, u32)>,
+) -> impl FnMut(On<ScreenshotCaptured>) {
     const THUMB_MAX: u32 = 512;
     move |captured: On<ScreenshotCaptured>| {
         let dyn_img = match captured.image.clone().try_into_dynamic() {
@@ -446,7 +457,10 @@ fn save_pane_thumbs(crops: Vec<(PathBuf, u32, u32, u32, u32)>) -> impl FnMut(On<
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            if let Err(e) = thumb.to_rgb8().save_with_format(path, image::ImageFormat::Png) {
+            if let Err(e) = thumb
+                .to_rgb8()
+                .save_with_format(path, image::ImageFormat::Png)
+            {
                 eprintln!("[canvas] pane thumb save {} failed: {e}", path.display());
             }
         }
@@ -454,7 +468,9 @@ fn save_pane_thumbs(crops: Vec<(PathBuf, u32, u32, u32, u32)>) -> impl FnMut(On<
 }
 
 fn thumb_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".jim").join("canvas-thumbs")
 }
 
@@ -572,10 +588,22 @@ fn handle_reparent(
     sidebar: Res<Sidebar>,
     viewport: Res<PaneViewport>,
     dragged_q: Query<
-        (&PaneRect, &PaneProject, Option<&PaneCanvas>, Option<&CanvasPane>, Option<&PaneSnapId>),
+        (
+            &PaneRect,
+            &PaneProject,
+            Option<&PaneCanvas>,
+            Option<&CanvasPane>,
+            Option<&PaneSnapId>,
+        ),
         With<PaneTag>,
     >,
-    tiles: Query<(Entity, &PaneRect, &PaneProject, Option<&PaneCanvas>, &CanvasPane)>,
+    tiles: Query<(
+        Entity,
+        &PaneRect,
+        &PaneProject,
+        Option<&PaneCanvas>,
+        &CanvasPane,
+    )>,
 ) {
     for ev in events.read() {
         let Ok((drect, dproj, dcanvas, dtile, dsnap)) = dragged_q.get(ev.pane) else {
@@ -637,7 +665,13 @@ fn handle_reparent(
             if let Some((x, y, w, h)) = pane_window_crop(&drect, &viewport, sidebar.width, window) {
                 commands
                     .spawn(Screenshot::primary_window())
-                    .observe(save_pane_thumbs(vec![(pane_thumb_path(snap_id), x, y, w, h)]));
+                    .observe(save_pane_thumbs(vec![(
+                        pane_thumb_path(snap_id),
+                        x,
+                        y,
+                        w,
+                        h,
+                    )]));
                 flow.capturing.retain(|(id, _)| *id != snap_id);
                 flow.capturing.push((snap_id, 0));
             }
@@ -647,6 +681,7 @@ fn handle_reparent(
         commands.entity(ev.pane).insert(GatherAnim {
             target_canvas,
             start: drect,
+            restore: rect_near_canvas_origin(drect, viewport.pan),
             dest_center: tile_center,
             elapsed: 0.0,
         });
@@ -665,9 +700,55 @@ const GATHER_DUR: f32 = 0.18;
 #[derive(Component)]
 struct GatherAnim {
     target_canvas: u64,
+    /// Geometry to use in the child canvas. `start` is expressed in the
+    /// source canvas's coordinates, which include that level's pan. Carrying
+    /// it across verbatim can put the pane thousands of units from a fresh
+    /// child canvas's origin.
+    restore: PaneRect,
     start: PaneRect,
     dest_center: Vec2,
     elapsed: f32,
+}
+
+fn rect_near_canvas_origin(mut rect: PaneRect, source_pan: Vec2) -> PaneRect {
+    // Preserve where the pane appeared relative to the visible canvas, but
+    // discard how far the source level had been panned. Clamp panes dragged
+    // partly past the top/left edge to the child canvas wall.
+    rect.pos = (rect.pos - source_pan).max(Vec2::ZERO);
+    rect
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gathered_rect_drops_source_canvas_pan() {
+        let rect = PaneRect {
+            pos: Vec2::new(2_120.0, 840.0),
+            size: Vec2::new(320.0, 240.0),
+            z: 7.0,
+        };
+
+        let restored = rect_near_canvas_origin(rect, Vec2::new(2_000.0, 700.0));
+
+        assert_eq!(restored.pos, Vec2::new(120.0, 140.0));
+        assert_eq!(restored.size, rect.size);
+        assert_eq!(restored.z, rect.z);
+    }
+
+    #[test]
+    fn gathered_rect_stays_inside_top_left_canvas_wall() {
+        let rect = PaneRect {
+            pos: Vec2::new(490.0, 290.0),
+            size: Vec2::new(320.0, 240.0),
+            z: 1.0,
+        };
+
+        let restored = rect_near_canvas_origin(rect, Vec2::new(500.0, 300.0));
+
+        assert_eq!(restored.pos, Vec2::ZERO);
+    }
 }
 
 /// A just-gathered pane's original geometry, restored once the pane is
@@ -703,7 +784,7 @@ fn animate_gather(
             commands
                 .entity(e)
                 .remove::<GatherAnim>()
-                .insert((PaneCanvas(anim.target_canvas), RestoreRect(anim.start)));
+                .insert((PaneCanvas(anim.target_canvas), RestoreRect(anim.restore)));
         }
     }
 }
@@ -1019,7 +1100,12 @@ fn render_breadcrumb(world: &mut World) {
     // crumbs[0] = project (depth 0), crumbs[k] = path[k-1] (depth k).
     let mut crumbs: Vec<String> = vec![project_name];
     for id in &path {
-        crumbs.push(tile_names.get(id).cloned().unwrap_or_else(|| "Canvas".to_string()));
+        crumbs.push(
+            tile_names
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| "Canvas".to_string()),
+        );
     }
 
     let sig = {
@@ -1043,7 +1129,9 @@ fn render_breadcrumb(world: &mut World) {
         }
     };
     let sidebar_w = world.resource::<Sidebar>().width;
-    let char_w = world.resource::<PaneFontMetrics>().char_width(BREADCRUMB_FONT);
+    let char_w = world
+        .resource::<PaneFontMetrics>()
+        .char_width(BREADCRUMB_FONT);
     let font = world.resource::<PaneFont>().0.clone();
     let theme = world.resource::<jim_style::Theme>().clone();
     let fg = Color::LinearRgba(theme.color(jim_style::tokens::FG));
@@ -1070,7 +1158,14 @@ fn render_breadcrumb(world: &mut World) {
 
     // Leading up affordance — ascend one level (depth = path.len()-1).
     let up_depth = path.len().saturating_sub(1);
-    spawn_crumb(world, root, &font, "↑", accent, to_world(wx, BREADCRUMB_TOP));
+    spawn_crumb(
+        world,
+        root,
+        &font,
+        "↑",
+        accent,
+        to_world(wx, BREADCRUMB_TOP),
+    );
     let up_w = char_w; // single glyph
     hits.push((
         Rect::from_corners(
@@ -1084,7 +1179,14 @@ fn render_breadcrumb(world: &mut World) {
     for (i, crumb) in crumbs.iter().enumerate() {
         let is_current = i + 1 == crumbs.len();
         let color = if is_current { accent } else { fg };
-        spawn_crumb(world, root, &font, crumb, color, to_world(wx, BREADCRUMB_TOP));
+        spawn_crumb(
+            world,
+            root,
+            &font,
+            crumb,
+            color,
+            to_world(wx, BREADCRUMB_TOP),
+        );
         let w = crumb.chars().count() as f32 * char_w;
         hits.push((
             Rect::from_corners(
@@ -1095,7 +1197,14 @@ fn render_breadcrumb(world: &mut World) {
         ));
         wx += w;
         if !is_current {
-            spawn_crumb(world, root, &font, sep, fg_muted, to_world(wx, BREADCRUMB_TOP));
+            spawn_crumb(
+                world,
+                root,
+                &font,
+                sep,
+                fg_muted,
+                to_world(wx, BREADCRUMB_TOP),
+            );
             wx += sep.chars().count() as f32 * char_w;
         }
     }
@@ -1144,7 +1253,9 @@ fn handle_breadcrumb_click(
         return;
     }
     let Ok(window) = windows.single() else { return };
-    let Some(pt) = window.cursor_position() else { return };
+    let Some(pt) = window.cursor_position() else {
+        return;
+    };
     // Don't steal clicks the sidebar (or other host chrome) owns.
     if block_zones
         .0
@@ -1153,7 +1264,9 @@ fn handle_breadcrumb_click(
     {
         return;
     }
-    let Some(active) = projects.active else { return };
+    let Some(active) = projects.active else {
+        return;
+    };
     for (rect, depth) in &state.hits {
         if pt.x >= rect.min.x && pt.x <= rect.max.x && pt.y >= rect.min.y && pt.y <= rect.max.y {
             // Route through the capture flow so the level being left gets
