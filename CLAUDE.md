@@ -16,6 +16,11 @@ model crates keep `-core`; generic/reusable crates (`glaze`,
 `claude-bus`) stay plain. Package names use underscores (`jim_app`),
 dirs use hyphens (`crates/jim-app`).
 
+When changes need to be loaded into the running Jim application, always
+build and restart it with `./scripts/dev-restart.sh`. Do not substitute a
+plain `cargo build`, `cargo run`, direct binary launch, or manual app restart.
+Wait for the script to confirm that Jim launched before reporting completion.
+
 ## Workspace layout
 
 - `crates/editor-core` — buffer/selection/transaction/history/commands.
