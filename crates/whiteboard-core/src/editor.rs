@@ -719,8 +719,7 @@ impl<M: TextMeasurer, G: ShapeGenerator> Editor<M, G> {
             };
             if let Some(arrow) = self.scene.get_mut(&id) {
                 let origin = Point::new(arrow.x, arrow.y);
-                let changed = if let ElementKind::Arrow(d) | ElementKind::Line(d) =
-                    &mut arrow.kind
+                let changed = if let ElementKind::Arrow(d) | ElementKind::Line(d) = &mut arrow.kind
                 {
                     apply_bound_endpoints(d, origin, endpoints)
                 } else {
@@ -808,7 +807,12 @@ impl<M: TextMeasurer, G: ShapeGenerator> Editor<M, G> {
         // Vertex handles: when exactly one line/arrow is selected, draw a small
         // square at each vertex so the user sees the draggable points.
         if self.selection().len() == 1 {
-            if let Some(el) = self.selection().iter().next().and_then(|id| self.scene.get(id)) {
+            if let Some(el) = self
+                .selection()
+                .iter()
+                .next()
+                .and_then(|id| self.scene.get(id))
+            {
                 let verts = crate::interaction::linear_vertices_scene(el);
                 if !verts.is_empty() {
                     use crate::geometry::{Path, Point as P, Rect};

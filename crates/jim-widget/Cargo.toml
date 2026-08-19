@@ -10,6 +10,9 @@ jim_pane = { path = "../jim-pane" }
 jim_bus = { path = "../jim-bus" }
 jim_style = { path = "../jim-style" }
 jim_editor = { path = "../jim-editor" }
+# `md_parse` host fn: the real inline scanner, so widgets stop
+# reimplementing CommonMark in funct.
+markdown_core = { path = "../markdown-core" }
 claude-bus-bevy = { path = "../claude-bus-bevy" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

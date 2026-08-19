@@ -228,6 +228,29 @@ pub enum IpcRequest {
         #[serde(default)]
         titles: Option<Vec<String>>,
     },
+    /// `jimctl group assign|clear` — put panes into a named group (or take
+    /// them out of one). A grouped pane is hidden until its group is
+    /// revealed, so this is how a deck's dashboards get wired up ONCE;
+    /// revealing them later is a visibility flip, not a spawn. Membership
+    /// persists with the pane. See `crate::pane_groups`.
+    SetPaneGroup {
+        #[serde(default)]
+        project: Option<String>,
+        /// Panes to (re)assign, by exact title. Empty = no-op rather than
+        /// "every pane" — a mass regroup is never what a typo meant.
+        #[serde(default)]
+        titles: Vec<String>,
+        /// `None` clears membership.
+        #[serde(default)]
+        group: Option<String>,
+    },
+    /// `jimctl group list` — report every pane's title and group, so you
+    /// can verify a deck's wiring without guessing. Responds with
+    /// `{"panes": [{"title", "group", "visible"}], "shown": [name]}`.
+    ListPaneGroups {
+        #[serde(default)]
+        project: Option<String>,
+    },
     /// `tbmsg emit --project P --topic T [--json '{...}'] [--retain]` —
     /// publish a message onto the widget↔widget bus from the shell (or a
     /// `proc_spawn`ed child). Delivered to every widget in project `P` as

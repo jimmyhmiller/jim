@@ -41,8 +41,12 @@ pub fn resync_linear_box(el: &mut Element) {
     if pts.is_empty() {
         return;
     }
-    let (mut min_x, mut min_y, mut max_x, mut max_y) =
-        (f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
     for p in &pts {
         min_x = min_x.min(p.x);
         min_y = min_y.min(p.y);

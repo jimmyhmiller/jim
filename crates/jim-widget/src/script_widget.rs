@@ -186,11 +186,20 @@ pub(crate) enum HostToWorker {
     /// under the cursor (e.g. scroll its own sidebar list) instead of the
     /// whole pane. `dy > 0` is scroll-up/away. Only delivered to widgets
     /// that define `on_wheel`; others are unaffected.
-    Wheel { local_x: f32, local_y: f32, dx: f32, dy: f32 },
+    Wheel {
+        local_x: f32,
+        local_y: f32,
+        dx: f32,
+        dy: f32,
+    },
     /// A trackpad pinch over the pane. Drives `on_pinch(x, y, delta)` —
     /// `delta > 0` is pinch-out (zoom in). The host yields the gesture via
     /// the `PaneCapturesPinch` marker so the canvas doesn't also zoom.
-    Pinch { local_x: f32, local_y: f32, delta: f32 },
+    Pinch {
+        local_x: f32,
+        local_y: f32,
+        delta: f32,
+    },
     /// A navigation key press routed to the focused widget. Drives
     /// `on_key(key)` in the script. `key` is a stable name like
     /// "ArrowLeft" / "ArrowRight" / "Home" / "End".
@@ -377,6 +386,11 @@ pub(crate) struct WorkerSlots {
     /// one. `set_scroll` also marks the render dirty, so a request
     /// always has a frame to ride on.
     pub(crate) scroll_request: Arc<Mutex<Option<f32>>>,
+    /// The widget's Glaze stylesheet (`glaze_load` / `glaze_load_file`).
+    /// Written by the worker's `glaze_*` natives; the main thread reads
+    /// its path in `poll_watcher` so saving a `.glz` hot-reloads every
+    /// widget styled by it, exactly like saving the `.ft` does.
+    pub(crate) glaze_sheet: crate::glaze_host::GlazeSheet,
 }
 
 impl WorkerSlots {
@@ -399,6 +413,7 @@ impl WorkerSlots {
             wants_pinch: Arc::new(AtomicBool::new(false)),
             font_metrics: Arc::new(Mutex::new((0.0, 0.0))),
             scroll_request: Arc::new(Mutex::new(None)),
+            glaze_sheet: crate::glaze_host::GlazeSheet::new(),
         }
     }
 }
@@ -424,6 +439,17 @@ impl WorkerHandle {
             .lock()
             .map(|mut v| std::mem::take(&mut *v))
             .unwrap_or_default()
+    }
+}
+
+impl ScriptWidget {
+    /// Deliver a presentation/navigation key to this widget regardless of
+    /// global pane focus. The app uses this while a deck owns presentation
+    /// mode, so clicking a live terminal does not steal the slide remote.
+    pub fn send_key(&self, key: &str) {
+        self.handle.send(HostToWorker::Key {
+            key: key.to_string(),
+        });
     }
 }
 
@@ -893,8 +919,14 @@ fn setup_watcher(world: &mut World) {
     // we only write when absent (never clobber the user's edits).
     for (name, body) in [
         ("garden.ft", include_str!("../widgets/garden.ft")),
-        ("style_picker.ft", include_str!("../widgets/style_picker.ft")),
-        ("theme_editor.ft", include_str!("../widgets/theme_editor.ft")),
+        (
+            "style_picker.ft",
+            include_str!("../widgets/style_picker.ft"),
+        ),
+        (
+            "theme_editor.ft",
+            include_str!("../widgets/theme_editor.ft"),
+        ),
         ("chess.ft", include_str!("../widgets/chess.ft")),
         ("dev_panel.ft", include_str!("../widgets/dev_panel.ft")),
         ("style_lab.ft", include_str!("../widgets/style_lab.ft")),
@@ -908,8 +940,7 @@ fn setup_watcher(world: &mut World) {
     // in any `.ft` widget resolves and stays in sync with the natives the
     // funct worker registers. Owned by the app, not user-edited.
     let host_ft_path = dir.join("host.ft");
-    if std::fs::read_to_string(&host_ft_path).ok().as_deref()
-        != Some(crate::funct_widget::HOST_FT)
+    if std::fs::read_to_string(&host_ft_path).ok().as_deref() != Some(crate::funct_widget::HOST_FT)
     {
         let _ = std::fs::write(&host_ft_path, crate::funct_widget::HOST_FT);
     }
@@ -966,13 +997,24 @@ fn setup_watcher(world: &mut World) {
 /// up widgets that live OUTSIDE `~/.jim/widgets` — symlinked-out panes
 /// like `gcr_*.ft`, which would otherwise never hot reload because the
 /// startup watcher only knew about the base dir.
+///
+/// Glaze stylesheets get the same treatment: a `.glz` loaded via
+/// `glaze_load_file` can live anywhere (`~/.jim/styles/`, a repo's
+/// `decks/`), so its directory is watched too — otherwise editing the
+/// sheet would be invisible until the `.ft` was touched.
 fn watch_widget_dirs(watcher: Option<Res<ScriptWatcher>>, widgets: Query<&ScriptWidget>) {
     let _t_prof = jim_pane::prof::sys_span("watch_widget_dirs");
     let Some(watcher) = watcher else { return };
-    for w in &widgets {
-        let Some(dir) = w.script_path.parent().map(|p| p.to_path_buf()) else {
-            continue;
-        };
+    let dirs = widgets.iter().flat_map(|w| {
+        [
+            Some(w.script_path.clone()),
+            w.handle.slots.glaze_sheet.path(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+    });
+    for dir in dirs {
         {
             let watched = watcher.watched.lock().expect("funct watched set poisoned");
             if watched.contains(&dir) {
@@ -1195,10 +1237,25 @@ fn poll_watcher(watcher: Option<Res<ScriptWatcher>>, mut widgets: Query<&mut Scr
         if unique.contains(&w.script_path) {
             // The widget's own script changed → full re-eval.
             w.reload_gen = w.reload_gen.wrapping_add(1);
+        } else if w
+            .handle
+            .slots
+            .glaze_sheet
+            .path()
+            .is_some_and(|p| unique.contains(&p))
+        {
+            // The widget's Glaze stylesheet changed. Re-eval it too: the
+            // sheet is compiled by a `glaze_load_file` call in the script's
+            // top-level body / `on_start`, so replaying the script is what
+            // recompiles it. Without this, editing a `.glz` would appear to
+            // do nothing until the `.ft` was also touched — the exact
+            // "zero reloaded lines" failure hot reload is meant to avoid.
+            w.reload_gen = w.reload_gen.wrapping_add(1);
         }
         // Hot-swap any changed imported module into this widget's VM.
         for name in &changed_modules {
-            w.handle.send(HostToWorker::ReloadModule { name: name.clone() });
+            w.handle
+                .send(HostToWorker::ReloadModule { name: name.clone() });
         }
     }
 }
@@ -1655,10 +1712,7 @@ fn forward_inputs_to_workers(
         // Store BEFORE the wake: the channel send/recv establishes the
         // happens-before that lets the worker's loop observe the fresh `true`.
         let is_hidden = matches!(vis, Some(Visibility::Hidden));
-        w.handle
-            .slots
-            .visible
-            .store(!is_hidden, Ordering::Release);
+        w.handle.slots.visible.store(!is_hidden, Ordering::Release);
         if !is_hidden && !w.was_visible {
             w.handle.send(HostToWorker::SetVisible { visible: true });
         }
@@ -1904,11 +1958,15 @@ fn apply_latest_frames(
                 let mut extent = 0.0_f32;
                 for it in &children {
                     let bottom = match it {
-                        CanvasItem::Rect { y, h, anchor, .. } => canvas_item_bottom(*y, *h, *anchor),
-                        CanvasItem::Sprite { y, h, anchor, .. } => canvas_item_bottom(*y, *h, *anchor),
-                        CanvasItem::Text { y, size, anchor, .. } => {
-                            canvas_item_bottom(*y, size.unwrap_or(14.0), *anchor)
+                        CanvasItem::Rect { y, h, anchor, .. } => {
+                            canvas_item_bottom(*y, *h, *anchor)
                         }
+                        CanvasItem::Sprite { y, h, anchor, .. } => {
+                            canvas_item_bottom(*y, *h, *anchor)
+                        }
+                        CanvasItem::Text {
+                            y, size, anchor, ..
+                        } => canvas_item_bottom(*y, size.unwrap_or(14.0), *anchor),
                     };
                     if bottom > extent {
                         extent = bottom;
@@ -2057,7 +2115,8 @@ fn apply_latest_frames(
                     w.canvas_region_prev.truncate(region_count);
                 }
                 while w.canvas_region_entities.len() < region_count {
-                    w.canvas_region_entities.push(std::collections::HashMap::new());
+                    w.canvas_region_entities
+                        .push(std::collections::HashMap::new());
                 }
                 while w.canvas_region_prev.len() < region_count {
                     w.canvas_region_prev.push(std::collections::HashMap::new());
@@ -2653,4 +2712,3 @@ fn diff_render(
         path: String::new(),
     };
 }
-

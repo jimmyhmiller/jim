@@ -69,27 +69,27 @@ pub mod prof;
 pub mod text_input;
 pub mod trace;
 
-pub use camera::{
-    pane_camera_setup_for, PaneCameraOf, PaneCameraSetup, PaneCanvasRegion,
-};
+pub use camera::{PaneCameraOf, PaneCameraSetup, PaneCanvasRegion, pane_camera_setup_for};
 pub use chrome_material::{
     ActiveChromeShader, AnimatedChromePane, ChromeAnimates, ChromeMaterialPlugin, ChromeParams,
     ChromeStyle, ChromeTextStyle, PaneChromeMaterial, PaneChromeShader, PaneChromeStyle,
     PaneShadowMaterial, ShadowParams,
 };
 pub use dock::{
-    create_dock, create_dock_template, create_template_skeleton, dock_co_members, Dock, DockMember,
-    DockNode, DockPlugin, DockTemplate, DropEdge, PendingDockLink, DOCK_KIND,
+    DOCK_KIND, Dock, DockMember, DockNode, DockPlugin, DockTemplate, DropEdge, PendingDockLink,
+    create_dock, create_dock_template, create_template_skeleton, dock_co_members,
 };
 pub use layers::{PaneLayer, PaneLayerAllocator};
+pub mod view;
+pub use view::{MAX_VIEW_DEPTH, ROOT_VIEW, View, ViewId, Views};
 
 use bevy::camera::CameraUpdateSystems;
 use bevy::camera::visibility::VisibilitySystems;
 use bevy::transform::TransformSystems;
 pub use text_input::{
-    col_at_x, click_to_caret, focus_text_input, spawn_text_input, spawn_text_input_multiline,
-    FocusedTextInput, TextInput, TextInputEvent, TextInputFocused, TextInputPlugin,
-    TextInputStyle, TextInputView,
+    FocusedTextInput, TextInput, TextInputEvent, TextInputFocused, TextInputPlugin, TextInputStyle,
+    TextInputView, click_to_caret, col_at_x, focus_text_input, spawn_text_input,
+    spawn_text_input_multiline,
 };
 
 pub const TITLE_H: f32 = 22.0;
@@ -269,6 +269,26 @@ pub struct PanePinned;
 /// projection for these, and the per-pane camera uses the rect as-is.
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct PaneScreenAnchored;
+
+/// Membership in a **named, independently-revealable group of panes**.
+///
+/// Absent = an ordinary pane, always visible in its project/canvas.
+/// Present = the pane only shows while its group name is revealed by the
+/// host (jim-app's `pane_groups::VisibleGroups`).
+///
+/// This is a THIRD visibility dimension alongside [`PaneProject`] and
+/// [`PaneCanvas`], and deliberately orthogonal to both: a group can be
+/// revealed without changing which project or nesting level you're on.
+/// That is what lets a presentation deck reveal a dashboard *over* the
+/// slide it's presenting from, instead of navigating away from it.
+///
+/// The panes are real, live, and already running — revealing a group is a
+/// visibility flip, not a spawn. So a terminal in a group keeps its shell,
+/// and a widget keeps its fetched data, between reveals.
+///
+/// Pane-bevy doesn't interpret the name; the host owns the reveal policy.
+#[derive(Component, Clone, Debug, PartialEq, Eq)]
+pub struct PaneGroup(pub String);
 
 /// Marker: this pane has its own zoom and captures trackpad pinch gestures
 /// while the cursor is over it. Canvas pinch-to-zoom skips a pinch when the
@@ -668,6 +688,11 @@ pub struct PaneSnapshot {
     /// Member slot (column order) within the dock; 0 for the container.
     #[serde(default)]
     pub dock_slot: usize,
+    /// Named pane group this pane belonged to (see [`PaneGroup`]), if
+    /// any. Persisted so a deck's dashboards are wired up once and
+    /// survive restarts — the reveal is then just a visibility flip.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 fn default_value_null() -> Value {
@@ -814,6 +839,7 @@ impl Plugin for PanePlugin {
             .init_resource::<PaneInputBlockZones>()
             .init_resource::<PaneCanvasRegion>()
             .init_resource::<PaneViewport>()
+            .init_resource::<view::Views>()
             .init_resource::<PaneZoom>()
             .init_resource::<PaneCursorOverride>()
             .init_resource::<ForceLocalSelect>()
@@ -852,10 +878,7 @@ impl Plugin for PanePlugin {
             // this frame, and after the previous frame's command buffers
             // have all applied. See [`PaneClosing`].
             .add_systems(First, finalize_closing_panes)
-            .add_systems(
-                PreUpdate,
-                camera::spawn_pane_cameras,
-            )
+            .add_systems(PreUpdate, camera::spawn_pane_cameras)
             // Propagation runs in PostUpdate, not PreUpdate, so
             // children spawned by kinds during Update (the widget-bevy
             // `rerender_widgets` system despawns + respawns its tree
@@ -878,8 +901,7 @@ impl Plugin for PanePlugin {
                 PostUpdate,
                 (
                     reset_input_consumed,
-                    camera::propagate_render_layers
-                        .before(VisibilitySystems::CheckVisibility),
+                    camera::propagate_render_layers.before(VisibilitySystems::CheckVisibility),
                     // Backstop: after the fast-path propagation, GUARANTEE
                     // no pane content is left on the global layer-0 camera
                     // (catches content that churns faster than propagation
@@ -921,7 +943,7 @@ struct LastHover {
 
 fn emit_pane_hover(
     windows: Query<&Window>,
-    viewport: Res<PaneViewport>,
+    views: Res<Views>,
     buttons: Res<ButtonInput<MouseButton>>,
     mode: Res<PaneMouseMode>,
     mut last: Local<LastHover>,
@@ -930,6 +952,7 @@ fn emit_pane_hover(
         (
             Entity,
             &PaneRect,
+            &PaneProject,
             Option<&Visibility>,
             Has<PanePinned>,
             Has<PaneScreenAnchored>,
@@ -967,7 +990,8 @@ fn emit_pane_hover(
         return; // cursor parked — no new event.
     }
     last.window_pt = pt;
-    let pt_canvas = viewport.window_to_canvas(pt);
+    let (view_id, pt_canvas) = views.resolve(pt);
+    let target_project = views.get(view_id).and_then(|v| v.project);
     // Mirror the press hit-test (`handle_pane_mouse`) so hover and click
     // route identically.
     //
@@ -979,10 +1003,12 @@ fn emit_pane_hover(
     // (entity, rect, anchored, title_h, resizable)
     let unpinned_rects: Vec<(Entity, PaneRect, bool, f32, bool)> = panes
         .iter()
-        .filter(|(_, _, vis, pinned, _, _, _)| {
-            !matches!(vis, Some(Visibility::Hidden)) && !pinned
+        .filter(|(_, _, project, vis, pinned, _, _, _)| {
+            target_project.is_none_or(|id| project.0 == id)
+                && !matches!(vis, Some(Visibility::Hidden))
+                && !pinned
         })
-        .map(|(e, r, _, _, anchored, ov, member)| {
+        .map(|(e, r, _, _, _, anchored, ov, member)| {
             (e, *r, anchored, override_title_h(ov), !member)
         })
         .collect();
@@ -1001,7 +1027,10 @@ fn emit_pane_hover(
         }
         best.and_then(|(e, r, anchored, title_h, resizable, _)| {
             let c = hit_cursor(anchored, pt, pt_canvas);
-            if matches!(region_at_ex(c, &r, title_h, resizable), Some(PaneRegion::Content)) {
+            if matches!(
+                region_at_ex(c, &r, title_h, resizable),
+                Some(PaneRegion::Content)
+            ) {
                 Some((e, pt_to_content_local_th(c, &r, title_h)))
             } else {
                 None
@@ -1015,17 +1044,25 @@ fn emit_pane_hover(
     // and the press path exactly).
     if target.is_none() {
         let mut best: Option<(Entity, f32, Vec2)> = None;
-        for (e, r, vis, pinned, anchored, ov, member) in panes.iter() {
+        for (e, r, project, vis, pinned, anchored, ov, member) in panes.iter() {
+            if target_project.is_some_and(|id| project.0 != id) {
+                continue;
+            }
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
                 continue;
             }
             let title_h = override_title_h(ov);
             let cur = hit_cursor(anchored, pt, pt_canvas);
-            if !matches!(region_at_ex(cur, r, title_h, !member), Some(PaneRegion::Content)) {
+            if !matches!(
+                region_at_ex(cur, r, title_h, !member),
+                Some(PaneRegion::Content)
+            ) {
                 continue;
             }
             let local = pt_to_content_local_th(cur, r, title_h);
-            let Ok(zones) = hot_zones.get(e) else { continue };
+            let Ok(zones) = hot_zones.get(e) else {
+                continue;
+            };
             if !zones.contains(local) {
                 continue;
             }
@@ -1081,12 +1118,13 @@ pub struct PaneCursorOverride(pub Option<bevy::window::SystemCursorIcon>);
 fn update_pane_cursor(
     mut commands: Commands,
     mode: Res<PaneMouseMode>,
-    viewport: Res<PaneViewport>,
+    views: Res<Views>,
     cursor_override: Res<PaneCursorOverride>,
     windows: Query<(Entity, &Window)>,
     panes: Query<
         (
             &PaneRect,
+            &PaneProject,
             Option<&Visibility>,
             Has<PanePinned>,
             Option<&PaneKindMarker>,
@@ -1106,7 +1144,9 @@ fn update_pane_cursor(
         // Drag in progress: leave the cursor alone — a grabbing cursor
         // over the title bar was distracting.
         PaneMouseMode::WindowDrag { .. } | PaneMouseMode::ContentDrag { .. } => {
-            commands.entity(win_entity).remove::<bevy::window::CursorIcon>();
+            commands
+                .entity(win_entity)
+                .remove::<bevy::window::CursorIcon>();
             return;
         }
         PaneMouseMode::Idle => {
@@ -1115,51 +1155,59 @@ fn update_pane_cursor(
             if let Some(over) = cursor_override.0 {
                 over
             } else {
-            let Some(pt) = window.cursor_position() else {
-                commands.entity(win_entity).remove::<bevy::window::CursorIcon>();
-                return;
-            };
-            let pt_canvas = viewport.window_to_canvas(pt);
-            let mut best: Option<(SystemCursorIcon, f32)> = None;
-            // Highest z whose BODY (title/content — not an edge) covers the
-            // point. A resize edge belonging to a pane underneath that is
-            // occluded here, so it must not draw a resize cursor through the
-            // pane (or widget) the user is actually hovering. We also remember
-            // whether that topmost body is an editor's content area, so we can
-            // show the I-beam (text) cursor there.
-            let mut covered: Option<(f32, bool)> = None;
-            for (rect, vis, pinned, kind, ov, member) in &panes {
-                if matches!(vis, Some(Visibility::Hidden)) || pinned {
-                    continue;
-                }
-                // Only resize edges get a special cursor. The title
-                // bar stays default — no hand / grab indicator there.
-                match region_at_ex(pt_canvas, rect, override_title_h(ov), !member) {
-                    Some(PaneRegion::ResizeEdge(e)) => {
-                        if best.map_or(true, |(_, z)| rect.z > z) {
-                            best = Some((cursor_for_edges(e), rect.z));
-                        }
-                    }
-                    Some(region) => {
-                        if covered.map_or(true, |(z, _)| rect.z > z) {
-                            let is_editor_content = matches!(region, PaneRegion::Content)
-                                && matches!(kind, Some(PaneKindMarker("editor")));
-                            covered = Some((rect.z, is_editor_content));
-                        }
-                    }
-                    None => {}
-                }
-            }
-            match best {
-                // A resize edge that isn't occluded by a higher pane body wins.
-                Some((i, z)) if covered.map_or(true, |(cz, _)| z >= cz) => i,
-                // Otherwise the topmost body decides: editor content → I-beam.
-                _ if matches!(covered, Some((_, true))) => SystemCursorIcon::Text,
-                _ => {
-                    commands.entity(win_entity).remove::<bevy::window::CursorIcon>();
+                let Some(pt) = window.cursor_position() else {
+                    commands
+                        .entity(win_entity)
+                        .remove::<bevy::window::CursorIcon>();
                     return;
+                };
+                let (view_id, pt_canvas) = views.resolve(pt);
+                let target_project = views.get(view_id).and_then(|v| v.project);
+                let mut best: Option<(SystemCursorIcon, f32)> = None;
+                // Highest z whose BODY (title/content — not an edge) covers the
+                // point. A resize edge belonging to a pane underneath that is
+                // occluded here, so it must not draw a resize cursor through the
+                // pane (or widget) the user is actually hovering. We also remember
+                // whether that topmost body is an editor's content area, so we can
+                // show the I-beam (text) cursor there.
+                let mut covered: Option<(f32, bool)> = None;
+                for (rect, project, vis, pinned, kind, ov, member) in &panes {
+                    if target_project.is_some_and(|id| project.0 != id) {
+                        continue;
+                    }
+                    if matches!(vis, Some(Visibility::Hidden)) || pinned {
+                        continue;
+                    }
+                    // Only resize edges get a special cursor. The title
+                    // bar stays default — no hand / grab indicator there.
+                    match region_at_ex(pt_canvas, rect, override_title_h(ov), !member) {
+                        Some(PaneRegion::ResizeEdge(e)) => {
+                            if best.map_or(true, |(_, z)| rect.z > z) {
+                                best = Some((cursor_for_edges(e), rect.z));
+                            }
+                        }
+                        Some(region) => {
+                            if covered.map_or(true, |(z, _)| rect.z > z) {
+                                let is_editor_content = matches!(region, PaneRegion::Content)
+                                    && matches!(kind, Some(PaneKindMarker("editor")));
+                                covered = Some((rect.z, is_editor_content));
+                            }
+                        }
+                        None => {}
+                    }
                 }
-            }
+                match best {
+                    // A resize edge that isn't occluded by a higher pane body wins.
+                    Some((i, z)) if covered.map_or(true, |(cz, _)| z >= cz) => i,
+                    // Otherwise the topmost body decides: editor content → I-beam.
+                    _ if matches!(covered, Some((_, true))) => SystemCursorIcon::Text,
+                    _ => {
+                        commands
+                            .entity(win_entity)
+                            .remove::<bevy::window::CursorIcon>();
+                        return;
+                    }
+                }
             }
         }
     };
@@ -1224,8 +1272,14 @@ fn sync_chrome_uniforms(
         Option<Ref<chrome_material::PaneChromeShader>>,
         Option<Ref<PaneChromeOverride>>,
     )>,
-    mut bgs: Query<(&MeshMaterial2d<PaneChromeMaterial>, &mut Transform), Without<MeshMaterial2d<PaneShadowMaterial>>>,
-    mut shadows: Query<(&MeshMaterial2d<PaneShadowMaterial>, &mut Transform), Without<MeshMaterial2d<PaneChromeMaterial>>>,
+    mut bgs: Query<
+        (&MeshMaterial2d<PaneChromeMaterial>, &mut Transform),
+        Without<MeshMaterial2d<PaneShadowMaterial>>,
+    >,
+    mut shadows: Query<
+        (&MeshMaterial2d<PaneShadowMaterial>, &mut Transform),
+        Without<MeshMaterial2d<PaneChromeMaterial>>,
+    >,
     focused: Res<FocusedPane>,
     global_style: Res<chrome_material::ChromeStyle>,
     active_shader: Res<ActiveChromeShader>,
@@ -1250,8 +1304,10 @@ fn sync_chrome_uniforms(
             global_changed
         };
         // Per-pane fragment shader (its project's preset) if present.
-        let frag: &Handle<Shader> =
-            pane_shader.as_ref().map(|s| &s.0).unwrap_or(&active_shader.0);
+        let frag: &Handle<Shader> = pane_shader
+            .as_ref()
+            .map(|s| &s.0)
+            .unwrap_or(&active_shader.0);
         let frag_changed = if pane_shader.is_some() {
             pane_shader.as_ref().is_some_and(|s| s.is_changed()) || shader_changed
         } else {
@@ -1367,7 +1423,10 @@ pub fn spawn_pane(
     // frame. Without this, the pane spawns at (0,0,0); children render
     // there for one frame and then jump to the real position once
     // `position_panes` runs and transform propagation catches up.
-    let viewport: PaneViewport = world.get_resource::<PaneViewport>().copied().unwrap_or_default();
+    let viewport: PaneViewport = world
+        .get_resource::<PaneViewport>()
+        .copied()
+        .unwrap_or_default();
     let initial_translation = world
         .query::<&Window>()
         .iter(world)
@@ -1406,9 +1465,7 @@ pub fn spawn_pane(
     // unit square at (size/2, -size/2) to put its top-left at the
     // pane's origin. `sync_chrome_uniforms` keeps transform and
     // `params.size` in sync with PaneRect.
-    let style = world
-        .resource::<chrome_material::ChromeStyle>()
-        .clone();
+    let style = world.resource::<chrome_material::ChromeStyle>().clone();
     let initial_params = style.params_for(rect.size, false);
     let shadow_params = style.shadow_params_for(rect.size);
     let active_shader = world.resource::<ActiveChromeShader>().0.clone();
@@ -1434,33 +1491,26 @@ pub fn spawn_pane(
         ))
         .id();
 
-    // Drop shadow: same unit mesh + scale-via-transform trick, but
-    // sized to pane + 2×blur on each side and explicitly stamped onto
-    // layer 0 so the main camera renders it (no per-pane viewport
-    // clip). Local z is just below the bg's so the chrome sits in
-    // front in the unusual case the same camera ever sees both.
-    let shadow_material_handle = world
-        .resource_mut::<Assets<PaneShadowMaterial>>()
-        .add(PaneShadowMaterial { params: shadow_params });
+    // Drop shadow: same unit mesh + scale-via-transform trick. It shares
+    // the pane's render layer so additional live-view cameras can draw a
+    // foreign project's pane without leaking its shadow through layer 0
+    // onto the root canvas.
+    let shadow_material_handle =
+        world
+            .resource_mut::<Assets<PaneShadowMaterial>>()
+            .add(PaneShadowMaterial {
+                params: shadow_params,
+            });
     let shadow = world
         .spawn((
             ChildOf(pane),
             Mesh2d(unit_mesh.clone()),
             MeshMaterial2d(shadow_material_handle),
             Transform {
-                translation: Vec3::new(
-                    rect.size.x * 0.5,
-                    -rect.size.y * 0.5,
-                    -0.05,
-                ),
-                scale: Vec3::new(
-                    shadow_params.mesh_size.x,
-                    shadow_params.mesh_size.y,
-                    1.0,
-                ),
+                translation: Vec3::new(rect.size.x * 0.5, -rect.size.y * 0.5, -0.05),
+                scale: Vec3::new(shadow_params.mesh_size.x, shadow_params.mesh_size.y, 1.0),
                 ..default()
             },
-            bevy::camera::visibility::RenderLayers::layer(0),
         ))
         .id();
 
@@ -1484,23 +1534,20 @@ pub fn spawn_pane(
         .resource::<AssetServer>()
         .load::<Shader>("embedded://jim_pane/chrome_material.wgsl");
     let cover_params = style.params_for_title_cover(rect.size, false, TITLE_H);
-    let cover_material = world
-        .resource_mut::<Assets<PaneChromeMaterial>>()
-        .add(PaneChromeMaterial {
-            params: cover_params,
-            fragment: default_chrome_shader,
-        });
+    let cover_material =
+        world
+            .resource_mut::<Assets<PaneChromeMaterial>>()
+            .add(PaneChromeMaterial {
+                params: cover_params,
+                fragment: default_chrome_shader,
+            });
     let title_cover = world
         .spawn((
             ChildOf(pane),
             Mesh2d(unit_mesh),
             MeshMaterial2d(cover_material),
             Transform {
-                translation: Vec3::new(
-                    rect.size.x * 0.5,
-                    -rect.size.y * 0.5,
-                    0.25,
-                ),
+                translation: Vec3::new(rect.size.x * 0.5, -rect.size.y * 0.5, 0.25),
                 scale: Vec3::new(rect.size.x.max(1.0), rect.size.y.max(1.0), 1.0),
                 ..default()
             },
@@ -1587,15 +1634,13 @@ pub fn spawn_pane(
     // viewport (bg included) draws over the lower-z pane's content
     // — that's what stops one pane's text from bleeding through
     // another pane that's stacked on top of it.
-    let layer_id = world
-        .resource_mut::<PaneLayerAllocator>()
-        .allocate();
+    let layer_id = world.resource_mut::<PaneLayerAllocator>().allocate();
     // `from_layers` (growable), NOT the `layer()` const constructor: the
     // latter asserts `id < 64` (one inline u64 block), so once enough panes
     // exist for the allocator to hand out an id ≥ 64 it panics. `from_layers`
     // grows the bitset instead, giving effectively unbounded pane layers.
     let pane_layer_component = bevy::camera::visibility::RenderLayers::from_layers(&[layer_id]);
-    for chrome_entity in [bg, title_bar, title_text, title_cover, close_button] {
+    for chrome_entity in [bg, shadow, title_bar, title_text, title_cover, close_button] {
         world
             .entity_mut(chrome_entity)
             .insert(pane_layer_component.clone());
@@ -1719,11 +1764,7 @@ pub fn region_at_ex(
 /// stays clickable regardless of canvas pan/zoom.
 #[inline]
 pub fn hit_cursor(anchored: bool, window_pt: Vec2, canvas_pt: Vec2) -> Vec2 {
-    if anchored {
-        window_pt
-    } else {
-        canvas_pt
-    }
+    if anchored { window_pt } else { canvas_pt }
 }
 
 pub fn topmost_pane_at(pt: Vec2, panes: &[(Entity, PaneRect)]) -> Option<Entity> {
@@ -1850,13 +1891,10 @@ impl<'w, 's> DoublePress<'w, 's> {
 /// query, so there's no access conflict.
 #[derive(bevy::ecs::system::SystemParam)]
 struct PaneMouseAux<'w, 's> {
-    chrome_ov: Query<
-        'w,
-        's,
-        (Option<&'static PaneChromeOverride>, Has<dock::DockMember>),
-        With<PaneTag>,
-    >,
+    chrome_ov:
+        Query<'w, 's, (Option<&'static PaneChromeOverride>, Has<dock::DockMember>), With<PaneTag>>,
     hot_zones: Query<'w, 's, &'static PaneHotZones>,
+    projects: Query<'w, 's, &'static PaneProject, With<PaneTag>>,
     /// "Hold Fn to select locally" modifier (see [`ForceLocalSelect`]);
     /// packed here to keep `handle_pane_mouse` under the 16-arg ceiling.
     force_local: Res<'w, ForceLocalSelect>,
@@ -1866,7 +1904,7 @@ fn handle_pane_mouse(
     windows: Query<&Window>,
     buttons: Res<ButtonInput<MouseButton>>,
     mods: Res<ButtonInput<KeyCode>>,
-    viewport: Res<PaneViewport>,
+    views: Res<Views>,
     suppressed: Res<PaneInputSuppressed>,
     mut consumed: ResMut<InputConsumed>,
     mut mode: ResMut<PaneMouseMode>,
@@ -1907,14 +1945,13 @@ fn handle_pane_mouse(
     };
     // PaneRect now lives in canvas-units. Convert cursor to the same
     // frame once; every hit-test below operates in canvas-space.
-    let pt_canvas = viewport.window_to_canvas(pt);
+    let (view_id, pt_canvas) = views.resolve(pt);
+    let target_project = views.get(view_id).and_then(|v| v.project);
 
     // A press may start a drag or a double-click; either way its
     // consequences want the following frame to run. An in-progress drag
     // wants every frame (smooth even while the cursor is held still).
-    if buttons.just_pressed(MouseButton::Left)
-        || !matches!(*mode, PaneMouseMode::Idle)
-    {
+    if buttons.just_pressed(MouseButton::Left) || !matches!(*mode, PaneMouseMode::Idle) {
         dbl.request_redraw();
     }
 
@@ -2003,9 +2040,9 @@ fn handle_pane_mouse(
             // registered hot-zones (a button, link, input) belongs to
             // the widget, not the canvas, so don't count it.
             let on_click_target = matches!(region, Some(PaneRegion::Content))
-                && hot_zones
-                    .get(target)
-                    .map_or(false, |z| z.contains(pt_to_content_local_th(cur, &rect, title_h)));
+                && hot_zones.get(target).map_or(false, |z| {
+                    z.contains(pt_to_content_local_th(cur, &rect, title_h))
+                });
             if region.is_some() && !on_click_target {
                 dbl.note(target, pt);
             }
@@ -2040,8 +2077,8 @@ fn handle_pane_mouse(
                     focused.0 = Some(target);
                     consumed.0 = true;
                     bring_to_front(target, &mut panes);
-                    let shift = mods.pressed(KeyCode::ShiftLeft)
-                        || mods.pressed(KeyCode::ShiftRight);
+                    let shift =
+                        mods.pressed(KeyCode::ShiftLeft) || mods.pressed(KeyCode::ShiftRight);
                     content_press.write(PaneContentPressed {
                         pane: target,
                         window_pt: pt,
@@ -2072,6 +2109,9 @@ fn handle_pane_mouse(
         // works even while the tile is pinned to the background.
         let mut best_dclick: Option<(Entity, f32)> = None;
         for (e, r, vis, pinned, anchored) in panes.iter() {
+            if target_project.is_some_and(|id| aux.projects.get(e).is_ok_and(|p| p.0 != id)) {
+                continue;
+            }
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
                 continue;
             }
@@ -2085,7 +2125,9 @@ fn handle_pane_mouse(
                 best_dclick = Some((e, r.z));
             }
             let local = pt_to_content_local(cur, &r);
-            let Ok(zones) = hot_zones.get(e) else { continue };
+            let Ok(zones) = hot_zones.get(e) else {
+                continue;
+            };
             if !zones.contains(local) {
                 continue;
             }
@@ -2674,9 +2716,7 @@ fn enforce_pane_content_bounds(
                     height: None,
                 };
                 if let Ok(mut existing) = bounds_q.get_mut(entity) {
-                    if existing.width != new_bounds.width
-                        || existing.height != new_bounds.height
-                    {
+                    if existing.width != new_bounds.width || existing.height != new_bounds.height {
                         *existing = new_bounds;
                     }
                 } else {

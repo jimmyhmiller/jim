@@ -57,6 +57,7 @@ pub mod anim;
 pub mod audio;
 pub mod button_material;
 pub mod funct_widget;
+pub(crate) mod glaze_host;
 pub mod glaze_material;
 pub mod glaze_style;
 pub mod layout;
@@ -670,7 +671,12 @@ fn char_index_at_x(
 /// doesn't trail a highlighted space) — but it still lives in `text`, so a
 /// selection's `[a, b)` copy range stays exact across the break. Hard `\n`
 /// breaks are honored.
-fn wrap_lines(text: &str, max_w: f32, font_size: f32, metrics: &PaneFontMetrics) -> Vec<(usize, usize)> {
+fn wrap_lines(
+    text: &str,
+    max_w: f32,
+    font_size: f32,
+    metrics: &PaneFontMetrics,
+) -> Vec<(usize, usize)> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     if n == 0 {
@@ -838,7 +844,9 @@ fn begin_slider_drag(
     )>,
 ) {
     for ev in presses.read() {
-        let Ok(kind) = kinds.get(ev.pane) else { continue };
+        let Ok(kind) = kinds.get(ev.pane) else {
+            continue;
+        };
         if kind.0 != PANE_KIND {
             continue;
         }
@@ -957,7 +965,8 @@ fn render_select_overlay(
     let to_world = |p: Vec2| Vec2::new(p.x - win_w * 0.5, win_h * 0.5 - p.y);
 
     // content-local (unscrolled) → visual canvas → window.
-    let content_origin = rect.pos + Vec2::new(jim_pane::MARGIN, jim_pane::TITLE_H + jim_pane::MARGIN);
+    let content_origin =
+        rect.pos + Vec2::new(jim_pane::MARGIN, jim_pane::TITLE_H + jim_pane::MARGIN);
     let local_to_window = |local: Vec2| {
         viewport.canvas_to_window(content_origin + Vec2::new(local.x, local.y - scroll_y))
     };
@@ -967,7 +976,8 @@ fn render_select_overlay(
     hits.trigger_rect = Rect::from_corners(tr_min, tr_max);
 
     // Menu anchor: just below the trigger.
-    let menu_top_window = local_to_window(Vec2::new(target.anchor.min.x, target.anchor.max.y + 4.0));
+    let menu_top_window =
+        local_to_window(Vec2::new(target.anchor.min.x, target.anchor.max.y + 4.0));
     let anchor_world = to_world(menu_top_window);
 
     let pad = render::SELECT_MENU_PAD;
@@ -1006,7 +1016,14 @@ fn render_select_overlay(
 
     // Menu panel: `menu` slot plan, else a default surface + border.
     if let Some(plan) = target.style.as_ref().and_then(|s| s.menu.as_ref()) {
-        render::paint_style_background(&mut commands, &octx, Some(plan), Vec2::ZERO, Vec2::new(menu_w, menu_h), 0.0);
+        render::paint_style_background(
+            &mut commands,
+            &octx,
+            Some(plan),
+            Vec2::ZERO,
+            Vec2::new(menu_w, menu_h),
+            0.0,
+        );
     } else {
         render::paint_rounded_panel(
             &mut commands,
@@ -1049,7 +1066,14 @@ fn render_select_overlay(
             target.style.as_ref().and_then(|s| s.item.as_ref())
         };
         if let Some(plan) = plan {
-            render::paint_style_background(&mut commands, &octx, Some(plan), item_origin, item_size, 0.01);
+            render::paint_style_background(
+                &mut commands,
+                &octx,
+                Some(plan),
+                item_origin,
+                item_size,
+                0.01,
+            );
         } else if is_sel {
             render::paint_rounded_panel(
                 &mut commands,
@@ -1175,7 +1199,10 @@ fn handle_overlay_input(
     windows: Query<&Window>,
     hits: Res<SelectMenuHits>,
     mut open: ResMut<WidgetOpenSelect>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
+    widgets: Query<(
+        Option<&WidgetIO>,
+        Option<&crate::script_widget::ScriptWidget>,
+    )>,
 ) {
     if open.0.is_none() {
         return;
@@ -1251,7 +1278,11 @@ fn click_to_host_event(kind: &ClickKind, id: &str) -> Option<HostEvent> {
     })
 }
 
-fn send_host_event(io: Option<&WidgetIO>, sw: Option<&crate::script_widget::ScriptWidget>, evt: &HostEvent) {
+fn send_host_event(
+    io: Option<&WidgetIO>,
+    sw: Option<&crate::script_widget::ScriptWidget>,
+    evt: &HostEvent,
+) {
     if let Some(io) = io {
         if let Ok(json) = serde_json::to_string(evt) {
             let _ = io.tx.send(json);
@@ -1425,7 +1456,14 @@ fn render_dialog_overlay(
 
     // Panel background (behind the content, z 0.0 within the root).
     if let Some(plan) = dialog.style.as_ref().and_then(|s| s.panel.as_ref()) {
-        render::paint_style_background(&mut commands, &pctx, Some(plan), Vec2::ZERO, Vec2::new(panel_w, panel_h), 0.0);
+        render::paint_style_background(
+            &mut commands,
+            &pctx,
+            Some(plan),
+            Vec2::ZERO,
+            Vec2::new(panel_w, panel_h),
+            0.0,
+        );
     } else {
         render::paint_rounded_panel(
             &mut commands,
@@ -1456,7 +1494,10 @@ fn render_dialog_overlay(
             id: ct.id.clone(),
         });
     }
-    hits.panel_rect = Rect::from_corners(panel_tl_window, panel_tl_window + Vec2::new(panel_w, panel_h));
+    hits.panel_rect = Rect::from_corners(
+        panel_tl_window,
+        panel_tl_window + Vec2::new(panel_w, panel_h),
+    );
     hits.dialog_id = dialog.id.clone();
     hits.pane = Some(pane);
 }
@@ -1468,7 +1509,10 @@ fn handle_dialog_input(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&Window>,
     hits: Res<WidgetOverlayHits>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
+    widgets: Query<(
+        Option<&WidgetIO>,
+        Option<&crate::script_widget::ScriptWidget>,
+    )>,
 ) {
     if hits.dialog_id.is_empty() {
         return;
@@ -1480,7 +1524,13 @@ fn handle_dialog_input(
         return;
     };
     if keys.just_pressed(KeyCode::Escape) {
-        send_host_event(io, sw, &HostEvent::DialogClose { id: hits.dialog_id.clone() });
+        send_host_event(
+            io,
+            sw,
+            &HostEvent::DialogClose {
+                id: hits.dialog_id.clone(),
+            },
+        );
         return;
     }
     if !buttons.just_pressed(bevy::input::mouse::MouseButton::Left) {
@@ -1497,7 +1547,13 @@ fn handle_dialog_input(
             send_host_event(io, sw, &evt);
         }
     } else if !hits.panel_rect.contains(pt) {
-        send_host_event(io, sw, &HostEvent::DialogClose { id: hits.dialog_id.clone() });
+        send_host_event(
+            io,
+            sw,
+            &HostEvent::DialogClose {
+                id: hits.dialog_id.clone(),
+            },
+        );
     }
 }
 
@@ -1560,8 +1616,10 @@ fn render_popover_overlay(
         rect.pos + Vec2::new(jim_pane::MARGIN, jim_pane::TITLE_H + jim_pane::MARGIN);
     let local_to_window =
         |l: Vec2| viewport.canvas_to_window(content_origin + Vec2::new(l.x, l.y - scroll_y));
-    hits.trigger_rect =
-        Rect::from_corners(local_to_window(target.anchor.min), local_to_window(target.anchor.max));
+    hits.trigger_rect = Rect::from_corners(
+        local_to_window(target.anchor.min),
+        local_to_window(target.anchor.max),
+    );
     let surface_top_window =
         local_to_window(Vec2::new(target.anchor.min.x, target.anchor.max.y + 4.0));
     let anchor_world = to_world(surface_top_window);
@@ -1608,7 +1666,14 @@ fn render_popover_overlay(
     );
     let surf_h = consumed.y + 2.0 * pad;
     if let Some(plan) = target.style.as_ref().and_then(|s| s.surface.as_ref()) {
-        render::paint_style_background(&mut commands, &pctx, Some(plan), Vec2::ZERO, Vec2::new(width, surf_h), 0.0);
+        render::paint_style_background(
+            &mut commands,
+            &pctx,
+            Some(plan),
+            Vec2::ZERO,
+            Vec2::new(width, surf_h),
+            0.0,
+        );
     } else {
         render::paint_rounded_panel(
             &mut commands,
@@ -1637,8 +1702,10 @@ fn render_popover_overlay(
             id: ct.id.clone(),
         });
     }
-    hits.surface_rect =
-        Rect::from_corners(surface_top_window, surface_top_window + Vec2::new(width, surf_h));
+    hits.surface_rect = Rect::from_corners(
+        surface_top_window,
+        surface_top_window + Vec2::new(width, surf_h),
+    );
     hits.popover_id = op.id.clone();
     hits.pane = Some(op.pane);
 }
@@ -1651,7 +1718,10 @@ fn handle_popover_input(
     windows: Query<&Window>,
     hits: Res<PopoverHits>,
     mut open: ResMut<WidgetOpenPopover>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
+    widgets: Query<(
+        Option<&WidgetIO>,
+        Option<&crate::script_widget::ScriptWidget>,
+    )>,
 ) {
     if open.0.is_none() {
         return;
@@ -1700,7 +1770,10 @@ fn render_toast_overlay(
     existing: Query<Entity, With<WidgetToastRoot>>,
     mut hits: ResMut<ToastHits>,
     time: Res<bevy::time::Time>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
+    widgets: Query<(
+        Option<&WidgetIO>,
+        Option<&crate::script_widget::ScriptWidget>,
+    )>,
     // (first_seen, dismiss_sent) per live toast — drives TTL auto-dismiss
     mut ages: Local<std::collections::HashMap<(Entity, String), (f32, bool)>>,
 ) {
@@ -1726,14 +1799,22 @@ fn render_toast_overlay(
     // TTL: expired toasts stop rendering immediately and the owner is told
     // once (so its state catches up; a dead worker's toast still disappears).
     toasts.retain(|(pane, toast)| {
-        let entry = ages.entry((*pane, toast.id.clone())).or_insert((now, false));
+        let entry = ages
+            .entry((*pane, toast.id.clone()))
+            .or_insert((now, false));
         if now - entry.0 <= TOAST_TTL_SECS {
             return true;
         }
         if !entry.1 {
             entry.1 = true;
             if let Ok((io, sw)) = widgets.get(*pane) {
-                send_host_event(io, sw, &HostEvent::ToastDismiss { id: toast.id.clone() });
+                send_host_event(
+                    io,
+                    sw,
+                    &HostEvent::ToastDismiss {
+                        id: toast.id.clone(),
+                    },
+                );
             }
         }
         false
@@ -1801,7 +1882,14 @@ fn render_toast_overlay(
             anim: Default::default(),
         };
         if let Some(plan) = toast.style.as_ref().and_then(|s| s.surface.as_ref()) {
-            render::paint_style_background(&mut commands, &octx, Some(plan), Vec2::ZERO, Vec2::new(toast_w, th), 0.0);
+            render::paint_style_background(
+                &mut commands,
+                &octx,
+                Some(plan),
+                Vec2::ZERO,
+                Vec2::new(toast_w, th),
+                0.0,
+            );
         } else {
             render::paint_rounded_panel(
                 &mut commands,
@@ -1924,7 +2012,10 @@ fn handle_toast_input(
     buttons: Res<ButtonInput<bevy::input::mouse::MouseButton>>,
     windows: Query<&Window>,
     hits: Res<ToastHits>,
-    widgets: Query<(Option<&WidgetIO>, Option<&crate::script_widget::ScriptWidget>)>,
+    widgets: Query<(
+        Option<&WidgetIO>,
+        Option<&crate::script_widget::ScriptWidget>,
+    )>,
 ) {
     if hits.items.is_empty() || !buttons.just_pressed(bevy::input::mouse::MouseButton::Left) {
         return;
@@ -2065,7 +2156,14 @@ fn render_tooltip_overlay(
         anim: Default::default(),
     };
     if let Some(plan) = tip.style.as_ref().and_then(|s| s.bubble.as_ref()) {
-        render::paint_style_background(&mut commands, &octx, Some(plan), Vec2::ZERO, Vec2::new(bubble_w, bubble_h), 0.0);
+        render::paint_style_background(
+            &mut commands,
+            &octx,
+            Some(plan),
+            Vec2::ZERO,
+            Vec2::new(bubble_w, bubble_h),
+            0.0,
+        );
     } else {
         render::paint_rounded_panel(
             &mut commands,
@@ -2296,8 +2394,7 @@ impl Plugin for WidgetPlugin {
             // glyph into fallback spans, before text is laid out.
             .add_systems(
                 PostUpdate,
-                text_fallback::apply_text_fallback
-                    .before(bevy::text::Text2dUpdateSystems),
+                text_fallback::apply_text_fallback.before(bevy::text::Text2dUpdateSystems),
             );
     }
 }
@@ -2407,9 +2504,8 @@ fn update_widget_hover(
                     .map(|t| t.hover_washes.iter().any(|w| w.id == id))
                     .unwrap_or(false)
             };
-            let nonwash_clickable = |id: &Option<String>| -> bool {
-                matches!(id, Some(s) if !is_wash(s))
-            };
+            let nonwash_clickable =
+                |id: &Option<String>| -> bool { matches!(id, Some(s) if !is_wash(s)) };
             let needs_render = nonwash_clickable(&old_id) || nonwash_clickable(&new_id);
 
             // Move the persistent wash overlay to the newly-hovered row (or
@@ -2440,9 +2536,9 @@ fn update_widget_hover(
                     // leaks onto the main camera for a frame before
                     // `propagate_render_layers` catches it.
                     if let Ok(layer) = pane_layers.get(pane) {
-                        commands
-                            .entity(ent)
-                            .insert(bevy::camera::visibility::RenderLayers::from_layers(&[layer.0]));
+                        commands.entity(ent).insert(
+                            bevy::camera::visibility::RenderLayers::from_layers(&[layer.0]),
+                        );
                     }
                     hover.hover_overlay = Some(ent);
                 }
@@ -2498,7 +2594,9 @@ fn forward_pinch_to_widgets(
         return;
     }
     let Ok(win) = windows.single() else { return };
-    let Some(pt) = win.cursor_position() else { return };
+    let Some(pt) = win.cursor_position() else {
+        return;
+    };
     let candidates: Vec<(Entity, jim_pane::PaneRect)> = all_panes
         .iter()
         .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
@@ -2577,8 +2675,7 @@ fn handle_widget_wheel(
         .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
         .map(|(e, r, _)| (e, *r))
         .collect();
-    let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &candidates)
-    else {
+    let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &candidates) else {
         return;
     };
 
@@ -2799,10 +2896,7 @@ fn clip_widget_sprites(
         if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             continue;
         }
-        let Some(root) = wcr
-            .map(|w| w.0)
-            .or_else(|| chrome.map(|c| c.content_root))
-        else {
+        let Some(root) = wcr.map(|w| w.0).or_else(|| chrome.map(|c| c.content_root)) else {
             continue;
         };
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
@@ -2882,10 +2976,18 @@ fn clip_widget_sprites(
                     let anchor_y = anchors.get(entity).map(|a| a.as_vec().y).unwrap_or(0.0);
                     let new_h = if anchor_y < 0.0 {
                         // bottom-anchored: grows up from eff_top toward 0.
-                        if eff_top <= 0.0 { 0.0 } else { want.y.min(eff_top) }
+                        if eff_top <= 0.0 {
+                            0.0
+                        } else {
+                            want.y.min(eff_top)
+                        }
                     } else if anchor_y > 0.0 {
                         // top-anchored: grows down from eff_top.
-                        if eff_top + want.y <= 0.0 { 0.0 } else { want.y.min(avail_h) }
+                        if eff_top + want.y <= 0.0 {
+                            0.0
+                        } else {
+                            want.y.min(avail_h)
+                        }
                     } else {
                         // center-anchored: grows both ways, so the limit is
                         // twice the distance to the nearer content edge.
@@ -3942,7 +4044,6 @@ fn handle_widget_press(
         // Empty-space press on an unpinned widget: nothing to do.
     }
 }
-
 
 fn poll_widget_children(
     mut commands: Commands,

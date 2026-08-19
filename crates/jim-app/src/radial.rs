@@ -257,12 +257,12 @@ pub fn radial_open_close(
     buttons: Res<ButtonInput<MouseButton>>,
     mut keys: MessageReader<KeyboardInput>,
     sidebar: Res<Sidebar>,
-    viewport: Res<jim_pane::PaneViewport>,
+    views: Res<jim_pane::Views>,
     mut menu: ResMut<RadialMenu>,
     mut consumed: ResMut<InputConsumed>,
     registry: Res<ActionRegistry>,
     mut invocations: ResMut<ActionInvocations>,
-    panes: Query<(Entity, &PaneRect, &Visibility), With<PaneTag>>,
+    panes: Query<(Entity, &PaneRect, &jim_pane::PaneProject, &Visibility), With<PaneTag>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -303,10 +303,13 @@ pub fn radial_open_close(
         // cursor through the viewport before the hit-test.
         let visible_rects: Vec<(Entity, PaneRect)> = panes
             .iter()
-            .filter(|(_, _, vis)| !matches!(vis, Visibility::Hidden))
-            .map(|(e, r, _)| (e, *r))
+            .filter(|(_, _, project, vis)| {
+                views.project_at(pt).is_none_or(|id| project.0 == id)
+                    && !matches!(vis, Visibility::Hidden)
+            })
+            .map(|(e, r, _, _)| (e, *r))
             .collect();
-        if topmost_pane_at(viewport.window_to_canvas(pt), &visible_rects).is_some() {
+        if topmost_pane_at(views.resolve(pt).1, &visible_rects).is_some() {
             return;
         }
         menu.center = Some(pt);

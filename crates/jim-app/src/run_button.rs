@@ -1468,9 +1468,18 @@ fn scroll_run_button_output(
     mut wheel: MessageReader<MouseWheel>,
     mut accum: Local<f32>,
     windows: Query<&Window>,
-    viewport: Res<jim_pane::PaneViewport>,
+    views: Res<jim_pane::Views>,
     keys: Res<ButtonInput<KeyCode>>,
-    panes_q: Query<(Entity, &PaneRect, Option<&Visibility>, &PaneKindMarker), With<PaneTag>>,
+    panes_q: Query<
+        (
+            Entity,
+            &PaneRect,
+            &jim_pane::PaneProject,
+            Option<&Visibility>,
+            &PaneKindMarker,
+        ),
+        With<PaneTag>,
+    >,
     mut rbs: Query<&mut RunButton>,
 ) {
     // Cmd+scroll is canvas pan, not pane scroll.
@@ -1506,11 +1515,14 @@ fn scroll_run_button_output(
 
     let visible_rects: Vec<(Entity, PaneRect)> = panes_q
         .iter()
-        .filter(|(_, _, vis, kind)| kind.0 == PANE_KIND && !matches!(vis, Some(Visibility::Hidden)))
-        .map(|(e, r, _, _)| (e, *r))
+        .filter(|(_, _, project, vis, kind)| {
+            kind.0 == PANE_KIND
+                && views.project_at(pt).is_none_or(|id| project.0 == id)
+                && !matches!(vis, Some(Visibility::Hidden))
+        })
+        .map(|(e, r, _, _, _)| (e, *r))
         .collect();
-    let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &visible_rects)
-    else {
+    let Some(target) = jim_pane::topmost_pane_at(views.resolve(pt).1, &visible_rects) else {
         return;
     };
     let target_rect = visible_rects

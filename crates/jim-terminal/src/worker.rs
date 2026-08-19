@@ -26,8 +26,8 @@ use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -40,11 +40,27 @@ use libghostty_vt::{
 };
 use nix::errno::Errno;
 use nix::fcntl::{self, OFlag};
-use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::daemon_client::DaemonClient;
 
 // ---------- Process-global wake throttle ----------
+
+/// How many consecutive failed reattach attempts before a worker stops
+/// trying and declares its pane dead. With the backoff in the reconnect
+/// block (250 ms × 20, then 2 s) this is a bit over two minutes of
+/// trying — long enough to ride out a daemon that's briefly wedged,
+/// short enough that a genuinely dead session doesn't retry forever.
+const RECONNECT_MAX_FAILURES: u32 = 80;
+
+/// Two successful reattaches closer together than this count as churn.
+/// The daemon accepts clients last-wins, so if two panes are ever bound
+/// to one `session_id` they kick each other and both reconnect forever,
+/// replaying the daemon's whole buffer every cycle. We can't fix the
+/// duplicate from here, but we can refuse to spin on it.
+const REATTACH_CHURN_WINDOW: Duration = Duration::from_secs(5);
+/// Consecutive churning reattaches before we start throttling.
+const REATTACH_CHURN_LIMIT: u32 = 3;
 
 /// Maximum rate at which any worker may wake the Bevy event loop. We
 /// share this across every terminal worker so N busy terminals can't
@@ -242,7 +258,11 @@ pub enum WorkerMsg {
     ///     keys (xterm alternate-scroll), honoring application-cursor
     ///     mode (DECCKM);
     ///   - otherwise → scroll libghostty's local scrollback viewport.
-    Wheel { lines: isize, col: u16, row: u16 },
+    Wheel {
+        lines: isize,
+        col: u16,
+        row: u16,
+    },
     /// A mouse button/motion event to report to the child. Only acted on
     /// when the VT currently has a mouse tracking mode active; the worker
     /// asks libghostty's mouse encoder to turn it into the right escape
@@ -507,12 +527,8 @@ fn worker_loop(
         width: initial_size.cell_width_px as u32,
         height: initial_size.cell_height_px as u32,
     };
-    let (mut terminal, pty_response) = vt::build_terminal(
-        initial_size.cols,
-        initial_size.rows,
-        scrollback,
-        cell_px,
-    );
+    let (mut terminal, pty_response) =
+        vt::build_terminal(initial_size.cols, initial_size.rows, scrollback, cell_px);
 
     // Shared flag: are we currently feeding replay bytes into the VT?
     // BEL bytes from past sessions show up during disk-replay (line
@@ -625,9 +641,28 @@ fn worker_loop(
     // Starts true on attach because if the daemon's still serving, the
     // child is presumed alive — we'll get notified if it isn't.
     let mut child_alive = true;
-    // Set when the daemon socket closes — we publish a final snapshot
-    // and then idle waiting for Shutdown from the main thread.
+    // Set when the daemon socket closes. We publish a snapshot and then
+    // try to reattach (see the reconnect block at the bottom of the
+    // loop); only a child that actually exited makes this terminal.
     let mut daemon_gone = false;
+    // True once the daemon has told us the child exited. Distinct from
+    // `daemon_gone`: a closed socket alone does NOT mean the session is
+    // over, and reconnecting to a still-live daemon is how a pane
+    // recovers. Only this flag makes the pane permanently dead.
+    let mut child_exited_reported = false;
+    // Consecutive failed reattach attempts, for backoff + giving up.
+    let mut reconnect_failures: u32 = 0;
+    // When we last successfully reattached, and how many of those came
+    // back-to-back — see REATTACH_CHURN_WINDOW.
+    let mut last_reattach: Option<Instant> = None;
+    let mut reattach_churn: u32 = 0;
+
+    // Set when a publish was skipped because the renderer held the
+    // snapshot mutex. Carried across ticks so an output burst that ends
+    // on a contended tick still repaints instead of sitting stale, and
+    // so the `force` flag of the skipped publish isn't lost.
+    let mut publish_pending = false;
+    let mut publish_pending_force = false;
 
     // libghostty's mouse encoder + a reusable event, created once and
     // kept on this thread (both are `!Send`). The encoder holds the
@@ -676,6 +711,15 @@ fn worker_loop(
             pending_wake = false;
         }
 
+        // Same treatment for a publish we still owe: a hidden pane gets a
+        // forced full publish on the reveal edge anyway, so drop the debt
+        // rather than let it pin the poll timeout at 16 ms and spin on a
+        // pane nobody is looking at.
+        if !visible_now {
+            publish_pending = false;
+            publish_pending_force = false;
+        }
+
         let mut did_anything = false;
         let mut force_full_publish = false;
         tick_count += 1;
@@ -708,8 +752,7 @@ fn worker_loop(
                     match m {
                         DaemonMessage::Output(bytes) => {
                             {
-                                let _vt =
-                                    jim_pane::trace::span("term.vt_write", "terminal.worker");
+                                let _vt = jim_pane::trace::span("term.vt_write", "terminal.worker");
                                 terminal.vt_write(&bytes);
                             }
                             if !in_replay {
@@ -764,6 +807,7 @@ fn worker_loop(
                         }
                         DaemonMessage::ChildExited { code: _ } => {
                             child_alive = false;
+                            child_exited_reported = true;
                         }
                         DaemonMessage::Attached => {
                             // Already consumed during handshake — a
@@ -779,9 +823,16 @@ fn worker_loop(
             }
             if !alive {
                 daemon_gone = true;
-                child_alive = false;
                 force_full_publish = true;
                 did_anything = true;
+                // Only a reported child exit means the session is over.
+                // A socket that just closed (the daemon's zombie timeout
+                // firing on a stalled client, say) leaves the child
+                // running, and the reconnect block below reattaches to
+                // it — so don't tell the renderer the child is dead.
+                if child_exited_reported {
+                    child_alive = false;
+                }
             }
         }
 
@@ -843,16 +894,13 @@ fn worker_loop(
                     if lines != 0 {
                         let count = lines.unsigned_abs();
                         let up = lines > 0;
-                        let mouse_tracking =
-                            terminal.is_mouse_tracking().unwrap_or(false);
+                        let mouse_tracking = terminal.is_mouse_tracking().unwrap_or(false);
                         let alt_screen = alt_screen_of(&mut terminal);
                         if mouse_tracking {
                             // Forward the wheel to the child. Clamp the
                             // cell to the grid so the report is in-bounds.
-                            let max_c =
-                                terminal.cols().unwrap_or(1).saturating_sub(1);
-                            let max_r =
-                                terminal.rows().unwrap_or(1).saturating_sub(1);
+                            let max_c = terminal.cols().unwrap_or(1).saturating_sub(1);
+                            let max_r = terminal.rows().unwrap_or(1).saturating_sub(1);
                             let c = col.min(max_c);
                             let r = row.min(max_r);
                             let sgr = terminal.mode(Mode::SGR_MOUSE).unwrap_or(false);
@@ -865,11 +913,9 @@ fn worker_loop(
                         } else if alt_screen {
                             // No scrollback in the alt screen; translate to
                             // arrow keys the way xterm's alternateScroll does.
-                            let app_cursor =
-                                terminal.mode(Mode::DECCKM).unwrap_or(false);
+                            let app_cursor = terminal.mode(Mode::DECCKM).unwrap_or(false);
                             let seq = arrow_seq(up, app_cursor);
-                            let mut bytes =
-                                Vec::with_capacity(seq.len() * count as usize);
+                            let mut bytes = Vec::with_capacity(seq.len() * count as usize);
                             for _ in 0..count {
                                 bytes.extend_from_slice(seq);
                             }
@@ -879,8 +925,11 @@ fn worker_loop(
                             // Normal scrollback. libghostty's Delta is
                             // positive toward the active area, negative back
                             // into history — so an up gesture goes negative.
-                            let delta =
-                                if up { -(count as isize) } else { count as isize };
+                            let delta = if up {
+                                -(count as isize)
+                            } else {
+                                count as isize
+                            };
                             terminal.scroll_viewport(ScrollViewport::Delta(delta));
                             did_anything = true;
                             force_full_publish = true;
@@ -902,10 +951,7 @@ fn worker_loop(
                     // Only report while the child actually asked for mouse
                     // tracking; otherwise a stray event during the tail of a
                     // just-disabled mode would inject junk at the prompt.
-                    if cell_w > 0
-                        && cell_h > 0
-                        && terminal.is_mouse_tracking().unwrap_or(false)
-                    {
+                    if cell_w > 0 && cell_h > 0 && terminal.is_mouse_tracking().unwrap_or(false) {
                         let cols = terminal.cols().unwrap_or(1) as u32;
                         let rows = terminal.rows().unwrap_or(1) as u32;
                         // `set_options_from_terminal` copies the child's
@@ -1007,12 +1053,12 @@ fn worker_loop(
         //    same block resets `replay_just_ended` and section 2 keys the
         //    pty-response *drop* on it — leaving it stuck true would make
         //    us swallow the live child's DA/mode replies indefinitely.
-        let want_publish = did_anything && !in_replay && visible_now;
+        let want_publish = (did_anything || publish_pending) && !in_replay && visible_now;
         if want_publish || replay_just_ended {
-            let force = force_full_publish || replay_just_ended;
+            let force = force_full_publish || replay_just_ended || publish_pending_force;
             let t = Instant::now();
             let _pub = jim_pane::trace::span("term.publish", "terminal.worker");
-            let (pc, pr, published) = publish_snapshot(
+            let (pc, pr, outcome) = publish_snapshot(
                 &mut terminal,
                 &mut render_state,
                 &mut row_it,
@@ -1027,29 +1073,120 @@ fn worker_loop(
             last_rows = pr;
             publish_ns_since_log += t.elapsed().as_nanos();
             publishes_since_log += 1;
-            if published {
-                // Skip waking the renderer for hidden panes. The only
-                // publish that reaches here while hidden is the exempt
-                // `replay_just_ended` one-shot; there's no visible pane to
-                // repaint, so we suppress the wake and the reveal edge will
-                // republish + wake later.
-                if visible_now {
-                    if try_wake_winit_throttled(&wakeup) {
-                        pending_wake = false;
+            if outcome == PublishOutcome::Contended {
+                // Renderer had the snapshot. Nothing was consumed —
+                // remember that we still owe a publish (and keep the
+                // `force` we would have used) and retry on a short
+                // timeout below. Critically, `replay_just_ended` stays
+                // set so its one-shot isn't swallowed.
+                publish_pending = true;
+                publish_pending_force = force;
+            } else {
+                publish_pending = false;
+                publish_pending_force = false;
+                if outcome == PublishOutcome::Published {
+                    // Skip waking the renderer for hidden panes. The only
+                    // publish that reaches here while hidden is the exempt
+                    // `replay_just_ended` one-shot; there's no visible pane to
+                    // repaint, so we suppress the wake and the reveal edge will
+                    // republish + wake later.
+                    if visible_now {
+                        if try_wake_winit_throttled(&wakeup) {
+                            pending_wake = false;
+                        } else {
+                            pending_wake = true;
+                        }
                     } else {
-                        pending_wake = true;
+                        pending_wake = false;
                     }
-                } else {
-                    pending_wake = false;
                 }
+                replay_just_ended = false;
             }
-            replay_just_ended = false;
         }
 
         if daemon_gone {
-            // Daemon socket closed — nothing more we can do here, just
-            // idle until main thread issues Shutdown / disconnects.
-            thread::sleep(Duration::from_millis(50));
+            // The socket closed. That is NOT the same as the session
+            // ending: the daemon force-disconnects a client whose
+            // send_buf hasn't drained for ZOMBIE_TIMEOUT (30s), which a
+            // long main-thread stall can trigger on a perfectly healthy
+            // pane. Reattach instead of idling forever — the daemon
+            // replays its buffer, so the pane catches up on everything
+            // it missed while disconnected.
+            if child_exited_reported {
+                // Session really is over. Hold the final frame and wait
+                // for the main thread to close the pane.
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            if reconnect_failures >= RECONNECT_MAX_FAILURES {
+                // Daemon is gone for good (crashed without reporting an
+                // exit). Mark the child dead so the pane stops pretending
+                // to be live, and idle as before.
+                if child_alive {
+                    child_alive = false;
+                    publish_pending = true;
+                    publish_pending_force = true;
+                    eprintln!(
+                        "[worker {session_id}] daemon unreachable after {reconnect_failures} \
+                         attempts; giving up (pane is dead, session state lost)"
+                    );
+                }
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            match DaemonClient::reattach(session_id, last_cols, last_rows) {
+                Ok(c) => {
+                    eprintln!(
+                        "[worker {session_id}] reattached to daemon after \
+                         {reconnect_failures} failed attempt(s)"
+                    );
+                    client = c;
+                    daemon_gone = false;
+                    reconnect_failures = 0;
+
+                    // If we keep getting kicked and reattaching, some
+                    // other client is bound to this same session and we
+                    // are both stealing the daemon last-wins. Throttle so
+                    // that degrades into a slow flap instead of a hot
+                    // loop re-replaying the buffer every cycle.
+                    if last_reattach
+                        .map(|t| t.elapsed() < REATTACH_CHURN_WINDOW)
+                        .unwrap_or(false)
+                    {
+                        reattach_churn += 1;
+                        if reattach_churn >= REATTACH_CHURN_LIMIT {
+                            eprintln!(
+                                "[worker {session_id}] reattached {reattach_churn}x in quick \
+                                 succession — another pane is probably bound to this session; \
+                                 backing off"
+                            );
+                            thread::sleep(Duration::from_secs(2));
+                        }
+                    } else {
+                        reattach_churn = 0;
+                    }
+                    last_reattach = Some(Instant::now());
+                    // The daemon reopens with ReplayStart/…/ReplayEnd,
+                    // which drives `in_replay` — but clear it here too so
+                    // a disconnect *during* a replay window can't leave
+                    // publishes suppressed forever.
+                    in_replay = false;
+                    in_replay_flag.store(false, Ordering::Relaxed);
+                    publish_pending = true;
+                    publish_pending_force = true;
+                }
+                Err(e) => {
+                    reconnect_failures += 1;
+                    if reconnect_failures == 1 {
+                        eprintln!("[worker {session_id}] daemon dropped us ({e}); reattaching…");
+                    }
+                    thread::sleep(if reconnect_failures < 20 {
+                        Duration::from_millis(250)
+                    } else {
+                        Duration::from_secs(2)
+                    });
+                }
+            }
             continue;
         }
 
@@ -1062,10 +1199,8 @@ fn worker_loop(
                 elapsed.as_secs_f64() * 1000.0,
                 (bytes_since_log as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64(),
                 publishes_since_log,
-                (publish_ns_since_log as f64 / 1_000_000.0)
-                    / (publishes_since_log.max(1) as f64),
-                (vt_write_ns_since_log as f64 / 1_000_000.0)
-                    / (publishes_since_log.max(1) as f64),
+                (publish_ns_since_log as f64 / 1_000_000.0) / (publishes_since_log.max(1) as f64),
+                (vt_write_ns_since_log as f64 / 1_000_000.0) / (publishes_since_log.max(1) as f64),
             );
             bytes_since_log = 0;
             publishes_since_log = 0;
@@ -1104,7 +1239,12 @@ fn worker_loop(
             // timeout so we come back around in time to fire it. Without
             // this, an output burst that ends exactly when we'd suppress
             // the last wake could leave the screen stale for up to 5s.
-            let timeout_ms: i32 = if pending_wake {
+            let timeout_ms: i32 = if publish_pending {
+                // We owe the renderer a publish that lost a race for the
+                // snapshot mutex. Come back around promptly rather than
+                // sitting on it for up to 5s waiting for new bytes.
+                16
+            } else if pending_wake {
                 wake_cooldown_remaining_ms().min(5_000) as i32
             } else {
                 5_000
@@ -1130,6 +1270,18 @@ fn alt_screen_of(terminal: &mut libghostty_vt::Terminal<'static, 'static>) -> bo
         || terminal.mode(Mode::ALT_SCREEN_LEGACY).unwrap_or(false)
 }
 
+/// Result of one `publish_snapshot` call.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublishOutcome {
+    /// Snapshot updated; renderer should be woken.
+    Published,
+    /// Nothing had changed — no update was needed.
+    Unchanged,
+    /// The renderer held the snapshot mutex, so we skipped rather than
+    /// block. Nothing was consumed; the caller must retry.
+    Contended,
+}
+
 fn publish_snapshot(
     terminal: &mut libghostty_vt::Terminal<'static, 'static>,
     render_state: &mut RenderState<'static>,
@@ -1140,7 +1292,29 @@ fn publish_snapshot(
     force_full: bool,
     prev_cols: u16,
     prev_rows: u16,
-) -> (u16, u16, bool) {
+) -> (u16, u16, PublishOutcome) {
+    // Never block the worker on the renderer. If the main thread is
+    // holding the snapshot we bail immediately and retry next tick,
+    // because everything below this point runs on the same thread that
+    // drains the daemon socket. A worker parked on this mutex stops
+    // draining; the daemon's send_buf then stops shrinking, and after
+    // ZOMBIE_TIMEOUT (30s) the daemon force-disconnects us and the pane
+    // is dead until it's rebuilt. That is exactly how terminal 854
+    // froze on 2026-08-08: a 70s main-thread stall cost the pane its
+    // daemon connection while the session behind it stayed healthy.
+    //
+    // Bailing here is lossless: libghostty's dirty flags aren't cleared
+    // until the extraction below, so the same rows come back dirty on
+    // the retry. (A renderer that grabs the lock *after* this probe
+    // just costs us one ordinary frame of blocking, as before.)
+    match snapshot_arc.try_lock() {
+        Ok(_) => {}
+        Err(TryLockError::WouldBlock) => {
+            return (prev_cols, prev_rows, PublishOutcome::Contended);
+        }
+        Err(TryLockError::Poisoned(e)) => panic!("snapshot lock poisoned: {e}"),
+    }
+
     // These modes are toggled by escape sequences that don't dirty the
     // grid, so read them up front and reconcile on *every* publish path —
     // including the clean early-return below — or the main thread would
@@ -1154,7 +1328,7 @@ fn publish_snapshot(
 
     let snap = match render_state.update(terminal) {
         Ok(s) => s,
-        Err(_) => return (prev_cols, prev_rows, false),
+        Err(_) => return (prev_cols, prev_rows, PublishOutcome::Unchanged),
     };
     let dirty = snap.dirty().unwrap_or(Dirty::Full);
     let cols = snap.cols().unwrap_or(0);
@@ -1178,7 +1352,15 @@ fn publish_snapshot(
             g.generation = g.generation.wrapping_add(1);
             published = true;
         }
-        return (cols, rows, published);
+        return (
+            cols,
+            rows,
+            if published {
+                PublishOutcome::Published
+            } else {
+                PublishOutcome::Unchanged
+            },
+        );
     }
     let cursor_visible = snap.cursor_visible().unwrap_or(false);
     let cursor_pos = snap.cursor_viewport().ok().flatten();
@@ -1214,7 +1396,7 @@ fn publish_snapshot(
     {
         let mut iter = match row_it.update(&snap) {
             Ok(it) => it,
-            Err(_) => return (cols, rows, false),
+            Err(_) => return (cols, rows, PublishOutcome::Unchanged),
         };
         let mut r = 0usize;
         while let Some(row) = iter.next() {
@@ -1325,7 +1507,7 @@ fn publish_snapshot(
     g.alt_screen = alt_screen;
     g.bracketed_paste = bracketed_paste;
     g.generation = g.generation.wrapping_add(1);
-    (cols, rows, true)
+    (cols, rows, PublishOutcome::Published)
 }
 
 /// Extract the text covered by a `(col, absolute_row)` selection from
@@ -1522,11 +1704,7 @@ impl ScrollbackLogWriter {
             log_disk_err(format_args!("[worker] mkdir {}: {}", parent.display(), e));
             return None;
         }
-        let file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
+        let file = match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(f) => f,
             Err(e) => {
                 log_disk_err(format_args!("[worker] open {}: {}", path.display(), e));
@@ -1596,13 +1774,21 @@ impl ScrollbackLogWriter {
             std::fs::rename(&tmp_path, path)
         })();
         if let Err(e) = write_result {
-            log_disk_err(format_args!("[worker] log rotate {}: {}", path.display(), e));
+            log_disk_err(format_args!(
+                "[worker] log rotate {}: {}",
+                path.display(),
+                e
+            ));
             return;
         }
 
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(f) => self.file = f,
-            Err(e) => log_disk_err(format_args!("[worker] log reopen {}: {}", path.display(), e)),
+            Err(e) => log_disk_err(format_args!(
+                "[worker] log reopen {}: {}",
+                path.display(),
+                e
+            )),
         }
     }
 }

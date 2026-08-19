@@ -1074,7 +1074,9 @@ impl InteractionState {
                 self.laser.clear();
                 InteractionResult::view()
             }
-            Gesture::DraggingVertex { id, index, moved, .. } => {
+            Gesture::DraggingVertex {
+                id, index, moved, ..
+            } => {
                 if moved {
                     // If an ENDPOINT was dragged, (re)bind it to a shape under it,
                     // or unbind if it landed in empty space — same as Excalidraw.
@@ -1305,13 +1307,15 @@ fn bind_one_endpoint(
 /// Clear one endpoint's binding and remove the reverse link from the shape it was
 /// attached to — used when an endpoint is dragged off its target into empty space.
 fn unbind_one_endpoint(scene: &mut Scene, arrow_id: &ElementId, which: ArrowEnd) {
-    let old_target = scene.get_mut(arrow_id).and_then(|arrow| match &mut arrow.kind {
-        ElementKind::Arrow(d) | ElementKind::Line(d) => match which {
-            ArrowEnd::Start => d.start_binding.take().map(|b| b.element_id),
-            ArrowEnd::End => d.end_binding.take().map(|b| b.element_id),
-        },
-        _ => None,
-    });
+    let old_target = scene
+        .get_mut(arrow_id)
+        .and_then(|arrow| match &mut arrow.kind {
+            ElementKind::Arrow(d) | ElementKind::Line(d) => match which {
+                ArrowEnd::Start => d.start_binding.take().map(|b| b.element_id),
+                ArrowEnd::End => d.end_binding.take().map(|b| b.element_id),
+            },
+            _ => None,
+        });
     if let Some(tid) = old_target {
         if let Some(target) = scene.get_mut(&tid) {
             target.bound_elements.retain(|b| b.id != *arrow_id);

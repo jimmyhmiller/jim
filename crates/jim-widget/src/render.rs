@@ -289,7 +289,17 @@ pub fn render(
     crate::layout::compute(&mut laid, max_w, avail_h, &ctx.metrics);
     let root_layout = laid.layout(laid.root);
     let root_origin = origin + Vec2::new(root_layout.location.x, root_layout.location.y);
-    render_node(commands, ctx, targets, &laid, laid.root, el, root_origin, z, None);
+    render_node(
+        commands,
+        ctx,
+        targets,
+        &laid,
+        laid.root,
+        el,
+        root_origin,
+        z,
+        None,
+    );
     Vec2::new(root_layout.size.width, root_layout.size.height)
 }
 
@@ -333,7 +343,17 @@ fn render_node(
         for (cid, child) in child_ids.iter().zip(children.iter()) {
             let cl = laid.layout(*cid);
             let cpos = origin + Vec2::new(cl.location.x, cl.location.y);
-            render_node(commands, ctx, targets, laid, *cid, child, cpos, z + 0.01, child_clip);
+            render_node(
+                commands,
+                ctx,
+                targets,
+                laid,
+                *cid,
+                child,
+                cpos,
+                z + 0.01,
+                child_clip,
+            );
         }
     };
 
@@ -448,6 +468,33 @@ fn render_node(
             size,
             z,
         ),
+        Element::RichText {
+            runs,
+            size: base_size,
+            color,
+            family,
+            selectable,
+            wrap,
+        } => render_richtext_at(
+            commands,
+            ctx,
+            targets,
+            runs,
+            color.as_deref(),
+            *base_size,
+            family.as_deref(),
+            *selectable,
+            *wrap,
+            origin,
+            size,
+            z,
+        ),
+        Element::Image { path, fit, style } => {
+            if let Some(style) = style {
+                paint_style_background(commands, ctx, Some(style), origin, size, z);
+            }
+            render_image_at(commands, ctx, path, *fit, origin, size, z);
+        }
         Element::Divider => render_divider_at(commands, ctx, origin, size, z),
         Element::Spacer { .. } => {}
         Element::Badge {
@@ -583,8 +630,18 @@ fn render_node(
                 paint_style_background(commands, ctx, Some(plan), origin, size, z);
             } else {
                 paint_rounded_panel(
-                    commands, ctx, origin, size, 6.0, ctx.palette.bar_track, ctx.palette.divider,
-                    1.0, transparent, 0.0, 0.0, z,
+                    commands,
+                    ctx,
+                    origin,
+                    size,
+                    6.0,
+                    ctx.palette.bar_track,
+                    ctx.palette.divider,
+                    1.0,
+                    transparent,
+                    0.0,
+                    0.0,
+                    z,
                 );
             }
             let cy = origin.y + size.y * 0.5;
@@ -923,9 +980,12 @@ fn render_text_at(
     // container's edge, with no overflow to fight — and it survives resizing,
     // because every re-render re-truncates to the current width.
     let rendered: String = match clip_right {
-        Some(cr) => {
-            crate::layout::truncate_to_width(value, font_size, (cr - origin.x).max(0.0), &ctx.metrics)
-        }
+        Some(cr) => crate::layout::truncate_to_width(
+            value,
+            font_size,
+            (cr - origin.x).max(0.0),
+            &ctx.metrics,
+        ),
         None => value.to_string(),
     };
     // For wrapping (multi-line) runs the box still bounds the wrap width.
@@ -957,10 +1017,286 @@ fn render_text_at(
         let span_w = ctx.metrics.measure(&rendered, font_size).min(size.x);
         targets.spans.push(TextSpan {
             text: rendered.clone(),
-            rect: Rect::new(origin.x, origin.y, origin.x + span_w, origin.y + size.y.max(line_h)),
+            rect: Rect::new(
+                origin.x,
+                origin.y,
+                origin.x + span_w,
+                origin.y + size.y.max(line_h),
+            ),
             font_size,
         });
     }
+}
+
+/// Render an `Element::RichText`: ONE `Text2d` block whose runs are
+/// `TextSpan` children.
+///
+/// This is the whole reason the element exists. Bevy lays a `Text2d` root
+/// plus its `TextSpan` children out as a single block — the parent's
+/// `TextLayout`/`TextBounds` govern wrapping while each node keeps its own
+/// `TextFont`/`TextColor` — so a bold phrase mid-sentence wraps with the
+/// sentence instead of being pushed into its own box. Composing an hstack
+/// of `Text`s cannot do that: each child wraps independently.
+///
+/// The first run rides on the root itself (a `Text2d`'s own string is the
+/// block's first section); the rest become children in order.
+#[allow(clippy::too_many_arguments)]
+fn render_richtext_at(
+    commands: &mut Commands,
+    ctx: &LayoutCtx,
+    targets: &mut WidgetTargets,
+    runs: &[crate::protocol::TextRun],
+    base_color: Option<&str>,
+    base_size: Option<f32>,
+    base_family: Option<&str>,
+    selectable: bool,
+    wrap: bool,
+    origin: Vec2,
+    size: Vec2,
+    z: f32,
+) {
+    let Some((first, rest)) = runs.split_first() else {
+        return;
+    };
+    let base_size = base_size.unwrap_or(DEFAULT_FONT_SIZE);
+    let default_color = base_color
+        .and_then(|c| ctx.resolve_color(c))
+        .unwrap_or(ctx.palette.text);
+
+    // One line height for the whole block, from the tallest run — mixing
+    // per-span line heights inside one Bevy text block gives uneven
+    // baselines, and the measure pass sized the box the same way.
+    let block_size = runs
+        .iter()
+        .map(|r| r.size.unwrap_or(base_size))
+        .fold(base_size, f32::max);
+    let block_line_h = line_height(block_size);
+
+    let resolve = |run: &crate::protocol::TextRun| {
+        let size = run.size.unwrap_or(base_size);
+        let mut col = run
+            .color
+            .as_deref()
+            .and_then(|c| ctx.resolve_color(c))
+            .unwrap_or(default_color);
+        if matches!(run.weight, Some(Weight::Bold)) {
+            col = brighten(col, 0.08);
+        }
+        let family = run.family.as_deref().or(base_family);
+        let font = family
+            .and_then(|f| ctx.font_for(f))
+            .unwrap_or_else(|| ctx.font.clone());
+        (size, col, font)
+    };
+
+    let (first_size, first_col, first_font) = resolve(first);
+    let mut root = commands.spawn((
+        ChildOf(ctx.content_root),
+        Text2d::new(first.value.clone()),
+        TextFont {
+            font: first_font.into(),
+            font_size: FontSize::Px(first_size),
+            ..default()
+        },
+        LineHeight::Px(block_line_h),
+        TextColor(first_col),
+        Anchor::TOP_LEFT,
+        TextBounds {
+            width: Some(size.x.max(0.0)),
+            height: Some(size.y.max(0.0)),
+        },
+        Transform::from_xyz(origin.x, -origin.y, z),
+    ));
+    if !wrap {
+        root.insert(bevy::text::TextLayout::no_wrap());
+    }
+    let root = root.id();
+    for run in rest {
+        let (run_size, col, font) = resolve(run);
+        commands.spawn((
+            ChildOf(root),
+            bevy::text::TextSpan::new(run.value.clone()),
+            TextFont {
+                font: font.into(),
+                font_size: FontSize::Px(run_size),
+                ..default()
+            },
+            LineHeight::Px(block_line_h),
+            TextColor(col),
+        ));
+    }
+
+    // Drag-select registers the block as ONE span over the whole box. Per-run
+    // sub-selection would need Bevy's per-glyph layout back out of the text
+    // pipeline; the block-level rect keeps copy working (the common case:
+    // grab the paragraph) without pretending to a precision we don't have.
+    if selectable {
+        let text: String = runs.iter().map(|r| r.value.as_str()).collect();
+        if !text.is_empty() {
+            targets.spans.push(TextSpan {
+                text,
+                rect: Rect::new(
+                    origin.x,
+                    origin.y,
+                    origin.x + size.x,
+                    origin.y + size.y.max(block_line_h),
+                ),
+                font_size: block_size,
+            });
+        }
+    }
+}
+
+/// Height an `Element::Image` claims when nothing in the flex tree gives
+/// it one. A bare image with no size would otherwise collapse to zero and
+/// look like a broken path rather than an unsized element.
+pub const DEFAULT_IMAGE_MIN_H: f32 = 120.0;
+
+/// How an image lands inside its layout box.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ImageFitted {
+    /// Sprite size to draw.
+    pub draw: Vec2,
+    /// Offset from the box's top-left (non-zero only when letterboxing).
+    pub offset: Vec2,
+    /// Sub-rect of the SOURCE texture to sample, for fits that crop.
+    pub crop: Option<Rect>,
+}
+
+/// Place a `src`-sized image inside a `box_size` box under `fit`.
+///
+/// Pure so the aspect math is testable without a GPU: the render path
+/// only learns the intrinsic size after a deferred decode, which is
+/// exactly the kind of code that quietly regresses.
+pub(crate) fn fit_image(box_size: Vec2, src: Vec2, fit: crate::protocol::ImageFit) -> ImageFitted {
+    use crate::protocol::ImageFit;
+    let degenerate = src.x <= 0.0 || src.y <= 0.0 || box_size.x <= 0.0 || box_size.y <= 0.0;
+    if degenerate || fit == ImageFit::Fill {
+        return ImageFitted {
+            draw: box_size,
+            offset: Vec2::ZERO,
+            crop: None,
+        };
+    }
+    match fit {
+        ImageFit::Fill => unreachable!("handled above"),
+        ImageFit::Contain => {
+            let scale = (box_size.x / src.x).min(box_size.y / src.y);
+            let draw = src * scale;
+            ImageFitted {
+                draw,
+                offset: (box_size - draw) * 0.5,
+                crop: None,
+            }
+        }
+        ImageFit::Cover => {
+            // Keep the sprite the size of the box and sample a centered
+            // sub-rect of the source with the box's aspect — cropping in
+            // texture space, so nothing spills outside the layout box (a
+            // sprite drawn larger than its box would overlap siblings,
+            // since widget flow layout does not clip by default).
+            let box_aspect = box_size.x / box_size.y;
+            let src_aspect = src.x / src.y;
+            let (cw, ch) = if src_aspect > box_aspect {
+                (src.y * box_aspect, src.y)
+            } else {
+                (src.x, src.x / box_aspect)
+            };
+            let min = Vec2::new((src.x - cw) * 0.5, (src.y - ch) * 0.5);
+            ImageFitted {
+                draw: box_size,
+                offset: Vec2::ZERO,
+                crop: Some(Rect::from_corners(min, min + Vec2::new(cw, ch))),
+            }
+        }
+    }
+}
+
+/// Render an `Element::Image` into its layout box, honouring `fit`.
+///
+/// The intrinsic size is only known after the file decodes, which happens
+/// in a deferred `Commands::queue` (same path as `background_image`:
+/// widgets hand us absolute paths, which `AssetServer` doesn't handle
+/// reliably). So the sprite spawns first and its size/offset/crop are
+/// written once the pixels are in hand.
+fn render_image_at(
+    commands: &mut Commands,
+    ctx: &LayoutCtx,
+    path: &str,
+    fit: crate::protocol::ImageFit,
+    origin: Vec2,
+    size: Vec2,
+    z: f32,
+) {
+    use crate::protocol::ImageFit;
+
+    let path = crate::funct_widget::expand_tilde(path);
+    let entity = commands
+        .spawn((
+            ChildOf(ctx.content_root),
+            Sprite {
+                custom_size: Some(size),
+                ..default()
+            },
+            Anchor::TOP_LEFT,
+            Transform::from_xyz(origin.x, -origin.y, z),
+        ))
+        .id();
+
+    commands.queue(move |world: &mut World| {
+        let path_buf = std::path::PathBuf::from(&path);
+        let cached = world
+            .get_resource::<crate::WidgetImageCache>()
+            .and_then(|c| c.by_path.get(&path_buf).cloned());
+        let (handle, intrinsic) = match cached {
+            Some(h) => {
+                let dims = world
+                    .resource::<Assets<Image>>()
+                    .get(&h)
+                    .map(|img| Vec2::new(img.width() as f32, img.height() as f32));
+                (h, dims)
+            }
+            None => {
+                let Ok(bytes) = std::fs::read(&path_buf) else {
+                    return;
+                };
+                let Ok(decoded) = image::load_from_memory(&bytes) else {
+                    return;
+                };
+                let rgba = decoded.to_rgba8();
+                let (w, h) = (rgba.width(), rgba.height());
+                let img = crate::make_nearest_image(rgba.into_raw(), w, h);
+                let handle = world.resource_mut::<Assets<Image>>().add(img);
+                if let Some(mut cache) = world.get_resource_mut::<crate::WidgetImageCache>() {
+                    cache.by_path.insert(path_buf, handle.clone());
+                }
+                (handle, Some(Vec2::new(w as f32, h as f32)))
+            }
+        };
+
+        let Ok(mut ec) = world.get_entity_mut(entity) else {
+            return;
+        };
+        let ImageFitted { draw, offset, crop } = match intrinsic {
+            Some(src) => fit_image(size, src, fit),
+            None => ImageFitted {
+                draw: size,
+                offset: Vec2::ZERO,
+                crop: None,
+            },
+        };
+        if let Some(mut sp) = ec.get_mut::<Sprite>() {
+            sp.image = handle;
+            sp.custom_size = Some(draw);
+            sp.rect = crop;
+        }
+        if offset != Vec2::ZERO {
+            if let Some(mut tf) = ec.get_mut::<Transform>() {
+                tf.translation.x = origin.x + offset.x;
+                tf.translation.y = -(origin.y + offset.y);
+            }
+        }
+    });
 }
 
 fn render_divider_at(commands: &mut Commands, ctx: &LayoutCtx, origin: Vec2, size: Vec2, z: f32) {
@@ -1098,8 +1434,7 @@ fn render_button_at(
                     state: "hover".into(),
                     target,
                     duration_ms: tr.duration_ms,
-                    easing: glaze::Easing::from_name(&tr.easing)
-                        .unwrap_or(glaze::Easing::EaseOut),
+                    easing: glaze::Easing::from_name(&tr.easing).unwrap_or(glaze::Easing::EaseOut),
                 });
             }
             let on = s.hover_overlaid();
@@ -1523,8 +1858,18 @@ fn paint_glaze_layers(
                 let border = ctx.resolve_color(color).unwrap_or(transparent);
                 if sides.is_all() {
                     paint_rounded_panel(
-                        commands, ctx, origin, size, radius, transparent, border, *width,
-                        transparent, 0.0, 0.0, layer_z,
+                        commands,
+                        ctx,
+                        origin,
+                        size,
+                        radius,
+                        transparent,
+                        border,
+                        *width,
+                        transparent,
+                        0.0,
+                        0.0,
+                        layer_z,
                     );
                 } else {
                     // Partial borders are sharp edge rects (a rounded corner can't
@@ -1675,7 +2020,18 @@ fn paint_border_edges(
     let transparent = Color::srgba(0.0, 0.0, 0.0, 0.0);
     let mut edge = |o: Vec2, s: Vec2| {
         paint_rounded_panel(
-            commands, ctx, o, s, 0.0, color, transparent, 0.0, transparent, 0.0, 0.0, z,
+            commands,
+            ctx,
+            o,
+            s,
+            0.0,
+            color,
+            transparent,
+            0.0,
+            transparent,
+            0.0,
+            0.0,
+            z,
         );
     };
     if sides.top {
@@ -1729,9 +2085,7 @@ fn gradient_wgsl(ctx: &LayoutCtx, angle_deg: f32, stops: &[GradientStop]) -> Str
     let mut b = String::new();
     b.push_str(&format!("    let a = radians({});\n", wgsl_f(angle_deg)));
     b.push_str("    let dir = vec2<f32>(cos(a), -sin(a));\n");
-    b.push_str(
-        "    let t = clamp(dot(in.uv - vec2<f32>(0.5, 0.5), dir) + 0.5, 0.0, 1.0);\n",
-    );
+    b.push_str("    let t = clamp(dot(in.uv - vec2<f32>(0.5, 0.5), dir) + 0.5, 0.0, 1.0);\n");
     b.push_str(&format!("    var col = {};\n", cols[0].1));
     for pair in cols.windows(2) {
         let (o0, _) = &pair[0];
@@ -1882,7 +2236,14 @@ fn render_slider_at(
     if range_w > 0.0 {
         let range_size = Vec2::new(range_w, track_h);
         if let Some(plan) = range_plan {
-            paint_style_background(commands, ctx, Some(plan), track_origin, range_size, z + 0.01);
+            paint_style_background(
+                commands,
+                ctx,
+                Some(plan),
+                track_origin,
+                range_size,
+                z + 0.01,
+            );
         } else {
             let accent = ctx
                 .resolve_color("accent")
@@ -1908,7 +2269,14 @@ fn render_slider_at(
     let thumb_origin = Vec2::new(thumb_x, origin.y);
     let thumb_size = Vec2::splat(thumb_d);
     if let Some(plan) = thumb_plan {
-        paint_style_background(commands, ctx, Some(plan), thumb_origin, thumb_size, z + 0.02);
+        paint_style_background(
+            commands,
+            ctx,
+            Some(plan),
+            thumb_origin,
+            thumb_size,
+            z + 0.02,
+        );
     } else {
         paint_rounded_panel(
             commands,
@@ -2191,9 +2559,36 @@ fn render_stepper_at(
         field_plan.and_then(|f| f.text_color.as_deref()),
         ctx.palette.text,
     );
-    spawn_centered_text(commands, ctx, "-", minus_origin, btn_size, glyph, 18.0, z + 0.01);
-    spawn_centered_text(commands, ctx, &value_str, field_origin, field_size, value_color, DEFAULT_FONT_SIZE, z + 0.01);
-    spawn_centered_text(commands, ctx, "+", plus_origin, btn_size, glyph, 18.0, z + 0.01);
+    spawn_centered_text(
+        commands,
+        ctx,
+        "-",
+        minus_origin,
+        btn_size,
+        glyph,
+        18.0,
+        z + 0.01,
+    );
+    spawn_centered_text(
+        commands,
+        ctx,
+        &value_str,
+        field_origin,
+        field_size,
+        value_color,
+        DEFAULT_FONT_SIZE,
+        z + 0.01,
+    );
+    spawn_centered_text(
+        commands,
+        ctx,
+        "+",
+        plus_origin,
+        btn_size,
+        glyph,
+        18.0,
+        z + 0.01,
+    );
 
     // click targets carry the clamped target value
     let dec = (value - step).clamp(min.min(max), min.max(max));
@@ -2349,7 +2744,11 @@ fn render_tabs_at(
         let label_color = style_text_color(
             ctx,
             label_slot.and_then(|s| s.text_color.as_deref()),
-            if is_selected { accent } else { ctx.palette.text_muted },
+            if is_selected {
+                accent
+            } else {
+                ctx.palette.text_muted
+            },
         );
         commands.spawn((
             ChildOf(ctx.content_root),
@@ -2445,15 +2844,16 @@ fn render_radio_at(
         let is_selected = opt.id == selected;
 
         // ring (left, vertically centred within the row)
-        let ring_pos = Vec2::new(
-            cell_pos.x,
-            cell_pos.y + (cell_size.y - RADIO_RING) * 0.5,
-        );
+        let ring_pos = Vec2::new(cell_pos.x, cell_pos.y + (cell_size.y - RADIO_RING) * 0.5);
         let ring_size = Vec2::splat(RADIO_RING);
         if let Some(plan) = style.and_then(|s| s.ring.as_ref()) {
             paint_style_background(commands, ctx, Some(plan), ring_pos, ring_size, z);
         } else {
-            let border = if is_selected { accent } else { ctx.palette.text_muted };
+            let border = if is_selected {
+                accent
+            } else {
+                ctx.palette.text_muted
+            };
             paint_rounded_panel(
                 commands,
                 ctx,
@@ -2510,7 +2910,11 @@ fn render_radio_at(
                 style
                     .and_then(|s| s.ring.as_ref())
                     .and_then(|r| r.text_color.as_deref()),
-                if is_selected { ctx.palette.text } else { ctx.palette.text_muted },
+                if is_selected {
+                    ctx.palette.text
+                } else {
+                    ctx.palette.text_muted
+                },
             )),
             Anchor::TOP_LEFT,
             bevy::text::TextLayout::no_wrap(),
@@ -2817,11 +3221,19 @@ fn render_toggle_at(
     // Track slot: crossfade between the resting and `:checked` Glaze plans
     // when both are present (dual-resolve), else the single resolved plan,
     // else the hardcoded accent/muted pill (color-mixed by the same t).
-    let track_plan =
-        style.and_then(|s| animated_slot_plan(ctx, s.track.as_ref(), s.track_checked.as_ref(), checked, t));
+    let track_plan = style.and_then(|s| {
+        animated_slot_plan(ctx, s.track.as_ref(), s.track_checked.as_ref(), checked, t)
+    });
     if let Some(plan) = &track_plan {
         paint_style_background_for(
-            commands, ctx, Some(plan), track_pos, track_size, z, Some(id), t,
+            commands,
+            ctx,
+            Some(plan),
+            track_pos,
+            track_size,
+            z,
+            Some(id),
+            t,
         );
     } else {
         let track_color = mix_linear(ctx.palette.bar_track, accent, t);
@@ -2850,11 +3262,19 @@ fn render_toggle_at(
     };
     let knob_pos = Vec2::new(knob_x, track_pos.y + TOGGLE_KNOB_PAD);
     let knob_size = Vec2::new(knob_d, knob_d);
-    let knob_plan =
-        style.and_then(|s| animated_slot_plan(ctx, s.knob.as_ref(), s.knob_checked.as_ref(), checked, t));
+    let knob_plan = style.and_then(|s| {
+        animated_slot_plan(ctx, s.knob.as_ref(), s.knob_checked.as_ref(), checked, t)
+    });
     if let Some(plan) = &knob_plan {
         paint_style_background_for(
-            commands, ctx, Some(plan), knob_pos, knob_size, z + 0.01, Some(id), t,
+            commands,
+            ctx,
+            Some(plan),
+            knob_pos,
+            knob_size,
+            z + 0.01,
+            Some(id),
+            t,
         );
     } else {
         paint_rounded_panel(
@@ -2954,7 +3374,11 @@ fn render_checkbox_at(
     if let Some(plan) = box_plan {
         paint_style_background(commands, ctx, Some(plan), box_pos, box_size, z);
     } else {
-        let border = if checked { accent } else { ctx.palette.text_muted };
+        let border = if checked {
+            accent
+        } else {
+            ctx.palette.text_muted
+        };
         paint_rounded_panel(
             commands,
             ctx,
@@ -3647,4 +4071,83 @@ fn truncate_to_width(
     }
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod image_fit_tests {
+    use super::*;
+    use crate::protocol::ImageFit;
+
+    const BOX: Vec2 = Vec2::new(200.0, 100.0); // 2:1 box
+
+    /// `contain` must never crop and never overflow: the image scales down
+    /// to fit entirely, keeping its aspect, centered in the leftover space.
+    #[test]
+    fn contain_preserves_aspect_and_centers() {
+        // A 1:1 source in a 2:1 box is height-limited → 100x100, centered.
+        let f = fit_image(BOX, Vec2::new(400.0, 400.0), ImageFit::Contain);
+        assert_eq!(f.draw, Vec2::new(100.0, 100.0));
+        assert_eq!(f.offset, Vec2::new(50.0, 0.0));
+        assert!(f.crop.is_none(), "contain never crops");
+        assert!(f.draw.x <= BOX.x && f.draw.y <= BOX.y, "never overflows");
+    }
+
+    /// A source wider than the box is width-limited instead, and the
+    /// letterboxing moves to the vertical axis.
+    #[test]
+    fn contain_handles_the_other_limiting_axis() {
+        // 4:1 source in a 2:1 box → width-limited: 200x50, centered vertically.
+        let f = fit_image(BOX, Vec2::new(400.0, 100.0), ImageFit::Contain);
+        assert_eq!(f.draw, Vec2::new(200.0, 50.0));
+        assert_eq!(f.offset, Vec2::new(0.0, 25.0));
+    }
+
+    /// `cover` fills the box exactly and crops in TEXTURE space — drawing
+    /// a sprite bigger than its box would overlap siblings, because widget
+    /// flow layout doesn't clip.
+    #[test]
+    fn cover_fills_the_box_and_crops_the_source() {
+        // 1:1 source, 2:1 box → keep full width, crop height to half.
+        let f = fit_image(BOX, Vec2::new(400.0, 400.0), ImageFit::Cover);
+        assert_eq!(f.draw, BOX, "cover always fills the box exactly");
+        let crop = f.crop.expect("cover crops");
+        assert_eq!(crop.min, Vec2::new(0.0, 100.0));
+        assert_eq!(crop.max, Vec2::new(400.0, 300.0));
+        // The crop's aspect must match the box's, or the image is squashed.
+        let crop_size = crop.max - crop.min;
+        assert!((crop_size.x / crop_size.y - BOX.x / BOX.y).abs() < 1e-4);
+    }
+
+    /// A source wider than the box crops horizontally instead.
+    #[test]
+    fn cover_crops_the_other_axis_when_source_is_wider() {
+        // 8:1 source in a 2:1 box → crop width, keep full height.
+        let f = fit_image(BOX, Vec2::new(800.0, 100.0), ImageFit::Cover);
+        let crop = f.crop.expect("cover crops");
+        assert_eq!(crop.min, Vec2::new(300.0, 0.0));
+        assert_eq!(crop.max, Vec2::new(500.0, 100.0));
+    }
+
+    /// `fill` is the `background_image` behaviour: stretch, ignore aspect.
+    #[test]
+    fn fill_stretches_to_the_box() {
+        let f = fit_image(BOX, Vec2::new(400.0, 400.0), ImageFit::Fill);
+        assert_eq!(f.draw, BOX);
+        assert_eq!(f.offset, Vec2::ZERO);
+        assert!(f.crop.is_none());
+    }
+
+    /// A zero-sized source (or box) must not produce NaN geometry — a
+    /// NaN transform silently removes the entity from rendering, which
+    /// looks like "the image path is wrong" and wastes an hour.
+    #[test]
+    fn degenerate_sizes_do_not_produce_nan() {
+        for fit in [ImageFit::Contain, ImageFit::Cover, ImageFit::Fill] {
+            let f = fit_image(BOX, Vec2::ZERO, fit);
+            assert!(f.draw.is_finite(), "{fit:?} draw must be finite");
+            assert!(f.offset.is_finite(), "{fit:?} offset must be finite");
+            let f = fit_image(Vec2::ZERO, Vec2::new(10.0, 10.0), fit);
+            assert!(f.draw.is_finite() && f.offset.is_finite());
+        }
+    }
 }

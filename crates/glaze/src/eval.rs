@@ -123,7 +123,10 @@ pub enum Layer {
     Fill(Rgba),
     /// A linear gradient fill. `angle` is in degrees (0° = left→right, 90° =
     /// bottom→top); `stops` are sorted by ascending offset.
-    LinearGradient { angle: f32, stops: Vec<GradientStop> },
+    LinearGradient {
+        angle: f32,
+        stops: Vec<GradientStop>,
+    },
     Border {
         color: Rgba,
         width: f32,
@@ -261,6 +264,38 @@ pub(crate) fn eval_static_expr(
 }
 
 impl Program {
+    /// Evaluate a single `token` by name.
+    ///
+    /// Styles only carry *box* properties (fill, radius, padding, …), so a
+    /// host that also needs to style **text** — a font size, a foreground
+    /// colour — cannot get it from [`Program::resolve`]. Reading the token
+    /// directly keeps the stylesheet the single source of truth for those
+    /// values instead of forcing the caller to hard-code them alongside it.
+    ///
+    /// Aliases and token arithmetic resolve as they do inside a style
+    /// (`token h1 = base * 2`), including cycle detection.
+    pub fn token(&self, name: &str) -> Result<Value, GlazeError> {
+        if !self.tokens.iter().any(|t| t.name == name) {
+            return Err(GlazeError::Eval(format!("no token named `{name}`")));
+        }
+        let variant = HashMap::new();
+        let mut ctx = Ctx {
+            program: self,
+            variant: &variant,
+            resolving: Vec::new(),
+            lets: HashMap::new(),
+            vw: f32::INFINITY,
+            vh: f32::INFINITY,
+        };
+        eval_ident(name, &mut ctx)
+    }
+
+    /// Every token name in the sheet, in declaration order. For
+    /// introspection (pickers, "did I typo it" debugging).
+    pub fn token_names(&self) -> Vec<&str> {
+        self.tokens.iter().map(|t| t.name.as_str()).collect()
+    }
+
     /// Resolve a style for a variant + active discrete states. Viewport is
     /// treated as infinite (no `when` breakpoint fires).
     pub fn resolve(
@@ -429,10 +464,14 @@ fn apply_overlay(
                 out.layers.push(Layer::Shader(cs));
             }
             Item::State { .. } => {
-                return Err(GlazeError::Parse("nested state blocks are not allowed".into()));
+                return Err(GlazeError::Parse(
+                    "nested state blocks are not allowed".into(),
+                ));
             }
             Item::When { .. } => {
-                return Err(GlazeError::Parse("nested `when` blocks are not allowed".into()));
+                return Err(GlazeError::Parse(
+                    "nested `when` blocks are not allowed".into(),
+                ));
             }
             Item::Part { .. } => {
                 return Err(GlazeError::Parse(
@@ -458,7 +497,10 @@ fn apply_prop(
         out.transitions.push(tr);
         return Ok(());
     }
-    let vals: Vec<Value> = args.iter().map(|e| eval(e, ctx)).collect::<Result<_, _>>()?;
+    let vals: Vec<Value> = args
+        .iter()
+        .map(|e| eval(e, ctx))
+        .collect::<Result<_, _>>()?;
     let want = |n: usize| -> Result<(), GlazeError> {
         if vals.len() == n {
             Ok(())
@@ -648,14 +690,20 @@ fn parse_transition(args: &[Expr]) -> Result<Transition, GlazeError> {
 fn as_color(v: &Value, prop: &str) -> Result<Rgba, GlazeError> {
     match v {
         Value::Color(c) => Ok(*c),
-        _ => Err(GlazeError::Eval(format!("`{}` expects a color, got {:?}", prop, v))),
+        _ => Err(GlazeError::Eval(format!(
+            "`{}` expects a color, got {:?}",
+            prop, v
+        ))),
     }
 }
 fn as_px(v: &Value, prop: &str) -> Result<f32, GlazeError> {
     match v {
         Value::Len(Length::Px(p)) => Ok(*p),
         Value::Num(n) => Ok(*n as f32),
-        _ => Err(GlazeError::Eval(format!("`{}` expects a px length, got {:?}", prop, v))),
+        _ => Err(GlazeError::Eval(format!(
+            "`{}` expects a px length, got {:?}",
+            prop, v
+        ))),
     }
 }
 /// An optional gradient-stop offset: `%` (→ 0..1) or a bare number (0..1).
@@ -740,7 +788,10 @@ fn as_dim(v: &Value, prop: &str) -> Result<Dim, GlazeError> {
         Value::Len(Length::Pct(p)) => Ok(Dim::Pct(*p)),
         Value::Len(Length::Auto) => Ok(Dim::Auto),
         Value::Num(n) => Ok(Dim::Px(*n as f32)),
-        _ => Err(GlazeError::Eval(format!("`{}` expects a dimension, got {:?}", prop, v))),
+        _ => Err(GlazeError::Eval(format!(
+            "`{}` expects a dimension, got {:?}",
+            prop, v
+        ))),
     }
 }
 
@@ -802,7 +853,10 @@ fn eval(e: &Expr, ctx: &mut Ctx) -> Result<Value, GlazeError> {
                 let inlined = crate::ast::subst_params(&body, &params, args);
                 return eval(&inlined, ctx);
             }
-            let vs: Vec<Value> = args.iter().map(|a| eval(a, ctx)).collect::<Result<_, _>>()?;
+            let vs: Vec<Value> = args
+                .iter()
+                .map(|a| eval(a, ctx))
+                .collect::<Result<_, _>>()?;
             eval_call(name, &vs)
         }
     }
@@ -881,7 +935,10 @@ fn eval_bin(op: &str, a: Value, b: Value) -> Result<Value, GlazeError> {
                 };
                 Ok(Bool(r))
             } else {
-                Err(GlazeError::Eval(format!("cannot compare {:?} {} {:?}", a, op, b)))
+                Err(GlazeError::Eval(format!(
+                    "cannot compare {:?} {} {:?}",
+                    a, op, b
+                )))
             }
         }
         "+" | "-" | "*" | "/" => eval_arith(op, a, b),
@@ -909,13 +966,18 @@ fn eval_arith(op: &str, a: Value, b: Value) -> Result<Value, GlazeError> {
     };
     match (a, b) {
         (Num(x), Num(y)) => Ok(Num(f(x, y))),
-        (Len(Px(x)), Len(Px(y))) if op == "+" || op == "-" => Ok(Len(Px(f(x as f64, y as f64) as f32))),
+        (Len(Px(x)), Len(Px(y))) if op == "+" || op == "-" => {
+            Ok(Len(Px(f(x as f64, y as f64) as f32)))
+        }
         (Len(Px(x)), Num(y)) if op == "*" || op == "/" => Ok(Len(Px(f(x as f64, y) as f32))),
         (Num(x), Len(Px(y))) if op == "*" => Ok(Len(Px((x * y as f64) as f32))),
         (Color(c), Num(s)) if op == "*" => Ok(Color(scale(c, s as f32))),
         (Num(s), Color(c)) if op == "*" => Ok(Color(scale(c, s as f32))),
         (Color(x), Color(y)) if op == "+" => Ok(Color(add(x, y))),
-        (x, y) => Err(GlazeError::Eval(format!("cannot evaluate {:?} {} {:?}", x, op, y))),
+        (x, y) => Err(GlazeError::Eval(format!(
+            "cannot evaluate {:?} {} {:?}",
+            x, op, y
+        ))),
     }
 }
 
@@ -948,7 +1010,9 @@ fn eval_call(name: &str, vs: &[Value]) -> Result<Value, GlazeError> {
                 let t = num(&vs[2])?;
                 Ok(Value::Num(a + (b - a) * t))
             }
-            _ => Err(GlazeError::Eval("mix(color,color,t) or mix(num,num,t)".into())),
+            _ => Err(GlazeError::Eval(
+                "mix(color,color,t) or mix(num,num,t)".into(),
+            )),
         },
         "min" if vs.len() == 2 => Ok(Value::Num(num(&vs[0])?.min(num(&vs[1])?))),
         "max" if vs.len() == 2 => Ok(Value::Num(num(&vs[0])?.max(num(&vs[1])?))),
@@ -966,12 +1030,12 @@ fn eval_call(name: &str, vs: &[Value]) -> Result<Value, GlazeError> {
         "sign" if vs.len() == 1 => Ok(Value::Num(num(&vs[0])?.signum())),
         "exp" if vs.len() == 1 => Ok(Value::Num(num(&vs[0])?.exp())),
         "log" if vs.len() == 1 => Ok(Value::Num(num(&vs[0])?.ln())),
-        "clamp" if vs.len() == 3 => {
-            Ok(Value::Num(num(&vs[0])?.clamp(num(&vs[1])?, num(&vs[2])?)))
-        }
-        "step" if vs.len() == 2 => {
-            Ok(Value::Num(if num(&vs[1])? < num(&vs[0])? { 0.0 } else { 1.0 }))
-        }
+        "clamp" if vs.len() == 3 => Ok(Value::Num(num(&vs[0])?.clamp(num(&vs[1])?, num(&vs[2])?))),
+        "step" if vs.len() == 2 => Ok(Value::Num(if num(&vs[1])? < num(&vs[0])? {
+            0.0
+        } else {
+            1.0
+        })),
         "smoothstep" if vs.len() == 3 => {
             let (e0, e1, x) = (num(&vs[0])?, num(&vs[1])?, num(&vs[2])?);
             let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
@@ -979,10 +1043,12 @@ fn eval_call(name: &str, vs: &[Value]) -> Result<Value, GlazeError> {
         }
         // These are valid Glaze functions but only meaningful once their inputs
         // can be dynamic / once we evaluate them — kept as explicit hard errors.
-        "lighten" | "darken" | "saturate" | "pick_readable" => Err(GlazeError::Unsupported(format!(
-            "`{}()` not implemented yet (Stage 1 supports literals + mix/min/max/pow/abs/sqrt)",
-            name
-        ))),
+        "lighten" | "darken" | "saturate" | "pick_readable" => {
+            Err(GlazeError::Unsupported(format!(
+                "`{}()` not implemented yet (Stage 1 supports literals + mix/min/max/pow/abs/sqrt)",
+                name
+            )))
+        }
         _ => Err(GlazeError::Eval(format!(
             "unknown function `{}` (arity {})",
             name,
@@ -994,7 +1060,12 @@ fn eval_call(name: &str, vs: &[Value]) -> Result<Value, GlazeError> {
 // ---------- color helpers (linear-rgb storage) ----------
 
 fn scale(c: Rgba, s: f32) -> Rgba {
-    Rgba { r: c.r * s, g: c.g * s, b: c.b * s, a: c.a }
+    Rgba {
+        r: c.r * s,
+        g: c.g * s,
+        b: c.b * s,
+        a: c.a,
+    }
 }
 fn add(x: Rgba, y: Rgba) -> Rgba {
     Rgba {
@@ -1023,7 +1094,12 @@ fn color_literal(space: &str, nums: &[f64]) -> Result<Rgba, GlazeError> {
         "oklab" => oklab_to_linear(nums[0], nums[1], nums[2]),
         _ => return Err(GlazeError::Eval(format!("unknown color space `{}`", space))),
     };
-    Ok(Rgba { r: lr, g: lg, b: lb, a })
+    Ok(Rgba {
+        r: lr,
+        g: lg,
+        b: lb,
+        a,
+    })
 }
 
 fn srgb_to_linear(c: f32) -> f32 {

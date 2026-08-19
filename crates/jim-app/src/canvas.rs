@@ -212,6 +212,9 @@ enum PanDragKind {
 
 pub struct CanvasPlugin;
 
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CanvasInputSet;
+
 impl Plugin for CanvasPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(CanvasView::default())
@@ -225,7 +228,8 @@ impl Plugin for CanvasPlugin {
                     cycle_config_hotkey,
                     jump_to_double_clicked_pane,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(CanvasInputSet),
             )
             // PaneViewport must be published BEFORE pane-bevy's
             // position_panes / handle_pane_mouse / per-pane camera sync
@@ -336,6 +340,7 @@ fn publish_canvas_region(
     mut block_zones: ResMut<PaneInputBlockZones>,
     mut pane_zoom: ResMut<jim_pane::PaneZoom>,
     mut viewport: ResMut<jim_pane::PaneViewport>,
+    mut views: ResMut<jim_pane::Views>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -375,6 +380,15 @@ fn publish_canvas_region(
     {
         *viewport = want_vp;
     }
+    // Keep the root view in step with the window and the active project.
+    // The root IS the window: `Views::resolve` on a one-view world returns
+    // exactly what `viewport.window_to_canvas` returns, which is what makes
+    // introducing views a no-op until a second one is created.
+    views.set_root(
+        Rect::from_corners(Vec2::ZERO, Vec2::new(window.width(), window.height())),
+        want_vp,
+        projects.active,
+    );
     if (pane_zoom.0 - zoom).abs() > 0.0001 {
         pane_zoom.0 = zoom;
     }
@@ -407,6 +421,13 @@ fn handle_pan_zoom_input(
         (With<PaneTag>, With<jim_pane::PaneCapturesPinch>),
     >,
 ) {
+    // Nested live views get first refusal on wheel input. Advance this
+    // reader too, so claimed input cannot replay against the outer canvas.
+    if consumed.0 {
+        wheel.clear();
+        pinch.clear();
+        return;
+    }
     // Exposé locks the canvas so its grid can't drift under a stray
     // scroll/pinch. Swallow the events so they don't leak to panes either.
     if expose.active {

@@ -444,8 +444,16 @@ fn scroll_inbox(
     mut wheel: MessageReader<MouseWheel>,
     windows: Query<&Window>,
     keys: Res<ButtonInput<KeyCode>>,
-    viewport: Res<jim_pane::PaneViewport>,
-    all_panes: Query<(Entity, &PaneRect, Option<&Visibility>), With<jim_pane::PaneTag>>,
+    views: Res<jim_pane::Views>,
+    all_panes: Query<
+        (
+            Entity,
+            &PaneRect,
+            &jim_pane::PaneProject,
+            Option<&Visibility>,
+        ),
+        With<jim_pane::PaneTag>,
+    >,
     mut inboxes: Query<(&mut InboxPane, &PaneRect)>,
 ) {
     if keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight) {
@@ -466,11 +474,14 @@ fn scroll_inbox(
     let Some(pt) = win.cursor_position() else {
         return;
     };
-    let pt_canvas = viewport.window_to_canvas(pt);
+    let (view_id, pt_canvas) = views.resolve(pt);
     let all_rects: Vec<(Entity, PaneRect)> = all_panes
         .iter()
-        .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
-        .map(|(e, r, _)| (e, *r))
+        .filter(|(_, _, project, vis)| {
+            views.project_at(pt).is_none_or(|id| project.0 == id)
+                && !matches!(vis, Some(Visibility::Hidden))
+        })
+        .map(|(e, r, _, _)| (e, *r))
         .collect();
     let Some(target) = jim_pane::topmost_pane_at(pt_canvas, &all_rects) else {
         return;
@@ -481,7 +492,12 @@ fn scroll_inbox(
     let (_, content_size) = content_area(rect);
     let y_max = (pane.content_height - content_size.y).max(0.0);
     // Wheel delta is in screen pixels; scroll lives in canvas units.
-    let dy_canvas = dy_px / viewport.zoom.max(0.0001);
+    let zoom = views
+        .get(view_id)
+        .expect("resolved view must remain present")
+        .transform
+        .zoom;
+    let dy_canvas = dy_px / zoom.max(0.0001);
     pane.scroll = (pane.scroll - dy_canvas).clamp(0.0, y_max);
 }
 

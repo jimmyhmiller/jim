@@ -45,8 +45,11 @@ pub mod issues_pane;
 /// callers can continue to write `jim_app::daemon_proto::*`.
 pub use jim_daemon::proto as daemon_proto;
 pub mod ipc;
+pub mod live_views;
 mod notify_setup;
 pub mod pane_annotation;
+pub mod pane_groups;
+pub mod present;
 pub mod projects;
 pub mod radial;
 pub mod render_trace;
@@ -240,6 +243,9 @@ impl Plugin for AppShellPlugin {
             // (WhiteboardBackgroundPlugin) is the single drawing layer; it
             // already renders over panes via the overlay camera.
             // .add_plugins(pane_annotation::PaneAnnotationPlugin)
+            .add_plugins(pane_groups::PaneGroupsPlugin)
+            .add_plugins(live_views::ProjectRegionPlugin)
+            .add_plugins(present::PresentPlugin)
             .add_plugins(workflow_graph::WorkflowGraphPlugin)
             .add_plugins(fps::FpsOverlayPlugin)
             .add_plugins(debug_bar::DebugBarPlugin)
@@ -767,6 +773,17 @@ fn drain_ipc_open_requests(
     mut palette_open: ResMut<command_palette::PaletteOpenRequest>,
     mut issues: ResMut<issues_pane::IssuesStore>,
     mut screenshot_consent: ResMut<screenshot_consent::ScreenshotConsent>,
+    // Read-only view for `ListPaneGroups`: pane titles + their group, so
+    // `jimctl group list` can report a deck's wiring.
+    group_panes: Query<
+        (
+            &jim_pane::PaneTitle,
+            Option<&jim_pane::PaneGroup>,
+            &jim_pane::PaneProject,
+        ),
+        With<jim_pane::PaneTag>,
+    >,
+    visible_groups: Res<pane_groups::VisibleGroups>,
     mut commands: Commands,
 ) {
     let Some(inbox) = inbox else { return };
@@ -1079,6 +1096,61 @@ fn drain_ipc_open_requests(
                     continue;
                 };
                 pending.close_panes.push((project_id, kind, titles));
+            }
+            ipc::IpcRequest::SetPaneGroup {
+                project,
+                titles,
+                group,
+            } => {
+                if titles.is_empty() {
+                    eprintln!(
+                        "[ipc] set_pane_group: no --title given; refusing to regroup every pane"
+                    );
+                    continue;
+                }
+                let target = match project.as_deref() {
+                    Some("active") | None => OpenProjectTarget::Active,
+                    Some(name) => OpenProjectTarget::ByName(name.to_string()),
+                };
+                let Some(project_id) = projects::resolve_project(&target, &projects) else {
+                    eprintln!("[ipc] set_pane_group: no matching project");
+                    continue;
+                };
+                pending.set_pane_groups.push((project_id, titles, group));
+            }
+            ipc::IpcRequest::ListPaneGroups { project } => {
+                use std::io::Write as _;
+                let target = match project.as_deref() {
+                    Some("active") | None => OpenProjectTarget::Active,
+                    Some(name) => OpenProjectTarget::ByName(name.to_string()),
+                };
+                let project_id = projects::resolve_project(&target, &projects);
+                let entries: Vec<Value> = group_panes
+                    .iter()
+                    .filter(|(_, _, p)| project_id.is_none_or(|id| p.0 == id))
+                    .map(|(title, group, _)| {
+                        let name = group.map(|g| g.0.as_str());
+                        serde_json::json!({
+                            "title": title.0,
+                            "group": name,
+                            // Ungrouped panes are always visible; a grouped
+                            // one only while its group is revealed.
+                            "visible": name.is_none_or(|n| visible_groups.is_visible(n)),
+                        })
+                    })
+                    .collect();
+                let mut shown: Vec<&String> = visible_groups.0.iter().collect();
+                shown.sort();
+                let body = serde_json::json!({ "panes": entries, "shown": shown });
+                match serde_json::to_vec(&body) {
+                    Ok(bytes) => {
+                        if let Err(e) = _stream.write_all(&bytes) {
+                            eprintln!("[ipc] list_pane_groups: write: {}", e);
+                        }
+                        let _ = _stream.shutdown(std::net::Shutdown::Write);
+                    }
+                    Err(e) => eprintln!("[ipc] list_pane_groups: serialize: {}", e),
+                }
             }
             ipc::IpcRequest::DockPanes {
                 project,
@@ -1461,12 +1533,20 @@ fn handle_scroll(
     mut accum: Local<f32>,
     windows: Query<&Window>,
     sidebar: Res<Sidebar>,
-    viewport: Res<jim_pane::PaneViewport>,
+    views: Res<jim_pane::Views>,
     projects: Res<Projects>,
     store: Res<TerminalStore>,
     metrics: Res<MonoMetrics>,
     keys: Res<ButtonInput<KeyCode>>,
-    all_panes: Query<(Entity, &PaneRect, Option<&Visibility>), With<PaneTag>>,
+    all_panes: Query<
+        (
+            Entity,
+            &PaneRect,
+            &jim_pane::PaneProject,
+            Option<&Visibility>,
+        ),
+        With<PaneTag>,
+    >,
     terminals: Query<(Entity, Option<&ProjectMembership>, &PaneKindMarker), With<PaneTag>>,
 ) {
     // Cmd+scroll is reserved for canvas pan (see canvas.rs). Drain the
@@ -1510,10 +1590,14 @@ fn handle_scroll(
     // underneath.
     let all_rects: Vec<(Entity, PaneRect)> = all_panes
         .iter()
-        .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
-        .map(|(e, r, _)| (e, *r))
+        .filter(|(_, _, project, vis)| {
+            views.project_at(pt).is_none_or(|id| project.0 == id)
+                && !matches!(vis, Some(Visibility::Hidden))
+        })
+        .map(|(e, r, _, _)| (e, *r))
         .collect();
-    let Some(target) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &all_rects) else {
+    let (_, pt_canvas) = views.resolve(pt);
+    let Some(target) = jim_pane::topmost_pane_at(pt_canvas, &all_rects) else {
         return;
     };
     // Only consume the wheel if that topmost pane is a VT-grid pane
@@ -1541,7 +1625,7 @@ fn handle_scroll(
     // against the live grid size.
     let (col, row) = match all_rects.iter().find(|(e, _)| *e == target) {
         Some((_, rect)) => {
-            let (c, r) = pt_to_cell(viewport.window_to_canvas(pt), rect, metrics.cell_width);
+            let (c, r) = pt_to_cell(pt_canvas, rect, metrics.cell_width);
             (c.max(0) as u16, r.max(0) as u16)
         }
         None => (0, 0),

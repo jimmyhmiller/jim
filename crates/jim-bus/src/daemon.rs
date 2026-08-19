@@ -65,9 +65,15 @@ struct RingEntry {
 
 enum ConnState {
     /// Hello not yet received.
-    Anonymous { recv_buf: Vec<u8> },
-    Publisher { recv_buf: Vec<u8> },
-    Subscriber { send_buf: Vec<u8> },
+    Anonymous {
+        recv_buf: Vec<u8>,
+    },
+    Publisher {
+        recv_buf: Vec<u8>,
+    },
+    Subscriber {
+        send_buf: Vec<u8>,
+    },
 }
 
 struct Conn {
@@ -125,7 +131,12 @@ impl Daemon {
         let retained = load_retained(retained_path);
         // Seed next_seq past anything we reloaded so replayed retained
         // entries never collide with fresh live seqs.
-        let next_seq = retained.values().map(|v| v.seq).max().map(|s| s + 1).unwrap_or(0);
+        let next_seq = retained
+            .values()
+            .map(|v| v.seq)
+            .max()
+            .map(|s| s + 1)
+            .unwrap_or(0);
 
         Ok(Self {
             listener,
@@ -325,7 +336,9 @@ impl Daemon {
         // missed live messages after `n`. If the ring still covers `n`,
         // replay just that tail — no `ReplayStart`/retained resync.
         if let Some(n) = since_seq {
-            let covered = oldest_ring.map(|o| n + 1 >= o).unwrap_or(n + 1 >= self.next_seq);
+            let covered = oldest_ring
+                .map(|o| n + 1 >= o)
+                .unwrap_or(n + 1 >= self.next_seq);
             if covered {
                 for e in &self.ring {
                     if e.seq > n && send_buf.len() < MAX_SEND_BUF {
@@ -484,8 +497,7 @@ impl Daemon {
                 project: *project,
                 topic: topic.clone(),
                 sender: val.sender.clone(),
-                payload: serde_json::from_str(&val.payload_json)
-                    .unwrap_or(serde_json::Value::Null),
+                payload: serde_json::from_str(&val.payload_json).unwrap_or(serde_json::Value::Null),
             })
             .collect();
         if let Ok(json) = serde_json::to_vec(&entries) {

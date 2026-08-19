@@ -226,8 +226,13 @@ fn sync_input_panel_size(mut q: Query<(&FlameGraph, &mut FlameGraphInput)>) {
 /// canvas size.
 fn resize_image_to_panel(mut q: Query<&mut FlameGraph>, images: Res<Assets<Image>>) {
     for mut flame in &mut q {
-        let Some(img) = images.get(&flame.image) else { continue };
-        let want = (img.texture_descriptor.size.width, img.texture_descriptor.size.height);
+        let Some(img) = images.get(&flame.image) else {
+            continue;
+        };
+        let want = (
+            img.texture_descriptor.size.width,
+            img.texture_descriptor.size.height,
+        );
         if want != flame.gpu.size && want.0 > 0 && want.1 > 0 {
             flame.gpu.resize(want.0, want.1);
             flame.dirty = true;
@@ -253,13 +258,7 @@ fn render_and_upload(mut q: Query<&mut FlameGraph>, mut images: ResMut<Assets<Im
             continue;
         };
         let expected_len = (w * h * 4) as usize;
-        if img
-            .data
-            .as_ref()
-            .map(|d| d.len())
-            .unwrap_or(0)
-            != expected_len
-        {
+        if img.data.as_ref().map(|d| d.len()).unwrap_or(0) != expected_len {
             // Either the image was freshly created (data: None) or our size
             // changed underneath the asset. Reallocate.
             img.texture_descriptor.size = Extent3d {

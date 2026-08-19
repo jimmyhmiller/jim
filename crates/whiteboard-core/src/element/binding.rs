@@ -138,13 +138,25 @@ pub fn determine_focus_distance(element: &Element, adjacent: Point, edge: Point)
     let is_diamond = matches!(element.kind, ElementKind::Diamond);
     let interceptees: [(Point, Point); 2] = if is_diamond {
         [
-            (Point::new(x + w / 2.0, y - h), Point::new(x + w / 2.0, y + h * 2.0)),
-            (Point::new(x - w, y + h / 2.0), Point::new(x + w * 2.0, y + h / 2.0)),
+            (
+                Point::new(x + w / 2.0, y - h),
+                Point::new(x + w / 2.0, y + h * 2.0),
+            ),
+            (
+                Point::new(x - w, y + h / 2.0),
+                Point::new(x + w * 2.0, y + h / 2.0),
+            ),
         ]
     } else {
         [
-            (Point::new(x - w, y - h), Point::new(x + w * 2.0, y + h * 2.0)),
-            (Point::new(x + w * 2.0, y - h), Point::new(x - w, y + h * 2.0)),
+            (
+                Point::new(x - w, y - h),
+                Point::new(x + w * 2.0, y + h * 2.0),
+            ),
+            (
+                Point::new(x + w * 2.0, y - h),
+                Point::new(x - w, y + h * 2.0),
+            ),
         ]
     };
     let axes: [(Point, Point); 2] = if is_diamond {
@@ -312,7 +324,10 @@ pub fn determine_focus_point(element: &Element, focus: f64, adjacent: Point) -> 
     let r: Vec<Point> = base
         .iter()
         .map(|c| {
-            let p = Point::new(center.x + (c.x - center.x) * f, center.y + (c.y - center.y) * f);
+            let p = Point::new(
+                center.x + (c.x - center.x) * f,
+                center.y + (c.y - center.y) * f,
+            );
             point_rotate_rads(p, center, element.angle)
         })
         .collect();
@@ -342,11 +357,23 @@ pub fn determine_focus_point(element: &Element, focus: f64, adjacent: Point) -> 
         ]
     };
     if s[0] {
-        if pos { r[1] } else { r[0] }
+        if pos {
+            r[1]
+        } else {
+            r[0]
+        }
     } else if s[1] {
-        if pos { r[2] } else { r[1] }
+        if pos {
+            r[2]
+        } else {
+            r[1]
+        }
     } else if s[2] {
-        if pos { r[3] } else { r[2] }
+        if pos {
+            r[3]
+        } else {
+            r[2]
+        }
     } else if pos {
         r[0]
     } else {
@@ -592,7 +619,12 @@ pub fn update_bound_arrow(scene: &Scene, arrow_id: &ElementId) -> Option<BoundEn
         if let Some(fixed) = binding.fixed_point {
             return Some(fixed_bound_point(target, fixed));
         }
-        Some(binding_endpoint(target, binding.focus, binding.gap, adjacent))
+        Some(binding_endpoint(
+            target,
+            binding.focus,
+            binding.gap,
+            adjacent,
+        ))
     };
     let start = data
         .start_binding
@@ -844,12 +876,23 @@ mod tests {
         // live at the centre and follow the shape.
         let r = rect_el("r", 0.0, 0.0, 100.0, 100.0);
         let b = compute_binding(Point::new(50.0, 50.0), Point::new(-50.0, 50.0), &r);
-        assert_eq!(b.fixed_point, Some([0.5, 0.5]), "centre release → fixed centre point");
-        approx_pt(fixed_bound_point(&r, b.fixed_point.unwrap()), Point::new(50.0, 50.0), 1e-9);
+        assert_eq!(
+            b.fixed_point,
+            Some([0.5, 0.5]),
+            "centre release → fixed centre point"
+        );
+        approx_pt(
+            fixed_bound_point(&r, b.fixed_point.unwrap()),
+            Point::new(50.0, 50.0),
+            1e-9,
+        );
 
         // A release near the edge still uses edge binding (no fixed point).
         let edge = compute_binding(Point::new(98.0, 50.0), Point::new(-50.0, 50.0), &r);
-        assert!(edge.fixed_point.is_none(), "near-edge release stays edge binding");
+        assert!(
+            edge.fixed_point.is_none(),
+            "near-edge release stays edge binding"
+        );
     }
 
     // ---- update_bound_arrow: the headline behavior ----
@@ -952,10 +995,16 @@ mod tests {
         let r = rect_el("r", 100.0, 0.0, 100.0, 100.0); // centre (150,50)
                                                         // Approaching from the right: endpoint on the right facing edge.
         let from_right = binding_endpoint(&r, 0.0, 12.0, Point::new(400.0, 50.0));
-        assert!(from_right.x > 150.0, "right approach → right edge, {from_right:?}");
+        assert!(
+            from_right.x > 150.0,
+            "right approach → right edge, {from_right:?}"
+        );
         // Approaching from the left: endpoint on the left facing edge.
         let from_left = binding_endpoint(&r, 0.0, 12.0, Point::new(-200.0, 50.0));
-        assert!(from_left.x < 150.0, "left approach → left edge, {from_left:?}");
+        assert!(
+            from_left.x < 150.0,
+            "left approach → left edge, {from_left:?}"
+        );
     }
 
     #[test]
@@ -1000,7 +1049,10 @@ mod tests {
             end.x >= 100.0 && end.x < 180.0,
             "end on B's left / in the gap, got {end:?}"
         );
-        assert!(end.x >= start.x, "arrow must not reverse: {start:?} -> {end:?}");
+        assert!(
+            end.x >= start.x,
+            "arrow must not reverse: {start:?} -> {end:?}"
+        );
     }
 
     #[test]
@@ -1035,7 +1087,7 @@ mod tests {
     fn ellipse_follow_keeps_clearance() {
         let mut scene = Scene::new();
         scene.insert(ellipse_el("e", 100.0, 0.0, 100.0, 100.0)); // centre (150,50)
-        // End just OUTSIDE the left vertex (x=100) so this is an edge binding.
+                                                                 // End just OUTSIDE the left vertex (x=100) so this is an edge binding.
         scene.insert(arrow_el(
             "arrow",
             vec![Point::new(0.0, 50.0), Point::new(90.0, 50.0)],
@@ -1081,7 +1133,11 @@ mod tests {
             .unwrap();
         // Collinear with the fixed adjacent (0,40) and the diamond's new centre.
         let moved = scene.get(&ElementId::from("d")).unwrap();
-        approx(cross_collinear(Point::new(0.0, 40.0), moved.center(), end), 0.0, 0.5);
+        approx(
+            cross_collinear(Point::new(0.0, 40.0), moved.center(), end),
+            0.0,
+            0.5,
+        );
     }
 
     #[test]
@@ -1115,7 +1171,7 @@ mod tests {
     fn start_binding_follows_too() {
         let mut scene = Scene::new();
         scene.insert(rect_el("r", 100.0, 0.0, 100.0, 50.0)); // centre (150,25)
-                                                            // Arrow whose START (points[0]) is near the box, END far right.
+                                                             // Arrow whose START (points[0]) is near the box, END far right.
         scene.insert(arrow_el(
             "arrow",
             vec![Point::new(90.0, 25.0), Point::new(400.0, 25.0)],
@@ -1139,7 +1195,10 @@ mod tests {
         // Box moved right; the START tracks the box's right edge (facing the END).
         let moved = scene.get(&ElementId::from("r")).unwrap();
         approx(distance_to_outline(moved, start), 10.0, 1e-3);
-        assert!(start.x > 150.0, "start tracked to the right edge, got {start:?}");
+        assert!(
+            start.x > 150.0,
+            "start tracked to the right edge, got {start:?}"
+        );
     }
 
     #[test]

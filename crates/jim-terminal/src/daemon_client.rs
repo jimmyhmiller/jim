@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::daemon_proto::{decode, encode, ClientMessage, DaemonMessage};
+use crate::daemon_proto::{ClientMessage, DaemonMessage, decode, encode};
 
 /// Outbound frame buffer high-water mark — purely an early-warning so
 /// runaway senders surface as something other than unbounded memory growth.
@@ -69,6 +69,34 @@ impl DaemonClient {
             }
         };
 
+        Self::handshake(sock, session_id, cols, rows, attached_existing)
+    }
+
+    /// Reattach to an ALREADY-RUNNING daemon for `session_id`.
+    ///
+    /// Unlike [`DaemonClient::open`] this never forks a fresh daemon. A
+    /// reconnect must not silently replace the session the user was
+    /// watching with a brand-new shell, so if nothing is listening on
+    /// the socket we fail and let the caller keep the pane dead.
+    ///
+    /// The daemon replays its history buffer on attach, so a client that
+    /// reconnects catches up on everything it missed while away.
+    pub fn reattach(session_id: u64, cols: u16, rows: u16) -> std::io::Result<Self> {
+        let socket_path = crate::socket_path(session_id)
+            .ok_or_else(|| std::io::Error::other("no data_dir (HOME unset?)"))?;
+        let sock = UnixStream::connect(&socket_path)?;
+        Self::handshake(sock, session_id, cols, rows, true)
+    }
+
+    /// Shared tail of `open` / `reattach`: send `Attach` and block for
+    /// the ack, then flip the socket non-blocking for the poll loop.
+    fn handshake(
+        sock: UnixStream,
+        session_id: u64,
+        cols: u16,
+        rows: u16,
+        attached_existing: bool,
+    ) -> std::io::Result<Self> {
         sock.set_nonblocking(false)?;
         let mut client = Self {
             sock,
@@ -143,10 +171,7 @@ impl DaemonClient {
     /// Drain the socket non-blockingly, invoking `f` for each fully-
     /// decoded frame. Returns `Ok(false)` on clean EOF (daemon gone) or
     /// a fatal error; the caller should then stop using this client.
-    pub fn poll_frames<F: FnMut(DaemonMessage)>(
-        &mut self,
-        mut f: F,
-    ) -> std::io::Result<bool> {
+    pub fn poll_frames<F: FnMut(DaemonMessage)>(&mut self, mut f: F) -> std::io::Result<bool> {
         let mut tmp = [0u8; 8192];
         loop {
             match self.sock.read(&mut tmp) {

@@ -15,7 +15,7 @@ use bevy::sprite_render::ColorMaterial;
 
 use jim_pane::{
     InputConsumed, MARGIN, PaneChrome, PaneInputSuppressed, PaneKindMarker, PaneRect,
-    PaneScreenAnchored, PaneTag, PaneViewport, TITLE_H,
+    PaneScreenAnchored, PaneTag, TITLE_H,
 };
 
 use whiteboard_core::Point;
@@ -106,7 +106,7 @@ struct PaneAnnoRoot;
 fn update_suppression(
     canvas_active: Res<CanvasDrawActive>,
     ts: Res<WbToolState>,
-    viewport: Res<PaneViewport>,
+    views: Res<jim_pane::Views>,
     windows: Query<&Window>,
     anno: Res<PaneAnnotations>,
     panes: PaneQuery,
@@ -119,7 +119,7 @@ fn update_suppression(
                 .single()
                 .ok()
                 .and_then(|w| w.cursor_position())
-                .and_then(|c| pane_under_cursor(&panes, viewport.window_to_canvas(c)))
+                .and_then(|c| pane_under_cursor(&panes, views.resolve(c).1))
                 .and_then(|(pane, local)| {
                     anno.editors
                         .get(&pane)
@@ -180,7 +180,7 @@ fn content_rect_canvas(rect: &PaneRect) -> (Vec2, Vec2) {
 fn annotation_input(
     canvas_active: Res<CanvasDrawActive>,
     ts: Res<WbToolState>,
-    viewport: Res<PaneViewport>,
+    views: Res<jim_pane::Views>,
     windows: Query<&Window>,
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,
@@ -198,7 +198,7 @@ fn annotation_input(
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    let cursor_canvas = viewport.window_to_canvas(cursor);
+    let (_, cursor_canvas) = views.resolve(cursor);
     let mods = modifiers(&keys);
     let drawing_tool = is_drawing_tool(ts.tool);
 

@@ -133,7 +133,10 @@ fn register_shared_epoch(epoch: &std::sync::Arc<std::sync::atomic::AtomicU64>) {
             .name("funct-shared-epoch-ticker".into())
             .spawn(|| epoch_ticker_loop(epoch_ticker()));
     });
-    t.epochs.lock().unwrap().push(std::sync::Arc::downgrade(epoch));
+    t.epochs
+        .lock()
+        .unwrap()
+        .push(std::sync::Arc::downgrade(epoch));
 }
 
 /// RAII handle held by a worker while it is running fuel slices. Creating
@@ -207,6 +210,31 @@ extern fn uniform_set(name, value)
 extern fn mask_paint(name, x, y, radius, value)
 extern fn oklch(l, c, h)
 
+// --- Glaze: the style language (see docs/GLAZE.md) ---
+// Compile a stylesheet ONCE (top-level body or on_start), then ask it for
+// styles by name and drop the result straight under an element's `style:`.
+// Every call faults loudly on a bad sheet / unknown style — never a silent
+// default, which would render as an unstyled element and read as a layout bug.
+//
+//   glaze_load_file(widget_asset("talk.glz"))     // saving the .glz hot-reloads
+//   el("frame", { style: glaze("card"), children: [ … ] })
+//
+extern fn glaze_load(src)            // compile literal Glaze source -> true
+extern fn glaze_load_file(path)      // read + compile a .glz (~ expanded) -> true
+extern fn glaze_loaded()             // is a sheet loaded? -> bool
+extern fn glaze_styles()             // style names in the sheet -> [name]
+// glaze(name[, variant[, states]]) -> Style record.
+//   variant: static params, e.g. { intent: "danger" }  (folded at compile time)
+//   states:  discrete pseudo-states, e.g. ["hover"] or a bare "hover"
+extern fn glaze(name, variant, states)
+// Same, resolved at a viewport size so `when vw < 600 { … }` breakpoints
+// apply — pass `render(w, h)`'s own arguments to make a widget responsive.
+extern fn glaze_at(name, variant, states, vw, vh)
+// Per-slot style for a compound component (Glaze `part {}` blocks).
+// component: toggle select tabs bar stepper radio checkbox slider table
+//            toast popover dialog tooltip
+extern fn glaze_slot(name, component, variant, states)
+
 // --- widget<->widget message bus ---
 extern fn emit(topic, payload)
 extern fn emit_retained(topic, payload)
@@ -224,6 +252,16 @@ extern fn rand_int(lo, hi)
 extern fn hash_str(s)
 extern fn time()
 
+// --- markdown ---
+// md_parse(text) -> [ { kind, level, ordered, indent, lang, lines: [[run]] } ]
+//   kind: "paragraph" | "blank" | "heading" | "code-block" | "block-quote"
+//         | "list-item" | "thematic-break"
+//   run:  { value, bold, italic, code, strike, link }
+// Runs drop in as-is to `{ kind: "richtext", runs: [...] }`. Syntax markers
+// (`#`, `**`, fences, bullets) are already stripped — render your own from
+// the block `kind`.
+extern fn md_parse(text)
+
 // --- syntax highlighting + filesystem (the diff / code-review widget) ---
 // highlight(code, lang) -> [ [ { text, kind }, … ], … ] (one line per entry)
 extern fn highlight(code, lang)
@@ -232,9 +270,74 @@ extern fn read_file(path)
 extern fn write_file(path, text)
 "#;
 
+/// Convert a Markdown source string into the JSON shape `md_parse`
+/// hands to a widget. Kept out of the closure so it is unit-testable.
+///
+/// Marker runs are dropped (see the `md_parse` registration for why); a
+/// line consisting only of markers therefore becomes an empty run list,
+/// which still occupies a line so blank-line spacing survives.
+fn md_parse_to_json(text: &str) -> Json {
+    use markdown_core::{BlockKind, RunKind};
+
+    let doc = markdown_core::parse(text);
+    let blocks: Vec<Json> = doc
+        .blocks
+        .iter()
+        .map(|b| {
+            let (kind, level, ordered) = match b.kind {
+                BlockKind::Paragraph => ("paragraph", None, None),
+                BlockKind::Blank => ("blank", None, None),
+                BlockKind::Heading(n) => ("heading", Some(n), None),
+                BlockKind::CodeBlock => ("code-block", None, None),
+                BlockKind::BlockQuote => ("block-quote", None, None),
+                BlockKind::ListItem { ordered } => ("list-item", None, Some(ordered)),
+                BlockKind::ThematicBreak => ("thematic-break", None, None),
+            };
+            let lines: Vec<Json> = b
+                .lines
+                .iter()
+                .map(|line| {
+                    let runs: Vec<Json> = line
+                        .runs
+                        .iter()
+                        .filter(|r| !r.kind.is_marker())
+                        .map(|r| {
+                            let s = r.kind.style();
+                            serde_json::json!({
+                                "value": r.text,
+                                "bold": s.bold,
+                                "italic": s.italic,
+                                "code": s.code,
+                                "strike": s.strike,
+                                "link": s.link,
+                            })
+                        })
+                        .collect();
+                    Json::Array(runs)
+                })
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert("kind".into(), Json::String(kind.into()));
+            if let Some(l) = level {
+                obj.insert("level".into(), Json::from(l));
+            }
+            if let Some(o) = ordered {
+                obj.insert("ordered".into(), Json::Bool(o));
+            }
+            obj.insert("indent".into(), Json::from(b.indent));
+            if let Some(lang) = &b.lang {
+                obj.insert("lang".into(), Json::String(lang.clone()));
+            }
+            obj.insert("lines".into(), Json::Array(lines));
+            Json::Object(obj)
+        })
+        .collect();
+    Json::Array(blocks)
+}
+
 /// Expand a leading `~` / `~/` to the user's home dir for the filesystem
 /// host fns. Anything else is returned unchanged.
-fn expand_tilde(path: &str) -> String {
+pub(crate) fn expand_tilde(path: &str) -> String {
     if path == "~" || path.starts_with("~/") {
         if let Ok(home) = std::env::var("HOME") {
             return format!("{home}{}", &path[1..]);
@@ -689,7 +792,12 @@ impl FunctWorker {
                     self.start_handler("on_scroll", vec![Value::Float(y as f64)], false);
                 }
             }
-            HostToWorker::Wheel { local_x, local_y, dx, dy } => {
+            HostToWorker::Wheel {
+                local_x,
+                local_y,
+                dx,
+                dy,
+            } => {
                 // Cursor-aware wheel: on_wheel(x, y, dx, dy). dx/dy are the
                 // horizontal/vertical deltas so a widget can pan a timeline by
                 // the dominant axis (avoids jitter from the minor axis).
@@ -706,7 +814,11 @@ impl FunctWorker {
                     );
                 }
             }
-            HostToWorker::Pinch { local_x, local_y, delta } => {
+            HostToWorker::Pinch {
+                local_x,
+                local_y,
+                delta,
+            } => {
                 if self.defines("on_pinch") {
                     self.start_handler(
                         "on_pinch",
@@ -734,10 +846,18 @@ impl FunctWorker {
                 } else {
                     "on_event"
                 };
-                self.start_handler(name, vec![Value::str(kind), Value::from_json(&payload)], true);
+                self.start_handler(
+                    name,
+                    vec![Value::str(kind), Value::from_json(&payload)],
+                    true,
+                );
             }
             HostToWorker::Toggle { id, checked } => {
-                self.start_handler("on_toggle", vec![Value::str(id), Value::Bool(checked)], true);
+                self.start_handler(
+                    "on_toggle",
+                    vec![Value::str(id), Value::Bool(checked)],
+                    true,
+                );
             }
             HostToWorker::TabSelect { id, tab } => {
                 self.start_handler("on_tab_select", vec![Value::str(id), Value::str(tab)], true);
@@ -784,7 +904,11 @@ impl FunctWorker {
                 );
             }
             HostToWorker::InputChange { id, value } => {
-                self.start_handler("on_input_change", vec![Value::str(id), Value::str(value)], true);
+                self.start_handler(
+                    "on_input_change",
+                    vec![Value::str(id), Value::str(value)],
+                    true,
+                );
             }
             HostToWorker::EditorChange { id, value } => {
                 self.start_handler(
@@ -805,7 +929,11 @@ impl FunctWorker {
                 );
             }
             HostToWorker::InputSubmit { id, value } => {
-                self.start_handler("on_input_submit", vec![Value::str(id), Value::str(value)], true);
+                self.start_handler(
+                    "on_input_submit",
+                    vec![Value::str(id), Value::str(value)],
+                    true,
+                );
             }
             HostToWorker::Message {
                 topic,
@@ -1216,6 +1344,28 @@ fn register_host_surface(
         Value::from_json(&json)
     });
 
+    // ---- markdown ----
+    // md_parse(text) -> [ block ]. Backed by `markdown_core`, the same
+    // parser the WYSIWYG editor uses, so a widget gets a real inline
+    // scanner (emphasis, code spans, strikethrough, links) instead of
+    // reimplementing CommonMark in funct — which is why `markdown.ft`
+    // had to strip `**bold**` rather than render it.
+    //
+    // Each block: { kind, level, ordered, indent, lang, lines: [ [run] ] }
+    //   kind:  "paragraph" | "blank" | "heading" | "code-block"
+    //          | "block-quote" | "list-item" | "thematic-break"
+    //   run:   { value, bold, italic, code, strike, link }
+    // Runs are ready to hand to `{kind:"richtext", runs: [...]}`.
+    //
+    // Syntax MARKER runs (`#`, `**`, fences, list bullets, link
+    // brackets) are dropped: a widget renders its own bullets and
+    // heading sizes from `kind`, and wants the visible text. Use
+    // `markdown_core` directly if you need markers (the WYSIWYG editor
+    // does, to reveal them around the caret).
+    vm.register1("md_parse", |text: String| -> Value {
+        Value::from_json(&md_parse_to_json(&text))
+    });
+
     // ---- filesystem bridge ----
     // read_file(path) -> { ok, text, error }. `~` is expanded. Lets a widget
     // load a file (a diff, a .md) without the `cat` subprocess dance, and is
@@ -1280,7 +1430,10 @@ fn register_host_surface(
                 }
                 _ => return Err(Fault::new("proc_spawn expects (cmd) or (cmd, [args])")),
             };
-            let id = procs.lock().map(|mut r| r.spawn(&cmd, &extra)).unwrap_or(-1);
+            let id = procs
+                .lock()
+                .map(|mut r| r.spawn(&cmd, &extra))
+                .unwrap_or(-1);
             Ok(Value::Int(id))
         });
     }
@@ -1296,7 +1449,10 @@ fn register_host_surface(
     {
         let procs = procs.clone();
         vm.register1("proc_read", move |id: i64| -> String {
-            procs.lock().map(|mut r| r.read_line(id)).unwrap_or_default()
+            procs
+                .lock()
+                .map(|mut r| r.read_line(id))
+                .unwrap_or_default()
         });
     }
     {
@@ -1426,7 +1582,9 @@ fn register_host_surface(
             crate::audio::record_start(&device, &path, dual)
         },
     );
-    vm.register0("audio_record_stop", || -> bool { crate::audio::record_stop() });
+    vm.register0("audio_record_stop", || -> bool {
+        crate::audio::record_stop()
+    });
     vm.register0("audio_levels", || -> Value {
         let arr: Vec<serde_json::Value> = crate::audio::take_levels()
             .into_iter()
@@ -1434,7 +1592,9 @@ fn register_host_surface(
             .collect();
         Value::from_json(&serde_json::Value::Array(arr))
     });
-    vm.register0("audio_recording", || -> bool { crate::audio::is_recording() });
+    vm.register0("audio_recording", || -> bool {
+        crate::audio::is_recording()
+    });
     vm.register0("audio_status", || -> String { crate::audio::status() });
 
     // ---- native audio playback (podcast editor) ----
@@ -1443,7 +1603,9 @@ fn register_host_surface(
     // estimate against a spawned `ffplay` (see playback.rs). EDL clips are
     // spliced with crossfades and variable speed is pitch-preserving WSOLA —
     // no ffmpeg render, no latency fudge.
-    vm.register1("audio_play_load", |path: String| { crate::playback::load(&path); });
+    vm.register1("audio_play_load", |path: String| {
+        crate::playback::load(&path);
+    });
     vm.register1("audio_play_ready", |path: String| -> bool {
         crate::playback::is_ready(&path)
     });
@@ -1454,24 +1616,35 @@ fn register_host_surface(
     vm.register3(
         "audio_play_start",
         |start_ms: f64, clips_json: String, speed: f64| -> bool {
-            let clips: Vec<(f64, f64)> = serde_json::from_str::<Vec<serde_json::Value>>(&clips_json)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|c| {
-                    let from = c.get("from")?.as_f64()?;
-                    let to = c.get("to")?.as_f64()?;
-                    Some((from, to))
-                })
-                .collect();
+            let clips: Vec<(f64, f64)> =
+                serde_json::from_str::<Vec<serde_json::Value>>(&clips_json)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|c| {
+                        let from = c.get("from")?.as_f64()?;
+                        let to = c.get("to")?.as_f64()?;
+                        Some((from, to))
+                    })
+                    .collect();
             crate::playback::start(start_ms, clips, speed)
         },
     );
-    vm.register1("audio_play_seek", |src_ms: f64| { crate::playback::seek(src_ms); });
-    vm.register1("audio_play_set_speed", |speed: f64| { crate::playback::set_speed(speed); });
-    vm.register0("audio_play_stop", || { crate::playback::stop(); });
+    vm.register1("audio_play_seek", |src_ms: f64| {
+        crate::playback::seek(src_ms);
+    });
+    vm.register1("audio_play_set_speed", |speed: f64| {
+        crate::playback::set_speed(speed);
+    });
+    vm.register0("audio_play_stop", || {
+        crate::playback::stop();
+    });
     vm.register0("audio_play_pos", || -> f64 { crate::playback::pos_ms() });
-    vm.register0("audio_playing", || -> bool { crate::playback::is_playing() });
-    vm.register0("audio_play_finished", || -> bool { crate::playback::is_finished() });
+    vm.register0("audio_playing", || -> bool {
+        crate::playback::is_playing()
+    });
+    vm.register0("audio_play_finished", || -> bool {
+        crate::playback::is_finished()
+    });
 
     // ---- widget<->widget message bus ----
     {
@@ -1509,6 +1682,13 @@ fn register_host_surface(
     jim_style::register_theme_host_fns_funct(vm);
     jim_style::register_preset_host_fns_funct(vm);
     jim_style::register_script_host_fns_funct(vm);
+
+    // Glaze — the style language. Registered after the theme surface so a
+    // widget can mix both: theme tokens for host-wide colors, Glaze for
+    // its own reusable, hot-retunable component styles. The sheet lives in
+    // `slots` (not a closure-local) so the main thread can see its path
+    // and hot-reload the widget when the `.glz` is saved.
+    crate::glaze_host::register(vm, &slots.glaze_sheet);
 }
 
 /// Shared body for `emit` / `emit_retained`: `emit(topic)` or
@@ -1537,6 +1717,476 @@ fn rand_state(seed: u64) -> u32 {
 mod tests {
     use super::*;
     use crate::protocol::Element;
+
+    /// A scratch module root holding a fresh `host.ft`, so a widget's
+    /// `import "host"` resolves without depending on `~/.jim/widgets`
+    /// (which is gitignored and absent in CI).
+    ///
+    /// Unique per CALL, not per process: several tests boot the same
+    /// widget, and each removes its root when it finishes. Sharing one
+    /// directory let a finishing test delete `host.ft` out from under a
+    /// concurrently-booting one — a flaky `import "host"` failure that
+    /// only showed up under parallel `cargo test`.
+    fn scratch_root(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("jim-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("scratch module root");
+        std::fs::write(root.join("host.ft"), HOST_FT).expect("write host.ft");
+        root
+    }
+
+    /// The point of `md_parse`: emphasis survives as run flags instead of
+    /// being stripped, and the runs are shaped for `Element::RichText`.
+    #[test]
+    fn md_parse_keeps_inline_emphasis() {
+        let json = md_parse_to_json("a **bold** word");
+        let blocks = json.as_array().expect("array of blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["kind"], "paragraph");
+        let runs = blocks[0]["lines"][0].as_array().expect("runs");
+        let bolded: Vec<&str> = runs
+            .iter()
+            .filter(|r| r["bold"] == true)
+            .map(|r| r["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(bolded, vec!["bold"], "the emphasized word keeps its flag");
+        let text: String = runs.iter().map(|r| r["value"].as_str().unwrap()).collect();
+        assert_eq!(text, "a bold word", "markers are dropped, content is whole");
+    }
+
+    /// Block kinds a renderer branches on must survive with their
+    /// distinguishing data (heading level, list ordering, code language).
+    #[test]
+    fn md_parse_reports_block_kinds() {
+        let json = md_parse_to_json("## Title\n\n- one\n\n```rust\nlet x = 1;\n```\n");
+        let blocks = json.as_array().expect("blocks");
+        let by_kind = |k: &str| blocks.iter().find(|b| b["kind"] == k);
+
+        let heading = by_kind("heading").expect("heading block");
+        assert_eq!(heading["level"], 2);
+        let item = by_kind("list-item").expect("list item block");
+        assert_eq!(item["ordered"], false);
+        let code = by_kind("code-block").expect("code block");
+        assert_eq!(code["lang"], "rust");
+    }
+
+    /// Evaluate the shipped `glaze_demo.ft` against the shipped
+    /// `glaze_demo.glz` in a hermetic module root, and assert the Glaze
+    /// styling actually reaches the `Element` tree.
+    ///
+    /// This is the one test that covers the WHOLE bridge in the order a
+    /// real widget hits it: `import "host"` → `glaze_load_file` → `glaze`
+    /// / `glaze_at` → funct record → `to_json` → `protocol::Element`. The
+    /// unit tests in `glaze_host` cover the resolver; only this one would
+    /// catch the demo widget's funct syntax rotting, the sheet failing to
+    /// parse, or a `Style` field being dropped on the serde hop.
+    fn eval_glaze_demo(w: f32) -> Element {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let src = std::fs::read_to_string(widgets.join("glaze_demo.ft"))
+            .expect("glaze_demo.ft must ship with the crate");
+        let sheet = widgets.join("glaze_demo.glz");
+        assert!(sheet.exists(), "glaze_demo.glz must ship with the crate");
+
+        // `import "host"` resolves against the module root, so give the VM
+        // a scratch root holding a freshly-written host.ft (the real one in
+        // ~/.jim/widgets is gitignored and absent in CI).
+        let root = scratch_root("glaze-demo");
+
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        let sheet_slot = crate::glaze_host::GlazeSheet::new();
+        crate::glaze_host::register(&mut vm, &sheet_slot);
+        // The two host natives the demo touches outside Glaze.
+        vm.register0("request_render", || {});
+        vm.register1("host_env", |name: String| -> String {
+            std::env::var(name).unwrap_or_default()
+        });
+        vm.set_global(
+            "params",
+            Value::from_json(&serde_json::json!({ "sheet": sheet })),
+        );
+
+        vm.eval(&src).expect("glaze_demo.ft must compile and run");
+        let frame = vm
+            .call("render", vec![Value::Float(w as f64), Value::Float(600.0)])
+            .expect("call render");
+        let el = funct_frame_to_element(&frame)
+            .expect("frame must convert")
+            .expect("render must return a tree");
+        let _ = std::fs::remove_dir_all(&root);
+        el
+    }
+
+    /// End-to-end for step two, in the order a real widget hits it:
+    /// `md_parse` → funct run records → `Element::RichText`. Covers the
+    /// shipped `md_demo.ft`, so its funct syntax and the run mapping stay
+    /// honest.
+    #[test]
+    fn md_demo_renders_rich_runs() {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let src = std::fs::read_to_string(widgets.join("md_demo.ft"))
+            .expect("md_demo.ft must ship with the crate");
+
+        let root = scratch_root("md-demo");
+
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.register0("request_render", || {});
+        vm.register1("md_parse", |text: String| -> Value {
+            Value::from_json(&md_parse_to_json(&text))
+        });
+        vm.register1("read_file", |_p: String| -> Value {
+            Value::from_json(&serde_json::json!({ "ok": false, "text": "" }))
+        });
+        vm.set_global(
+            "params",
+            Value::from_json(&serde_json::json!({
+                "text": "A **bold** word and `code`.\n"
+            })),
+        );
+
+        vm.eval(&src).expect("md_demo.ft must compile and run");
+        let frame = vm
+            .call("render", vec![Value::Float(600.0), Value::Float(400.0)])
+            .expect("call render");
+        let el = funct_frame_to_element(&frame)
+            .expect("frame must convert")
+            .expect("render must return a tree");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Find the paragraph's RichText and check the emphasis survived as
+        // a run flag rather than being stripped to plain text.
+        fn find_rich(el: &Element) -> Option<&Vec<crate::protocol::TextRun>> {
+            match el {
+                Element::RichText { runs, .. } => Some(runs),
+                Element::Vstack { children, .. }
+                | Element::Hstack { children, .. }
+                | Element::Frame { children, .. } => children.iter().find_map(find_rich),
+                _ => None,
+            }
+        }
+        let runs = find_rich(&el).expect("a RichText block must be rendered");
+        let text: String = runs.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(text, "A bold word and code.");
+        let bold: Vec<&str> = runs
+            .iter()
+            .filter(|r| matches!(r.weight, Some(crate::protocol::Weight::Bold)))
+            .map(|r| r.value.as_str())
+            .collect();
+        assert_eq!(bold, vec!["bold"], "bold run keeps its weight");
+        let mono: Vec<&str> = runs
+            .iter()
+            .filter(|r| r.family.as_deref() == Some("mono"))
+            .map(|r| r.value.as_str())
+            .collect();
+        assert_eq!(mono, vec!["code"], "code span becomes a mono run");
+    }
+
+    /// Boot the shipped `deck.ft` against the shipped `deck.glz` in a
+    /// hermetic module root and return the VM, ready to `render` / `on_key`.
+    ///
+    /// The deck is the first widget that leans on BOTH new surfaces at
+    /// once — Glaze for box styling and `md_parse`/`RichText` for content —
+    /// so this is the integration test for step three.
+    /// A booted deck plus the scratch root to clean up and the
+    /// `deck.slide` messages it published.
+    struct Deck {
+        vm: Funct,
+        root: std::path::PathBuf,
+        published: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl Drop for Deck {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn boot_deck(markdown: &str) -> Deck {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let src = std::fs::read_to_string(widgets.join("deck.ft"))
+            .expect("deck.ft must ship with the crate");
+        let sheet = widgets.join("deck.glz");
+        assert!(sheet.exists(), "deck.glz must ship with the crate");
+
+        let root = scratch_root("deck");
+
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        let sheet_slot = crate::glaze_host::GlazeSheet::new();
+        crate::glaze_host::register(&mut vm, &sheet_slot);
+        vm.register0("request_render", || {});
+        vm.register1("md_parse", |text: String| -> Value {
+            Value::from_json(&md_parse_to_json(&text))
+        });
+        vm.register1("host_env", |name: String| -> String {
+            std::env::var(name).unwrap_or_default()
+        });
+        vm.register1("read_file", |_p: String| -> Value {
+            Value::from_json(&serde_json::json!({ "ok": false, "text": "" }))
+        });
+        // Capture every publication so a test can assert on what the deck
+        // announces to the rest of the app.
+        let published = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
+            String,
+            serde_json::Value,
+        )>::new()));
+        {
+            let published = published.clone();
+            vm.register_raw("emit_retained", move |_vm, args| {
+                if let (Some(Value::Str(topic)), Some(payload)) = (args.first(), args.get(1)) {
+                    if let Ok(j) = payload.to_json() {
+                        published
+                            .lock()
+                            .expect("published lock")
+                            .push((topic.to_string(), j));
+                    }
+                }
+                Ok(Value::Unit)
+            });
+        }
+        vm.set_global(
+            "params",
+            Value::from_json(&serde_json::json!({
+                "text": markdown,
+                "style": sheet,
+            })),
+        );
+
+        vm.eval(&src).expect("deck.ft must compile and run");
+        vm.call("on_start", vec![])
+            .expect("on_start loads the theme");
+        Deck {
+            vm,
+            root,
+            published,
+        }
+    }
+
+    fn deck_render(vm: &mut Funct) -> Element {
+        let frame = vm
+            .call("render", vec![Value::Float(1280.0), Value::Float(720.0)])
+            .expect("call render");
+        funct_frame_to_element(&frame)
+            .expect("frame must convert")
+            .expect("render must return a tree")
+    }
+
+    /// Collect every text run in the tree, so a test can assert on the
+    /// slide's visible content without knowing the exact box nesting.
+    fn all_text(el: &Element, out: &mut Vec<String>) {
+        match el {
+            Element::Text { value, .. } => out.push(value.clone()),
+            Element::RichText { runs, .. } => {
+                out.push(runs.iter().map(|r| r.value.as_str()).collect())
+            }
+            Element::Vstack { children, .. }
+            | Element::Hstack { children, .. }
+            | Element::Frame { children, .. } => {
+                for c in children {
+                    all_text(c, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    const DECK: &str = "---\ntitle: T\n---\n<!-- layout: title -->\n\n# First\n\n\
+                        ::: notes\nsecret\n:::\n\n---\n\n## Second\n\n\
+                        body **bold**\n\n---\n\n## Third\n";
+
+    /// One slide at a time: the deck shows slide 0 and nothing from the
+    /// other slides leaks in.
+    #[test]
+    fn deck_renders_one_slide_at_a_time() {
+        let mut d = boot_deck(DECK);
+        let mut text = Vec::new();
+        all_text(&deck_render(&mut d.vm), &mut text);
+        let joined = text.join("|");
+        assert!(joined.contains("First"), "slide 0 content: {joined}");
+        assert!(
+            !joined.contains("Second"),
+            "later slides must not leak: {joined}"
+        );
+        // Speaker notes are stripped from the rendered body.
+        assert!(
+            !joined.contains("secret"),
+            "notes must not render: {joined}"
+        );
+        assert!(!joined.contains("1 / 3"), "footer is opt-in: {joined}");
+    }
+
+    /// Arrow keys move between slides and clamp at both ends rather than
+    /// running off into an empty deck.
+    #[test]
+    fn deck_navigates_and_clamps() {
+        let mut d = boot_deck(DECK);
+        let text_now = |vm: &mut Funct| {
+            let mut t = Vec::new();
+            all_text(&deck_render(vm), &mut t);
+            t.join("|")
+        };
+        let key = |vm: &mut Funct, k: &str| {
+            vm.call("on_key", vec![Value::str(k)]).expect("on_key");
+        };
+
+        key(&mut d.vm, "ArrowLeft");
+        assert!(text_now(&mut d.vm).contains("First"), "clamps at the start");
+        key(&mut d.vm, "ArrowRight");
+        assert!(text_now(&mut d.vm).contains("Second"), "advances");
+        key(&mut d.vm, "End");
+        assert!(
+            text_now(&mut d.vm).contains("Third"),
+            "End jumps to the last"
+        );
+        key(&mut d.vm, "ArrowRight");
+        assert!(text_now(&mut d.vm).contains("Third"), "clamps at the end");
+        key(&mut d.vm, "Home");
+        assert!(text_now(&mut d.vm).contains("First"), "Home jumps back");
+    }
+
+    #[test]
+    fn deck_footer_is_explicitly_opt_in() {
+        let mut d = boot_deck("<!-- footer: true -->\n# One");
+        let mut text = Vec::new();
+        all_text(&deck_render(&mut d.vm), &mut text);
+        assert!(text.join("|").contains("1 / 1"));
+    }
+
+    /// The deck announces itself on two topics, retained — including on
+    /// start, while still resting on slide 0. Without the start-time
+    /// publish, a dashboard named on the FIRST slide would never be
+    /// revealed until the presenter happened to navigate.
+    ///
+    /// `pane.groups` is the load-bearing one: it is the generic channel
+    /// the app consumes (`pane_groups::apply_bus_group_messages`), so the
+    /// app never has to know what a deck is.
+    #[test]
+    fn deck_publishes_its_position_including_on_start() {
+        let mut d = boot_deck("<!-- dashboard: repo-health -->\n\n# One\n\n---\n\n# Two\n");
+        let topic = |msgs: &[(String, serde_json::Value)], name: &str| {
+            msgs.iter()
+                .filter(|(t, _)| t == name)
+                .map(|(_, p)| p.clone())
+                .collect::<Vec<_>>()
+        };
+        {
+            let msgs = d.published.lock().expect("published");
+            let slides = topic(&msgs, "deck.slide");
+            assert_eq!(slides.len(), 1, "on_start publishes once");
+            assert_eq!(slides[0]["index"], 0);
+            assert_eq!(slides[0]["total"], 2);
+            assert_eq!(slides[0]["dashboard"], "repo-health");
+
+            let groups = topic(&msgs, "pane.groups");
+            assert_eq!(
+                groups[0]["show"],
+                serde_json::json!(["repo-health"]),
+                "the dashboard is revealed on start"
+            );
+        }
+
+        d.vm.call("on_key", vec![Value::str("ArrowRight")])
+            .expect("on_key");
+        let msgs = d.published.lock().expect("published");
+        let slides = topic(&msgs, "deck.slide");
+        assert_eq!(slides.len(), 2, "navigating publishes again");
+        assert_eq!(slides[1]["index"], 1);
+
+        let groups = topic(&msgs, "pane.groups");
+        assert_eq!(
+            groups[1]["show"],
+            serde_json::json!([]),
+            "a slide with no dashboard reveals nothing, which hides the old one"
+        );
+    }
+
+    /// Typography scales with the pane so a slide looks the same small and
+    /// full-screen. The deck RESIZES rather than zooming precisely so this
+    /// stays crisp — if the scale stopped applying, slides would render at
+    /// reference size in every pane.
+    #[test]
+    fn deck_scales_type_to_the_pane() {
+        let mut d = boot_deck("# Title\n");
+        let heading_size = |vm: &mut Funct, w: f32, h: f32| {
+            let frame = vm
+                .call(
+                    "render",
+                    vec![Value::Float(w as f64), Value::Float(h as f64)],
+                )
+                .expect("render");
+            let el = funct_frame_to_element(&frame).unwrap().unwrap();
+            fn find(el: &Element) -> Option<f32> {
+                match el {
+                    Element::RichText { runs, size, .. } => {
+                        runs.first().and_then(|r| r.size).or(*size)
+                    }
+                    Element::Vstack { children, .. }
+                    | Element::Hstack { children, .. }
+                    | Element::Frame { children, .. } => children.iter().find_map(find),
+                    _ => None,
+                }
+            }
+            find(&el).expect("a heading run")
+        };
+        // deck.glz: size_h1 = 64 at the 1280x720 reference.
+        let full = heading_size(&mut d.vm, 1280.0, 720.0);
+        assert!((full - 64.0).abs() < 0.01, "reference size, got {full}");
+        let half = heading_size(&mut d.vm, 640.0, 360.0);
+        assert!(
+            (half - 32.0).abs() < 0.01,
+            "half-size pane halves type, got {half}"
+        );
+    }
+
+    #[test]
+    fn glaze_demo_styles_reach_the_element_tree() {
+        let Element::Vstack {
+            style, children, ..
+        } = eval_glaze_demo(800.0)
+        else {
+            panic!("glaze_demo renders a vstack root");
+        };
+        // Root carries `style page`: a fill layer and 20px padding.
+        let style = style.expect("root must be Glaze-styled");
+        assert_eq!(style.glaze_layers.len(), 1, "page paints one fill");
+        assert_eq!(
+            style.padding.expect("page sets pad").top,
+            20.0,
+            "pad space(5) = 20px"
+        );
+        // …and the variant-styled pills made it down the tree.
+        assert_eq!(children.len(), 6, "header, sheet list, card, three rows");
+    }
+
+    /// `when vw < 420` must fire off the width the script forwards from
+    /// `render(w, h)` — the mechanism a responsive widget depends on.
+    #[test]
+    fn glaze_demo_when_breakpoint_fires_on_pane_width() {
+        let radius_at = |w: f32| {
+            let Element::Vstack { children, .. } = eval_glaze_demo(w) else {
+                panic!("vstack root");
+            };
+            // The card is the third child.
+            let Element::Vstack { style, .. } = &children[2] else {
+                panic!("card is a vstack");
+            };
+            style
+                .as_ref()
+                .expect("card is Glaze-styled")
+                .radius
+                .clone()
+                .expect("card sets a radius")
+        };
+        assert_eq!(radius_at(800.0), "12", "wide: radius space(3)");
+        assert_eq!(
+            radius_at(300.0),
+            "8",
+            "narrow: `when` overrides to space(2)"
+        );
+    }
 
     /// End-to-end of the adapter: a funct `render` returning a record with
     /// `kind:` discriminators round-trips through to_json + the rename into

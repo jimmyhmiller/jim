@@ -1,0 +1,152 @@
+// md_demo.ft — Markdown rendered with REAL inline emphasis.
+//
+// The old `markdown.ft` had to strip `**bold**` / `*italic*` / `` `code` ``
+// because `Element::Text` is one uniform run: there was no way to bold three
+// words inside a wrapped sentence. Two host additions fix that, and this
+// widget is the smallest thing that exercises both:
+//
+//   md_parse(text)  -> blocks of {value, bold, italic, code, …} runs
+//                      (markdown_core's real inline scanner, not a funct
+//                       reimplementation)
+//   kind: "richtext" -> one wrapped text block whose runs keep their own
+//                      size / weight / color / family
+//
+// Sources: params.text, params.path, or the built-in sample.
+import "host"
+
+fn base_size()  = 14.0
+fn code_color() = "#e2c08d"
+fn link_color() = "#7fb4e6"
+fn text_color() = "#cfd2d8"
+fn muted()      = "#8a92a0"
+
+fn sample() =
+    "# Rich text, finally\n" +
+    "\n" +
+    "A paragraph with **bold**, *italic*, `inline code`, and a\n" +
+    "[link](https://example.com) — all wrapping as **one** block, so\n" +
+    "emphasis lands mid-line instead of breaking the flow.\n" +
+    "\n" +
+    "Emphasis can even land mid-word: un**bold**ed stays one word.\n" +
+    "\n" +
+    "## Blocks\n" +
+    "\n" +
+    "- list items keep their **runs**\n" +
+    "- and their `code spans`\n" +
+    "\n" +
+    "> block quotes too\n" +
+    "\n" +
+    "```rust\n" +
+    "let x = 1; // code blocks stay monospace\n" +
+    "```\n" +
+    "\n" +
+    "---\n"
+
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+
+fn source() {
+    let path = param("path", "")
+    if path != "" {
+        let r = read_file(path)
+        if r.ok { return r.text }
+        return "# Could not read\n\n`" + path + "`\n"
+    }
+    param("text", sample())
+}
+
+// Heading font size by level: h1 biggest, h6 back to body size.
+fn heading_size(level) {
+    if level == 1 { return 26.0 }
+    if level == 2 { return 20.0 }
+    if level == 3 { return 17.0 }
+    base_size()
+}
+
+// One md_parse run -> one richtext run. This mapping is the whole reason
+// `md_parse` returns flags rather than pre-styled elements: the widget
+// decides what bold/code/link LOOK like.
+fn to_run(r, size) {
+    let mut out = { value: r.value, size: size }
+    if r.bold   { out = { ..out, weight: "bold" } }
+    if r.italic { out = { ..out, italic: true } }
+    if r.code   { out = { ..out, family: "mono", color: code_color() } }
+    if r.link   { out = { ..out, color: link_color() } }
+    out
+}
+
+fn to_runs(line, size) {
+    let mut out = []
+    for r in line { out = push(out, to_run(r, size)) }
+    out
+}
+
+// All of a block's lines as one flat run list. Markdown keeps source-line
+// structure, but a paragraph should re-wrap to the pane, so its lines are
+// joined with a space rather than a hard break.
+fn block_runs(block, size) {
+    let mut out = []
+    let mut first = true
+    for line in block.lines {
+        if not first { out = push(out, { value: " ", size: size }) }
+        for r in line { out = push(out, to_run(r, size)) }
+        first = false
+    }
+    out
+}
+
+fn rich(runs, size) = { kind: "richtext", runs: runs, size: size, color: text_color() }
+
+// Code blocks keep their source lines verbatim, so they stay plain Text
+// (monospace, no wrap) rather than a re-wrapped rich block.
+fn code_lines(block) {
+    let mut out = []
+    for line in block.lines {
+        let mut s = ""
+        for r in line { s = s + r.value }
+        out = push(out, { kind: "text", value: s, size: 12.5,
+                          family: "mono", color: code_color(), wrap: false })
+    }
+    out
+}
+
+fn render_block(block) {
+    let kind = block.kind
+    if kind == "blank" { return { kind: "spacer", size: 6.0 } }
+    if kind == "thematic-break" { return { kind: "divider" } }
+    if kind == "heading" {
+        let size = heading_size(block.level)
+        return { kind: "vstack", gap: 0.0, children: [
+            rich(block_runs(block, size), size),
+        ]}
+    }
+    if kind == "code-block" {
+        return { kind: "frame", pad: 10.0, gap: 2.0,
+                 style: { background: "#15171c", radius: "6" },
+                 children: code_lines(block) }
+    }
+    if kind == "block-quote" {
+        return { kind: "hstack", gap: 10.0, align: "stretch", children: [
+            { kind: "frame", style: { background: "#3a4150", width: "3", radius: "2" },
+              children: [] },
+            rich(block_runs(block, base_size()), base_size()),
+        ]}
+    }
+    if kind == "list-item" {
+        let bullet = if unwrap_or(get(block, "ordered"), false) { "1." } else { "•" }
+        return { kind: "hstack", gap: 8.0, align: "start", children: [
+            { kind: "text", value: bullet, size: base_size(), color: muted(),
+              style: { width: "14", flex_shrink: 0.0 } },
+            rich(block_runs(block, base_size()), base_size()),
+        ]}
+    }
+    rich(block_runs(block, base_size()), base_size())
+}
+
+fn on_init() { request_render() }
+
+fn render(w, h) {
+    let blocks = md_parse(source())
+    let mut kids = []
+    for b in blocks { kids = push(kids, render_block(b)) }
+    { kind: "vstack", gap: 6.0, pad: 16.0, children: kids }
+}

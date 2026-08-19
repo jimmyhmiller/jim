@@ -51,7 +51,11 @@ const fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 }
 
 const fn abs_const(x: f32) -> f32 {
-    if x < 0.0 { -x } else { x }
+    if x < 0.0 {
+        -x
+    } else {
+        x
+    }
 }
 
 pub fn color_for(name: &str) -> [f32; 4] {

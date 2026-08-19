@@ -1,0 +1,101 @@
+// glaze_demo.ft — styling a funct widget with Glaze instead of inline Style.
+//
+// Every color, radius, border and padding below comes from
+// `glaze_demo.glz`; this script sets none of them. Edit the .glz and save:
+// the widget hot-reloads on the stylesheet, not just on this file.
+//
+// What it exercises, one row per Glaze feature:
+//   glaze(name)                       — a plain style
+//   glaze_at(name, {}, [], w, h)      — `when vw < …` responsive overrides
+//   glaze(name, { intent: … })        — static variant params (folded)
+//   glaze(name, {}, ["hover"])        — discrete pseudo-state plans
+//   glaze_styles()                    — introspection
+import "host"
+
+// NOTE: this demo deliberately does NOT drive Glaze's `:hover` plan from
+// `on_hover(x, y)`. That handler reports raw content-local coordinates and
+// nothing else, so a script has to GUESS where its own rows ended up —
+// Taffy owns the real layout and never tells the script. Guessing is what
+// made this demo highlight rows while the cursor was well above them.
+//
+// The rows are selected by CLICK instead, because `on_click` carries the
+// element `id` the host hit-tested for real. Same Glaze state plan, driven
+// by a fact rather than an estimate. The proper fix is host-side: report
+// the hovered element id (`on_hover(x, y, id)`), matching `on_click`.
+fn row_count() = 3
+
+fn init_state() = { hover: -1 }
+let state = atom(init_state())
+
+// Where the stylesheet lives. Defaults to the copy next to this file;
+// `--params '{"sheet":"…"}'` points the same widget at any other sheet.
+fn sheet_path(p) {
+    if typeof(p) == "Record" {
+        let v = get(p, "sheet")
+        if typeof(v) == "Str" { return v }
+    }
+    host_env("HOME") + "/.jim/widgets/glaze_demo.glz"
+}
+
+// Compiled once per load — which includes every hot reload of THIS file
+// and of the sheet, so saving either one takes effect immediately. The
+// host canonicalizes the path so the file watcher's events match it.
+glaze_load_file(sheet_path(params))
+
+fn on_init() { request_render() }
+
+fn on_click(x, y, shift, cmd, id) {
+    // `id` came from the host's real hit-test, so this is exact.
+    let idx = if id == "row0" { 0 } else if id == "row1" { 1 }
+              else if id == "row2" { 2 } else { -1 }
+    let s = @state
+    let next = if s.hover == idx { -1 } else { idx }
+    reset!(state, { ..s, hover: next })
+    request_render()
+}
+
+// One row: a Glaze `row` style, resolved with the `:hover` plan when the
+// cursor is on it, plus a variant-styled pill.
+fn row(id, label, intent, hovered) = {
+    kind: "list-item", id: id, gap: 12.0,
+    style: glaze("row", {}, if hovered { ["hover"] } else { [] }),
+    children: [
+        { kind: "text", value: label, size: 13.0, color: "#cfd2d8" },
+        { kind: "spacer", flex: 1.0 },
+        { kind: "text", value: intent, size: 11.0, color: "#14161b",
+          style: glaze("pill", { intent: intent }) },
+    ]
+}
+
+fn render(w, h) {
+    let s = @state
+    let names = glaze_styles()
+    {
+        kind: "vstack", gap: 12.0,
+        style: glaze("page"),
+        children: [
+            { kind: "text", value: "Styled by glaze_demo.glz", size: 16.0,
+              color: "#e6e8ec" },
+            { kind: "text",
+              value: "sheet defines: " + join(names, ", "),
+              size: 11.0, color: "#7f8794" },
+            // `card` carries a `when vw < 420` block: narrow the pane and
+            // its padding and radius tighten, with no branch in this script.
+            {
+                kind: "vstack", gap: 6.0,
+                style: glaze_at("card", {}, [], w, h),
+                children: [
+                    { kind: "text",
+                      value: "card @ " + str(to_int(w)) + "px" +
+                             (if w < 420.0 { " (compact)" } else { "" }),
+                      size: 12.0, color: "#9098a4" },
+                    { kind: "text", value: "resize the pane to cross 420px",
+                      size: 11.0, color: "#7f8794" },
+                ]
+            },
+            row("row0", "click me", "primary", s.hover == 0),
+            row("row1", "click me", "calm",    s.hover == 1),
+            row("row2", "click me", "danger",  s.hover == 2),
+        ]
+    }
+}

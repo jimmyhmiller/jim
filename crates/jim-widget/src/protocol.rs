@@ -800,6 +800,54 @@ pub enum Element {
         #[serde(default = "default_true")]
         wrap: bool,
     },
+    /// A paragraph of **mixed-style runs** wrapped as ONE block.
+    ///
+    /// [`Element::Text`] is a single uniform run, which is why a widget
+    /// rendering Markdown has to strip `**bold**` — there was no way to
+    /// bold three words inside a wrapped sentence. `RichText` is that
+    /// missing piece: the runs concatenate into one text block and wrap
+    /// across run boundaries, so emphasis lands mid-line instead of
+    /// forcing an awkward hstack that breaks wrapping.
+    ///
+    /// Each run carries its own size / weight / color / family; anything
+    /// a run leaves unset falls back to the element-level defaults, which
+    /// in turn fall back to the theme. Hard `\n` inside a run's value
+    /// still breaks the line.
+    /// `"richtext"` is accepted alongside the kebab-case `"rich-text"`,
+    /// matching the `textarea` / `text-area` precedent — the one-word
+    /// spelling is what authors reach for.
+    #[serde(alias = "richtext")]
+    RichText {
+        runs: Vec<TextRun>,
+        /// Default size for runs that don't set one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<f32>,
+        /// Default color for runs that don't set one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+        /// Default family for runs that don't set one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        family: Option<String>,
+        /// Drag-selectable, like `Text`. Selection covers one run.
+        #[serde(default = "default_true")]
+        selectable: bool,
+        /// When false the whole block lays out on a single line.
+        #[serde(default = "default_true")]
+        wrap: bool,
+    },
+    /// A raster image, sized by the flex tree and scaled to fit its box.
+    ///
+    /// Distinct from `Style::background_image`, which anchors top-left
+    /// and STRETCHES to fill — fine for a texture, wrong for a photo or
+    /// a screenshot. `Image` preserves aspect ratio by default.
+    Image {
+        /// Filesystem path. `~` is expanded.
+        path: String,
+        #[serde(default)]
+        fit: ImageFit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<Style>,
+    },
     /// Clickable button. The host sends `{"event":"click","id":"<id>"}`
     /// back to the widget on press; ids must be unique within a frame.
     Button {
@@ -1347,6 +1395,47 @@ pub enum Align {
 pub enum Weight {
     Normal,
     Bold,
+}
+
+/// One styled segment of an [`Element::RichText`] block. Only `value` is
+/// required; every other field falls back to the element's default, then
+/// the theme. This mirrors `markdown_core::Run` closely enough that
+/// `md_parse` can hand runs straight to a widget.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TextRun {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<Weight>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Family name resolved through the host's `FontRegistry`
+    /// (`"serif"` / `"sans"` / `"mono"`, or a theme token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// Render in italic. Applied by the font registry when the family
+    /// has an italic face; otherwise it is a no-op (never a fake slant).
+    #[serde(default)]
+    pub italic: bool,
+}
+
+/// How an [`Element::Image`] fills its layout box.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageFit {
+    /// Scale down to fit entirely inside the box, preserving aspect
+    /// ratio and letterboxing the remainder. The safe default for
+    /// photos and screenshots.
+    #[default]
+    Contain,
+    /// Scale to cover the box, preserving aspect ratio and cropping the
+    /// overflow. For hero/banner images where filling matters more than
+    /// seeing every pixel.
+    Cover,
+    /// Stretch to the box, ignoring aspect ratio. Matches what
+    /// `Style::background_image` does.
+    Fill,
 }
 
 fn default_align() -> Align {

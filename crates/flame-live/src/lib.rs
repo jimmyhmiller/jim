@@ -14,9 +14,9 @@
 //!    scratch each time but reuses pre-computed sample aggregation so the
 //!    cost is O(stack-tree + aggregated nodes), not O(samples).
 
+pub mod aggregator;
 pub mod event;
 pub mod reader;
-pub mod aggregator;
 pub mod symbols;
 
 pub use aggregator::LiveAggregator;

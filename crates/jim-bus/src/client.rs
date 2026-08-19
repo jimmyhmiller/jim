@@ -77,7 +77,12 @@ fn wait_for_socket(path: &Path, timeout: Duration) -> std::io::Result<UnixStream
 /// publisher hangs up.
 pub fn publish_oneshot(msg: &BusMessage) -> std::io::Result<()> {
     let mut s = connect_or_spawn()?;
-    s.write_all(&encode(&ClientFrame::Hello { role: Role::Publisher }).map_err(std::io::Error::other)?)?;
+    s.write_all(
+        &encode(&ClientFrame::Hello {
+            role: Role::Publisher,
+        })
+        .map_err(std::io::Error::other)?,
+    )?;
     s.write_all(&encode(&ClientFrame::Publish(msg.clone())).map_err(std::io::Error::other)?)?;
     let _ = s.shutdown(std::net::Shutdown::Write);
     Ok(())
@@ -310,6 +315,11 @@ fn publisher_loop(rx: Receiver<BusMessage>, stop: Arc<AtomicBool>) {
 
 fn open_publisher() -> std::io::Result<UnixStream> {
     let mut s = connect_or_spawn()?;
-    s.write_all(&encode(&ClientFrame::Hello { role: Role::Publisher }).map_err(std::io::Error::other)?)?;
+    s.write_all(
+        &encode(&ClientFrame::Hello {
+            role: Role::Publisher,
+        })
+        .map_err(std::io::Error::other)?,
+    )?;
     Ok(s)
 }

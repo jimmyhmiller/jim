@@ -144,10 +144,19 @@ fn context_open_close(
     buttons: Res<ButtonInput<MouseButton>>,
     mut keys: MessageReader<KeyboardInput>,
     sidebar: Res<Sidebar>,
-    viewport: Res<jim_pane::PaneViewport>,
+    views: Res<jim_pane::Views>,
     mut menu: ResMut<ContextMenu>,
     mut consumed: ResMut<InputConsumed>,
-    panes: Query<(Entity, &PaneRect, &Visibility, Has<PanePinned>), With<PaneTag>>,
+    panes: Query<
+        (
+            Entity,
+            &PaneRect,
+            &jim_pane::PaneProject,
+            &Visibility,
+            Has<PanePinned>,
+        ),
+        With<PaneTag>,
+    >,
     members: Query<(), With<jim_pane::dock::DockMember>>,
     gathered: Query<&jim_pane::PaneCanvas>,
     mut pending: ResMut<PendingPaneActions>,
@@ -191,13 +200,17 @@ fn context_open_close(
         // PaneRect lives in canvas-space; convert the cursor into the
         // same frame before hit-testing, otherwise panning/zooming the
         // canvas makes the radial menu open on top of visible panes.
-        let pt_canvas = viewport.window_to_canvas(pt);
+        let (_, pt_canvas) = views.resolve(pt);
+        let target_project = views.project_at(pt);
         // Only consider visible panes; include pinned so the user can
         // right-click them to unpin.
         let visible: Vec<(Entity, PaneRect, bool)> = panes
             .iter()
-            .filter(|(_, _, vis, _)| !matches!(vis, Visibility::Hidden))
-            .map(|(e, r, _, pinned)| (e, *r, pinned))
+            .filter(|(_, _, project, vis, _)| {
+                target_project.is_none_or(|id| project.0 == id)
+                    && !matches!(vis, Visibility::Hidden)
+            })
+            .map(|(e, r, _, _, pinned)| (e, *r, pinned))
             .collect();
         // First try to hit an unpinned pane (they sit on top); fall
         // back to pinned. Reuses topmost_pane_at's z-aware hit-test.

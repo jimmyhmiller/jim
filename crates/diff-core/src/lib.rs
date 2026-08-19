@@ -53,16 +53,8 @@ pub struct Hunk {
 impl Hunk {
     /// Classic `@@ -old,oldn +new,newn @@` header string.
     pub fn header(&self) -> String {
-        let old_n = self
-            .lines
-            .iter()
-            .filter(|l| l.old_lineno.is_some())
-            .count();
-        let new_n = self
-            .lines
-            .iter()
-            .filter(|l| l.new_lineno.is_some())
-            .count();
+        let old_n = self.lines.iter().filter(|l| l.old_lineno.is_some()).count();
+        let new_n = self.lines.iter().filter(|l| l.new_lineno.is_some()).count();
         format!(
             "@@ -{},{} +{},{} @@",
             self.old_start, old_n, self.new_start, new_n
@@ -459,7 +451,10 @@ pub fn git_staged(repo: &Path) -> Result<DiffSet, DiffError> {
     } else {
         // Unborn HEAD: everything in the index is a staged add.
         let raw = git_raw(repo, &["ls-files", "-z", "--cached"], false)?;
-        for path in String::from_utf8_lossy(&raw).split('\0').filter(|s| !s.is_empty()) {
+        for path in String::from_utf8_lossy(&raw)
+            .split('\0')
+            .filter(|s| !s.is_empty())
+        {
             let new = git_show_index(repo, path);
             files.push(file_diff_from_texts(
                 path,
@@ -482,7 +477,11 @@ pub fn git_unstaged(repo: &Path) -> Result<DiffSet, DiffError> {
     if String::from_utf8_lossy(&inside).trim() != "true" {
         return Err(DiffError::NotARepo(repo.display().to_string()));
     }
-    let raw = git_raw(repo, &["diff", "--name-status", "-z", "--find-renames"], false)?;
+    let raw = git_raw(
+        repo,
+        &["diff", "--name-status", "-z", "--find-renames"],
+        false,
+    )?;
     let mut files = Vec::new();
     for (change, orig, path) in parse_name_status(&String::from_utf8_lossy(&raw)) {
         let old_spec_path = orig.clone().unwrap_or_else(|| path.clone());
@@ -516,7 +515,10 @@ pub fn git_unstaged(repo: &Path) -> Result<DiffSet, DiffError> {
         &["ls-files", "-z", "--others", "--exclude-standard"],
         false,
     )?;
-    for path in String::from_utf8_lossy(&raw).split('\0').filter(|s| !s.is_empty()) {
+    for path in String::from_utf8_lossy(&raw)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+    {
         let new = std::fs::read(repo.join(path))
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_default();
@@ -757,7 +759,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let run = |args: &[&str]| {
-            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
             assert!(
                 out.status.success(),
                 "git {:?} failed: {}",

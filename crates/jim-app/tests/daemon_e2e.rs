@@ -151,3 +151,81 @@ fn reattach_replays_history() {
     c2.try_flush();
     std::thread::sleep(Duration::from_millis(200));
 }
+
+/// `reattach` is what a worker uses to recover after the daemon drops it
+/// (its 30s zombie timeout fires whenever a client stops draining, which
+/// a long main-thread stall can cause on a perfectly healthy pane). It
+/// must reconnect to the live session AND replay what was missed.
+#[test]
+fn reattach_recovers_a_dropped_client() {
+    let _env = common::setup_isolated_daemon_env();
+    let session = common::random_session_id();
+    let cmd = vec!["/bin/cat".to_string()];
+
+    let mut c1 = DaemonClient::open(session, 80, 24, cmd, None).expect("first attach");
+    c1.send(&jim_terminal::daemon_proto::ClientMessage::Input(
+        b"before-drop\n".to_vec(),
+    ));
+    c1.try_flush();
+    let _ = drain_for(&mut c1, Duration::from_millis(500));
+
+    // Simulate the daemon force-disconnecting us: the client goes away
+    // without a Detach or Kill, exactly as it does when the zombie
+    // timeout fires.
+    drop(c1);
+    std::thread::sleep(Duration::from_millis(150));
+
+    let mut c2 = DaemonClient::reattach(session, 80, 24).expect("reattach to live daemon");
+    let (frames, alive) = drain_for(&mut c2, Duration::from_millis(800));
+    assert!(alive, "reattached client should still be connected");
+    assert!(
+        frames.iter().any(|m| matches!(
+            m, DaemonMessage::Output(b) if String::from_utf8_lossy(b).contains("before-drop")
+        )),
+        "reattach did not replay pre-drop history: {:?}",
+        frames
+    );
+
+    // Still a live session, not a fresh shell: the child echoes again.
+    c2.send(&jim_terminal::daemon_proto::ClientMessage::Input(
+        b"after-drop\n".to_vec(),
+    ));
+    c2.try_flush();
+    let (frames2, _) = drain_for(&mut c2, Duration::from_millis(600));
+    assert!(
+        frames2.iter().any(|m| matches!(
+            m, DaemonMessage::Output(b) if String::from_utf8_lossy(b).contains("after-drop")
+        )),
+        "child not reachable after reattach: {:?}",
+        frames2
+    );
+
+    c2.send(&jim_terminal::daemon_proto::ClientMessage::Kill);
+    c2.try_flush();
+    std::thread::sleep(Duration::from_millis(200));
+}
+
+/// The safety property that separates `reattach` from `open`: it must
+/// NEVER fork a daemon. A reconnect that spawned one would silently
+/// replace the session the user was watching with a brand-new shell.
+#[test]
+fn reattach_refuses_to_spawn_a_daemon() {
+    let _env = common::setup_isolated_daemon_env();
+    let session = common::random_session_id();
+
+    // `DaemonClient` isn't Debug, so match rather than `expect_err`.
+    let err = match DaemonClient::reattach(session, 80, 24) {
+        Ok(_) => panic!("reattach must fail when no daemon is listening"),
+        Err(e) => e,
+    };
+    eprintln!("[test] reattach with no daemon: {err}");
+
+    // And it must not have left one behind.
+    std::thread::sleep(Duration::from_millis(300));
+    let sock = jim_terminal::socket_path(session).expect("socket path");
+    assert!(
+        !sock.exists(),
+        "reattach forked a daemon; socket exists at {}",
+        sock.display()
+    );
+}

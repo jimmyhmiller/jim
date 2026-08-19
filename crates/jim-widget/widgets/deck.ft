@@ -1,0 +1,415 @@
+// deck.ft — a Markdown presentation deck. One widget, one slide at a time.
+//
+//   jimctl widget --kind script_widget --title Talk \
+//       --params '{"path":"~/talks/jim.md"}' deck.ft
+//
+// FORMAT
+//   ---            a line of exactly `---` separates slides. (Use `***`
+//                  for a horizontal RULE inside a slide — `---` is taken.)
+//   front matter   an opening `---` block at the very top of the file sets
+//                  deck-wide keys: `style: path/to.glz`, `title: …`
+//   <!-- k: v -->  per-slide directives, stripped from the rendered body.
+//                  `layout: title`   picks the Glaze variant.
+//                  `project: Name`   shows that PROJECT's whole canvas —
+//                                    its real terminals, widgets, editors —
+//                                    live in the lower part of the slide.
+//                                    This is the demo path.
+//                  `application: true` shows the complete current Jim app,
+//                                    including sidebar and canvas chrome.
+//                  `footer: true` opts this slide into the progress bar and
+//                                    slide count. Slides are clean by default.
+//                  `dashboard: name` reveals a named pane group instead,
+//                                    when you want a hand-picked subset
+//                                    (see `jimctl group`).
+//   ::: notes      speaker notes; stripped from the body, kept on the slide.
+//   :::
+//
+// STYLING
+//   Box styling comes from `glaze(...)`, typography from `glaze_token(...)`
+//   — see deck.glz. Sizes there are authored against a 1280x720 reference
+//   slide and scaled to the pane here, so a slide looks the same in a small
+//   pane and window-filling presentation mode. Save the .glz and the deck reloads.
+//
+// NAVIGATION
+//   →/↓/click advance, ←/↑/shift-click go back, Home/End jump to the ends.
+//   Each move publishes `deck.slide` (retained) so other panes can follow.
+import "host"
+
+// Reference slide the .glz sizes are authored against.
+fn ref_w() = 1280.0
+fn ref_h() = 720.0
+
+fn init_state() = { i: 0 }
+let state = atom(init_state())
+
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+// ---------------------------------------------------------------- source
+
+fn sample() =
+    "---\n" +
+    "title: Jim\n" +
+    "---\n" +
+    "<!-- layout: title -->\n" +
+    "\n" +
+    "# Jim\n" +
+    "\n" +
+    "A canvas of live panes.\n" +
+    "\n" +
+    "::: notes\n" +
+    "Open cold. Do not explain the architecture yet.\n" +
+    ":::\n" +
+    "\n" +
+    "---\n" +
+    "\n" +
+    "## Markdown in, slides out\n" +
+    "\n" +
+    "Text keeps its **bold**, *italic* and `inline code` because slides\n" +
+    "render through `md_parse` into rich text runs.\n" +
+    "\n" +
+    "- one bullet\n" +
+    "- another with a `code span`\n" +
+    "\n" +
+    "---\n" +
+    "\n" +
+    "## Styled by Glaze\n" +
+    "\n" +
+    "> The whole theme is one `.glz` file.\n" +
+    "\n" +
+    "```rust\n" +
+    "let deck = Deck::from_markdown(path);\n" +
+    "```\n" +
+    "\n" +
+    "Save the stylesheet and this slide restyles itself.\n"
+
+fn source() {
+    let path = param("path", "")
+    if path != "" {
+        let r = read_file(path)
+        if r.ok { return r.text }
+        return "# Could not read\n\n`" + path + "`\n"
+    }
+    param("text", sample())
+}
+
+// ------------------------------------------------------------- directives
+
+// `<!-- key: value -->` -> { key, value }, or Unit when the line isn't one.
+fn directive(line) {
+    let t = trim(line)
+    if not starts_with(t, "<!--") { return () }
+    if not ends_with(t, "-->") { return () }
+    let inner = trim(slice(t, 4, len(t) - 7))
+    let c = unwrap_or(index_of(inner, ":"), -1)
+    if c < 0 { return () }
+    { key: trim(slice(inner, 0, c)), value: trim(slice(inner, c + 1, len(inner) - c - 1)) }
+}
+
+// `key: value` -> { key, value }, for front matter.
+fn kv(line) {
+    let t = trim(line)
+    let c = unwrap_or(index_of(t, ":"), -1)
+    if c < 0 { return () }
+    { key: trim(slice(t, 0, c)), value: trim(slice(t, c + 1, len(t) - c - 1)) }
+}
+
+fn is_sep(line) = trim(line) == "---"
+
+// ------------------------------------------------------------------ parse
+
+// Front matter: an opening `---` block at the very top. Returns
+// { meta, rest } where `rest` is the remaining lines.
+fn split_front_matter(lines) {
+    if len(lines) == 0 { return { meta: {}, rest: lines } }
+    if not is_sep(lines[0]) { return { meta: {}, rest: lines } }
+    let mut meta = {}
+    let mut i = 1
+    while i < len(lines) {
+        if is_sep(lines[i]) {
+            return { meta: meta, rest: slice(lines, i + 1, len(lines) - i - 1) }
+        }
+        let e = kv(lines[i])
+        if typeof(e) == "Record" { meta = assoc(meta, e.key, e.value) }
+        i = i + 1
+    }
+    // Unterminated front matter: treat the whole file as content rather
+    // than silently swallowing it.
+    { meta: {}, rest: lines }
+}
+
+// One slide's raw lines -> { body, dirs, notes }.
+fn build_slide(raw) {
+    let mut body = []
+    let mut dirs = {}
+    let mut notes = []
+    let mut in_notes = false
+    for line in raw {
+        let t = trim(line)
+        if in_notes {
+            if t == ":::" { in_notes = false } else { notes = push(notes, line) }
+        } else if t == "::: notes" {
+            in_notes = true
+        } else {
+            let d = directive(line)
+            if typeof(d) == "Record" {
+                dirs = assoc(dirs, d.key, d.value)
+            } else {
+                body = push(body, line)
+            }
+        }
+    }
+    { body: join(body, "\n"), dirs: dirs, notes: join(notes, "\n") }
+}
+
+fn parse_deck(text) {
+    let split = split_front_matter(split(text, "\n"))
+    let mut slides = []
+    let mut cur = []
+    for line in split.rest {
+        if is_sep(line) {
+            slides = push(slides, build_slide(cur))
+            cur = []
+        } else {
+            cur = push(cur, line)
+        }
+    }
+    slides = push(slides, build_slide(cur))
+    // Keep directive-only slides: a full-bleed live project intentionally
+    // has no Markdown body. Drop only truly empty separator artifacts.
+    let mut keep = []
+    for s in slides {
+        let project = unwrap_or(get(s.dirs, "project"), "")
+        let application = unwrap_or(get(s.dirs, "application"), "")
+        if trim(s.body) != "" or project != "" or application != "" {
+            keep = push(keep, s)
+        }
+    }
+    if len(keep) == 0 { keep = [{ body: "", dirs: {}, notes: "" }] }
+    { meta: split.meta, slides: keep }
+}
+
+// ---------------------------------------------------------------- styling
+
+// Uniform scale from the reference slide to this pane. Slides are RESIZED,
+// never zoomed: canvas zoom scales already-rasterized glyphs (blurry), so
+// the deck re-lays-out at native size and multiplies the type scale instead.
+fn scale_for(w, h) {
+    let s = min(w / ref_w(), h / ref_h())
+    if s < 0.2 { 0.2 } else if s > 4.0 { 4.0 } else { s }
+}
+
+fn sz(token, scale) = glaze_token(token) * scale
+
+// ----------------------------------------------------------- run mapping
+
+fn to_run(r, size, scale) {
+    let mut out = { value: r.value, size: size }
+    if r.bold   { out = { ..out, weight: "bold" } }
+    if r.italic { out = { ..out, italic: true } }
+    if r.code   { out = { ..out, family: "mono", color: glaze_token("code_fg"),
+                          size: size * 0.86 } }
+    if r.link   { out = { ..out, color: glaze_token("link") } }
+    out
+}
+
+// A block's lines flattened into one run list. Markdown keeps source-line
+// structure; a slide paragraph should re-wrap to the slide, so lines join
+// with a space instead of a hard break.
+fn block_runs(block, size, scale) {
+    let mut out = []
+    let mut first = true
+    for line in block.lines {
+        if not first { out = push(out, { value: " ", size: size }) }
+        for r in line { out = push(out, to_run(r, size, scale)) }
+        first = false
+    }
+    out
+}
+
+fn rich(runs, size, color) =
+    { kind: "richtext", runs: runs, size: size, color: color }
+
+fn heading_size(level, scale) {
+    if level == 1 { return sz("size_h1", scale) }
+    if level == 2 { return sz("size_h2", scale) }
+    sz("size_h3", scale)
+}
+
+fn code_lines(block, scale) {
+    let size = sz("size_code", scale)
+    let mut out = []
+    for line in block.lines {
+        let mut s = ""
+        for r in line { s = s + r.value }
+        out = push(out, { kind: "text", value: s, size: size, family: "mono",
+                          color: glaze_token("code_fg"), wrap: false })
+    }
+    out
+}
+
+fn render_block(block, scale) {
+    let kind = block.kind
+    let body = sz("size_body", scale)
+    let fg = glaze_token("fg")
+
+    if kind == "blank" { return { kind: "spacer", size: body * 0.4 } }
+    if kind == "thematic-break" { return { kind: "divider" } }
+    if kind == "heading" {
+        let size = heading_size(block.level, scale)
+        return rich(block_runs(block, size, scale), size, fg)
+    }
+    if kind == "code-block" {
+        return { kind: "frame", gap: 2.0, style: glaze("code_block"),
+                 children: code_lines(block, scale) }
+    }
+    if kind == "block-quote" {
+        return { kind: "hstack", gap: body * 0.6, align: "stretch", children: [
+            { kind: "frame", style: glaze("quote_rule"), children: [] },
+            rich(block_runs(block, body, scale), body, glaze_token("fg_muted")),
+        ]}
+    }
+    if kind == "list-item" {
+        let bullet = if unwrap_or(get(block, "ordered"), false) { "1." } else { "•" }
+        return { kind: "hstack", gap: body * 0.5, align: "start", children: [
+            { kind: "text", value: bullet, size: body, color: glaze_token("accent"),
+              style: { width: str(body), flex_shrink: 0.0 } },
+            rich(block_runs(block, body, scale), body, fg),
+        ]}
+    }
+    rich(block_runs(block, body, scale), body, fg)
+}
+
+// A thin progress bar + "n / total", so you always know where you are.
+// The fill is a percentage-width child of the track, so it re-measures
+// with the pane instead of being computed against a stale width.
+fn footer(i, total, scale) {
+    let pct = 100.0 * (to_float(i) + 1.0) / to_float(total)
+    { kind: "hstack", gap: 12.0, align: "center", style: glaze("footer"), children: [
+        { kind: "frame",
+          style: { ..glaze("footer_bar"), flex_grow: 1.0 },
+          children: [
+            { kind: "frame",
+              style: { ..glaze("footer_fill"), width: str(pct) + "%" },
+              children: [] },
+          ]},
+        { kind: "text", value: str(i + 1) + " / " + str(total),
+          size: sz("size_note", scale), color: glaze_token("fg_muted") },
+    ]}
+}
+
+// ----------------------------------------------------------------- render
+
+fn clamp_index(i, n) = if i < 0 { 0 } else if i >= n { n - 1 } else { i }
+
+fn render(w, h) {
+    let s = cur_state()
+    let deck = parse_deck(source())
+    let total = len(deck.slides)
+    let i = clamp_index(s.i, total)
+    let slide = deck.slides[i]
+    let scale = scale_for(w, h)
+    let layout = unwrap_or(get(slide.dirs, "layout"), "content")
+    let footer_value = unwrap_or(get(slide.dirs, "footer"), "")
+    let show_footer = footer_value == "true" or footer_value == "yes" or footer_value == "1"
+
+    let blocks = md_parse(slide.body)
+    let mut kids = []
+    for b in blocks { kids = push(kids, render_block(b, scale)) }
+
+    // A title slide centers its content block; a content slide starts at
+    // the top so successive slides don't jump around.
+    let content = { kind: "vstack", gap: sz("size_body", scale) * 0.45,
+                    style: { flex_grow: 1.0 }, children: kids }
+
+    { kind: "vstack", gap: sz("size_body", scale) * 0.6,
+      style: glaze_at("slide", { layout: layout }, [], w, h),
+      children: [
+        if layout == "title" { { kind: "spacer", size: 1.0, style: { flex_grow: 1.0 } } }
+        else { { kind: "spacer", size: 0.0 } },
+        content,
+        if show_footer { footer(i, total, scale) }
+        else { { kind: "spacer", size: 0.0 } },
+      ]}
+}
+
+// ------------------------------------------------------------- navigation
+
+// Announce the current slide. Retained, so a pane that opens mid-talk
+// learns where we are and the position survives a GUI restart.
+//
+// Two topics, deliberately:
+//   deck.slide   rich state for anything that follows the talk (a notes
+//                pane, a remote) — index, total, notes, dashboard name.
+//   pane.groups  the GENERIC reveal channel the app understands. The app
+//                never learns what a "deck" is; it just shows the named
+//                group. `show: []` on a slide with no dashboard is what
+//                hides the previous one.
+fn publish(deck, i) {
+    let slide = deck.slides[i]
+    let dash = unwrap_or(get(slide.dirs, "dashboard"), "")
+    let proj = unwrap_or(get(slide.dirs, "project"), "")
+    let app = unwrap_or(get(slide.dirs, "application"), "")
+    let full_bleed = trim(slide.body) == ""
+    emit_retained("deck.slide", {
+        index: i,
+        total: len(deck.slides),
+        dashboard: dash,
+        project: proj,
+        notes: slide.notes,
+    })
+    emit_retained("pane.groups", { show: if dash == "" { [] } else { [dash] } })
+    // `project:` shows that project's whole canvas — its real terminals,
+    // widgets, editors — live inside the lower part of this slide, with
+    // the heading still above it. `inset` is a fraction of THIS pane, so
+    // the host can anchor the region without the script knowing where it
+    // sits on screen. Empty name clears it.
+    emit_retained("pane.project", {
+        name: proj,
+        whole_app: app == "true" or app == "yes" or app == "1",
+        inset: if full_bleed { [0.0, 0.0, 1.0, 1.0] }
+               else { [0.06, 0.30, 0.88, 0.62] },
+    })
+}
+
+fn goto(idx) {
+    let s = cur_state()
+    let deck = parse_deck(source())
+    let i = clamp_index(idx, len(deck.slides))
+    if i == s.i { return }
+    reset!(state, { ..s, i: i })
+    publish(deck, i)
+    request_render()
+}
+
+fn on_init() { request_render() }
+
+fn on_start() {
+    // Load the theme every start (fresh, restart, hot reload) so saving
+    // either the .ft or the .glz re-applies it.
+    glaze_load_file(param("style", host_env("HOME") + "/.jim/widgets/deck.glz"))
+    // Announce where we already are. Without this a deck resting on slide
+    // 0 never publishes, so anything driven by `deck.slide` (a dashboard
+    // named on the FIRST slide, a notes pane) would sit blank until the
+    // presenter happened to navigate.
+    let deck = parse_deck(source())
+    publish(deck, clamp_index(cur_state().i, len(deck.slides)))
+    request_render()
+}
+
+fn on_key(key) {
+    let s = cur_state()
+    if key == "ArrowRight" or key == "ArrowDown" { goto(s.i + 1) }
+    if key == "ArrowLeft"  or key == "ArrowUp"   { goto(s.i - 1) }
+    if key == "Home" { goto(0) }
+    if key == "End"  { goto(len(parse_deck(source()).slides) - 1) }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if shift { goto(s.i - 1) } else { goto(s.i + 1) }
+}

@@ -348,6 +348,171 @@ and only repaints when a handler calls `request_render()`. No
 `set_animating` for I/O. `proc_read` / `proc_alive` still exist for
 explicit polling / back-compat.
 
+### Rich text and Markdown
+
+`Element::Text` is a **single uniform run**. To style part of a wrapped
+sentence — bold three words mid-paragraph — use `richtext`, which lays
+its runs out as ONE wrapped block:
+
+```funct
+{ kind: "richtext", size: 14.0, color: "#cfd2d8", runs: [
+    { value: "A paragraph with " },
+    { value: "bold", weight: "bold" },
+    { value: " and " },
+    { value: "code", family: "mono", color: "#e2c08d" },
+    { value: " that all wrap together." },
+]}
+```
+
+Each run may set `size` / `weight` / `italic` / `color` / `family`;
+anything it omits falls back to the element's defaults, then the theme.
+The block's line height comes from its tallest run. An hstack of `Text`s
+is *not* a substitute — each child wraps independently, so emphasis
+mid-sentence breaks the line.
+
+Don't hand-parse Markdown. **`md_parse(text)`** runs `markdown_core` —
+the same parser the WYSIWYG editor uses — and returns blocks whose runs
+drop straight into `richtext`:
+
+```funct
+for block in md_parse(text) {
+    // block.kind: "paragraph" | "blank" | "heading" | "code-block"
+    //           | "block-quote" | "list-item" | "thematic-break"
+    // block.level (heading), block.ordered (list), block.lang (code),
+    // block.indent, block.lines: [ [ run ] ]
+    // run: { value, bold, italic, code, strike, link }
+}
+```
+
+Syntax markers (`#`, `**`, fences, bullets, link brackets) are already
+stripped — you render your own bullet and heading size from `kind`, and
+decide what bold/code/link *look* like. `widgets/md_demo.ft` is a
+complete worked example.
+
+### Images
+
+`Element::Image` scales a file into its layout box:
+
+```funct
+{ kind: "image", path: "~/shots/demo.png", fit: "contain",
+  style: { width: "100%", height: "260" } }
+```
+
+`fit` is `"contain"` (default — scale down to fit, preserve aspect,
+letterbox), `"cover"` (fill the box, preserve aspect, crop), or `"fill"`
+(stretch). This is different from `style.background_image`, which always
+anchors top-left and stretches — fine for a texture, wrong for a photo.
+An image with no size from the flex tree claims a default minimum height
+so it can't silently collapse to nothing.
+
+### Revealing panes by name (pane groups)
+
+A widget can show and hide *other* panes — a dashboard of live terminals,
+charts, a diff view — without spawning anything. Put the panes in a named
+group once, then publish the group name:
+
+```funct
+emit_retained("pane.groups", { show: ["repo-health"] })   // reveal
+emit_retained("pane.groups", { show: [] })                // hide everything
+```
+
+The payload states the **complete** visible set, so revealing a different
+group hides the previous one; you never send an explicit "hide".
+
+Membership is assigned from the shell and persists with the pane:
+
+```sh
+jimctl group assign --project P --name repo-health --title "Repo Hub" --title "Diff"
+jimctl group show --name repo-health     # by hand, while building
+jimctl group list --project P            # verify the wiring
+```
+
+Grouped panes stay **alive** while hidden — a terminal keeps its shell, a
+widget keeps its fetched data — so revealing is instant. That's the point:
+a presentation deck can cut to a live dashboard mid-demo without a
+respawn. See `crates/jim-app/src/pane_groups.rs`.
+
+### Styling with Glaze
+
+Inline `style:` records are the escape hatch, not the default. For
+anything with more than one styled element, write a **Glaze stylesheet**
+(`.glz`) and ask it for styles by name — that is what the language is
+for: reuse, variants, pseudo-states, responsive `when` blocks, animated
+shader layers, and retuning the whole widget by editing one file. The
+full language is documented in `docs/GLAZE.md`.
+
+```funct
+// compiled once per load — so saving EITHER file hot-reloads the widget
+glaze_load_file(host_env("HOME") + "/.jim/widgets/mywidget.glz")
+
+fn render(w, h) = {
+    kind: "vstack", style: glaze("page"), children: [
+        // `when vw < 420 { … }` fires off the width you pass in
+        { kind: "vstack", style: glaze_at("card", {}, [], w, h), children: [ … ] },
+        // static variant params — the branch folds at resolve time
+        { kind: "text", value: "3 failed", style: glaze("pill", { intent: "danger" }) },
+        // discrete pseudo-state: pick the `:hover` plan for the hot row
+        { kind: "hstack", style: glaze("row", {}, ["hover"]), children: [ … ] },
+    ]
+}
+```
+
+| host fn | what it gives you |
+|---|---|
+| `glaze_load(src)` | compile literal Glaze source |
+| `glaze_load_file(path)` | read + compile a `.glz` (`~` expanded); registers it for hot reload |
+| `glaze_loaded()` | is a sheet loaded? (for a widget that wants a fallback) |
+| `glaze_styles()` | the style names in the sheet |
+| `glaze(name[, variant[, states]])` | a `Style` record for `style:` |
+| `glaze_at(name, variant, states, vw, vh)` | same, with `when` breakpoints resolved at that size |
+| `glaze_slot(name, component[, variant[, states]])` | the typed per-slot style a compound element wants — `toggle` `select` `tabs` `bar` `stepper` `radio` `checkbox` `slider` `table` `toast` `popover` `dialog` `tooltip` |
+| `glaze_token(name)` | one token's value — a colour as `"#rrggbb"`, a length/number as a number |
+| `glaze_tokens()` | the token names in the sheet |
+
+**Styles are box-only.** `fill`, `radius`, `border`, `shadow`, `pad`,
+sizing — but not a font size or a text colour, because `Style` has no
+typography. Read those from tokens instead, so a sheet stays the single
+source of truth rather than splitting a design system between a `.glz`
+and a pile of literals in the `.ft`:
+
+```funct
+{ kind: "text", value: title,
+  size: glaze_token("size_h1"), color: glaze_token("fg") }
+```
+
+`variant` is a record of static params (`{ intent: "danger" }`) compared
+as strings inside the sheet, so numbers and bools are fine too. `states`
+is a list like `["hover"]`, or a bare `"hover"`.
+
+**Shader layers work.** A `shader {}` / `overlay shader {}` block in the
+sheet compiles to WGSL and arrives as a live material on the element — a
+funct widget gets animated gradients and glows without touching the GPU
+path.
+
+**Everything faults loudly.** A parse error, an unknown token, a typo'd
+style name, or an unknown component slot raises a funct fault carrying
+the Glaze message. Nothing silently falls back to an unstyled element,
+because that reads as a layout bug and costs an hour to trace.
+
+Note *when* each error lands: `glaze_load*` only parses, and styles
+resolve lazily, so an unresolved token or a bad expression inside a style
+you never ask for stays quiet until something calls `glaze("that-one")`.
+The `check` example resolves every style in the sheet, which is the point
+of running it.
+
+Two gotchas worth knowing before you write a sheet:
+
+- **One property per line.** Glaze separates properties by newline, so
+  `pad 8px radius 8px` on one line parses as a three-argument `pad` and
+  fails at resolve time with "`pad` takes 1, 2, or 4 lengths".
+- **Check a sheet without running the app:**
+  `cargo run -p glaze --example check -- mywidget.glz` parses it and
+  resolves every style at a wide and a narrow viewport.
+
+`widgets/glaze_demo.ft` + `widgets/glaze_demo.glz` are a working example
+of all of the above, and are covered end-to-end by the tests in
+`funct_widget.rs`.
+
 ### Function scoping gotcha
 
 User-defined `fn`s are pure: they do **not** see top-level `const`s, and
@@ -356,6 +521,9 @@ as parameters. (See the funct fn-scoping notes in memory.)
 
 ### Host functions available to scripts
 
+The Glaze surface (`glaze_load` / `glaze_load_file` / `glaze` /
+`glaze_at` / `glaze_slot` / `glaze_styles` / `glaze_loaded`, see
+"[Styling with Glaze](#styling-with-glaze)"), plus
 `request_render`, `set_animating`, `time`, `rand`, `rand_int`,
 `hash_str`, `host_env`, `host_log`, `clipboard_set`, `widget_asset`, the
 widget↔widget bus `emit` / `emit_retained` / `my_id` (see "[The

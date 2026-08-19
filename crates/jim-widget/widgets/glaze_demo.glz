@@ -1,0 +1,58 @@
+// glaze_demo.glz — the stylesheet for glaze_demo.ft.
+//
+// Edit and save: the widget hot-reloads without touching the .ft.
+// Everything the widget draws is styled from here — the script sets no
+// colors, radii, or padding of its own.
+
+// ---- tokens: one place to retune the whole widget ----
+token surface   = oklch(0.19 0.012 255)
+token raised    = oklch(0.25 0.012 255)
+token line      = oklch(0.45 0.012 255 / 0.5)
+token gold      = oklch(0.80 0.13 85)
+token rose      = oklch(0.67 0.19 18)
+token teal      = oklch(0.76 0.10 195)
+
+// A spacing scale as a pure function — DSSSL-style style arithmetic.
+fn space(n) = n * 4px
+
+style page {
+    fill surface
+    pad  space(5)
+}
+
+style card {
+    fill   raised
+    radius space(3)
+    border line 1px
+    pad    space(4)
+
+    // Responsive: `when` fires on the viewport passed to glaze_at(),
+    // which the widget feeds from render(w, h). Narrow the pane and the
+    // card tightens up — no script branch involved.
+    // NB: one property per line — Glaze separates properties by newline,
+    // so `pad 8px radius 8px` on one line reads as a 3-argument `pad`.
+    when vw < 420 {
+        pad    space(2)
+        radius space(2)
+    }
+}
+
+// A variant param is a STATIC input: the ternary folds at resolve time,
+// so `intent` costs nothing at render.
+style pill(intent) {
+    fill   intent == danger ? rose : intent == calm ? teal : gold
+    radius 999px
+    pad    space(2) space(3)
+}
+
+// Discrete pseudo-states select an alternate plan. The widget passes
+// ["hover"] for the row under the cursor.
+style row {
+    fill   raised
+    radius space(2)
+    pad    space(3)
+    :hover {
+        fill   oklch(0.31 0.012 255)
+        border gold 1px
+    }
+}

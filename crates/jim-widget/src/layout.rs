@@ -43,6 +43,41 @@ pub struct MeasureCtx {
     /// `Element::Text.wrap`. Other leaves (button/badge/input) always
     /// pass true; only `Text` plumbs this through.
     pub wrap: bool,
+    /// Non-empty for an `Element::RichText`: the block's runs with their
+    /// own font sizes, so a word straddling a `**bold**` boundary is
+    /// measured with each half at its own size. Empty means the leaf is
+    /// a single uniform run described by `value` / `font_size`.
+    pub runs: Vec<MeasureRun>,
+}
+
+/// One run inside a [`MeasureCtx`] for a rich-text leaf.
+#[derive(Clone, Debug)]
+pub struct MeasureRun {
+    pub value: String,
+    pub font_size: f32,
+}
+
+impl MeasureCtx {
+    /// A uniform single-run leaf (`Text`, and every non-text leaf that
+    /// borrows the text measurer: button labels, badges, …).
+    pub fn plain(value: String, font_size: f32, wrap: bool) -> Self {
+        Self {
+            value,
+            font_size,
+            wrap,
+            runs: Vec::new(),
+        }
+    }
+
+    /// The tallest run in the block — the leaf's line height. A run that
+    /// sets a bigger size makes the whole line taller, the same way a
+    /// browser's `line-height` is driven by the tallest inline box.
+    fn max_font_size(&self) -> f32 {
+        self.runs
+            .iter()
+            .map(|r| r.font_size)
+            .fold(self.font_size, f32::max)
+    }
 }
 
 /// Built layout: the Taffy tree + the root node + a parallel vector of
@@ -148,15 +183,47 @@ fn build_node(
                 ..taffy::Style::DEFAULT
             };
             taffy
+                .new_leaf_with_context(st, MeasureCtx::plain(value.clone(), font_size, *wrap))
+                .unwrap()
+        }
+        Element::RichText {
+            runs, size, wrap, ..
+        } => {
+            let base = size.unwrap_or(crate::render::DEFAULT_FONT_SIZE);
+            taffy
                 .new_leaf_with_context(
-                    st,
+                    taffy::Style::DEFAULT,
                     MeasureCtx {
-                        value: value.clone(),
-                        font_size,
+                        // `value` is the concatenation, so the plain-text
+                        // paths (longest-word floor, hard-break split) work
+                        // on a rich block without special-casing.
+                        value: runs.iter().map(|r| r.value.as_str()).collect(),
+                        font_size: base,
                         wrap: *wrap,
+                        runs: runs
+                            .iter()
+                            .map(|r| MeasureRun {
+                                value: r.value.clone(),
+                                font_size: r.size.unwrap_or(base),
+                            })
+                            .collect(),
                     },
                 )
                 .unwrap()
+        }
+        Element::Image { style, .. } => {
+            // The image scales into whatever box the flex tree gives it, so
+            // it is a plain leaf. Without an explicit width/height in
+            // `style` it contributes no intrinsic size — say so with a
+            // small min-height rather than collapsing to nothing, which
+            // would make a bare `{kind:"image"}` invisible and read as a
+            // broken path.
+            let mut st = taffy::Style::DEFAULT;
+            apply_style_overrides(&mut st, style.as_ref());
+            if st.size.height == Dimension::auto() && st.min_size.height == Dimension::auto() {
+                st.min_size.height = Dimension::length(crate::render::DEFAULT_IMAGE_MIN_H);
+            }
+            taffy.new_leaf(st).unwrap()
         }
         Element::Divider => taffy
             .new_leaf(taffy::Style {
@@ -191,11 +258,7 @@ fn build_node(
                     },
                     ..taffy::Style::DEFAULT
                 },
-                MeasureCtx {
-                    value: value.clone(),
-                    font_size: crate::render::BADGE_FONT_SIZE,
-                    wrap: true,
-                },
+                MeasureCtx::plain(value.clone(), crate::render::BADGE_FONT_SIZE, true),
             )
             .unwrap(),
         Element::Button { label, .. } => taffy
@@ -209,31 +272,19 @@ fn build_node(
                     },
                     ..taffy::Style::DEFAULT
                 },
-                MeasureCtx {
-                    value: label.clone(),
-                    font_size: crate::render::DEFAULT_FONT_SIZE,
-                    wrap: true,
-                },
+                MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, true),
             )
             .unwrap(),
         Element::Link { label, .. } => taffy
             .new_leaf_with_context(
                 taffy::Style::DEFAULT,
-                MeasureCtx {
-                    value: label.clone(),
-                    font_size: crate::render::DEFAULT_FONT_SIZE,
-                    wrap: true,
-                },
+                MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, true),
             )
             .unwrap(),
         Element::Tooltip { label, .. } => taffy
             .new_leaf_with_context(
                 taffy::Style::DEFAULT,
-                MeasureCtx {
-                    value: label.clone(),
-                    font_size: crate::render::DEFAULT_FONT_SIZE,
-                    wrap: true,
-                },
+                MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, true),
             )
             .unwrap(),
         Element::Bar { width, height, .. } | Element::Slider { width, height, .. } => taffy
@@ -310,11 +361,11 @@ fn build_node(
                                 },
                                 ..taffy::Style::DEFAULT
                             },
-                            MeasureCtx {
-                                value: t.label.clone(),
-                                font_size: crate::render::DEFAULT_FONT_SIZE,
-                                wrap: true,
-                            },
+                            MeasureCtx::plain(
+                                t.label.clone(),
+                                crate::render::DEFAULT_FONT_SIZE,
+                                true,
+                            ),
                         )
                         .unwrap()
                 })
@@ -353,11 +404,11 @@ fn build_node(
                                 },
                                 ..taffy::Style::DEFAULT
                             },
-                            MeasureCtx {
-                                value: o.label.clone(),
-                                font_size: crate::render::DEFAULT_FONT_SIZE,
-                                wrap: true,
-                            },
+                            MeasureCtx::plain(
+                                o.label.clone(),
+                                crate::render::DEFAULT_FONT_SIZE,
+                                true,
+                            ),
                         )
                         .unwrap()
                 })
@@ -395,11 +446,7 @@ fn build_node(
                 let label_node = taffy
                     .new_leaf_with_context(
                         taffy::Style::DEFAULT,
-                        MeasureCtx {
-                            value: label.clone(),
-                            font_size: crate::render::DEFAULT_FONT_SIZE,
-                            wrap: true,
-                        },
+                        MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, true),
                     )
                     .unwrap();
                 let track_node = taffy
@@ -456,11 +503,7 @@ fn build_node(
                 let label_node = taffy
                     .new_leaf_with_context(
                         taffy::Style::DEFAULT,
-                        MeasureCtx {
-                            value: label.clone(),
-                            font_size: crate::render::DEFAULT_FONT_SIZE,
-                            wrap: true,
-                        },
+                        MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, true),
                     )
                     .unwrap();
                 taffy
@@ -632,11 +675,7 @@ fn table_cell_leaf(taffy: &mut TaffyTree<MeasureCtx>, text: &str) -> NodeId {
                 },
                 ..taffy::Style::DEFAULT
             },
-            MeasureCtx {
-                value: text.to_string(),
-                font_size: crate::render::DEFAULT_FONT_SIZE,
-                wrap: true,
-            },
+            MeasureCtx::plain(text.to_string(), crate::render::DEFAULT_FONT_SIZE, true),
         )
         .unwrap()
 }
@@ -823,6 +862,11 @@ fn measure_text(
             height: h,
         };
     }
+    // A rich block's words can straddle run boundaries and each half can be
+    // a different size, so it gets its own token walk.
+    if !ctx.runs.is_empty() {
+        return measure_runs(ctx, available, metrics);
+    }
     let char_w = metrics.char_width(ctx.font_size);
     // Min-content width is the widest *unbreakable word*, NOT the whole line.
     // If a text leaf reported its full single-line width as its minimum, flex
@@ -890,6 +934,142 @@ fn measure_text(
     Size {
         width,
         height: line_h * total_lines as f32,
+    }
+}
+
+/// One unit of the wrap walk over a rich block: either a word (which may
+/// be assembled from several runs) or a hard line break.
+#[derive(Debug, PartialEq)]
+enum Token {
+    /// A maximal run of non-whitespace, and its width. Unbreakable.
+    Word(f32),
+    /// A stretch of spaces/tabs between words, and its width.
+    Gap(f32),
+    /// A hard `\n`.
+    Break,
+}
+
+/// Split a rich block's runs into wrap tokens.
+///
+/// The subtlety this exists for: a word can span runs. Markdown's
+/// `un**bold**ed` produces three runs with no whitespace between them,
+/// and that is ONE unbreakable word whose width is the sum of three
+/// differently-sized pieces. Splitting each run independently would
+/// wrongly allow a line break inside it, so whitespace — not the run
+/// boundary — is what closes a word.
+fn tokenize_runs(runs: &[MeasureRun], metrics: &PaneFontMetrics) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::new();
+    // Width accumulated into the word/gap currently being built.
+    let mut pending: f32 = 0.0;
+    let mut in_word = false;
+
+    let flush = |out: &mut Vec<Token>, pending: &mut f32, in_word: &mut bool| {
+        if *pending > 0.0 {
+            out.push(if *in_word {
+                Token::Word(*pending)
+            } else {
+                Token::Gap(*pending)
+            });
+        }
+        *pending = 0.0;
+    };
+
+    for run in runs {
+        let char_w = metrics.char_width(run.font_size);
+        for ch in run.value.chars() {
+            if ch == '\n' {
+                flush(&mut out, &mut pending, &mut in_word);
+                out.push(Token::Break);
+                in_word = false;
+                continue;
+            }
+            let is_space = ch.is_whitespace();
+            // A word→gap or gap→word transition closes the pending token;
+            // staying in the same class (even across a run boundary) just
+            // keeps accumulating, which is what makes `un**bold**ed` one word.
+            if is_space == in_word && pending > 0.0 {
+                flush(&mut out, &mut pending, &mut in_word);
+            }
+            in_word = !is_space;
+            pending += char_w;
+        }
+    }
+    flush(&mut out, &mut pending, &mut in_word);
+    out
+}
+
+/// Measure an `Element::RichText` block: word-wrap the token stream at the
+/// available width and report the resulting box.
+///
+/// Same shape as the plain-text path above (longest word is the min-content
+/// floor; hard breaks always split), but widths come from the token walk so
+/// per-run sizes are respected. Line height is driven by the tallest run.
+fn measure_runs(
+    ctx: &MeasureCtx,
+    available: Size<AvailableSpace>,
+    metrics: &PaneFontMetrics,
+) -> Size<f32> {
+    let line_h = crate::render::line_height(ctx.max_font_size());
+    let tokens = tokenize_runs(&ctx.runs, metrics);
+    let longest_word = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::Word(w) => Some(*w),
+            _ => None,
+        })
+        .fold(0.0_f32, f32::max);
+
+    let max_w = match available.width {
+        AvailableSpace::Definite(w) => w,
+        AvailableSpace::MinContent => longest_word.max(1.0),
+        AvailableSpace::MaxContent => f32::INFINITY,
+    };
+    let wrappable = ctx.wrap && max_w > 0.0 && max_w.is_finite();
+
+    let mut lines: u32 = 1;
+    let mut line_w: f32 = 0.0;
+    let mut max_line_w: f32 = 0.0;
+    // A gap that would land at a wrap point is dropped rather than carried
+    // to the next line — trailing spaces must not push the following word
+    // off the edge (and every renderer collapses them anyway).
+    let mut pending_gap: f32 = 0.0;
+
+    for token in &tokens {
+        match token {
+            Token::Break => {
+                max_line_w = max_line_w.max(line_w);
+                lines += 1;
+                line_w = 0.0;
+                pending_gap = 0.0;
+            }
+            Token::Gap(w) => {
+                if line_w > 0.0 {
+                    pending_gap += w;
+                }
+            }
+            Token::Word(w) => {
+                let with_gap = line_w + pending_gap + w;
+                if wrappable && line_w > 0.0 && with_gap > max_w {
+                    max_line_w = max_line_w.max(line_w);
+                    lines += 1;
+                    line_w = *w;
+                } else {
+                    line_w = with_gap;
+                }
+                pending_gap = 0.0;
+            }
+        }
+    }
+    max_line_w = max_line_w.max(line_w);
+
+    let width = if wrappable {
+        max_line_w.min(max_w)
+    } else {
+        max_line_w
+    };
+    Size {
+        width,
+        height: line_h * lines as f32,
     }
 }
 
@@ -1011,7 +1191,10 @@ fn walk_clips(
     out: &mut Vec<ClippedRun>,
 ) {
     let size = laid.layout(node).size;
-    if let Element::Text { value, size: fs, .. } = el {
+    if let Element::Text {
+        value, size: fs, ..
+    } = el
+    {
         let font_size = fs.unwrap_or(crate::render::DEFAULT_FONT_SIZE);
         let rendered = match clip_right {
             Some(cr) => truncate_to_width(value, font_size, (cr - origin.x).max(0.0), metrics),
@@ -1080,6 +1263,150 @@ mod tests {
         }
     }
 
+    // ---- rich text ----
+
+    fn run(text: &str, size: f32) -> MeasureRun {
+        MeasureRun {
+            value: text.into(),
+            font_size: size,
+        }
+    }
+
+    /// The reason `tokenize_runs` exists: Markdown emphasis can land
+    /// mid-word (`un**bold**ed`), producing three runs with no whitespace
+    /// between them. That is ONE unbreakable word — if the tokenizer split
+    /// on run boundaries the layout would happily wrap inside it.
+    #[test]
+    fn runs_without_whitespace_form_one_word() {
+        let m = metrics();
+        let tokens = tokenize_runs(&[run("un", 14.0), run("bold", 14.0), run("ed", 14.0)], &m);
+        let widths: Vec<f32> = tokens
+            .iter()
+            .map(|t| match t {
+                Token::Word(w) => *w,
+                _ => panic!("expected a single word token, got {t:?}"),
+            })
+            .collect();
+        assert_eq!(widths.len(), 1, "three runs, no spaces → one word");
+        // 8 chars at the same size.
+        assert!((widths[0] - 8.0 * m.char_width(14.0)).abs() < 0.01);
+    }
+
+    /// A word straddling a size change must be measured with each half at
+    /// its own size, or a mixed-size line reports the wrong width.
+    #[test]
+    fn word_width_sums_per_run_font_size() {
+        let m = metrics();
+        let tokens = tokenize_runs(&[run("ab", 10.0), run("cd", 20.0)], &m);
+        let Token::Word(w) = tokens[0] else {
+            panic!("expected one word");
+        };
+        let expected = 2.0 * m.char_width(10.0) + 2.0 * m.char_width(20.0);
+        assert!((w - expected).abs() < 0.01, "got {w}, want {expected}");
+    }
+
+    /// Whitespace between runs still separates words, and hard newlines
+    /// still break, so wrapping behaves like the plain-text path.
+    #[test]
+    fn whitespace_and_newlines_split_tokens() {
+        let tokens = tokenize_runs(&[run("a b", 14.0), run("\nc", 14.0)], &metrics());
+        let shape: Vec<&str> = tokens
+            .iter()
+            .map(|t| match t {
+                Token::Word(_) => "w",
+                Token::Gap(_) => "g",
+                Token::Break => "n",
+            })
+            .collect();
+        assert_eq!(shape, vec!["w", "g", "w", "n", "w"]);
+    }
+
+    /// A rich block must wrap at the available width and report the
+    /// resulting height, exactly like `Element::Text` does.
+    #[test]
+    fn rich_block_wraps_and_reports_height() {
+        let m = metrics();
+        let ctx = MeasureCtx {
+            value: "one two three four".into(),
+            font_size: 14.0,
+            wrap: true,
+            runs: vec![run("one two ", 14.0), run("three four", 14.0)],
+        };
+        let line_h = crate::render::line_height(14.0);
+        // Wide enough for everything: one line.
+        let wide = measure_runs(
+            &ctx,
+            Size {
+                width: AvailableSpace::Definite(1000.0),
+                height: AvailableSpace::Definite(1000.0),
+            },
+            &m,
+        );
+        assert!((wide.height - line_h).abs() < 0.01, "one line when wide");
+        // Room for about two words: must wrap to more than one line.
+        let narrow = measure_runs(
+            &ctx,
+            Size {
+                width: AvailableSpace::Definite(m.char_width(14.0) * 10.0),
+                height: AvailableSpace::Definite(1000.0),
+            },
+            &m,
+        );
+        assert!(
+            narrow.height > wide.height,
+            "narrow box should wrap to more lines ({} vs {})",
+            narrow.height,
+            wide.height
+        );
+        assert!(narrow.width <= m.char_width(14.0) * 10.0 + 0.01);
+    }
+
+    /// Line height comes from the tallest run — a big inline run makes the
+    /// whole line taller, like an inline box in a browser.
+    #[test]
+    fn tallest_run_drives_line_height() {
+        let ctx = MeasureCtx {
+            value: "small BIG".into(),
+            font_size: 10.0,
+            wrap: true,
+            runs: vec![run("small ", 10.0), run("BIG", 30.0)],
+        };
+        let out = measure_runs(
+            &ctx,
+            Size {
+                width: AvailableSpace::Definite(1000.0),
+                height: AvailableSpace::Definite(1000.0),
+            },
+            &metrics(),
+        );
+        assert!((out.height - crate::render::line_height(30.0)).abs() < 0.01);
+    }
+
+    /// `wrap: false` keeps a rich block on one line no matter how narrow
+    /// the box gets, matching `Element::Text`'s no-wrap contract.
+    #[test]
+    fn rich_block_respects_no_wrap() {
+        let ctx = MeasureCtx {
+            value: "one two three".into(),
+            font_size: 14.0,
+            wrap: false,
+            runs: vec![run("one two three", 14.0)],
+        };
+        let out = measure_runs(
+            &ctx,
+            Size {
+                width: AvailableSpace::Definite(10.0),
+                height: AvailableSpace::Definite(1000.0),
+            },
+            &metrics(),
+        );
+        assert!((out.height - crate::render::line_height(14.0)).abs() < 0.01);
+        assert!(
+            out.width > 10.0,
+            "no-wrap reports its full width, overflowing"
+        );
+    }
+
     // ---- clip / truncation helpers ----
     fn text_run(s: &str, size: f32) -> Element {
         Element::Text {
@@ -1119,9 +1446,21 @@ mod tests {
     fn truncate_to_width_boundaries() {
         let m = metrics(); // cell_width 8.4 @ 14px
         let cw = m.char_width(14.0);
-        assert_eq!(truncate_to_width("hello", 14.0, 1000.0, &m), "hello", "fits → unchanged");
-        assert_eq!(truncate_to_width("hello", 14.0, 0.0, &m), "", "zero width → empty");
-        assert_eq!(truncate_to_width("hello", 14.0, -5.0, &m), "", "negative → empty");
+        assert_eq!(
+            truncate_to_width("hello", 14.0, 1000.0, &m),
+            "hello",
+            "fits → unchanged"
+        );
+        assert_eq!(
+            truncate_to_width("hello", 14.0, 0.0, &m),
+            "",
+            "zero width → empty"
+        );
+        assert_eq!(
+            truncate_to_width("hello", 14.0, -5.0, &m),
+            "",
+            "negative → empty"
+        );
         // exactly 3 chars of room
         assert_eq!(truncate_to_width("hello", 14.0, cw * 3.0 + 0.1, &m), "hel");
         // just under 3 → 2
@@ -1141,7 +1480,10 @@ mod tests {
             let runs = resolve_clipped_runs(&el, &m, 1000.0, 600.0);
             assert_eq!(runs.len(), 1);
             let r = &runs[0];
-            assert!(r.rendered.chars().count() < r.full.chars().count(), "w={w}: should truncate");
+            assert!(
+                r.rendered.chars().count() < r.full.chars().count(),
+                "w={w}: should truncate"
+            );
             let clip = r.clip_right.expect("inside clip box");
             assert!(
                 r.rendered_right(&m) <= clip + 0.01,
@@ -1189,7 +1531,10 @@ mod tests {
         assert_eq!(runs.len(), 1);
         let r = &runs[0];
         let clip = r.clip_right.unwrap();
-        assert!((clip - 80.0).abs() < 0.5, "tightest clip should be 80, got {clip}");
+        assert!(
+            (clip - 80.0).abs() < 0.5,
+            "tightest clip should be 80, got {clip}"
+        );
         assert!(r.rendered_right(&m) <= clip + 0.01);
     }
 

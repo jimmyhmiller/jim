@@ -4,8 +4,8 @@
 use whiteboard_core::editor::Editor;
 use whiteboard_core::element::Element;
 use whiteboard_core::interaction::{InputEvent, Modifiers, PointerButton, Tool};
-use whiteboard_core::text::MonospaceMeasurer;
 use whiteboard_core::shape::RoughGenerator;
+use whiteboard_core::text::MonospaceMeasurer;
 use whiteboard_core::Point;
 
 type Ed = Editor<MonospaceMeasurer, RoughGenerator>;

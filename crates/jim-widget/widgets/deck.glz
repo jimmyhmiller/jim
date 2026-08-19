@@ -1,0 +1,65 @@
+// deck.glz — the default deck theme.
+//
+// A deck's whole look lives here. `deck.ft` reads BOX styling through
+// `glaze(...)` and TYPOGRAPHY through `glaze_token(...)`, so retuning a
+// talk means editing this file — and saving it hot-reloads the live deck.
+//
+// Sizes are authored against a 1280x720 reference slide. `deck.ft` scales
+// every one of them by the pane's size, so a slide looks identical in a
+// small pane and on a projector.
+
+// ---- palette ----
+token bg         = oklch(0.17 0.014 260)
+token bg_alt     = oklch(0.22 0.014 260)
+token fg         = oklch(0.95 0.006 260)
+token fg_muted   = oklch(0.70 0.012 260)
+token accent     = oklch(0.80 0.13 85)
+token line       = oklch(0.42 0.014 260 / 0.6)
+token code_fg    = oklch(0.84 0.09 75)
+token code_bg    = oklch(0.13 0.012 260)
+token link       = oklch(0.76 0.10 240)
+
+// ---- type scale (reference px, scaled at render) ----
+token size_body  = 26
+token size_h1    = 64
+token size_h2    = 44
+token size_h3    = 32
+token size_code  = 21
+token size_note  = 18
+
+// ---- the slide surface ----
+// `layout` is a static variant param, so the branch folds at resolve time.
+style slide(layout) {
+    fill bg
+    pad  layout == title ? 96px : 72px
+}
+
+style code_block {
+    fill   code_bg
+    radius 10px
+    border line 1px
+    pad    20px
+}
+
+style quote_rule {
+    fill   accent
+    radius 2px
+    width  4px
+}
+
+// Progress affordance in the corner.
+style footer {
+    pad 0px
+}
+
+style footer_bar {
+    fill   line
+    radius 2px
+    height 3px
+}
+
+style footer_fill {
+    fill   accent
+    radius 2px
+    height 3px
+}

@@ -575,7 +575,8 @@ impl AppActionsExt for App {
 //     "icon": "♟",
 //     "keys": "cmd+k h",
 //     "kind": "script_widget",
-//     "config": { "script": "chess.ft", "title": "Chess" }
+//     "config": { "script": "chess.ft", "title": "Chess",
+//                 "_project": "Optional fixed host project" }
 //   }
 // ]
 // ```
@@ -1118,21 +1119,48 @@ pub fn run_requested_actions(world: &mut World) {
                 f(&mut ctx);
             }
             ActionRun::SpawnConfigured { kind } => {
-                let Some(active) = world.resource::<Projects>().active else {
-                    continue;
-                };
-                let config = world
+                let mut config = world
                     .resource::<RuntimeActions>()
                     .configs
                     .get(inv.id.as_str())
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+                // Test/demo actions can name a stable host project instead of
+                // silently following whichever sidebar project is active.
+                // Strip this action-only key before handing config to the pane.
+                let fixed_project = config
+                    .get("_project")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let switches_to_fixed_project = fixed_project.is_some();
+                if let Some(obj) = config.as_object_mut() {
+                    obj.remove("_project");
+                }
+                let project_id = match fixed_project {
+                    Some(name) => world
+                        .resource::<Projects>()
+                        .list
+                        .iter()
+                        .find(|project| project.name == name)
+                        .map(|project| project.id),
+                    None => world.resource::<Projects>().active,
+                };
+                let Some(project_id) = project_id else {
+                    warn!("action {:?}: configured host project was not found", inv.id);
+                    continue;
+                };
+                // A fixed-host action is also an "open there" action. This is
+                // important for live-view decks: their startup message must be
+                // observed while their host project is active.
+                if switches_to_fixed_project {
+                    world.resource_mut::<Projects>().set_active(project_id);
+                }
                 world
                     .resource_mut::<PendingActions>()
                     .new_panes
                     .push(NewPaneRequest {
                         kind,
-                        project_id: active,
+                        project_id,
                         origin: inv.origin,
                         size: None,
                         config,

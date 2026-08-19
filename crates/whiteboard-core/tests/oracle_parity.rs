@@ -24,8 +24,7 @@ fn point(v: &Value) -> Point {
 
 fn fixture(name: &str) -> Value {
     let path = format!("{}/tests/oracle/{}.json", env!("CARGO_MANIFEST_DIR"), name);
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"))
 }
 
@@ -157,7 +156,12 @@ fn binding_gap_match() {
         }
         let target = load_element(&case["target"]);
         let edge = point(&case["expected"]["edgeAtBind"]);
-        approx(binding_gap(&target, edge), want.as_f64().unwrap(), tol, &format!("{name} gap"));
+        approx(
+            binding_gap(&target, edge),
+            want.as_f64().unwrap(),
+            tol,
+            &format!("{name} gap"),
+        );
     }
 }
 

@@ -565,6 +565,9 @@ pub struct PendingActions {
     /// `None` kind closes every pane in the project. Resolved to pane
     /// entities in `apply_pending_actions` (needs a world query).
     pub close_panes: Vec<(u64, Option<String>, Option<Vec<String>>)>,
+    /// `jimctl group assign|clear`: `(project_id, titles, group)`. `None`
+    /// as the group clears membership. Applied by `apply_pane_group_sets`.
+    pub set_pane_groups: Vec<(u64, Vec<String>, Option<String>)>,
     /// Dock requests from `jimctl dock`:
     /// `(project_id, titles, template, empty, slots)`. With `empty`, spawn
     /// a template skeleton of `slots` empty cells; otherwise dock the
@@ -822,6 +825,7 @@ fn load_or_seed_projects(mut commands: Commands, mut pending: ResMut<PendingActi
             config: serde_json::json!({ "session_id": legacy.session_id }),
             pinned: false,
             canvas: 0,
+            group: None,
             snap_id: 0,
             dock_group: None,
             dock_slot: 0,
@@ -1588,6 +1592,28 @@ fn apply_pending_actions(world: &mut World) {
         }
     }
 
+    // `jimctl group assign|clear`: put panes into a named group (or take
+    // them out). Membership is what makes a pane revealable by name later;
+    // see `crate::pane_groups`. Titles are matched exactly, and an empty
+    // title list never reaches here (the IPC handler rejects it) so a typo
+    // can't silently regroup a whole project.
+    for (project_id, titles, group) in actions.set_pane_groups {
+        let targets: Vec<Entity> = {
+            let mut q = world.query::<(Entity, &PaneProject, &jim_pane::PaneTitle, &PaneTag)>();
+            q.iter(world)
+                .filter(|(_, m, _, _)| m.0 == project_id)
+                .filter(|(_, _, t, _)| titles.iter().any(|w| w == &t.0))
+                .map(|(e, _, _, _)| e)
+                .collect()
+        };
+        if targets.is_empty() {
+            eprintln!("[groups] no panes matched titles {titles:?}");
+        }
+        for e in targets {
+            crate::pane_groups::set_group(world, e, group.clone());
+        }
+    }
+
     // `jimctl dock` requests: frame existing panes into a new dock. Pick
     // the members (by title order, or all free panes when no titles), then
     // hand them to `create_dock` (the same path the snap gesture builds).
@@ -1862,6 +1888,12 @@ fn restore_pane(world: &mut World, snap: PaneSnapshot) {
                 .entity_mut(e)
                 .insert(jim_pane::PaneCanvas(snap.canvas));
         }
+        // Restore named-group membership, so a deck's dashboards stay
+        // wired up across restarts and revealing one is still just a
+        // visibility flip (see `pane_groups`).
+        if let Some(group) = snap.group.clone() {
+            world.entity_mut(e).insert(jim_pane::PaneGroup(group));
+        }
         // Restore the stable thumbnail id so the tile can find this
         // (now-hidden) pane's saved snapshot PNG.
         if snap.snap_id != 0 {
@@ -1991,8 +2023,15 @@ pub fn assert_pane_project_invariant(
 pub fn sync_visibility(
     projects: Res<Projects>,
     nav: Res<crate::canvas_pane::CanvasNav>,
+    groups: Res<crate::pane_groups::VisibleGroups>,
+    viewed: Res<crate::live_views::ViewedProjects>,
     mut panes: Query<
-        (&PaneProject, Option<&jim_pane::PaneCanvas>, &mut Visibility),
+        (
+            &PaneProject,
+            Option<&jim_pane::PaneCanvas>,
+            Option<&jim_pane::PaneGroup>,
+            &mut Visibility,
+        ),
         (With<PaneTag>, Without<jim_pane::PaneClosing>),
     >,
 ) {
@@ -2002,9 +2041,22 @@ pub fn sync_visibility(
     // exact level (root = 0 / no marker) — descending swaps the visible
     // set without moving any pane.
     let active_level = active.map(|p| nav.level(p)).unwrap_or(0);
-    for (m, canvas, mut vis) in &mut panes {
+    for (m, canvas, group, mut vis) in &mut panes {
         let pane_level = canvas.map_or(0, |c| c.0);
-        let want = if Some(m.0) == active && pane_level == active_level {
+        // Third visibility dimension, orthogonal to project and canvas
+        // level: a pane in a named group also needs that group revealed
+        // (see `pane_groups`). Ungrouped panes are unaffected.
+        // A full project/application view means the whole project, including
+        // panes that are normally parked in a reveal-only dashboard group.
+        let group_ok = viewed.0.contains(&m.0) || group.is_none_or(|g| groups.is_visible(&g.0));
+        let project_visible = Some(m.0) == active || viewed.0.contains(&m.0);
+        let level_visible = if Some(m.0) == active {
+            pane_level == active_level
+        } else {
+            // Embedded project views currently frame the root canvas.
+            pane_level == 0
+        };
+        let want = if project_visible && level_visible && group_ok {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -2294,7 +2346,16 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
         }
         m
     };
-    let entries: Vec<(Entity, String, Option<u64>, PaneRect, bool, u64, u64)> = {
+    let entries: Vec<(
+        Entity,
+        String,
+        Option<u64>,
+        PaneRect,
+        bool,
+        u64,
+        u64,
+        Option<String>,
+    )> = {
         let mut q = world.query::<(
             Entity,
             &PaneKindMarker,
@@ -2303,9 +2364,10 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
             Has<PanePinned>,
             Option<&jim_pane::PaneCanvas>,
             Option<&jim_pane::PaneSnapId>,
+            Option<&jim_pane::PaneGroup>,
         )>();
         q.iter(world)
-            .map(|(e, k, p, r, pinned, canvas, snap)| {
+            .map(|(e, k, p, r, pinned, canvas, snap, group)| {
                 (
                     e,
                     k.0.to_string(),
@@ -2314,6 +2376,7 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
                     pinned,
                     canvas.map_or(0, |c| c.0),
                     snap.map_or(0, |s| s.0),
+                    group.map(|g| g.0.clone()),
                 )
             })
             .collect()
@@ -2321,7 +2384,7 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
     let snapshots: Vec<PaneSnapshot> = entries
         .into_iter()
         .filter_map(
-            |(entity, kind, project_id, rect, pinned, canvas, snap_id)| {
+            |(entity, kind, project_id, rect, pinned, canvas, snap_id, group)| {
                 let snap_fn = world
                     .resource::<PaneRegistry>()
                     .get(&kind)
@@ -2343,6 +2406,7 @@ fn collect_pane_snapshots(world: &mut World) -> Vec<PaneSnapshot> {
                     snap_id,
                     dock_group,
                     dock_slot,
+                    group,
                 })
             },
         )

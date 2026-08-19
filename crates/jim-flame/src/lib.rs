@@ -190,7 +190,8 @@ impl TraceRecorder {
         let mut b = ProfileBuilder::new();
         let process = b.add_process(0, "jim");
         let mut tracks: std::collections::HashMap<u64, TrackId> = std::collections::HashMap::new();
-        let mut cats: std::collections::HashMap<&str, CategoryId> = std::collections::HashMap::new();
+        let mut cats: std::collections::HashMap<&str, CategoryId> =
+            std::collections::HashMap::new();
         for frame in &self.frames {
             for s in &frame.spans {
                 let track = match tracks.get(&s.thread) {
@@ -212,7 +213,9 @@ impl TraceRecorder {
                     }
                 };
                 let name_id = b.intern_string(&s.display);
-                b.add_complete_slice(track, s.depth, s.start_ns, s.dur_ns, name_id, category, None);
+                b.add_complete_slice(
+                    track, s.depth, s.start_ns, s.dur_ns, name_id, category, None,
+                );
             }
         }
         b.finish()
@@ -361,7 +364,9 @@ fn flame_spawn_from_config(
         PaneCapturesPinch,
     ));
     if recorder_view {
-        world.entity_mut(entity).insert(FlameRecorderView::default());
+        world
+            .entity_mut(entity)
+            .insert(FlameRecorderView::default());
     }
 }
 
@@ -421,7 +426,9 @@ fn newest_jim_trace() -> Option<String> {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if newest.as_ref().map_or(true, |(t, _)| modified > *t) {
             newest = Some((modified, path));
         }

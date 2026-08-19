@@ -4353,6 +4353,7 @@ dependencies = [
  "jim_pane",
  "jim_style",
  "libc",
+ "markdown_core",
  "notify",
  "schemars",
  "serde",
