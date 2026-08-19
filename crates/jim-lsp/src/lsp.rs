@@ -13,14 +13,14 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use crate::{symbol_kind_name, ProtoError, Range, SymbolNode};
+use crate::{ProtoError, Range, SymbolNode, symbol_kind_name};
 
 /// How long a single LSP request waits for its response.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -242,7 +242,8 @@ impl RaClient {
             let _ = self.ensure_open(f);
         }
         std::thread::sleep(Duration::from_millis(400));
-        let mut types: std::collections::BTreeMap<String, TypeAcc> = std::collections::BTreeMap::new();
+        let mut types: std::collections::BTreeMap<String, TypeAcc> =
+            std::collections::BTreeMap::new();
         let mut free: Vec<Value> = Vec::new();
         for f in &files {
             let syms = self
@@ -441,7 +442,10 @@ impl RaClient {
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         if let Err(e) = self.write_framed(&msg) {
             self.pending.lock().unwrap().remove(&id);
-            return Err(ProtoError { code: "transport".into(), message: e });
+            return Err(ProtoError {
+                code: "transport".into(),
+                message: e,
+            });
         }
 
         match rx.recv_timeout(REQUEST_TIMEOUT) {
@@ -799,7 +803,10 @@ fn impl_target(label: &str) -> String {
             body = r.trim_start();
         } else if let Some(r) = body.strip_prefix('&') {
             body = r.trim_start();
-        } else if let Some(r) = body.strip_prefix("*const ").or_else(|| body.strip_prefix("*mut ")) {
+        } else if let Some(r) = body
+            .strip_prefix("*const ")
+            .or_else(|| body.strip_prefix("*mut "))
+        {
             body = r.trim_start();
         } else {
             break;

@@ -22,8 +22,8 @@
 //! frame's worth (read once per frame from the `Last` schedule).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Global enable flag. Flipped by the overlay toggle (Cmd+Shift+F) and by
@@ -168,8 +168,14 @@ pub struct Span {
 }
 
 enum Target {
-    Pane { entity_bits: u64, kind: &'static str },
-    Sys { name: &'static str, nested: bool },
+    Pane {
+        entity_bits: u64,
+        kind: &'static str,
+    },
+    Sys {
+        name: &'static str,
+        nested: bool,
+    },
 }
 
 impl Drop for Span {
@@ -190,12 +196,9 @@ impl Drop for Span {
                 Target::Pane { entity_bits, kind } => {
                     crate::trace::end(pending, kind, "pane", entity_bits)
                 }
-                Target::Sys { name, nested } => crate::trace::end(
-                    pending,
-                    name,
-                    if nested { "sys.nested" } else { "sys" },
-                    0,
-                ),
+                Target::Sys { name, nested } => {
+                    crate::trace::end(pending, name, if nested { "sys.nested" } else { "sys" }, 0)
+                }
             }
         }
     }
@@ -207,7 +210,11 @@ impl Drop for Span {
 #[inline]
 pub fn pane_span(entity_bits: u64, kind: &'static str) -> Span {
     Span {
-        start: if enabled() { Some(Instant::now()) } else { None },
+        start: if enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        },
         trace: crate::trace::begin(),
         target: Target::Pane { entity_bits, kind },
     }
@@ -218,7 +225,11 @@ pub fn pane_span(entity_bits: u64, kind: &'static str) -> Span {
 #[inline]
 pub fn sys_span(name: &'static str) -> Span {
     Span {
-        start: if enabled() { Some(Instant::now()) } else { None },
+        start: if enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        },
         trace: crate::trace::begin(),
         target: Target::Sys {
             name,
@@ -233,7 +244,11 @@ pub fn sys_span(name: &'static str) -> Span {
 #[inline]
 pub fn sys_span_nested(name: &'static str) -> Span {
     Span {
-        start: if enabled() { Some(Instant::now()) } else { None },
+        start: if enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        },
         trace: crate::trace::begin(),
         target: Target::Sys { name, nested: true },
     }

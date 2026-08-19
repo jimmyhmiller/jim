@@ -3,12 +3,11 @@
 //! per-glyph geometry. Caret Y is `line * LINE_HEIGHT`, which is our
 //! grid, so it needs no tests.
 
-use jim_editor::{
-    caret_x_in_line, char_from_line_col, char_to_line_col, line_selection_span,
-    mouse_col_at_x,
-};
 use editor_core::selection::Selection;
 use editor_core::state::EditorState;
+use jim_editor::{
+    caret_x_in_line, char_from_line_col, char_to_line_col, line_selection_span, mouse_col_at_x,
+};
 use ropey::Rope;
 
 const W: f32 = 10.0;

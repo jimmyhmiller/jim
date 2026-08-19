@@ -78,7 +78,12 @@ fn bus_works_headless_and_retains_across_restart() {
         // Let the subscriber connect + finish its (empty) replay.
         std::thread::sleep(Duration::from_millis(300));
 
-        publish("agent.all", serde_json::json!({"text": "hello"}), false, "tester");
+        publish(
+            "agent.all",
+            serde_json::json!({"text": "hello"}),
+            false,
+            "tester",
+        );
 
         let mut got = None;
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -105,7 +110,10 @@ fn bus_works_headless_and_retains_across_restart() {
     // The daemon persists synchronously on accept; give the socket write a
     // beat to be processed, then confirm the store hit disk.
     std::thread::sleep(Duration::from_millis(300));
-    assert!(retained.exists(), "retained store should be written to disk");
+    assert!(
+        retained.exists(),
+        "retained store should be written to disk"
+    );
 
     daemon.kill().unwrap();
     let _ = daemon.wait();

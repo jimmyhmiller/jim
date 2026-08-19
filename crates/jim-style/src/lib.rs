@@ -50,13 +50,13 @@ pub use dynamic::{DynamicMaterial, DynamicMaterialPlugin, ShaderSchemas};
 pub use fonts::{FontRegistry, FontRegistryPlugin};
 pub use material::{register_preset_asset_source, register_style_asset_source};
 pub use presets::{
-    register_preset_host_fns_funct, resolve_project_theme, ActiveStylePreset, PresetsPlugin,
-    StylePreset, StylePresetRegistry,
+    ActiveStylePreset, PresetsPlugin, StylePreset, StylePresetRegistry,
+    register_preset_host_fns_funct, resolve_project_theme,
 };
-pub use script_bridge::{register_script_host_fns_funct, EventBus, ScriptBridgePlugin};
-pub use theme_bridge::{register_theme_host_fns_funct, ThemeBridgePlugin};
+pub use script_bridge::{EventBus, ScriptBridgePlugin, register_script_host_fns_funct};
 pub use state::{ProjectStyleState, StyleDataDir};
-pub use theme::{tokens, ProjectThemes, Theme, ThemeChanged, TokenId, TokenValue};
+pub use theme::{ProjectThemes, Theme, ThemeChanged, TokenId, TokenValue, tokens};
+pub use theme_bridge::{ThemeBridgePlugin, register_theme_host_fns_funct};
 
 // Compatibility re-exports for hosts that still spell paths the old
 // way. Once terminal-bevy switches to `jim_style::ActiveProject`,

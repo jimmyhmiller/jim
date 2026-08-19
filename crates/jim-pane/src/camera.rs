@@ -63,7 +63,15 @@ pub struct PaneCameraOf(pub Entity);
 /// delay before the camera exists is harmless: it has nothing to
 /// render anyway until Stage 3.
 pub fn spawn_pane_cameras(
-    new_panes: Query<(Entity, &PaneLayer, &PaneRect, Has<crate::PaneScreenAnchored>), Added<PaneLayer>>,
+    new_panes: Query<
+        (
+            Entity,
+            &PaneLayer,
+            &PaneRect,
+            Has<crate::PaneScreenAnchored>,
+        ),
+        Added<PaneLayer>,
+    >,
     windows: Query<&Window>,
     region: Option<Res<PaneCanvasRegion>>,
     viewport: Option<Res<PaneViewport>>,
@@ -162,9 +170,7 @@ pub fn sync_pane_cameras(
         if cam.order != new_order {
             cam.order = new_order;
         }
-        if xform.translation.x != setup.cam_center.x
-            || xform.translation.y != setup.cam_center.y
-        {
+        if xform.translation.x != setup.cam_center.x || xform.translation.y != setup.cam_center.y {
             xform.translation.x = setup.cam_center.x;
             xform.translation.y = setup.cam_center.y;
         }
@@ -399,9 +405,7 @@ pub fn propagate_render_layers(
         if layers_q.get(child).is_ok() {
             continue;
         }
-        let Some(layer_n) =
-            ancestor_pane_layer(child, &pane_layers, &parents_q)
-        else {
+        let Some(layer_n) = ancestor_pane_layer(child, &pane_layers, &parents_q) else {
             continue;
         };
         stamp_subtree(child, layer_n, &layers_q, &children_q, &mut commands);
@@ -458,7 +462,12 @@ pub fn propagate_render_layers(
 /// Runs `.before(CheckVisibility)` so the correction lands the same frame
 /// Bevy decides which camera draws each entity.
 pub fn reconcile_pane_content_layers(
-    panes: Query<(Entity, &PaneLayer, &crate::PaneChrome, &crate::PaneKindMarker)>,
+    panes: Query<(
+        Entity,
+        &PaneLayer,
+        &crate::PaneChrome,
+        &crate::PaneKindMarker,
+    )>,
     changed_children: Query<Entity, Changed<ChildOf>>,
     pane_layers: Query<&PaneLayer>,
     parents_q: Query<&ChildOf>,

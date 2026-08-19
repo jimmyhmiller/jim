@@ -102,11 +102,11 @@ impl std::fmt::Display for SchemaError {
                 f,
                 "shader has no `var<uniform> user: UserData;` declaration"
             ),
-            Self::UnsupportedField { struct_name, field_name, reason } => write!(
-                f,
-                "{}::{}: {}",
-                struct_name, field_name, reason
-            ),
+            Self::UnsupportedField {
+                struct_name,
+                field_name,
+                reason,
+            } => write!(f, "{}::{}: {}", struct_name, field_name, reason),
         }
     }
 }
@@ -158,21 +158,18 @@ impl Schema {
                 TypeInner::Scalar(s) if s.kind == naga::ScalarKind::Float && s.width == 4 => {
                     FieldKind::F32
                 }
-                TypeInner::Vector { size: VectorSize::Bi, scalar }
-                    if scalar.kind == naga::ScalarKind::Float && scalar.width == 4 =>
-                {
-                    FieldKind::Vec2
-                }
-                TypeInner::Vector { size: VectorSize::Tri, scalar }
-                    if scalar.kind == naga::ScalarKind::Float && scalar.width == 4 =>
-                {
-                    FieldKind::Vec3
-                }
-                TypeInner::Vector { size: VectorSize::Quad, scalar }
-                    if scalar.kind == naga::ScalarKind::Float && scalar.width == 4 =>
-                {
-                    FieldKind::Vec4
-                }
+                TypeInner::Vector {
+                    size: VectorSize::Bi,
+                    scalar,
+                } if scalar.kind == naga::ScalarKind::Float && scalar.width == 4 => FieldKind::Vec2,
+                TypeInner::Vector {
+                    size: VectorSize::Tri,
+                    scalar,
+                } if scalar.kind == naga::ScalarKind::Float && scalar.width == 4 => FieldKind::Vec3,
+                TypeInner::Vector {
+                    size: VectorSize::Quad,
+                    scalar,
+                } if scalar.kind == naga::ScalarKind::Float && scalar.width == 4 => FieldKind::Vec4,
                 other => {
                     // For now, silently skip unsupported kinds (u32,
                     // matrices, arrays, etc.) — they won't show up in
@@ -200,7 +197,9 @@ impl Schema {
         //    yet — anything declared as `texture_2d` gets a slot in
         //    the named-texture map.
         for (_, gv) in module.global_variables.iter() {
-            let Some(name) = gv.name.clone() else { continue };
+            let Some(name) = gv.name.clone() else {
+                continue;
+            };
             if name == "user" {
                 continue;
             }
@@ -238,7 +237,9 @@ impl Schema {
     }
 
     pub fn write_vec2(&self, buffer: &mut [u8], name: &str, value: [f32; 2]) {
-        let Some(field) = self.fields.get(name) else { return };
+        let Some(field) = self.fields.get(name) else {
+            return;
+        };
         if field.kind != FieldKind::Vec2 {
             return;
         }
@@ -249,7 +250,9 @@ impl Schema {
     }
 
     pub fn write_vec4(&self, buffer: &mut [u8], name: &str, value: [f32; 4]) {
-        let Some(field) = self.fields.get(name) else { return };
+        let Some(field) = self.fields.get(name) else {
+            return;
+        };
         if field.kind != FieldKind::Vec4 {
             return;
         }

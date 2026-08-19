@@ -85,7 +85,8 @@ fn discard_server(port: u16) {
         if let Some(mut r) = g.take() {
             eprintln!(
                 "[whisper] killing failed server: pid={} port={}",
-                r.child.id(), r.port
+                r.child.id(),
+                r.port
             );
             let _ = r.child.kill();
             let _ = r.child.wait();
@@ -106,7 +107,8 @@ pub fn idle_shutdown() {
         if let Some(mut r) = g.take() {
             eprintln!(
                 "[whisper] idle shutdown: pid={} port={}",
-                r.child.id(), r.port
+                r.child.id(),
+                r.port
             );
             let _ = r.child.kill();
             let _ = r.child.wait();
@@ -120,7 +122,8 @@ pub fn shutdown() {
     if let Some(mut r) = g.take() {
         eprintln!(
             "[whisper] app shutdown: pid={} port={}",
-            r.child.id(), r.port
+            r.child.id(),
+            r.port
         );
         let _ = r.child.kill();
         let _ = r.child.wait();

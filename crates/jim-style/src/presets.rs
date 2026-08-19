@@ -23,14 +23,14 @@ use std::sync::{Arc, RwLock};
 
 use bevy::prelude::*;
 use jim_pane::ActiveChromeShader;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::active::ActiveProject;
 use crate::material::PRESET_SOURCE;
 use crate::state::{ProjectStyleState, StyleDataDir};
-use crate::theme::{load_theme, theme_path_for_project, ActiveThemePath, Theme};
+use crate::theme::{ActiveThemePath, Theme, load_theme, theme_path_for_project};
 
 /// One discovered preset on disk.
 #[derive(Clone, Debug)]
@@ -69,10 +69,7 @@ impl Plugin for PresetsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<StylePresetRegistry>()
             .init_resource::<ActiveStylePreset>()
-            .add_systems(
-                Startup,
-                (seed_default_presets, discover_presets).chain(),
-            )
+            .add_systems(Startup, (seed_default_presets, discover_presets).chain())
             // `sync_active_preset_from_project` loads the active project's
             // saved preset on every switch; `drain_preset_messages` writes
             // the user's pick back to that project. Both feed
@@ -429,10 +426,26 @@ fn seed_default_presets() {
     write_seed(&dir.join("default"), SEED_DEFAULT_THEME);
     write_seed(&dir.join("linear"), SEED_LINEAR_THEME);
     write_seed(&dir.join("paper"), SEED_PAPER_THEME);
-    write_seed_full(&dir.join("neon"), SEED_NEON_THEME, Some(seed_neon_chrome_wgsl()));
-    write_seed_full(&dir.join("terminal"), SEED_TERMINAL_THEME, Some(seed_terminal_chrome_wgsl()));
-    write_seed_full(&dir.join("wireframe"), SEED_WIREFRAME_THEME, Some(seed_wireframe_chrome_wgsl()));
-    write_seed_full(&dir.join("glass"), SEED_GLASS_THEME, Some(seed_glass_chrome_wgsl()));
+    write_seed_full(
+        &dir.join("neon"),
+        SEED_NEON_THEME,
+        Some(seed_neon_chrome_wgsl()),
+    );
+    write_seed_full(
+        &dir.join("terminal"),
+        SEED_TERMINAL_THEME,
+        Some(seed_terminal_chrome_wgsl()),
+    );
+    write_seed_full(
+        &dir.join("wireframe"),
+        SEED_WIREFRAME_THEME,
+        Some(seed_wireframe_chrome_wgsl()),
+    );
+    write_seed_full(
+        &dir.join("glass"),
+        SEED_GLASS_THEME,
+        Some(seed_glass_chrome_wgsl()),
+    );
     // Practical presets — distinct *moods* rather than showy effects.
     // Theme-only:
     write_seed(&dir.join("ink"), SEED_INK_THEME);
@@ -461,11 +474,7 @@ fn write_seed(preset_dir: &std::path::Path, theme_body: &str) {
     write_seed_full(preset_dir, theme_body, None);
 }
 
-fn write_seed_full(
-    preset_dir: &std::path::Path,
-    theme_body: &str,
-    chrome_wgsl: Option<String>,
-) {
+fn write_seed_full(preset_dir: &std::path::Path, theme_body: &str, chrome_wgsl: Option<String>) {
     if let Err(e) = std::fs::create_dir_all(preset_dir) {
         warn!("style presets: mkdir {}: {}", preset_dir.display(), e);
         return;
@@ -1442,12 +1451,24 @@ fn join_chrome(fragment_src: &str) -> String {
 
 // Lazy-eval so we only build the joined strings when seeding fires
 // (once on startup, after disk check).
-fn seed_neon_chrome_wgsl() -> String { join_chrome(SEED_NEON_CHROME_FRAGMENT) }
-fn seed_terminal_chrome_wgsl() -> String { join_chrome(SEED_TERMINAL_CHROME_FRAGMENT) }
-fn seed_wireframe_chrome_wgsl() -> String { join_chrome(SEED_WIREFRAME_CHROME_FRAGMENT) }
-fn seed_glass_chrome_wgsl() -> String { join_chrome(SEED_GLASS_CHROME_FRAGMENT) }
-fn seed_sketch_chrome_wgsl() -> String { join_chrome(SEED_SKETCH_CHROME_FRAGMENT) }
-fn seed_mesh_chrome_wgsl() -> String { join_chrome(SEED_MESH_CHROME_FRAGMENT) }
+fn seed_neon_chrome_wgsl() -> String {
+    join_chrome(SEED_NEON_CHROME_FRAGMENT)
+}
+fn seed_terminal_chrome_wgsl() -> String {
+    join_chrome(SEED_TERMINAL_CHROME_FRAGMENT)
+}
+fn seed_wireframe_chrome_wgsl() -> String {
+    join_chrome(SEED_WIREFRAME_CHROME_FRAGMENT)
+}
+fn seed_glass_chrome_wgsl() -> String {
+    join_chrome(SEED_GLASS_CHROME_FRAGMENT)
+}
+fn seed_sketch_chrome_wgsl() -> String {
+    join_chrome(SEED_SKETCH_CHROME_FRAGMENT)
+}
+fn seed_mesh_chrome_wgsl() -> String {
+    join_chrome(SEED_MESH_CHROME_FRAGMENT)
+}
 
 // ============================================================
 // Practical presets — distinct *moods* of work, not showy effects.

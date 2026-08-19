@@ -177,7 +177,10 @@ impl FontRegistry {
 // for now. To add an additional family: drop a `.ttf` next to these
 // and add a row with `include_bytes!`.
 const BUNDLED_FONTS: &[(&str, &[u8])] = &[
-    ("mono", include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")),
+    (
+        "mono",
+        include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+    ),
     ("sans", include_bytes!("../assets/fonts/Inter-VF.ttf")),
     ("serif", include_bytes!("../assets/fonts/CrimsonPro-VF.ttf")),
     // Broad-coverage glyph fallback (geometric shapes, arrows, math,
@@ -185,7 +188,10 @@ const BUNDLED_FONTS: &[(&str, &[u8])] = &[
     // codepoint. Also selectable as a family by name.
     ("symbols", include_bytes!("../assets/fonts/DejaVuSans.ttf")),
     // COLOR emoji (Twemoji, COLRv0). Per-glyph fallback for emoji codepoints.
-    ("emoji", include_bytes!("../assets/fonts/TwemojiMozilla.ttf")),
+    (
+        "emoji",
+        include_bytes!("../assets/fonts/TwemojiMozilla.ttf"),
+    ),
 ];
 
 /// The family name whose handle becomes the per-glyph symbol fallback.
@@ -293,9 +299,6 @@ pub fn ensure_initialized(registry: &mut FontRegistry, fonts: &mut Assets<Font>)
     }
 }
 
-fn register_bundled_fonts(
-    mut registry: ResMut<FontRegistry>,
-    mut fonts: ResMut<Assets<Font>>,
-) {
+fn register_bundled_fonts(mut registry: ResMut<FontRegistry>, mut fonts: ResMut<Assets<Font>>) {
     ensure_initialized(&mut registry, &mut fonts);
 }

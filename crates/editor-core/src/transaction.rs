@@ -15,7 +15,11 @@ pub struct Change {
 impl Change {
     pub fn new(from: usize, to: usize, insert: impl Into<String>) -> Self {
         assert!(from <= to);
-        Self { from, to, insert: insert.into() }
+        Self {
+            from,
+            to,
+            insert: insert.into(),
+        }
     }
 
     pub fn insert(at: usize, text: impl Into<String>) -> Self {
@@ -98,9 +102,7 @@ impl Transaction {
         let mid = EditorState::new(doc.clone(), Selection::cursor(0))
             .apply(self)
             .doc;
-        let end = EditorState::new(mid, Selection::cursor(0))
-            .apply(other)
-            .doc;
+        let end = EditorState::new(mid, Selection::cursor(0)).apply(other).doc;
         let original: String = doc.to_string();
         let final_str: String = end.to_string();
         let original_chars: Vec<char> = original.chars().collect();
@@ -120,8 +122,7 @@ impl Transaction {
             .count();
         let from = common_prefix;
         let to = original_chars.len() - common_suffix;
-        let insert: String = final_chars
-            [common_prefix..final_chars.len() - common_suffix]
+        let insert: String = final_chars[common_prefix..final_chars.len() - common_suffix]
             .iter()
             .collect();
         let mut tx = Transaction::new();
@@ -147,6 +148,9 @@ impl Transaction {
             inverse.push(Change::new(new_from, new_to, removed));
             shift += insert_chars as isize - (c.to - c.from) as isize;
         }
-        Transaction { changes: inverse, selection: None }
+        Transaction {
+            changes: inverse,
+            selection: None,
+        }
     }
 }

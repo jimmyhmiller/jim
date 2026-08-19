@@ -366,8 +366,12 @@ mod tests {
         "#,
         )
         .unwrap();
-        let off = to_toggle_style(&prog.resolve_slots("toggle", &Default::default(), &[]).unwrap())
-            .unwrap();
+        let off = to_toggle_style(
+            &prog
+                .resolve_slots("toggle", &Default::default(), &[])
+                .unwrap(),
+        )
+        .unwrap();
         let on = to_toggle_style(
             &prog
                 .resolve_slots("toggle", &Default::default(), &["checked"])
@@ -454,9 +458,11 @@ mod tests {
         "#,
         )
         .unwrap();
-        assert!(resolve_select_style(&bad, "picker")
-            .unwrap_err()
-            .contains("panl"));
+        assert!(
+            resolve_select_style(&bad, "picker")
+                .unwrap_err()
+                .contains("panl")
+        );
     }
 
     #[test]
@@ -486,8 +492,8 @@ mod tests {
         "#,
         )
         .unwrap();
-        let err =
-            to_stepper_style(&bad.resolve_slots("st", &Default::default(), &[]).unwrap()).unwrap_err();
+        let err = to_stepper_style(&bad.resolve_slots("st", &Default::default(), &[]).unwrap())
+            .unwrap_err();
         assert!(err.contains("feild"));
     }
 
@@ -518,8 +524,8 @@ mod tests {
         "#,
         )
         .unwrap();
-        let err =
-            to_radio_style(&bad.resolve_slots("rg", &Default::default(), &[]).unwrap()).unwrap_err();
+        let err = to_radio_style(&bad.resolve_slots("rg", &Default::default(), &[]).unwrap())
+            .unwrap_err();
         assert!(err.contains("circle"));
     }
 
@@ -540,9 +546,12 @@ mod tests {
         "#,
         )
         .unwrap();
-        let cs =
-            to_checkbox_style(&prog.resolve_slots("cb", &Default::default(), &[]).unwrap()).unwrap();
-        assert!(cs.square.is_some(), "the `box` slot maps to the `square` field");
+        let cs = to_checkbox_style(&prog.resolve_slots("cb", &Default::default(), &[]).unwrap())
+            .unwrap();
+        assert!(
+            cs.square.is_some(),
+            "the `box` slot maps to the `square` field"
+        );
         assert!(cs.check.is_some());
 
         let bad = glaze::parse(
@@ -552,8 +561,8 @@ mod tests {
         "#,
         )
         .unwrap();
-        let err =
-            to_checkbox_style(&bad.resolve_slots("cb", &Default::default(), &[]).unwrap()).unwrap_err();
+        let err = to_checkbox_style(&bad.resolve_slots("cb", &Default::default(), &[]).unwrap())
+            .unwrap_err();
         assert!(err.contains("tick"));
     }
 
@@ -588,8 +597,8 @@ mod tests {
         "#,
         )
         .unwrap();
-        let err =
-            to_slider_style(&bad.resolve_slots("sl", &Default::default(), &[]).unwrap()).unwrap_err();
+        let err = to_slider_style(&bad.resolve_slots("sl", &Default::default(), &[]).unwrap())
+            .unwrap_err();
         assert!(err.contains("thmub"));
     }
 
@@ -623,9 +632,12 @@ mod tests {
         "#,
         )
         .unwrap();
-        let err =
-            to_table_style(&bad.resolve_slots("tbl", &Default::default(), &[]).unwrap()).unwrap_err();
-        assert!(err.contains("footre"), "error should name the bad slot: {err}");
+        let err = to_table_style(&bad.resolve_slots("tbl", &Default::default(), &[]).unwrap())
+            .unwrap_err();
+        assert!(
+            err.contains("footre"),
+            "error should name the bad slot: {err}"
+        );
     }
 
     #[test]
@@ -641,7 +653,10 @@ mod tests {
         .unwrap();
         let slots = prog.resolve_slots("bar", &Default::default(), &[]).unwrap();
         let err = to_bar_style(&slots).unwrap_err();
-        assert!(err.contains("trakc"), "error should name the bad slot: {err}");
+        assert!(
+            err.contains("trakc"),
+            "error should name the bad slot: {err}"
+        );
     }
 
     #[test]

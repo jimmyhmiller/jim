@@ -10,8 +10,8 @@
 use std::ops::Range;
 
 use bevy::prelude::*;
+use jim_style::{Theme, ThemeChanged, tokens};
 use ropey::Rope;
-use jim_style::{tokens, Theme, ThemeChanged};
 use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -60,21 +60,21 @@ impl Default for SyntaxPalette {
         // render doesn't flash uncolored.
         Self {
             colors: [
-                Color::srgb(0.92, 0.92, 0.94),  // Default
-                Color::srgb(0.78, 0.55, 0.90),  // Keyword
-                Color::srgb(0.65, 0.87, 0.60),  // String
-                Color::srgb(0.48, 0.52, 0.58),  // Comment
-                Color::srgb(0.55, 0.78, 1.00),  // Function
-                Color::srgb(0.94, 0.82, 0.55),  // Type
-                Color::srgb(0.85, 0.70, 0.50),  // Attribute
-                Color::srgb(0.95, 0.62, 0.48),  // Constant
-                Color::srgb(0.70, 0.75, 0.82),  // Operator
-                Color::srgb(0.70, 0.75, 0.82),  // Punctuation
-                Color::srgb(0.92, 0.92, 0.94),  // Variable
-                Color::srgb(0.85, 0.82, 0.95),  // Property
-                Color::srgb(0.95, 0.62, 0.48),  // Label
-                Color::srgb(0.95, 0.75, 0.40),  // Escape
-                Color::srgb(0.94, 0.82, 0.55),  // Constructor
+                Color::srgb(0.92, 0.92, 0.94), // Default
+                Color::srgb(0.78, 0.55, 0.90), // Keyword
+                Color::srgb(0.65, 0.87, 0.60), // String
+                Color::srgb(0.48, 0.52, 0.58), // Comment
+                Color::srgb(0.55, 0.78, 1.00), // Function
+                Color::srgb(0.94, 0.82, 0.55), // Type
+                Color::srgb(0.85, 0.70, 0.50), // Attribute
+                Color::srgb(0.95, 0.62, 0.48), // Constant
+                Color::srgb(0.70, 0.75, 0.82), // Operator
+                Color::srgb(0.70, 0.75, 0.82), // Punctuation
+                Color::srgb(0.92, 0.92, 0.94), // Variable
+                Color::srgb(0.85, 0.82, 0.95), // Property
+                Color::srgb(0.95, 0.62, 0.48), // Label
+                Color::srgb(0.95, 0.75, 0.40), // Escape
+                Color::srgb(0.94, 0.82, 0.55), // Constructor
             ],
             rev: 0,
         }

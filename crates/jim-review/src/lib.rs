@@ -76,10 +76,14 @@ impl Author {
             if name.is_empty() {
                 Err("agent author needs a name: agent:<name>".into())
             } else {
-                Ok(Author::Agent { name: name.to_string() })
+                Ok(Author::Agent {
+                    name: name.to_string(),
+                })
             }
         } else {
-            Err(format!("bad author '{s}': expected 'user' or 'agent:<name>'"))
+            Err(format!(
+                "bad author '{s}': expected 'user' or 'agent:<name>'"
+            ))
         }
     }
 
@@ -144,11 +148,20 @@ pub fn now_ms() -> u64 {
 
 pub fn load(root: &Path) -> ReviewFile {
     let Some(path) = repo_file_path(root) else {
-        return ReviewFile { next_id: 1, threads: Vec::new() };
+        return ReviewFile {
+            next_id: 1,
+            threads: Vec::new(),
+        };
     };
     match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or(ReviewFile { next_id: 1, threads: Vec::new() }),
-        Err(_) => ReviewFile { next_id: 1, threads: Vec::new() },
+        Ok(text) => serde_json::from_str(&text).unwrap_or(ReviewFile {
+            next_id: 1,
+            threads: Vec::new(),
+        }),
+        Err(_) => ReviewFile {
+            next_id: 1,
+            threads: Vec::new(),
+        },
     }
 }
 
@@ -176,7 +189,10 @@ pub fn make_anchor(file: &str, line: u32, lines: &[&str]) -> Anchor {
         .collect();
     let after_end = (idx + 1 + ANCHOR_CONTEXT).min(lines.len());
     let context_after = if idx + 1 < lines.len() {
-        lines[idx + 1..after_end].iter().map(|s| s.to_string()).collect()
+        lines[idx + 1..after_end]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     } else {
         Vec::new()
     };
@@ -253,20 +269,31 @@ pub fn reanchor(data: &mut ReviewFile, file: &str, new_lines: &[&str], search_ra
         }
         let old_idx = (t.anchor.line as usize).saturating_sub(1);
         let matches_at = |idx: usize| -> bool {
-            new_lines.get(idx).map(|l| *l == t.anchor.context_line).unwrap_or(false)
+            new_lines
+                .get(idx)
+                .map(|l| *l == t.anchor.context_line)
+                .unwrap_or(false)
         };
         let score_at = |idx: usize| -> usize {
             // context_line match is required; neighbors break ties.
             let mut s = 0;
             for (off, want) in t.anchor.context_before.iter().rev().enumerate() {
                 if idx > off {
-                    if new_lines.get(idx - 1 - off).map(|l| l == want).unwrap_or(false) {
+                    if new_lines
+                        .get(idx - 1 - off)
+                        .map(|l| l == want)
+                        .unwrap_or(false)
+                    {
                         s += 1;
                     }
                 }
             }
             for (off, want) in t.anchor.context_after.iter().enumerate() {
-                if new_lines.get(idx + 1 + off).map(|l| l == want).unwrap_or(false) {
+                if new_lines
+                    .get(idx + 1 + off)
+                    .map(|l| l == want)
+                    .unwrap_or(false)
+                {
                     s += 1;
                 }
             }
@@ -279,7 +306,10 @@ pub fn reanchor(data: &mut ReviewFile, file: &str, new_lines: &[&str], search_ra
         }
         let mut best: Option<(usize, usize)> = None; // (idx, score)
         for d in 1..=search_radius {
-            for idx in [old_idx.checked_sub(d), Some(old_idx + d)].into_iter().flatten() {
+            for idx in [old_idx.checked_sub(d), Some(old_idx + d)]
+                .into_iter()
+                .flatten()
+            {
                 if matches_at(idx) {
                     let s = score_at(idx);
                     if best.map(|(_, bs)| s > bs).unwrap_or(true) {
@@ -315,7 +345,10 @@ mod tests {
 
     #[test]
     fn round_trip_thread_lifecycle() {
-        let mut data = ReviewFile { next_id: 1, threads: Vec::new() };
+        let mut data = ReviewFile {
+            next_id: 1,
+            threads: Vec::new(),
+        };
         let lines = ["fn a() {}", "fn b() {}", "fn c() {}"];
         let id = add_thread(
             &mut data,
@@ -326,7 +359,14 @@ mod tests {
             "why is b empty?",
         );
         assert_eq!(id, 1);
-        assert!(add_reply(&mut data, id, Author::Agent { name: "claude".into() }, "fixing"));
+        assert!(add_reply(
+            &mut data,
+            id,
+            Author::Agent {
+                name: "claude".into()
+            },
+            "fixing"
+        ));
         assert!(set_status(&mut data, id, ThreadStatus::Resolved));
         let t = &data.threads[0];
         assert_eq!(t.replies.len(), 1);
@@ -344,7 +384,9 @@ mod tests {
         assert_eq!(Author::parse("user").unwrap(), Author::User);
         assert_eq!(
             Author::parse("agent:claude").unwrap(),
-            Author::Agent { name: "claude".into() }
+            Author::Agent {
+                name: "claude".into()
+            }
         );
         assert!(Author::parse("agent:").is_err());
         assert!(Author::parse("bob").is_err());
@@ -352,7 +394,10 @@ mod tests {
 
     #[test]
     fn reanchor_follows_inserted_lines() {
-        let mut data = ReviewFile { next_id: 1, threads: Vec::new() };
+        let mut data = ReviewFile {
+            next_id: 1,
+            threads: Vec::new(),
+        };
         let old = ["a", "b", "target", "c", "d"];
         add_thread(
             &mut data,
@@ -378,7 +423,8 @@ mod tests {
     #[test]
     fn save_and_load_atomic() {
         // Use a fake HOME so the test doesn't touch ~/.jim.
-        let fake_home = std::env::temp_dir().join(format!("jim-review-test-{}", std::process::id()));
+        let fake_home =
+            std::env::temp_dir().join(format!("jim-review-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&fake_home);
         std::fs::create_dir_all(&fake_home).unwrap();
         let old_home = std::env::var_os("HOME");
@@ -386,7 +432,10 @@ mod tests {
 
         let repo = fake_home.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let mut data = ReviewFile { next_id: 1, threads: Vec::new() };
+        let mut data = ReviewFile {
+            next_id: 1,
+            threads: Vec::new(),
+        };
         add_thread(
             &mut data,
             &repo,

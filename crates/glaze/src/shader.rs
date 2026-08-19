@@ -140,7 +140,13 @@ pub(crate) fn compile_shader(
         } else {
             let v = eval_static_expr(cx.program, cx.variant, &cx.static_lets, expr)?;
             cx.static_lets.insert(name.clone(), v);
-            cx.lets.insert(name.clone(), LetInfo { dynamic: false, dim });
+            cx.lets.insert(
+                name.clone(),
+                LetInfo {
+                    dynamic: false,
+                    dim,
+                },
+            );
         }
     }
 
@@ -160,7 +166,11 @@ pub(crate) fn compile_shader(
     }
 
     used.dedup();
-    Ok(CompiledShader { overlay, wgsl_body: out, used })
+    Ok(CompiledShader {
+        overlay,
+        wgsl_body: out,
+        used,
+    })
 }
 
 impl Sctx<'_> {
@@ -270,9 +280,7 @@ impl Sctx<'_> {
 
     fn call_dim(&self, name: &str, args: &[Expr]) -> Result<u8, GlazeError> {
         let arg = |i: usize| -> Result<u8, GlazeError> {
-            args.get(i)
-                .map(|a| self.dim_of(a))
-                .unwrap_or(Ok(1))
+            args.get(i).map(|a| self.dim_of(a)).unwrap_or(Ok(1))
         };
         Ok(match name {
             "vec2" => 2,
@@ -337,7 +345,9 @@ impl Sctx<'_> {
                 self.lower(a, used)?,
                 self.lower(c, used)?
             ),
-            Expr::Num(..) | Expr::Hex(_) | Expr::Color { .. } => unreachable!("literals are static"),
+            Expr::Num(..) | Expr::Hex(_) | Expr::Color { .. } => {
+                unreachable!("literals are static")
+            }
         })
     }
 }
@@ -357,7 +367,11 @@ fn fnum(x: f64) -> String {
         format!("{:.1}", x)
     } else {
         let s = format!("{}", x);
-        if s.contains('.') || s.contains('e') { s } else { format!("{s}.0") }
+        if s.contains('.') || s.contains('e') {
+            s
+        } else {
+            format!("{s}.0")
+        }
     }
 }
 
@@ -365,7 +379,11 @@ fn wgsl_literal(v: &Value) -> Result<String, GlazeError> {
     Ok(match v {
         Value::Num(n) => fnum(*n),
         Value::Len(Length::Px(p)) => fnum(*p as f64),
-        Value::Len(_) => return Err(GlazeError::Eval("non-px length in a shader expression".into())),
+        Value::Len(_) => {
+            return Err(GlazeError::Eval(
+                "non-px length in a shader expression".into(),
+            ));
+        }
         Value::Color(c) => format!(
             "vec4<f32>({}, {}, {}, {})",
             fnum(c.r as f64),

@@ -134,17 +134,25 @@ fn detect_wrap(
 
     // Try INSIDE first: `<open>[<space>]...[<space>]<close>` within from..to.
     if to >= from + open_chars + close_chars {
-        let starts_open_space =
-            slice_eq(doc, from, from + open_chars + 1, &with_space_open);
+        let starts_open_space = slice_eq(doc, from, from + open_chars + 1, &with_space_open);
         let starts_open = !starts_open_space && slice_eq(doc, from, from + open_chars, open);
         if starts_open_space || starts_open {
-            let open_to = from + if starts_open_space { open_chars + 1 } else { open_chars };
-            let ends_space_close = to >= close_chars + 1
-                && slice_eq(doc, to - close_chars - 1, to, &with_space_close);
-            let ends_close = !ends_space_close
-                && slice_eq(doc, to - close_chars, to, close);
+            let open_to = from
+                + if starts_open_space {
+                    open_chars + 1
+                } else {
+                    open_chars
+                };
+            let ends_space_close =
+                to >= close_chars + 1 && slice_eq(doc, to - close_chars - 1, to, &with_space_close);
+            let ends_close = !ends_space_close && slice_eq(doc, to - close_chars, to, close);
             if ends_space_close || ends_close {
-                let close_from = to - if ends_space_close { close_chars + 1 } else { close_chars };
+                let close_from = to
+                    - if ends_space_close {
+                        close_chars + 1
+                    } else {
+                        close_chars
+                    };
                 if open_to <= close_from {
                     return Some(DetectedWrap {
                         open_from: from,
@@ -159,22 +167,19 @@ fn detect_wrap(
 
     // Try OUTSIDE: `<open>[<space>]` immediately before from, and
     // `[<space>]<close>` immediately after to.
-    let outside_open = if from >= open_chars + 1
-        && slice_eq(doc, from - open_chars - 1, from, &with_space_open)
-    {
-        Some((from - open_chars - 1, from))
-    } else if from >= open_chars && slice_eq(doc, from - open_chars, from, open) {
-        Some((from - open_chars, from))
-    } else {
-        None
-    };
+    let outside_open =
+        if from >= open_chars + 1 && slice_eq(doc, from - open_chars - 1, from, &with_space_open) {
+            Some((from - open_chars - 1, from))
+        } else if from >= open_chars && slice_eq(doc, from - open_chars, from, open) {
+            Some((from - open_chars, from))
+        } else {
+            None
+        };
     let outside_close = if to + close_chars + 1 <= doc.len_chars()
         && slice_eq(doc, to, to + close_chars + 1, &with_space_close)
     {
         Some((to, to + close_chars + 1))
-    } else if to + close_chars <= doc.len_chars()
-        && slice_eq(doc, to, to + close_chars, close)
-    {
+    } else if to + close_chars <= doc.len_chars() && slice_eq(doc, to, to + close_chars, close) {
         Some((to, to + close_chars))
     } else {
         None
@@ -256,7 +261,12 @@ fn block_comment_changes_with_mode(
 
     // Build changes per target plus a tagged action for selection mapping.
     enum Action {
-        Wrap { from: usize, to: usize, open_len: usize, close_len: usize },
+        Wrap {
+            from: usize,
+            to: usize,
+            open_len: usize,
+            close_len: usize,
+        },
         Unwrap {
             open_from: usize,
             open_to: usize,
@@ -296,7 +306,12 @@ fn block_comment_changes_with_mode(
             let close_len = close_insert.chars().count();
             changes.push(Change::insert(from, open_insert));
             changes.push(Change::insert(to, close_insert));
-            actions.push(Action::Wrap { from, to, open_len, close_len });
+            actions.push(Action::Wrap {
+                from,
+                to,
+                open_len,
+                close_len,
+            });
         }
     }
 
@@ -306,7 +321,12 @@ fn block_comment_changes_with_mode(
 
     fn shift_for(p: usize, is_empty_cursor: bool, a: &Action) -> isize {
         match a {
-            Action::Wrap { from, to, open_len, close_len } => {
+            Action::Wrap {
+                from,
+                to,
+                open_len,
+                close_len,
+            } => {
                 if p < *from {
                     0
                 } else if p == *from {
@@ -314,7 +334,11 @@ fn block_comment_changes_with_mode(
                     // insert (CM6: `|/* ... */`). A non-empty range whose left
                     // edge is at the wrap start expands to include the open
                     // insert (the selection contains the wrapped content).
-                    if is_empty_cursor { 0 } else { *open_len as isize }
+                    if is_empty_cursor {
+                        0
+                    } else {
+                        *open_len as isize
+                    }
                 } else if p <= *to {
                     *open_len as isize
                 } else {
@@ -489,7 +513,10 @@ fn line_comment_inner(state: &EditorState, mode: LineCommentMode) -> Option<Tran
         return None;
     }
 
-    Some(Transaction { changes, selection: None })
+    Some(Transaction {
+        changes,
+        selection: None,
+    })
 }
 
 pub fn line_comment(state: &EditorState) -> Option<Transaction> {

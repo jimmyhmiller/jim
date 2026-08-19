@@ -96,10 +96,7 @@ pub fn gather_facts(cwd: &str) -> CwdFacts {
             if name.starts_with('.') && name != ".git" {
                 continue;
             }
-            let is_dir = entry
-                .file_type()
-                .map(|t| t.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             all_entries.push((name, is_dir));
         }
     }

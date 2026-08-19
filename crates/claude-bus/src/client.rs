@@ -17,11 +17,14 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::proto::{decode, encode, BusFrame, ClientFrame, Role};
+use crate::proto::{BusFrame, ClientFrame, Role, decode, encode};
 
 /// One delivered event, mirroring `BusFrame::Event`.
 #[derive(Debug, Clone)]
@@ -258,7 +261,10 @@ fn worker_loop(
                     let _ = tx.send(BusItem::Disconnected);
                     announced_disconnect = true;
                 }
-                eprintln!("[claude-bus-client] session ended: {} — retrying in {:?}", e, backoff);
+                eprintln!(
+                    "[claude-bus-client] session ended: {} — retrying in {:?}",
+                    e, backoff
+                );
                 // Cap backoff at a few seconds so a long bus outage
                 // still gets noticed quickly when it ends.
                 std::thread::sleep(backoff);

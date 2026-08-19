@@ -16,7 +16,7 @@
 //! perceptually even surface ladders.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::io::Write as _;
 use std::path::PathBuf;
 
@@ -300,14 +300,56 @@ impl Genome {
 }
 
 const ADJECTIVES: &[&str] = &[
-    "Quiet", "Velvet", "Copper", "Glacial", "Ember", "Mossy", "Night", "Saffron", "Cobalt",
-    "Ashen", "Lacquer", "Hazel", "Tidal", "Iron", "Opal", "Cinder", "Juniper", "Misty", "Paper",
-    "Tarnished", "Hollow", "Gilded", "Stray", "Deep",
+    "Quiet",
+    "Velvet",
+    "Copper",
+    "Glacial",
+    "Ember",
+    "Mossy",
+    "Night",
+    "Saffron",
+    "Cobalt",
+    "Ashen",
+    "Lacquer",
+    "Hazel",
+    "Tidal",
+    "Iron",
+    "Opal",
+    "Cinder",
+    "Juniper",
+    "Misty",
+    "Paper",
+    "Tarnished",
+    "Hollow",
+    "Gilded",
+    "Stray",
+    "Deep",
 ];
 const NOUNS: &[&str] = &[
-    "Harbor", "Dusk", "Atelier", "Signal", "Garden", "Archive", "Tide", "Lantern", "Meridian",
-    "Foundry", "Orchard", "Static", "Parlor", "Drift", "Veranda", "Reactor", "Library", "Canyon",
-    "Studio", "Aerie", "Furnace", "Causeway", "Cellar", "Observatory",
+    "Harbor",
+    "Dusk",
+    "Atelier",
+    "Signal",
+    "Garden",
+    "Archive",
+    "Tide",
+    "Lantern",
+    "Meridian",
+    "Foundry",
+    "Orchard",
+    "Static",
+    "Parlor",
+    "Drift",
+    "Veranda",
+    "Reactor",
+    "Library",
+    "Canyon",
+    "Studio",
+    "Aerie",
+    "Furnace",
+    "Causeway",
+    "Cellar",
+    "Observatory",
 ];
 
 fn gen_name(rng: &mut Rng) -> String {
@@ -364,7 +406,11 @@ pub fn append_feedback(mut ev: FeedbackEvent) -> std::io::Result<()> {
         .create(true)
         .append(true)
         .open(feedback_path())?;
-    writeln!(f, "{}", serde_json::to_string(&ev).expect("serialize feedback"))?;
+    writeln!(
+        f,
+        "{}",
+        serde_json::to_string(&ev).expect("serialize feedback")
+    )?;
     Ok(())
 }
 
@@ -500,11 +546,19 @@ pub fn sample_genome(rng: &mut Rng, model: &TasteModelHandle, avoid_hues: &[f32]
         1 => rng.gauss(250.0, 25.0).rem_euclid(360.0), // cool neutral
         _ => m.pick_hue(rng, |g| g.base_hue, &[]),
     };
-    let harmony = m.pick_cat(rng, "harmony", HARMONIES, &[0.3, 0.45, 0.25], |g| &g.harmony);
-    let contrast = m.pick_cat(rng, "contrast", CONTRASTS, &[0.3, 0.45, 0.25], |g| &g.contrast);
-    let border = m.pick_cat(rng, "border", BORDERS, &[0.3, 0.35, 0.1, 0.25], |g| &g.border);
+    let harmony = m.pick_cat(rng, "harmony", HARMONIES, &[0.3, 0.45, 0.25], |g| {
+        &g.harmony
+    });
+    let contrast = m.pick_cat(rng, "contrast", CONTRASTS, &[0.3, 0.45, 0.25], |g| {
+        &g.contrast
+    });
+    let border = m.pick_cat(rng, "border", BORDERS, &[0.3, 0.35, 0.1, 0.25], |g| {
+        &g.border
+    });
     let depth = m.pick_cat(rng, "depth", DEPTHS, &[0.2, 0.4, 0.25, 0.15], |g| &g.depth);
-    let gradient = m.pick_cat(rng, "gradient", GRADIENTS, &[0.45, 0.4, 0.15], |g| &g.gradient);
+    let gradient = m.pick_cat(rng, "gradient", GRADIENTS, &[0.45, 0.4, 0.15], |g| {
+        &g.gradient
+    });
     let motion = m.pick_cat(rng, "motion", MOTIONS, &[0.15, 0.5, 0.35], |g| &g.motion);
     let easing = m.pick_cat(rng, "easing", EASINGS, &[0.6, 0.4], |g| &g.easing);
     let effect = m.pick_cat(
@@ -754,10 +808,22 @@ pub fn expand_tokens(g: &Genome) -> Vec<(String, Value)> {
     let sh_l = if dark { 0.02 } else { 0.25 };
     let (shadow_color, shadow_blur, shadow_dy): (String, f64, f64) = match g.depth.as_str() {
         "flat" => (hexa(sh_l, sc, bh, 0.0), 1.0, 0.0),
-        "soft" => (hexa(sh_l, sc, bh, if dark { 0.42 } else { 0.18 }), 20.0, 5.0),
-        "floaty" => (hexa(sh_l, sc, bh, if dark { 0.55 } else { 0.25 }), 34.0, 11.0),
+        "soft" => (
+            hexa(sh_l, sc, bh, if dark { 0.42 } else { 0.18 }),
+            20.0,
+            5.0,
+        ),
+        "floaty" => (
+            hexa(sh_l, sc, bh, if dark { 0.55 } else { 0.25 }),
+            34.0,
+            11.0,
+        ),
         // glow: accent-tinted ambient halo, no offset
-        _ => (hexa(al, ac * 0.55, ah, if dark { 0.30 } else { 0.20 }), 26.0, 0.0),
+        _ => (
+            hexa(al, ac * 0.55, ah, if dark { 0.30 } else { 0.20 }),
+            26.0,
+            0.0,
+        ),
     };
 
     let primary_label = if dark {
@@ -814,7 +880,10 @@ pub fn expand_tokens(g: &Genome) -> Vec<(String, Value)> {
     if framed {
         let ring_l = if dark { r.pane - 0.04 } else { r.pane + 0.012 };
         st!("chrome_title_bg", hex(ring_l, sc, bh));
-        st!("chrome_title_bg_focused", hex(ring_l + step * 1.4, (sc * 1.4).min(0.045), bh));
+        st!(
+            "chrome_title_bg_focused",
+            hex(ring_l + step * 1.4, (sc * 1.4).min(0.045), bh)
+        );
     } else {
         st!("chrome_title_bg", hex(r.pane, sc, bh));
         st!("chrome_title_bg_focused", hex(r.pane + step, sc, bh));
@@ -828,27 +897,67 @@ pub fn expand_tokens(g: &Genome) -> Vec<(String, Value)> {
         }
     );
     st!("chrome_close", hex(r.muted, sc, bh));
-    st!("chrome_handle", hex(if dark { r.pane + 0.12 } else { r.pane - 0.16 }, sc, bh));
+    st!(
+        "chrome_handle",
+        hex(if dark { r.pane + 0.12 } else { r.pane - 0.16 }, sc, bh)
+    );
 
     st!("syntax_default", hex(r.fg, (sc * 0.6).min(0.015), bh));
     st!("syntax_keyword", hex(syl, syc, ah));
     st!("syntax_string", hex(syl2, syc, sh));
-    st!("syntax_comment", hex(if dark { 0.5 } else { 0.62 }, (sc * 1.2).min(0.03), bh));
-    st!("syntax_function", hex(syl + if dark { 0.04 } else { -0.04 }, syc, (ah + 20.0).rem_euclid(360.0)));
-    st!("syntax_type", hex(syl2, syc * 0.9, (sh + 30.0).rem_euclid(360.0)));
-    st!("syntax_attribute", hex(syl2, syc * 0.8, (ah - 35.0).rem_euclid(360.0)));
-    st!("syntax_constant", hex(syl2, syc, (ah - 60.0).rem_euclid(360.0)));
-    st!("syntax_operator", hex(if dark { 0.66 } else { 0.42 }, syc * 0.35, bh));
+    st!(
+        "syntax_comment",
+        hex(if dark { 0.5 } else { 0.62 }, (sc * 1.2).min(0.03), bh)
+    );
+    st!(
+        "syntax_function",
+        hex(
+            syl + if dark { 0.04 } else { -0.04 },
+            syc,
+            (ah + 20.0).rem_euclid(360.0)
+        )
+    );
+    st!(
+        "syntax_type",
+        hex(syl2, syc * 0.9, (sh + 30.0).rem_euclid(360.0))
+    );
+    st!(
+        "syntax_attribute",
+        hex(syl2, syc * 0.8, (ah - 35.0).rem_euclid(360.0))
+    );
+    st!(
+        "syntax_constant",
+        hex(syl2, syc, (ah - 60.0).rem_euclid(360.0))
+    );
+    st!(
+        "syntax_operator",
+        hex(if dark { 0.66 } else { 0.42 }, syc * 0.35, bh)
+    );
     st!("syntax_punctuation", hex(r.muted, syc * 0.25, bh));
     st!("syntax_variable", hex(r.fg, (sc * 0.6).min(0.015), bh));
-    st!("syntax_property", hex(syl2, syc * 0.7, (ah + 45.0).rem_euclid(360.0)));
-    st!("syntax_label", hex(syl2, syc, (ah - 60.0).rem_euclid(360.0)));
+    st!(
+        "syntax_property",
+        hex(syl2, syc * 0.7, (ah + 45.0).rem_euclid(360.0))
+    );
+    st!(
+        "syntax_label",
+        hex(syl2, syc, (ah - 60.0).rem_euclid(360.0))
+    );
     st!("syntax_escape", hex(sem_l, sem_c * 0.9, 85.0));
-    st!("syntax_constructor", hex(syl2, syc * 0.9, (sh + 30.0).rem_euclid(360.0)));
+    st!(
+        "syntax_constructor",
+        hex(syl2, syc * 0.9, (sh + 30.0).rem_euclid(360.0))
+    );
 
     st!("input_bg", hex(r.input, sc, bh));
-    st!("input_text", hex(r.fg - if dark { 0.06 } else { -0.06 }, sc * 0.6, bh));
-    st!("input_text_focused", hex(r.fg + if dark { 0.04 } else { -0.04 }, sc * 0.5, bh));
+    st!(
+        "input_text",
+        hex(r.fg - if dark { 0.06 } else { -0.06 }, sc * 0.6, bh)
+    );
+    st!(
+        "input_text_focused",
+        hex(r.fg + if dark { 0.04 } else { -0.04 }, sc * 0.5, bh)
+    );
 
     st!("button_bg", hex(r.s2, sc, bh));
     // hover token tuned by the hover gene: glow tints toward the accent,
@@ -869,13 +978,26 @@ pub fn expand_tokens(g: &Genome) -> Vec<(String, Value)> {
 
     nm!("widget_button_corner_radius", btn_radius);
     st!("widget_button_border", border_col.clone());
-    nm!("widget_button_border_width", if g.border == "none" { 0.0 } else { 1.0 });
+    nm!(
+        "widget_button_border_width",
+        if g.border == "none" { 0.0 } else { 1.0 }
+    );
     st!(
         "widget_button_shadow_color",
-        if g.depth == "flat" { hexa(sh_l, sc, bh, 0.0) } else { hexa(sh_l, sc, bh, if dark { 0.5 } else { 0.18 }) }
+        if g.depth == "flat" {
+            hexa(sh_l, sc, bh, 0.0)
+        } else {
+            hexa(sh_l, sc, bh, if dark { 0.5 } else { 0.18 })
+        }
     );
-    nm!("widget_button_shadow_blur", if g.depth == "flat" { 0.0 } else { 8.0 });
-    nm!("widget_button_shadow_offset_y", if g.depth == "flat" { 0.0 } else { 3.0 });
+    nm!(
+        "widget_button_shadow_blur",
+        if g.depth == "flat" { 0.0 } else { 8.0 }
+    );
+    nm!(
+        "widget_button_shadow_offset_y",
+        if g.depth == "flat" { 0.0 } else { 3.0 }
+    );
 
     st!("status_idle", accent.clone());
     st!("status_running", hex(sem_l, sem_c, 85.0));
@@ -898,10 +1020,46 @@ pub fn expand_tokens(g: &Genome) -> Vec<(String, Value)> {
     st!("widget_link", hex(if dark { 0.74 } else { 0.5 }, syc, sh));
 
     st!("canvas_bg", hex(r.canvas, sc, bh));
-    st!("sidebar_bg", hex(if dark { r.canvas + 0.015 } else { r.canvas + 0.015 }, sc, bh));
-    st!("sidebar_row_active_bg", hex(if dark { r.canvas + 0.06 } else { r.canvas - 0.05 }, sc, bh));
-    st!("sidebar_row_renaming_bg", hex(if dark { r.canvas + 0.04 } else { r.canvas - 0.03 }, sc, bh));
-    st!("sidebar_text_faint", hex(if dark { 0.45 } else { 0.68 }, sc, bh));
+    st!(
+        "sidebar_bg",
+        hex(
+            if dark {
+                r.canvas + 0.015
+            } else {
+                r.canvas + 0.015
+            },
+            sc,
+            bh
+        )
+    );
+    st!(
+        "sidebar_row_active_bg",
+        hex(
+            if dark {
+                r.canvas + 0.06
+            } else {
+                r.canvas - 0.05
+            },
+            sc,
+            bh
+        )
+    );
+    st!(
+        "sidebar_row_renaming_bg",
+        hex(
+            if dark {
+                r.canvas + 0.04
+            } else {
+                r.canvas - 0.03
+            },
+            sc,
+            bh
+        )
+    );
+    st!(
+        "sidebar_text_faint",
+        hex(if dark { 0.45 } else { 0.68 }, sc, bh)
+    );
 
     st!("surface_1", hex(r.s1, sc, bh));
     st!("surface_2", hex(r.s2, sc, bh));
@@ -909,9 +1067,20 @@ pub fn expand_tokens(g: &Genome) -> Vec<(String, Value)> {
 
     // accent ramp 50..900 (light → dark)
     let ramp_ls: [f32; 10] = [0.95, 0.9, 0.83, 0.76, 0.7, 0.62, 0.54, 0.45, 0.36, 0.27];
-    for (i, name) in ["accent_50", "accent_100", "accent_200", "accent_300", "accent_400", "accent_500", "accent_600", "accent_700", "accent_800", "accent_900"]
-        .iter()
-        .enumerate()
+    for (i, name) in [
+        "accent_50",
+        "accent_100",
+        "accent_200",
+        "accent_300",
+        "accent_400",
+        "accent_500",
+        "accent_600",
+        "accent_700",
+        "accent_800",
+        "accent_900",
+    ]
+    .iter()
+    .enumerate()
     {
         let cl = ramp_ls[i];
         let cc = ac * (1.0 - (cl - 0.62).abs() * 0.9);
@@ -924,7 +1093,14 @@ pub fn expand_tokens(g: &Genome) -> Vec<(String, Value)> {
     nm!("radius_lg", (g.radius * 1.6).round());
     nm!("radius_pill", 999.0);
 
-    st!("shadow_sm_color", if g.depth == "flat" { hexa(sh_l, sc, bh, 0.0) } else { hexa(sh_l, sc, bh, if dark { 0.35 } else { 0.12 }) });
+    st!(
+        "shadow_sm_color",
+        if g.depth == "flat" {
+            hexa(sh_l, sc, bh, 0.0)
+        } else {
+            hexa(sh_l, sc, bh, if dark { 0.35 } else { 0.12 })
+        }
+    );
     nm!("shadow_sm_blur", 6.0);
     nm!("shadow_sm_offset_y", 2.0);
     st!("shadow_md_color", shadow_color.clone());
@@ -1379,8 +1555,16 @@ pub fn gradient_stops(g: &Genome) -> Option<[String; 2]> {
             hex(al - 0.06, g.accent_chroma, g.accent_hue),
         ]),
         "bold" => Some([
-            hex(al + 0.04, g.accent_chroma, (g.accent_hue - 18.0).rem_euclid(360.0)),
-            hex(al - 0.05, g.accent_chroma * 1.1, (g.accent_hue + 22.0).rem_euclid(360.0)),
+            hex(
+                al + 0.04,
+                g.accent_chroma,
+                (g.accent_hue - 18.0).rem_euclid(360.0),
+            ),
+            hex(
+                al - 0.05,
+                g.accent_chroma * 1.1,
+                (g.accent_hue + 22.0).rem_euclid(360.0),
+            ),
         ]),
         _ => None,
     }
@@ -1469,7 +1653,11 @@ pub fn next_batch(count: usize, mode: &str, note: &str) -> Value {
         _ => false,
     };
     if want_llm {
-        let llm_count = if mode == "llm" { count } else { count.div_ceil(2) };
+        let llm_count = if mode == "llm" {
+            count
+        } else {
+            count.div_ceil(2)
+        };
         match llm_genomes(llm_count, note, &mut rng) {
             Ok(mut gs) => genomes.append(&mut gs),
             Err(e) => llm_error = Some(e),
@@ -1536,9 +1724,20 @@ mod tests {
         let tokens = expand_tokens(&g);
         let keys: Vec<&str> = tokens.iter().map(|(k, _)| k.as_str()).collect();
         for required in [
-            "pane_bg", "bg", "fg", "accent", "syntax_keyword", "button_primary_bg",
-            "canvas_bg", "sidebar_bg", "surface_2", "accent_500", "radius_md",
-            "pane_focus_strength", "status_failed", "widget_bar_fill",
+            "pane_bg",
+            "bg",
+            "fg",
+            "accent",
+            "syntax_keyword",
+            "button_primary_bg",
+            "canvas_bg",
+            "sidebar_bg",
+            "surface_2",
+            "accent_500",
+            "radius_md",
+            "pane_focus_strength",
+            "status_failed",
+            "widget_bar_fill",
         ] {
             assert!(keys.contains(&required), "missing token {}", required);
         }
@@ -1576,7 +1775,10 @@ mod tests {
             tokens["pane_border_focused"], tokens["pane_border"],
             "focused border must equal resting border"
         );
-        assert_eq!(tokens["pane_border_width_focused"], tokens["pane_border_width"]);
+        assert_eq!(
+            tokens["pane_border_width_focused"],
+            tokens["pane_border_width"]
+        );
         assert_ne!(
             tokens["chrome_title_bg_focused"], tokens["chrome_title_bg"],
             "ring must shift a step on focus"

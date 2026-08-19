@@ -18,7 +18,7 @@ use jim_pane::{
 
 use crate::presets::StylePresetRegistry;
 use crate::state::ProjectStyleState;
-use crate::theme::{tokens, ProjectThemes, Theme, ThemeChanged};
+use crate::theme::{ProjectThemes, Theme, ThemeChanged, tokens};
 
 /// Embedded default chrome fragment shader (the rounded-rect SDF). Used
 /// for projects whose preset doesn't ship a custom `chrome.wgsl`.
@@ -50,7 +50,10 @@ fn apply_per_project_chrome(
     asset_server: Res<AssetServer>,
     panes: Query<
         (Entity, &PaneProject, Option<&PaneChromeStyle>),
-        (With<PaneTag>, Or<(Changed<PaneProject>, Added<PaneProject>)>),
+        (
+            With<PaneTag>,
+            Or<(Changed<PaneProject>, Added<PaneProject>)>,
+        ),
     >,
     all_panes: Query<(Entity, &PaneProject, Option<&PaneChromeStyle>), With<PaneTag>>,
 ) {

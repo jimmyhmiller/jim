@@ -9,10 +9,12 @@
 //!
 //! See `term_material.wgsl` for the shader.
 
-use bevy::asset::{embedded_path, AssetPath, RenderAssetUsages};
+use bevy::asset::{AssetPath, RenderAssetUsages, embedded_path};
 use bevy::image::Image;
 use bevy::prelude::*;
-use bevy::render::render_resource::{AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, ShaderType, TextureDimension, TextureFormat,
+};
 use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dPlugin};
 use bytemuck::{Pod, Zeroable};
@@ -48,8 +50,7 @@ pub struct TermMaterial {
 impl Material2d for TermMaterial {
     fn fragment_shader() -> ShaderRef {
         ShaderRef::Path(
-            AssetPath::from_path_buf(embedded_path!("term_material.wgsl"))
-                .with_source("embedded"),
+            AssetPath::from_path_buf(embedded_path!("term_material.wgsl")).with_source("embedded"),
         )
     }
 
@@ -145,7 +146,6 @@ pub fn write_cell(image: &mut Image, cols: u32, col: u32, row: u32, cell: GpuCel
 /// compare-before-write.
 pub fn read_cell(image: &Image, cols: u32, col: u32, row: u32) -> Option<GpuCell> {
     let idx = (row * cols + col) as usize;
-    let cells: &[GpuCell] =
-        bytemuck::cast_slice(image.data.as_ref()?.as_slice());
+    let cells: &[GpuCell] = bytemuck::cast_slice(image.data.as_ref()?.as_slice());
     cells.get(idx).copied()
 }

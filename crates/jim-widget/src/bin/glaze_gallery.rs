@@ -134,7 +134,10 @@ fn setup(
         let x = start_x + col * (TILE_W + GAP);
         let y = start_y - row * (TILE_H + GAP);
 
-        let shader = shaders.add(Shader::from_wgsl(assemble_wgsl(body), "glaze://gallery.wgsl"));
+        let shader = shaders.add(Shader::from_wgsl(
+            assemble_wgsl(body),
+            "glaze://gallery.wgsl",
+        ));
         let mat = mats.add(GlazeMaterial {
             u: GlazeUniforms {
                 size: Vec2::new(TILE_W, TILE_H),

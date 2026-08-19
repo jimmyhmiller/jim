@@ -180,11 +180,7 @@ fn save_dirty_tick(
 /// Ensure a project's state is loaded from disk into [`ProjectStyleState`].
 /// Host calls this when it first becomes aware of a project (e.g. when
 /// projects.json is read on startup, or when a new project is created).
-pub fn load_project_state(
-    data_dir: &StyleDataDir,
-    state: &mut ProjectStyleState,
-    project_id: u64,
-) {
+pub fn load_project_state(data_dir: &StyleDataDir, state: &mut ProjectStyleState, project_id: u64) {
     if state.by_project.contains_key(&project_id) {
         return;
     }

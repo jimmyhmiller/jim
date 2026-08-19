@@ -12,9 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use flame_core::{
-    Profile, ProfileBuilder, TrackKind,
-};
+use flame_core::{Profile, ProfileBuilder, TrackKind};
 
 use crate::event::{LiveEvent, LiveFrame, LiveFrameKind};
 use crate::symbols::SymbolStore;
@@ -90,11 +88,7 @@ impl LiveAggregator {
     /// symbol loading. The builder thread uses this so a snapshot rebuilds
     /// when new function names land — not just when new samples do.
     pub fn combined_version(&self) -> u64 {
-        let sym_v = self
-            .symbols
-            .as_ref()
-            .map(|s| s.version())
-            .unwrap_or(0);
+        let sym_v = self.symbols.as_ref().map(|s| s.version()).unwrap_or(0);
         self.version.wrapping_add(sym_v)
     }
 }
@@ -386,12 +380,10 @@ impl LiveAggregator {
                     let Some(node) = self.stacks.get(&id) else {
                         break;
                     };
-                    let sid = *label_cache
-                        .entry((pid, id))
-                        .or_insert_with(|| {
-                            let label = self.frame_label(pid, &node.frame);
-                            b.intern_string(&label)
-                        });
+                    let sid = *label_cache.entry((pid, id)).or_insert_with(|| {
+                        let label = self.frame_label(pid, &node.frame);
+                        b.intern_string(&label)
+                    });
                     let fid = *frame_cache.entry(sid).or_insert_with(|| {
                         b.stacks.intern_frame(sid, empty_file, 0, node.frame.addr)
                     });

@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use jim_review::{Author, ReviewFile, Thread, ThreadStatus};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn run() -> ExitCode {
     let args: Vec<String> = crate::sub_args().collect();
@@ -51,7 +51,9 @@ pub fn run() -> ExitCode {
         "reply" => cmd_reply(&named),
         "resolve" => cmd_resolve(&named, &switches),
         "reanchor" => cmd_reanchor(&named),
-        other => Err(format!("unknown subcommand '{other}' (see jimctl review --help)")),
+        other => Err(format!(
+            "unknown subcommand '{other}' (see jimctl review --help)"
+        )),
     };
     match result {
         Ok(mut v) => {
@@ -90,7 +92,10 @@ fn parse_flags(args: &[String]) -> (Vec<(String, String)>, Vec<String>) {
 }
 
 fn get<'a>(named: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    named.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    named
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 fn resolve_repo(named: &[(String, String)]) -> Result<PathBuf, String> {
@@ -202,9 +207,13 @@ fn cmd_list(named: &[(String, String)], switches: &[String]) -> Result<Value, St
                     if path.extension().and_then(|e| e.to_str()) != Some("json") {
                         continue;
                     }
-                    let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
                     // Legacy diff.ft flat files are arrays — skip quietly.
-                    let Ok(data) = serde_json::from_str::<ReviewFile>(&text) else { continue };
+                    let Ok(data) = serde_json::from_str::<ReviewFile>(&text) else {
+                        continue;
+                    };
                     all.extend(data.threads.iter().filter(matches).map(thread_json));
                 }
             }
@@ -214,7 +223,12 @@ fn cmd_list(named: &[(String, String)], switches: &[String]) -> Result<Value, St
 
     let repo = resolve_repo(named)?;
     let data = jim_review::load(&repo);
-    let threads: Vec<Value> = data.threads.iter().filter(matches).map(thread_json).collect();
+    let threads: Vec<Value> = data
+        .threads
+        .iter()
+        .filter(matches)
+        .map(thread_json)
+        .collect();
     Ok(json!({ "threads": threads }))
 }
 
@@ -283,7 +297,11 @@ fn cmd_resolve(named: &[(String, String)], switches: &[String]) -> Result<Value,
         .parse()
         .map_err(|_| "bad --id")?;
     let reopen = switches.iter().any(|s| s == "reopen");
-    let status = if reopen { ThreadStatus::Open } else { ThreadStatus::Resolved };
+    let status = if reopen {
+        ThreadStatus::Open
+    } else {
+        ThreadStatus::Resolved
+    };
 
     let mut data = jim_review::load(&repo);
     if !jim_review::set_status(&mut data, id, status) {

@@ -15,9 +15,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use bevy::prelude::*;
 use bevy::app::AppExit;
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::prelude::*;
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::{ExitCondition, WindowPlugin, WindowResolution};
 use jim_pane::{PanePlugin, PaneRect};
 use jim_widget::WidgetPlugin;
@@ -181,7 +181,10 @@ fn main() -> ExitCode {
 
     app.insert_resource(config)
         .init_resource::<SnapshotState>()
-        .add_systems(Startup, setup_camera_and_pane.after(jim_editor::setup_editor_font))
+        .add_systems(
+            Startup,
+            setup_camera_and_pane.after(jim_editor::setup_editor_font),
+        )
         .add_systems(
             Update,
             (
@@ -253,7 +256,10 @@ fn setup_camera_and_pane(world: &mut World) {
     // Spawn the widget subprocess and attach its IO components.
     match jim_widget::spawn_widget_process(&cmd, &args, None) {
         Ok((process, io)) => {
-            world.entity_mut(spawned.entity).insert(bundle).insert((process, io));
+            world
+                .entity_mut(spawned.entity)
+                .insert(bundle)
+                .insert((process, io));
         }
         Err(e) => {
             eprintln!("widget-snapshot: spawn_widget_process failed: {}", e);

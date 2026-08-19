@@ -93,7 +93,14 @@ pub fn render_scene_into_layer(
             DrawCommand::FillPath { path, paint } => {
                 if let Some(mesh) = tessellate_fill(path, &cur) {
                     spawn_mesh(
-                        mesh, paint_color(paint), z, parent, layer, meshes, materials, commands,
+                        mesh,
+                        paint_color(paint),
+                        z,
+                        parent,
+                        layer,
+                        meshes,
+                        materials,
+                        commands,
                     );
                 }
             }
@@ -104,12 +111,28 @@ pub fn render_scene_into_layer(
             } => {
                 if let Some(mesh) = tessellate_stroke(path, stroke, &cur) {
                     spawn_mesh(
-                        mesh, paint_color(paint), z, parent, layer, meshes, materials, commands,
+                        mesh,
+                        paint_color(paint),
+                        z,
+                        parent,
+                        layer,
+                        meshes,
+                        materials,
+                        commands,
                     );
                 }
             }
             DrawCommand::DrawText { run, paint } => {
-                spawn_text(run, paint_color(paint), &cur, z, font, parent, layer, commands);
+                spawn_text(
+                    run,
+                    paint_color(paint),
+                    &cur,
+                    z,
+                    font,
+                    parent,
+                    layer,
+                    commands,
+                );
             }
             DrawCommand::DrawImage { .. } => {
                 if !warned_image {

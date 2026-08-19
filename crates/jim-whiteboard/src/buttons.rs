@@ -71,11 +71,7 @@ pub fn color_to_wb(c: Color) -> WbColor {
 
 /// Convert a whiteboard color into a Bevy color.
 pub fn wb_to_color(c: WbColor) -> Color {
-    Color::srgb(
-        c.r as f32 / 255.0,
-        c.g as f32 / 255.0,
-        c.b as f32 / 255.0,
-    )
+    Color::srgb(c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0)
 }
 
 /// Linear-space lerp between two colors.
@@ -100,10 +96,7 @@ impl ButtonTheme {
                 lin_to_color(c.title_bg_focused),
                 lin_to_color(c.border_focused),
             ),
-            None => (
-                Color::srgb(0.22, 0.22, 0.26),
-                Color::srgb(0.30, 0.42, 0.72),
-            ),
+            None => (Color::srgb(0.22, 0.22, 0.26), Color::srgb(0.30, 0.42, 0.72)),
         };
         // Hover = halfway between inactive and active cell fill.
         let hover = lerp_color(cell, cell_active, 0.5);
@@ -199,12 +192,7 @@ fn icon_polylines(icon: Icon) -> Vec<Vec<(f32, f32)>> {
         Icon::Trash => vec![
             vec![(0.22, 0.30), (0.78, 0.30)],
             vec![(0.40, 0.30), (0.43, 0.22), (0.57, 0.22), (0.60, 0.30)],
-            vec![
-                (0.28, 0.30),
-                (0.32, 0.82),
-                (0.68, 0.82),
-                (0.72, 0.30),
-            ],
+            vec![(0.28, 0.30), (0.32, 0.82), (0.68, 0.82), (0.72, 0.30)],
             vec![(0.42, 0.40), (0.44, 0.72)],
             vec![(0.58, 0.40), (0.56, 0.72)],
         ],
@@ -244,7 +232,10 @@ pub fn icon_meshes(icon: Icon, x: f32, y: f32, w: f32, h: f32, stroke_w: f32) ->
 pub fn width_sample_mesh(x: f32, y: f32, w: f32, h: f32, width: f32) -> Option<Mesh> {
     let cy = -(y + h * 0.5);
     let pad = w * 0.22;
-    stroke_mesh(&[(x + pad, cy), (x + w - pad, cy)], width.clamp(1.0, h * 0.6))
+    stroke_mesh(
+        &[(x + pad, cy), (x + w - pad, cy)],
+        width.clamp(1.0, h * 0.6),
+    )
 }
 
 /// A filled rounded rectangle mesh for the given content-local (y-down) rect.
@@ -273,10 +264,10 @@ fn rounded_rect_points(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Vec<(f32,
     // down the right edge. Getting these 90° off (the old bug) folds the outline
     // into a 4-pointed star, which only became visible once the meshes rendered.
     let corners = [
-        (rt - r, top - r, FRAC_PI_2),       // top-right:    90° → 0°
-        (rt - r, bot + r, 0.0_f32),         // bottom-right:  0° → -90°
-        (l + r, bot + r, FRAC_PI_2 * 3.0),  // bottom-left: 270° → 180°
-        (l + r, top - r, PI),               // top-left:    180° → 90°
+        (rt - r, top - r, FRAC_PI_2),      // top-right:    90° → 0°
+        (rt - r, bot + r, 0.0_f32),        // bottom-right:  0° → -90°
+        (l + r, bot + r, FRAC_PI_2 * 3.0), // bottom-left: 270° → 180°
+        (l + r, top - r, PI),              // top-left:    180° → 90°
     ];
     let mut pts = Vec::new();
     for (cx, cy, start) in corners {
@@ -356,7 +347,10 @@ fn buffers_to_mesh(buf: VertexBuffers<[f32; 2], u32>) -> Option<Mesh> {
     let positions: Vec<[f32; 3]> = buf.vertices.iter().map(|v| [v[0], v[1], 0.0]).collect();
     let normals: Vec<[f32; 3]> = vec![[0.0, 0.0, 1.0]; positions.len()];
     let uvs: Vec<[f32; 2]> = vec![[0.0, 0.0]; positions.len()];
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);

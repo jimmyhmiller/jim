@@ -84,13 +84,20 @@ pub struct ResponseLine {
 
 impl ResponseLine {
     pub fn ok(id: Option<serde_json::Value>, result: serde_json::Value) -> Self {
-        Self { id, result: Some(result), error: None }
+        Self {
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
     pub fn err(id: Option<serde_json::Value>, code: &str, message: impl Into<String>) -> Self {
         Self {
             id,
             result: None,
-            error: Some(ProtoError { code: code.to_string(), message: message.into() }),
+            error: Some(ProtoError {
+                code: code.to_string(),
+                message: message.into(),
+            }),
         }
     }
 }
@@ -281,9 +288,11 @@ pub fn find_rust_analyzer() -> Result<PathBuf, String> {
     {
         return Ok(PathBuf::from("rust-analyzer"));
     }
-    Err("rust-analyzer not found. Install it with `rustup component add rust-analyzer` \
+    Err(
+        "rust-analyzer not found. Install it with `rustup component add rust-analyzer` \
          (or set $RUST_ANALYZER to its path)."
-        .to_string())
+            .to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +353,9 @@ pub fn request_once(mut stream: UnixStream, req: &RequestLine) -> Result<Respons
     }
     let mut line = serde_json::to_string(&obj).map_err(|e| e.to_string())?;
     line.push('\n');
-    stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
     stream.flush().ok();
     let _ = stream.shutdown(std::net::Shutdown::Write);
 

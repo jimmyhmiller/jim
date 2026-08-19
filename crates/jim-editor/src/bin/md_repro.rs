@@ -10,13 +10,13 @@
 use std::path::{Path, PathBuf};
 
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::PrimaryWindow;
-use jim_editor::{spawn_editor_pane, EditorFilePath, EditorPlugin, EditorStateComp};
-use jim_pane::{FocusedPane, PaneRect};
 use editor_core::commands::insert_newline_and_indent;
 use editor_core::selection::Selection;
 use editor_core::transaction::Transaction;
+use jim_editor::{EditorFilePath, EditorPlugin, EditorStateComp, spawn_editor_pane};
+use jim_pane::{FocusedPane, PaneRect};
 
 const DOC: &str = "\
 # Is All Vibe Coding Slop?

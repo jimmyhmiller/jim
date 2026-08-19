@@ -63,9 +63,21 @@ fn left_heavy_totals_equal_sums() {
     }
     eprintln!("aggregated per-name totals: {got:?}");
     eprintln!("expected root={expect_root} work={expect_work} idle={expect_idle}");
-    assert_eq!(got.get("root").copied(), Some(expect_root), "root total != sum");
-    assert_eq!(got.get("work").copied(), Some(expect_work), "work total != sum");
-    assert_eq!(got.get("idle").copied(), Some(expect_idle), "idle total != sum");
+    assert_eq!(
+        got.get("root").copied(),
+        Some(expect_root),
+        "root total != sum"
+    );
+    assert_eq!(
+        got.get("work").copied(),
+        Some(expect_work),
+        "work total != sum"
+    );
+    assert_eq!(
+        got.get("idle").copied(),
+        Some(expect_idle),
+        "idle total != sum"
+    );
 }
 
 #[test]
@@ -73,7 +85,10 @@ fn left_heavy_is_non_empty() {
     let profile = build_profile();
     assert_eq!(profile.slices.len(), 4, "sanity: 4 input slices");
     assert!(
-        profile.slices.rows.contains_key(&(flame_core::TrackId(0), 0)),
+        profile
+            .slices
+            .rows
+            .contains_key(&(flame_core::TrackId(0), 0)),
         "depth-0 row index must exist after finish()"
     );
 

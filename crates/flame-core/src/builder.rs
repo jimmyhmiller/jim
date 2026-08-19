@@ -118,7 +118,10 @@ impl ProfileBuilder {
             return c;
         }
         let cat = CategoryId(self.categories.len() as u32);
-        self.categories.push(Category { name: id, color_idx: u16::MAX });
+        self.categories.push(Category {
+            name: id,
+            color_idx: u16::MAX,
+        });
         self.category_dedup.insert(id, cat);
         cat
     }
@@ -148,7 +151,11 @@ impl ProfileBuilder {
         }
         let name_id = self.strings.intern(name);
         let id = ThreadId(self.threads.len() as u32);
-        self.threads.push(Thread { tid, process, name: name_id });
+        self.threads.push(Thread {
+            tid,
+            process,
+            name: name_id,
+        });
         self.thread_dedup.insert(key, id);
         id
     }
@@ -156,7 +163,12 @@ impl ProfileBuilder {
     pub fn add_track(&mut self, kind: TrackKind, name: &str, parent: Option<TrackId>) -> TrackId {
         let name_id = self.strings.intern(name);
         let id = TrackId(self.tracks.len() as u32);
-        self.tracks.push(Track { kind, name: name_id, parent, row_count: 0 });
+        self.tracks.push(Track {
+            kind,
+            name: name_id,
+            parent,
+            row_count: 0,
+        });
         id
     }
 
@@ -187,7 +199,11 @@ impl ProfileBuilder {
         self.observe_ts(start_ns);
         let stack = self.open_stacks.entry(track).or_default();
         let depth = stack.len() as u16;
-        stack.push(OpenSlice { start_ns, name, category });
+        stack.push(OpenSlice {
+            start_ns,
+            name,
+            category,
+        });
         depth
     }
 
@@ -195,7 +211,9 @@ impl ProfileBuilder {
     /// `end_slice` calls (no open slice) are tolerated and dropped with a warning.
     pub fn end_slice(&mut self, track: TrackId, end_ns: u64) {
         self.observe_ts(end_ns);
-        let Some(stack) = self.open_stacks.get_mut(&track) else { return };
+        let Some(stack) = self.open_stacks.get_mut(&track) else {
+            return;
+        };
         let Some(open) = stack.pop() else { return };
         let depth = stack.len() as u16; // depth after pop = position the closing slice occupied
         let dur = end_ns.saturating_sub(open.start_ns);
@@ -223,7 +241,14 @@ impl ProfileBuilder {
         stack: Option<StackId>,
     ) {
         self.add_complete_slice_with_attrs(
-            track, depth, start_ns, dur_ns, name, category, stack, Vec::new(),
+            track,
+            depth,
+            start_ns,
+            dur_ns,
+            name,
+            category,
+            stack,
+            Vec::new(),
         );
     }
 
@@ -244,14 +269,25 @@ impl ProfileBuilder {
         self.observe_ts(start_ns);
         self.observe_ts(start_ns + dur_ns);
         self.pending_slices.push(PendingSlice {
-            track, depth, start_ns, dur_ns, name, category, stack,
+            track,
+            depth,
+            start_ns,
+            dur_ns,
+            name,
+            category,
+            stack,
         });
         self.pending_attrs.push(attrs);
     }
 
     pub fn add_sample(&mut self, thread: ThreadId, ts_ns: u64, stack: StackId, weight: u32) {
         self.observe_ts(ts_ns);
-        self.samples.push(Sample { thread, ts_ns, stack, weight });
+        self.samples.push(Sample {
+            thread,
+            ts_ns,
+            stack,
+            weight,
+        });
     }
 
     /// Number of currently-open B-slices on `track`. Used by Chrome `X`/`i` events
@@ -269,7 +305,12 @@ impl ProfileBuilder {
         let end = self.max_ts;
         let tracks: Vec<TrackId> = self.open_stacks.keys().copied().collect();
         for t in tracks {
-            while self.open_stacks.get(&t).map(|s| !s.is_empty()).unwrap_or(false) {
+            while self
+                .open_stacks
+                .get(&t)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            {
                 self.end_slice(t, end);
             }
         }
@@ -316,7 +357,11 @@ impl ProfileBuilder {
                     Some(&i) => i,
                     None => {
                         let i = nodes.len() as u32;
-                        nodes.push(Node { frame: fid, weight: 0, children: Vec::new() });
+                        nodes.push(Node {
+                            frame: fid,
+                            weight: 0,
+                            children: Vec::new(),
+                        });
                         if let Some(p) = parent {
                             nodes[p as usize].children.push(i);
                         }
@@ -347,9 +392,17 @@ impl ProfileBuilder {
             strings_ref.get(fid)
         };
         if stable {
-            roots.sort_by(|&a, &b| name_of(a).cmp(name_of(b)).then(frame_of(a).0.cmp(&frame_of(b).0)));
+            roots.sort_by(|&a, &b| {
+                name_of(a)
+                    .cmp(name_of(b))
+                    .then(frame_of(a).0.cmp(&frame_of(b).0))
+            });
         } else {
-            roots.sort_by(|&a, &b| weight_of(b).cmp(&weight_of(a)).then(frame_of(a).0.cmp(&frame_of(b).0)));
+            roots.sort_by(|&a, &b| {
+                weight_of(b)
+                    .cmp(&weight_of(a))
+                    .then(frame_of(a).0.cmp(&frame_of(b).0))
+            });
         }
 
         // Iterative DFS: stack of (node_idx, depth, x_offset).
@@ -383,7 +436,9 @@ impl ProfileBuilder {
             let mut kids: Vec<u32> = n.children.clone();
             if stable {
                 kids.sort_by(|&a, &b| {
-                    name_of(a).cmp(name_of(b)).then(frame_of(a).0.cmp(&frame_of(b).0))
+                    name_of(a)
+                        .cmp(name_of(b))
+                        .then(frame_of(a).0.cmp(&frame_of(b).0))
                 });
             } else {
                 kids.sort_by(|&a, &b| {
@@ -438,14 +493,14 @@ impl ProfileBuilder {
         });
 
         let mut slices = SliceTable {
-            track:    Vec::with_capacity(n),
-            depth:    Vec::with_capacity(n),
+            track: Vec::with_capacity(n),
+            depth: Vec::with_capacity(n),
             start_ns: Vec::with_capacity(n),
-            dur_ns:   Vec::with_capacity(n),
-            name:     Vec::with_capacity(n),
+            dur_ns: Vec::with_capacity(n),
+            name: Vec::with_capacity(n),
             category: Vec::with_capacity(n),
-            stack:    Vec::with_capacity(n),
-            rows:     AHashMap::new(),
+            stack: Vec::with_capacity(n),
+            rows: AHashMap::new(),
         };
         let mut attrs_per_slice: Vec<Vec<(u16, StringId)>> = Vec::with_capacity(n);
 

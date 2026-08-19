@@ -19,9 +19,7 @@ fn main() {
     let session_id: u64 = match args.next().and_then(|s| s.parse().ok()) {
         Some(id) => id,
         None => {
-            eprintln!(
-                "usage: jim-daemon <session_id> <program> [args...]"
-            );
+            eprintln!("usage: jim-daemon <session_id> <program> [args...]");
             std::process::exit(2);
         }
     };

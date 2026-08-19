@@ -23,17 +23,12 @@ fn main() {
     };
 
     let lines = initial.matches('\n').count().saturating_add(1);
-    eprintln!(
-        "opening doc: {} bytes, {} lines",
-        initial.len(),
-        lines,
-    );
+    eprintln!("opening doc: {} bytes, {} lines", initial.len(), lines,);
 
     let mut app = build_app(&initial);
     // Spawn a second editor with different content so the multi-editor
     // drag/resize/focus paths get exercised out of the box.
-    const SECOND_DOC: &str =
-        "// second editor\nfn fib(n: u32) -> u32 {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n";
+    const SECOND_DOC: &str = "// second editor\nfn fib(n: u32) -> u32 {\n    if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n}\n";
     app.add_systems(
         Startup,
         (|world: &mut World| {
@@ -48,7 +43,7 @@ fn main() {
                 None,
             );
         })
-            .after(setup_editor_font),
+        .after(setup_editor_font),
     );
     if args.log_frames {
         app.add_plugins(FrameTimeDiagnosticsPlugin::default())
@@ -128,10 +123,7 @@ fn synthetic_doc(n: usize) -> String {
 /// Every 60 frames, log the rolling-average frame time. Enough to eyeball
 /// where large documents start costing real milliseconds without flooding
 /// stderr.
-fn log_frame_time(
-    diagnostics: Res<DiagnosticsStore>,
-    mut frame_count: Local<u32>,
-) {
+fn log_frame_time(diagnostics: Res<DiagnosticsStore>, mut frame_count: Local<u32>) {
     *frame_count += 1;
     if *frame_count % 60 != 0 {
         return;
@@ -144,5 +136,8 @@ fn log_frame_time(
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.average())
         .unwrap_or(0.0);
-    eprintln!("frame {:>5}: {:6.2} ms ({:5.1} fps)", *frame_count, avg_ms, fps);
+    eprintln!(
+        "frame {:>5}: {:6.2} ms ({:5.1} fps)",
+        *frame_count, avg_ms, fps
+    );
 }

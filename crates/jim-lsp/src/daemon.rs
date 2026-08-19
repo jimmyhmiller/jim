@@ -83,8 +83,8 @@ fn run_loop(root: &Path) -> Result<(), String> {
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
-    let listener =
-        UnixListener::bind(&socket_path).map_err(|e| format!("bind {}: {e}", socket_path.display()))?;
+    let listener = UnixListener::bind(&socket_path)
+        .map_err(|e| format!("bind {}: {e}", socket_path.display()))?;
 
     for conn in listener.incoming() {
         match conn {
@@ -163,7 +163,11 @@ fn dispatch(client: &Arc<RaClient>, req: RequestLine) -> ResponseLine {
             }
             match client.symbols(&abs(client, &file)) {
                 Ok(syms) => ResponseLine::ok(id, json!({ "symbols": syms })),
-                Err(e) => ResponseLine { id, result: None, error: Some(e) },
+                Err(e) => ResponseLine {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             }
         }
         Op::Outline => {
@@ -178,7 +182,11 @@ fn dispatch(client: &Arc<RaClient>, req: RequestLine) -> ResponseLine {
                         .collect();
                     ResponseLine::ok(id, json!({ "files": arr }))
                 }
-                Err(e) => ResponseLine { id, result: None, error: Some(e) },
+                Err(e) => ResponseLine {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             }
         }
         Op::Impls { name } => {
@@ -187,7 +195,11 @@ fn dispatch(client: &Arc<RaClient>, req: RequestLine) -> ResponseLine {
             }
             match client.type_impls(&name) {
                 Ok(impls) => ResponseLine::ok(id, json!({ "impls": impls })),
-                Err(e) => ResponseLine { id, result: None, error: Some(e) },
+                Err(e) => ResponseLine {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             }
         }
         Op::TypeOutline => {
@@ -196,12 +208,20 @@ fn dispatch(client: &Arc<RaClient>, req: RequestLine) -> ResponseLine {
             }
             match client.type_outline() {
                 Ok(v) => ResponseLine::ok(id, v),
-                Err(e) => ResponseLine { id, result: None, error: Some(e) },
+                Err(e) => ResponseLine {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             }
         }
         Op::Source { file, range } => match client.source(&abs(client, &file), &range) {
             Ok(text) => ResponseLine::ok(id, json!({ "text": text })),
-            Err(e) => ResponseLine { id, result: None, error: Some(e) },
+            Err(e) => ResponseLine {
+                id,
+                result: None,
+                error: Some(e),
+            },
         },
         Op::WorkspaceSymbols { query } => {
             if !client.wait_ready(QUERY_READY_WAIT) {
@@ -209,24 +229,40 @@ fn dispatch(client: &Arc<RaClient>, req: RequestLine) -> ResponseLine {
             }
             match client.workspace_symbols(&query) {
                 Ok(v) => ResponseLine::ok(id, json!({ "symbols": v })),
-                Err(e) => ResponseLine { id, result: None, error: Some(e) },
+                Err(e) => ResponseLine {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             }
         }
         Op::References { file, position } => {
             match client.references(&abs(client, &file), position) {
                 Ok(v) => ResponseLine::ok(id, json!({ "locations": client.enrich_locations(&v) })),
-                Err(e) => ResponseLine { id, result: None, error: Some(e) },
+                Err(e) => ResponseLine {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             }
         }
         Op::Definition { file, position } => {
             match client.definition(&abs(client, &file), position) {
                 Ok(v) => ResponseLine::ok(id, json!({ "definition": client.enrich_locations(&v) })),
-                Err(e) => ResponseLine { id, result: None, error: Some(e) },
+                Err(e) => ResponseLine {
+                    id,
+                    result: None,
+                    error: Some(e),
+                },
             }
         }
         Op::Hover { file, position } => match client.hover(&abs(client, &file), position) {
             Ok(v) => ResponseLine::ok(id, json!({ "hover": v })),
-            Err(e) => ResponseLine { id, result: None, error: Some(e) },
+            Err(e) => ResponseLine {
+                id,
+                result: None,
+                error: Some(e),
+            },
         },
     }
 }
@@ -394,7 +430,11 @@ fn daemonize() -> std::io::Result<()> {
         .open("/dev/null")?;
     let dn_fd = devnull.as_raw_fd();
     let err_fd = if let Some(log) = std::env::var_os("JIM_LSP_LOG") {
-        match std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
             Ok(f) => {
                 let raw = f.as_raw_fd();
                 std::mem::forget(f);

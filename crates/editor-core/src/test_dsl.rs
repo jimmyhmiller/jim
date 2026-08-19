@@ -92,10 +92,7 @@ pub fn parse_comment_dsl(spec: &str) -> EditorState {
             "comment DSL needs 1 marker or an even count, got {}",
             markers.len()
         );
-        markers
-            .chunks(2)
-            .map(|w| Range::new(w[0], w[1]))
-            .collect()
+        markers.chunks(2).map(|w| Range::new(w[0], w[1])).collect()
     };
     let selection = if ranges.is_empty() {
         Selection::cursor(0)
@@ -155,6 +152,9 @@ mod tests {
     fn parse_multiple_cursors() {
         let st = parse("a|b|c");
         assert_eq!(st.doc.to_string(), "abc");
-        assert_eq!(st.selection.ranges, vec![Range::cursor(1), Range::cursor(2)]);
+        assert_eq!(
+            st.selection.ranges,
+            vec![Range::cursor(1), Range::cursor(2)]
+        );
     }
 }

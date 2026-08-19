@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket};
 
 use crate::agent_bus;
@@ -37,14 +37,25 @@ type Ws = WebSocket<UnixStream>;
 
 fn control_socket() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".codex").join("app-server-control").join("app-server-control.sock"))
+    Some(
+        Path::new(&home)
+            .join(".codex")
+            .join("app-server-control")
+            .join("app-server-control.sock"),
+    )
 }
 
 fn ws_req(ws: &mut Ws, id: u64, method: &str, params: Value) {
-    let _ = ws.send(Message::Text(json!({ "id": id, "method": method, "params": params }).to_string().into()));
+    let _ = ws.send(Message::Text(
+        json!({ "id": id, "method": method, "params": params })
+            .to_string()
+            .into(),
+    ));
 }
 fn ws_note(ws: &mut Ws, method: &str) {
-    let _ = ws.send(Message::Text(json!({ "method": method }).to_string().into()));
+    let _ = ws.send(Message::Text(
+        json!({ "method": method }).to_string().into(),
+    ));
 }
 fn ws_poll(ws: &mut Ws) -> Result<Option<Value>, ()> {
     match ws.read() {
@@ -64,13 +75,18 @@ pub fn run() -> ExitCode {
     let label = name_arg.unwrap_or_else(agent_bus::default_label);
     eprintln!("jimctl codex: id={id} name={label:?}");
 
-    match Command::new("codex").args(["app-server", "daemon", "start"])
-        .stdout(Stdio::null()).stderr(Stdio::null()).status()
+    match Command::new("codex")
+        .args(["app-server", "daemon", "start"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
     {
         Ok(s) if s.success() => {}
         _ => {
             eprintln!("jimctl codex: `codex app-server daemon start` failed.");
-            eprintln!("  needs the standalone codex install (curl -fsSL https://chatgpt.com/codex/install.sh | sh)");
+            eprintln!(
+                "  needs the standalone codex install (curl -fsSL https://chatgpt.com/codex/install.sh | sh)"
+            );
             return ExitCode::from(1);
         }
     }
@@ -81,11 +97,17 @@ pub fn run() -> ExitCode {
 
     let stream = match UnixStream::connect(&sock) {
         Ok(s) => s,
-        Err(e) => { eprintln!("jimctl codex: connect {}: {e}", sock.display()); return ExitCode::from(1); }
+        Err(e) => {
+            eprintln!("jimctl codex: connect {}: {e}", sock.display());
+            return ExitCode::from(1);
+        }
     };
     let (mut ws, _r) = match tungstenite::client("ws://localhost/", stream) {
         Ok(ok) => ok,
-        Err(e) => { eprintln!("jimctl codex: ws handshake: {e}"); return ExitCode::from(1); }
+        Err(e) => {
+            eprintln!("jimctl codex: ws handshake: {e}");
+            return ExitCode::from(1);
+        }
     };
     if ws.get_mut().set_nonblocking(true).is_err() {
         eprintln!("jimctl codex: could not set non-blocking");
@@ -93,11 +115,22 @@ pub fn run() -> ExitCode {
     }
 
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as extern "C" fn(i32) as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as extern "C" fn(i32) as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(i32) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(i32) as libc::sighandler_t,
+        );
     }
 
-    ws_req(&mut ws, 1, "initialize", json!({ "clientInfo": { "name": "jim", "version": env!("CARGO_PKG_VERSION") } }));
+    ws_req(
+        &mut ws,
+        1,
+        "initialize",
+        json!({ "clientInfo": { "name": "jim", "version": env!("CARGO_PKG_VERSION") } }),
+    );
     ws_note(&mut ws, "initialized");
     agent_bus::announce(&id, &label);
     ensure_codex_mcp(&id);
@@ -134,7 +167,8 @@ pub fn run() -> ExitCode {
                     // the jim_send tool. We only track the thread + its busy state.
                     match m.get("method").and_then(Value::as_str).unwrap_or("") {
                         "thread/started" => {
-                            if let Some(t) = m.pointer("/params/thread/id").and_then(Value::as_str) {
+                            if let Some(t) = m.pointer("/params/thread/id").and_then(Value::as_str)
+                            {
                                 if active_thread.as_deref() != Some(t) {
                                     active_thread = Some(t.to_string());
                                     eprintln!("jimctl codex: attached to live thread {t}");
@@ -142,7 +176,9 @@ pub fn run() -> ExitCode {
                             }
                         }
                         "thread/status/changed" => {
-                            let st = m.pointer("/params/status/type").and_then(Value::as_str)
+                            let st = m
+                                .pointer("/params/status/type")
+                                .and_then(Value::as_str)
                                 .or_else(|| m.pointer("/params/status").and_then(Value::as_str))
                                 .unwrap_or("");
                             thread_busy = st != "idle" && !st.is_empty();
@@ -155,7 +191,11 @@ pub fn run() -> ExitCode {
                     }
                 }
                 Ok(None) => break,
-                Err(()) => { eprintln!("jimctl codex: connection closed"); SHUTDOWN.store(true, Ordering::SeqCst); break; }
+                Err(()) => {
+                    eprintln!("jimctl codex: connection closed");
+                    SHUTDOWN.store(true, Ordering::SeqCst);
+                    break;
+                }
             }
         }
 
@@ -177,7 +217,12 @@ pub fn run() -> ExitCode {
                     in_flight = Some(Instant::now());
                     let framed = frame_turn(&id, &from, &text, broadcast);
                     let input = json!([{ "type": "text", "text": framed }]);
-                    ws_req(&mut ws, rid, "turn/start", json!({ "threadId": thread, "input": input, "approvalPolicy": "never" }));
+                    ws_req(
+                        &mut ws,
+                        rid,
+                        "turn/start",
+                        json!({ "threadId": thread, "input": input, "approvalPolicy": "never" }),
+                    );
                     eprintln!("jimctl codex: injected a turn from {from}");
                 }
             }
@@ -229,15 +274,30 @@ fn ensure_codex_mcp(id: &str) {
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "jimctl".to_string());
     // Remove any stale entry, then add fresh with our id.
-    let _ = Command::new("codex").args(["mcp", "remove", "jim"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = Command::new("codex")
+        .args(["mcp", "remove", "jim"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let status = Command::new("codex")
-        .args(["mcp", "add", "jim", "--env", &format!("JIM_AGENT_ID={id}"), "--", &exe, "mcp"])
+        .args([
+            "mcp",
+            "add",
+            "jim",
+            "--env",
+            &format!("JIM_AGENT_ID={id}"),
+            "--",
+            &exe,
+            "mcp",
+        ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     match status {
         Ok(s) if s.success() => {
-            eprintln!("jimctl codex: registered the `jim` MCP server (jim_send/jim_roster/jim_do) for codex.");
+            eprintln!(
+                "jimctl codex: registered the `jim` MCP server (jim_send/jim_roster/jim_do) for codex."
+            );
         }
         _ => {
             eprintln!(

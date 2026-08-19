@@ -15,8 +15,8 @@
 //! via `compute_keyboard_owner`), queue `TextEdit`s, and render the resulting
 //! `TextLayoutInfo`. Run it standalone:  `cargo run --bin editable_text_demo`.
 
-use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::text::{EditableText, FontSize, TextEdit};
 

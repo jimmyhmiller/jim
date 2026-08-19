@@ -123,11 +123,18 @@ impl Parser {
                     styles.push(self.style_def()?);
                 }
                 other => {
-                    return err(format!("expected `token`, `let`, `fn`, or `style`, found {:?}", other));
+                    return err(format!(
+                        "expected `token`, `let`, `fn`, or `style`, found {:?}",
+                        other
+                    ));
                 }
             }
         }
-        Ok(Program { tokens, fns, styles })
+        Ok(Program {
+            tokens,
+            fns,
+            styles,
+        })
     }
 
     fn fn_def(&mut self) -> PResult<FnDef> {
@@ -199,7 +206,10 @@ impl Parser {
                 Tok::Ident(name) if name == "shader" => {
                     self.bump();
                     let body = self.shader_block()?;
-                    items.push(Item::Shader { overlay: false, body });
+                    items.push(Item::Shader {
+                        overlay: false,
+                        body,
+                    });
                 }
                 Tok::Ident(name) if name == "overlay" => {
                     self.bump();
@@ -208,9 +218,17 @@ impl Parser {
                         Tok::Ident(s) if s == "shader" => {
                             self.bump();
                             let body = self.shader_block()?;
-                            items.push(Item::Shader { overlay: true, body });
+                            items.push(Item::Shader {
+                                overlay: true,
+                                body,
+                            });
                         }
-                        other => return err(format!("expected `shader` after `overlay`, found {:?}", other)),
+                        other => {
+                            return err(format!(
+                                "expected `shader` after `overlay`, found {:?}",
+                                other
+                            ));
+                        }
                     }
                 }
                 Tok::Ident(name) => {
@@ -263,7 +281,12 @@ impl Parser {
                     }
                     emit = Some(self.expr(0)?);
                 }
-                other => return err(format!("expected `let` or `emit` in shader block, found {:?}", other)),
+                other => {
+                    return err(format!(
+                        "expected `let` or `emit` in shader block, found {:?}",
+                        other
+                    ));
+                }
             }
         }
         let emit = emit.ok_or_else(|| GlazeError::Parse("shader block needs an `emit`".into()))?;

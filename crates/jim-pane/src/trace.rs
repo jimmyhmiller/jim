@@ -248,7 +248,12 @@ pub struct TraceSpan {
 
 impl Drop for TraceSpan {
     fn drop(&mut self) {
-        end(self.pending.take(), self.name, self.category, self.entity_bits);
+        end(
+            self.pending.take(),
+            self.name,
+            self.category,
+            self.entity_bits,
+        );
     }
 }
 

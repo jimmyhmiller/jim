@@ -18,10 +18,15 @@ fn ui_pack_matches_protocol_serde() {
         let ctx = |k: &str| format!("genome #{i} ({}) key {k}", g.name);
 
         let _: Style = serde_json::from_value(ui["card"].clone()).expect("card");
-        for key in ["button_primary", "button_secondary", "button_outline", "input", "badge"] {
-            let s: Style = serde_json::from_value(ui[key].clone()).unwrap_or_else(|e| {
-                panic!("{}: {e}\n{}", ctx(key), ui[key])
-            });
+        for key in [
+            "button_primary",
+            "button_secondary",
+            "button_outline",
+            "input",
+            "badge",
+        ] {
+            let s: Style = serde_json::from_value(ui[key].clone())
+                .unwrap_or_else(|e| panic!("{}: {e}\n{}", ctx(key), ui[key]));
             // candidate previews must never inherit active-theme label colors
             assert!(s.text_color.is_some(), "{} missing text_color", ctx(key));
         }

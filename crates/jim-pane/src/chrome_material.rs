@@ -8,7 +8,7 @@
 //!
 //! See `chrome_material.wgsl` for the shader.
 
-use bevy::asset::{embedded_path, AssetPath};
+use bevy::asset::{AssetPath, embedded_path};
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -91,8 +91,7 @@ fn init_default_chrome_shader(
     asset_server: Res<AssetServer>,
     mut active: ResMut<ActiveChromeShader>,
 ) {
-    active.0 = asset_server
-        .load::<Shader>("embedded://jim_pane/chrome_material.wgsl");
+    active.0 = asset_server.load::<Shader>("embedded://jim_pane/chrome_material.wgsl");
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
@@ -240,9 +239,17 @@ impl ChromeStyle {
         ChromeParams {
             size,
             corner_radius: self.corner_radius,
-            border_width: if focused { self.border_width_focused } else { self.border_width },
+            border_width: if focused {
+                self.border_width_focused
+            } else {
+                self.border_width
+            },
             bg: self.bg,
-            border: if focused { self.border_focused } else { self.border },
+            border: if focused {
+                self.border_focused
+            } else {
+                self.border
+            },
             focus: Vec4::new(
                 self.focus_glow.x,
                 self.focus_glow.y,
@@ -255,7 +262,11 @@ impl ChromeStyle {
             // body quads carry the title height too: the two-tone ring
             // (title strip + content margin) starts below it
             title_h: crate::TITLE_H,
-            title_bg: if focused { self.title_bg_focused } else { self.title_bg },
+            title_bg: if focused {
+                self.title_bg_focused
+            } else {
+                self.title_bg
+            },
             content_margin: crate::MARGIN,
             _pad_r0: 0.0,
             _pad_r1: 0.0,
@@ -303,7 +314,9 @@ pub struct ChromeMaterialKey {
 
 impl From<&PaneChromeMaterial> for ChromeMaterialKey {
     fn from(m: &PaneChromeMaterial) -> Self {
-        Self { fragment: m.fragment.clone() }
+        Self {
+            fragment: m.fragment.clone(),
+        }
     }
 }
 

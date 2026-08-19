@@ -30,8 +30,8 @@ use markdown_core::{Block, BlockKind, Document, InlineStyle, RenderLine, RunKind
 use ropey::Rope;
 
 use crate::highlight::{HighlightKind, Highlighter, SyntaxPalette};
-use crate::{content_area_size, EditorCaret, EditorScroll, EditorStateComp};
-use jim_pane::{PaneChrome, PaneKindMarker, PaneRect, PaneTag, MARGIN, TITLE_H};
+use crate::{EditorCaret, EditorScroll, EditorStateComp, content_area_size};
+use jim_pane::{MARGIN, PaneChrome, PaneKindMarker, PaneRect, PaneTag, TITLE_H};
 
 // ---------- Tunables ----------
 
@@ -42,7 +42,6 @@ const LINE_SPACING: f32 = 1.45;
 const INDENT_PX: f32 = 24.0;
 /// Extra left pad inside code blocks / blockquotes.
 const BLOCK_PAD: f32 = 10.0;
-
 
 fn heading_size(level: u8) -> f32 {
     match level {
@@ -184,14 +183,11 @@ pub fn setup_markdown_fonts(
 ) {
     commands.insert_resource(MarkdownCodeHl(Highlighter::new()));
     let body = fonts.add(Font::from_bytes(INTER_VF.to_vec()));
-    let italic =
-        fonts.add(Font::from_bytes(INTER_ITALIC_VF.to_vec()));
+    let italic = fonts.add(Font::from_bytes(INTER_ITALIC_VF.to_vec()));
     // Reuse the editor's mono font handle when present; else load ours.
     let mono = match editor_font {
         Some(f) => f.0.clone(),
-        None => fonts.add(
-            Font::from_bytes(crate::EMBEDDED_FONT.to_vec()),
-        ),
+        None => fonts.add(Font::from_bytes(crate::EMBEDDED_FONT.to_vec())),
     };
     commands.insert_resource(MarkdownFonts { body, italic, mono });
 }
@@ -258,7 +254,12 @@ fn resolve_style(
         // Markers render in the body/mono face, dim, at the block size.
         let mono = matches!(block, BlockKind::CodeBlock);
         return ResolvedStyle {
-            font: (if mono { fonts.mono.clone() } else { fonts.body.clone() }).into(),
+            font: (if mono {
+                fonts.mono.clone()
+            } else {
+                fonts.body.clone()
+            })
+            .into(),
             weight: if matches!(block, BlockKind::Heading(_)) {
                 FontWeight::BOLD
             } else {
@@ -281,8 +282,16 @@ fn resolve_style(
     } else {
         fonts.body.clone()
     };
-    let weight = if bold { FontWeight::BOLD } else { FontWeight::NORMAL };
-    let size = if mono { CODE_SIZE.max(base_size.min(CODE_SIZE).max(CODE_SIZE)) } else { base_size };
+    let weight = if bold {
+        FontWeight::BOLD
+    } else {
+        FontWeight::NORMAL
+    };
+    let size = if mono {
+        CODE_SIZE.max(base_size.min(CODE_SIZE).max(CODE_SIZE))
+    } else {
+        base_size
+    };
     let size = if s.code && !matches!(block, BlockKind::CodeBlock) {
         CODE_SIZE
     } else {
@@ -299,7 +308,12 @@ fn resolve_style(
     } else {
         colors.body
     };
-    ResolvedStyle { font, weight, size, color }
+    ResolvedStyle {
+        font,
+        weight,
+        size,
+        color,
+    }
 }
 
 /// Dominant font size for a render line, from its block (used for row
@@ -664,7 +678,10 @@ fn rebuild_lines(
 
         for (li, line) in block.lines.iter().enumerate() {
             let entity = ensure_line_entity(commands, content_root, pool, idx, editor);
-            if let Some(chunks) = code_chunks.as_ref().and_then(|c| c.get(li)).and_then(|c| c.as_ref())
+            if let Some(chunks) = code_chunks
+                .as_ref()
+                .and_then(|c| c.get(li))
+                .and_then(|c| c.as_ref())
             {
                 build_code_line(
                     commands, entity, editor, bi, line, x_offset, rh, fonts, palette, colors,
@@ -672,8 +689,18 @@ fn rebuild_lines(
                 );
             } else {
                 build_line(
-                    commands, entity, editor, block, bi, line, is_active, content_width, x_offset,
-                    rh, fonts, colors,
+                    commands,
+                    entity,
+                    editor,
+                    block,
+                    bi,
+                    line,
+                    is_active,
+                    content_width,
+                    x_offset,
+                    rh,
+                    fonts,
+                    colors,
                 );
             }
             idx += 1;
@@ -858,15 +885,9 @@ fn highlight_code_block(
         return None;
     }
     // Content lines = those that aren't a fence marker line.
-    let is_fence = |l: &RenderLine| {
-        l.runs
-            .first()
-            .map(|r| r.kind.is_marker())
-            .unwrap_or(false)
-    };
-    let content_text = |l: &RenderLine| -> String {
-        l.runs.first().map(|r| r.text.clone()).unwrap_or_default()
-    };
+    let is_fence = |l: &RenderLine| l.runs.first().map(|r| r.kind.is_marker()).unwrap_or(false);
+    let content_text =
+        |l: &RenderLine| -> String { l.runs.first().map(|r| r.text.clone()).unwrap_or_default() };
 
     // Join content lines into a single code body to parse.
     let content_lines: Vec<&RenderLine> = block.lines.iter().filter(|l| !is_fence(l)).collect();
@@ -918,9 +939,7 @@ fn build_code_line(
     chunks: &[(String, HighlightKind)],
 ) {
     commands.entity(entity).despawn_related::<Children>();
-    commands
-        .entity(entity)
-        .insert(TextBounds::UNBOUNDED); // code doesn't soft-wrap
+    commands.entity(entity).insert(TextBounds::UNBOUNDED); // code doesn't soft-wrap
 
     let mut spans: Vec<(usize, String)> = Vec::new();
     let mut src = line.src.start;
@@ -928,9 +947,7 @@ fn build_code_line(
         if text.is_empty() {
             continue;
         }
-        let color = palette
-            .map(|p| p.color_for(*kind))
-            .unwrap_or(colors.code);
+        let color = palette.map(|p| p.color_for(*kind)).unwrap_or(colors.code);
         commands.entity(entity).with_child((
             TextSpan::new(text.clone()),
             TextFont {
@@ -1158,8 +1175,7 @@ pub fn markdown_position(
         // GLOBAL orphan sweep: MdLineRef entities whose editor is no longer a
         // live wysiwyg editor in this query. Such entities keep rendering at
         // their last positions — a second, untracked copy of the doc.
-        let live_editors: std::collections::HashSet<Entity> =
-            editors.iter().map(|t| t.0).collect();
+        let live_editors: std::collections::HashSet<Entity> = editors.iter().map(|t| t.0).collect();
         let mut orphan_editors: std::collections::HashMap<Entity, usize> =
             std::collections::HashMap::new();
         for (_e, r) in &all_refs {
@@ -1181,7 +1197,9 @@ pub fn markdown_position(
         }
         // Position each render line at its top.
         for (i, &line_e) in pool.0.iter().enumerate() {
-            let Some(g) = layout.lines.get(i) else { continue };
+            let Some(g) = layout.lines.get(i) else {
+                continue;
+            };
             if let Ok(mut t) = tf_q.get_mut(line_e) {
                 t.translation.x = g.x_offset;
                 t.translation.y = -g.top;
@@ -1240,10 +1258,16 @@ pub fn markdown_position(
                 eprintln!("[md-pos {editor:?}] {report}");
                 let doc_str = state.0.doc.to_string();
                 for (i, &line_e) in pool.0.iter().enumerate().take(24) {
-                    let Some(g) = layout.lines.get(i) else { continue };
+                    let Some(g) = layout.lines.get(i) else {
+                        continue;
+                    };
                     let max_row = g.glyphs.iter().map(|gl| gl.row + 1).max().unwrap_or(0);
                     let ent = ent_src.get(&line_e).copied().unwrap_or((0, 0));
-                    let flag = if ent != (g.src.start, g.src.end) { " <<MISMATCH" } else { "" };
+                    let flag = if ent != (g.src.start, g.src.end) {
+                        " <<MISMATCH"
+                    } else {
+                        ""
+                    };
                     let txt: String = doc_str
                         .get(g.src.start..g.src.end)
                         .unwrap_or("<oob>")
@@ -1373,7 +1397,14 @@ pub fn markdown_decorations(
             }
         }
 
-        draw_decorations(&mut commands, editor, chrome.content_root, layout, content.x, &deco);
+        draw_decorations(
+            &mut commands,
+            editor,
+            chrome.content_root,
+            layout,
+            content.x,
+            &deco,
+        );
     }
 }
 
@@ -1688,10 +1719,18 @@ mod tests {
         // Select from middle of line 0 to middle of line 2.
         let rects = selection_rects(&layout, 1, 9);
         // Expect one rect per line (3).
-        assert_eq!(rects.len(), 3, "rects: {:?}", rects.iter().map(|r| (r.x, r.y, r.w)).collect::<Vec<_>>());
+        assert_eq!(
+            rects.len(),
+            3,
+            "rects: {:?}",
+            rects.iter().map(|r| (r.x, r.y, r.w)).collect::<Vec<_>>()
+        );
         // Each rect should sit at its line's top.
         let ys: Vec<f32> = rects.iter().map(|r| r.y).collect();
-        assert!(ys.contains(&0.0) && ys.contains(&20.0) && ys.contains(&40.0), "ys={ys:?}");
+        assert!(
+            ys.contains(&0.0) && ys.contains(&20.0) && ys.contains(&40.0),
+            "ys={ys:?}"
+        );
     }
 
     #[test]
@@ -1732,6 +1771,10 @@ mod tests {
 
 impl std::fmt::Debug for SelGeom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SelGeom{{x:{},y:{},w:{},h:{}}}", self.x, self.y, self.w, self.h)
+        write!(
+            f,
+            "SelGeom{{x:{},y:{},w:{},h:{}}}",
+            self.x, self.y, self.w, self.h
+        )
     }
 }

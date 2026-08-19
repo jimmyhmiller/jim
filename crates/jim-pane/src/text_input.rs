@@ -390,14 +390,13 @@ fn spawn_text_input_inner(
     } else {
         strip_newlines(initial)
     };
-    let state = EditorState::new(Rope::from_str(&initial), Selection::cursor(initial.chars().count()));
+    let state = EditorState::new(
+        Rope::from_str(&initial),
+        Selection::cursor(initial.chars().count()),
+    );
 
     let input = commands
-        .spawn((
-            ChildOf(parent),
-            transform,
-            Visibility::default(),
-        ))
+        .spawn((ChildOf(parent), transform, Visibility::default()))
         .id();
 
     // We feed the text entity our own pre-wrapped text (visual lines
@@ -566,7 +565,6 @@ pub fn focus_text_input(
     focused.0 = target;
     let _ = inputs; // reserved for future "blur others" sweep if needed
 }
-
 
 /// Compute the column at a given local-x position. Used by hosts to
 /// turn a click on a text-input into a caret position.
@@ -780,14 +778,22 @@ fn text_input_keyboard(
                 continue;
             }
             KeyCode::Home => {
-                let cmd = if shift { select_line_start } else { cursor_line_start };
+                let cmd = if shift {
+                    select_line_start
+                } else {
+                    cursor_line_start
+                };
                 if apply(&mut ti.state, cmd) {
                     changed = true;
                 }
                 continue;
             }
             KeyCode::End => {
-                let cmd = if shift { select_line_end } else { cursor_line_end };
+                let cmd = if shift {
+                    select_line_end
+                } else {
+                    cursor_line_end
+                };
                 if apply(&mut ti.state, cmd) {
                     changed = true;
                 }
@@ -812,7 +818,11 @@ fn text_input_keyboard(
                 continue;
             }
             KeyCode::KeyZ if mod_doc => {
-                let new = if shift { redo(&ti.state) } else { undo(&ti.state) };
+                let new = if shift {
+                    redo(&ti.state)
+                } else {
+                    undo(&ti.state)
+                };
                 if let Some(s) = new {
                     ti.state = s;
                     changed = true;
@@ -981,10 +991,19 @@ fn text_input_render_caret(
     for (ti, view, focused) in &inputs {
         let visible = focused.is_some() && blink_on;
         if let Ok(mut v) = vis_q.get_mut(view.caret_entity) {
-            *v = if visible { Visibility::Inherited } else { Visibility::Hidden };
+            *v = if visible {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
         }
         if focused.is_some() {
-            let head = ti.state.selection.primary_range().head.min(ti.state.doc.len_chars());
+            let head = ti
+                .state
+                .selection
+                .primary_range()
+                .head
+                .min(ti.state.doc.len_chars());
             let (line, col) = if ti.multiline {
                 ti.caret_line_col(head)
             } else {

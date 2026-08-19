@@ -99,7 +99,8 @@ pub fn decode<T: for<'de> Deserialize<'de>>(
     if buf.len() < total {
         return Ok(None);
     }
-    let (msg, _) = bincode::serde::decode_from_slice(&buf[LEN_PREFIX..total], bincode::config::standard())?;
+    let (msg, _) =
+        bincode::serde::decode_from_slice(&buf[LEN_PREFIX..total], bincode::config::standard())?;
     Ok(Some((msg, total)))
 }
 
@@ -130,7 +131,10 @@ mod tests {
 
     #[test]
     fn decode_partial_is_none() {
-        let bytes = encode(&ClientFrame::Hello { role: Role::Publisher }).unwrap();
+        let bytes = encode(&ClientFrame::Hello {
+            role: Role::Publisher,
+        })
+        .unwrap();
         let res: Result<Option<(ClientFrame, _)>, _> = decode(&bytes[..bytes.len() - 1]);
         assert!(matches!(res, Ok(None)));
     }

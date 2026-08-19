@@ -10,7 +10,9 @@
 
 use std::collections::HashMap;
 
-use flame_core::{CategoryId, LoadError, LoadResult, ProfileBuilder, TrackId, TrackKind, TraceSource};
+use flame_core::{
+    CategoryId, LoadError, LoadResult, ProfileBuilder, TraceSource, TrackId, TrackKind,
+};
 use serde::Deserialize;
 
 /// Minimal view of the dump — we only need the spans (+ their per-span fields)
@@ -88,7 +90,11 @@ impl TraceSource for JimTraceSource {
                 }
             };
             // Prefer the resolved pane title; fall back to the static span name.
-            let display = if s.label.is_empty() { &s.name } else { &s.label };
+            let display = if s.label.is_empty() {
+                &s.name
+            } else {
+                &s.label
+            };
             let name_id = b.intern_string(display);
             let start_ns = (s.start_ms * 1.0e6).max(0.0) as u64;
             let dur_ns = (s.dur_ms * 1.0e6).max(0.0) as u64;

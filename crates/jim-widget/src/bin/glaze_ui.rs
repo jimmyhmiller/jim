@@ -7,12 +7,12 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
 use glaze::{Program, parse};
+use jim_widget::glaze_style::to_table_style;
 use jim_widget::glaze_style::{
     hex, resolve_select_style, resolve_tabs_style, resolve_toggle_style, to_bar_style,
     to_checkbox_style, to_dialog_style, to_popover_style, to_radio_style, to_slider_style,
     to_stepper_style, to_style, to_toast_style, to_tooltip_style,
 };
-use jim_widget::glaze_style::to_table_style;
 use jim_widget::protocol::{
     Align, Border, ButtonKind, Edges, Element, HostEvent, Style, TabItem, TableColumn, Weight,
     WidgetMsg,
@@ -389,23 +389,42 @@ fn text(value: &str, color: &str, size: f32, bold: bool) -> Element {
 }
 
 fn col(gap: f32, children: Vec<Element>) -> Element {
-    Element::Vstack { gap, pad: 0.0, children, style: None }
+    Element::Vstack {
+        gap,
+        pad: 0.0,
+        children,
+        style: None,
+    }
 }
 fn row(gap: f32, align: Align, children: Vec<Element>) -> Element {
-    Element::Hstack { gap, pad: 0.0, align, children, style: None }
+    Element::Hstack {
+        gap,
+        pad: 0.0,
+        align,
+        children,
+        style: None,
+    }
 }
 
 /// A Glaze-styled frame; resolve errors render as a loud red tile (house rule).
 fn glz(prog: &Program, name: &str, gap: f32, children: Vec<Element>) -> Element {
     match prog.resolve(name, &HashMap::new(), &[]) {
-        Ok(c) => Element::Frame { gap, pad: 0.0, children, style: Some(to_style(&c)) },
+        Ok(c) => Element::Frame {
+            gap,
+            pad: 0.0,
+            children,
+            style: Some(to_style(&c)),
+        },
         Err(e) => Element::Frame {
             gap: 4.0,
             pad: 0.0,
             children: vec![text(&format!("glaze: {e}"), "#ff6b5a", 10.0, true)],
             style: Some(Style {
                 background: Some("#2a1414".into()),
-                border: Some(Border { color: "#ff6b5a".into(), width: 1.0 }),
+                border: Some(Border {
+                    color: "#ff6b5a".into(),
+                    width: 1.0,
+                }),
                 radius: Some("8".into()),
                 padding: Some(Edges::all(10.0)),
                 ..Default::default()
@@ -415,7 +434,12 @@ fn glz(prog: &Program, name: &str, gap: f32, children: Vec<Element>) -> Element 
 }
 
 fn badge(value: &str, color: &str) -> Element {
-    Element::Badge { value: value.into(), color: Some(color.into()), selectable: false, style: None }
+    Element::Badge {
+        value: value.into(),
+        color: Some(color.into()),
+        selectable: false,
+        style: None,
+    }
 }
 
 /// A progress bar that fills its container width (so it shrinks/grows with the
@@ -705,7 +729,11 @@ fn glaze_table(prog: &Program) -> Element {
         align: Align::Start,
     };
     Element::Table {
-        columns: vec![col("Service", Some(140.0)), col("Status", Some(90.0)), col("Latency", None)],
+        columns: vec![
+            col("Service", Some(140.0)),
+            col("Status", Some(90.0)),
+            col("Latency", None),
+        ],
         rows: vec![
             vec!["api".into(), "live".into(), "42ms".into()],
             vec!["worker".into(), "live".into(), "8ms".into()],
@@ -733,7 +761,14 @@ fn stat_card(prog: &Program, label: &str, value: &str, tone: &str, frac: f32) ->
 }
 
 fn feature(prog: &Program, label: &str) -> Element {
-    row(8.0, Align::Center, vec![badge("✓", &tok(prog, "green")), text(label, &tok(prog, "fg"), 12.0, false)])
+    row(
+        8.0,
+        Align::Center,
+        vec![
+            badge("✓", &tok(prog, "green")),
+            text(label, &tok(prog, "fg"), 12.0, false),
+        ],
+    )
 }
 
 fn cta(prog: &Program, label: &str) -> Element {
@@ -757,7 +792,13 @@ fn resp_row(prog: &Program, width: f32, gap: f32, children: Vec<Element>) -> Ele
         .resolve_at("row_resp", &HashMap::new(), &[], width, f32::MAX)
         .ok()
         .map(|c| to_style(&c));
-    Element::Hstack { gap, pad: 0.0, align: Align::Stretch, children, style }
+    Element::Hstack {
+        gap,
+        pad: 0.0,
+        align: Align::Stretch,
+        children,
+        style,
+    }
 }
 
 fn build_ui(
@@ -780,7 +821,12 @@ fn build_ui(
         4.0,
         vec![
             text("Glaze UI", &tok(prog, "gold"), 30.0, true),
-            text("components · flex layout · shader-styled — all from one .glz", &muted, 12.0, false),
+            text(
+                "components · flex layout · shader-styled — all from one .glz",
+                &muted,
+                12.0,
+                false,
+            ),
         ],
     );
 
@@ -836,7 +882,12 @@ fn build_ui(
                     ),
                 ],
             ),
-            text("Building delightful interfaces with a tiny staged style language.", &muted, 11.0, false),
+            text(
+                "Building delightful interfaces with a tiny staged style language.",
+                &muted,
+                11.0,
+                false,
+            ),
             row(
                 10.0,
                 Align::Center,
@@ -872,11 +923,36 @@ fn build_ui(
                 width,
                 12.0,
                 vec![
-                    glz(prog, "g_linear", 0.0, vec![text("linear gradient", "#fdf6ec", 11.0, true)]),
-                    glz(prog, "g_diag", 0.0, vec![text("angled gradient", "#fdf6ec", 11.0, true)]),
-                    glz(prog, "edged", 0.0, vec![text("per-side border", &fg, 11.0, true)]),
-                    glz(prog, "insets", 0.0, vec![text("inset shadow", "#0c2226", 11.0, true)]),
-                    glz(prog, "raised", 0.0, vec![text("drop shadow · spread", "#1a1407", 11.0, true)]),
+                    glz(
+                        prog,
+                        "g_linear",
+                        0.0,
+                        vec![text("linear gradient", "#fdf6ec", 11.0, true)],
+                    ),
+                    glz(
+                        prog,
+                        "g_diag",
+                        0.0,
+                        vec![text("angled gradient", "#fdf6ec", 11.0, true)],
+                    ),
+                    glz(
+                        prog,
+                        "edged",
+                        0.0,
+                        vec![text("per-side border", &fg, 11.0, true)],
+                    ),
+                    glz(
+                        prog,
+                        "insets",
+                        0.0,
+                        vec![text("inset shadow", "#0c2226", 11.0, true)],
+                    ),
+                    glz(
+                        prog,
+                        "raised",
+                        0.0,
+                        vec![text("drop shadow · spread", "#1a1407", 11.0, true)],
+                    ),
                 ],
             ),
         ],
@@ -926,8 +1002,22 @@ fn build_ui(
             8.0,
             vec![
                 text("RECENT ACTIVITY", &muted, 10.0, true),
-                row(10.0, Align::Center, vec![text("Deploys", &fg, 12.0, false), glaze_bar(prog, "progress", 0.82, 360.0)]),
-                row(10.0, Align::Center, vec![text("Reviews", &fg, 12.0, false), glaze_bar(prog, "progress_gold", 0.46, 360.0)]),
+                row(
+                    10.0,
+                    Align::Center,
+                    vec![
+                        text("Deploys", &fg, 12.0, false),
+                        glaze_bar(prog, "progress", 0.82, 360.0),
+                    ],
+                ),
+                row(
+                    10.0,
+                    Align::Center,
+                    vec![
+                        text("Reviews", &fg, 12.0, false),
+                        glaze_bar(prog, "progress_gold", 0.46, 360.0),
+                    ],
+                ),
             ],
         ),
         // Settings — the toggles live here, and they actually toggle now.
@@ -939,7 +1029,13 @@ fn build_ui(
                     20.0,
                     Align::Center,
                     vec![
-                        glaze_toggle(prog, "toggle", "notifications", "Notifications", checked("notifications")),
+                        glaze_toggle(
+                            prog,
+                            "toggle",
+                            "notifications",
+                            "Notifications",
+                            checked("notifications"),
+                        ),
                         glaze_toggle(prog, "toggle", "autosync", "Auto-sync", checked("autosync")),
                     ],
                 ),
@@ -951,7 +1047,12 @@ fn build_ui(
     let retrofit = col(
         10.0,
         vec![
-            text("SLOT-RETROFIT COMPONENTS · PHASE 1D — click the tabs", &muted, 10.0, true),
+            text(
+                "SLOT-RETROFIT COMPONENTS · PHASE 1D — click the tabs",
+                &muted,
+                10.0,
+                true,
+            ),
             glaze_tabs(
                 prog,
                 "demo-tabs",
@@ -968,7 +1069,12 @@ fn build_ui(
     let animation = col(
         8.0,
         vec![
-            text("ANIMATED STATE · GLAZE `transition` — click the toggles", &muted, 10.0, true),
+            text(
+                "ANIMATED STATE · GLAZE `transition` — click the toggles",
+                &muted,
+                10.0,
+                true,
+            ),
             text(
                 "transition checked 180ms ease_in_out · 700ms linear · 450ms + checked-driven shader glow",
                 &muted,
@@ -980,8 +1086,20 @@ fn build_ui(
                 Align::Center,
                 vec![
                     glaze_toggle(prog, "toggle", "anim-eased", "Eased", checked("anim-eased")),
-                    glaze_toggle(prog, "toggle_slow", "anim-slow", "Slow linear", checked("anim-slow")),
-                    glaze_toggle(prog, "toggle_glow", "anim-glow", "Shader glow", checked("anim-glow")),
+                    glaze_toggle(
+                        prog,
+                        "toggle_slow",
+                        "anim-slow",
+                        "Slow linear",
+                        checked("anim-slow"),
+                    ),
+                    glaze_toggle(
+                        prog,
+                        "toggle_glow",
+                        "anim-glow",
+                        "Shader glow",
+                        checked("anim-glow"),
+                    ),
                 ],
             ),
         ],
@@ -991,7 +1109,12 @@ fn build_ui(
     let phase2 = col(
         8.0,
         vec![
-            text("NEW COMPONENT · PHASE 2 — DRAGGABLE SLIDER", &muted, 10.0, true),
+            text(
+                "NEW COMPONENT · PHASE 2 — DRAGGABLE SLIDER",
+                &muted,
+                10.0,
+                true,
+            ),
             row(
                 14.0,
                 Align::Center,
@@ -1049,7 +1172,12 @@ fn build_ui(
                     glaze_select(
                         prog,
                         "country",
-                        &[("us", "United States"), ("ca", "Canada"), ("uk", "United Kingdom"), ("de", "Germany")],
+                        &[
+                            ("us", "United States"),
+                            ("ca", "Canada"),
+                            ("uk", "United Kingdom"),
+                            ("de", "Germany"),
+                        ],
                         country,
                     ),
                     text(&format!("→ {country}"), &tok(prog, "teal"), 12.0, true),
@@ -1060,7 +1188,11 @@ fn build_ui(
                 Align::Center,
                 vec![
                     text("Hover the hint:", &muted, 12.0, false),
-                    tooltip(prog, "what is this?", "A floating hint on the overlay layer — it escapes the pane."),
+                    tooltip(
+                        prog,
+                        "what is this?",
+                        "A floating hint on the overlay layer — it escapes the pane.",
+                    ),
                 ],
             ),
             row(
@@ -1098,7 +1230,9 @@ fn build_ui(
     Element::Vstack {
         gap: 18.0,
         pad: 4.0,
-        children: vec![header, stats, middle, layers, slots, retrofit, animation, phase2, phase3, badges],
+        children: vec![
+            header, stats, middle, layers, slots, retrofit, animation, phase2, phase3, badges,
+        ],
         style: None,
     }
 }
@@ -1161,7 +1295,10 @@ fn main() {
     let _ = writeln!(
         out,
         "{}",
-        serde_json::to_string(&WidgetMsg::Title { value: "Glaze UI".into() }).unwrap()
+        serde_json::to_string(&WidgetMsg::Title {
+            value: "Glaze UI".into()
+        })
+        .unwrap()
     );
     // Track the pane's content width (row↔column breakpoint), the active tab,
     // and the slider value (the widget owns it; the host drives slider-change).
@@ -1184,10 +1321,25 @@ fn main() {
     // Default open when GLAZE_DIALOG is set (for the static snapshot).
     let mut dialog_open = std::env::var("GLAZE_DIALOG").is_ok();
     let mut toast_shown = true;
-    emit(&mut out, &prog, &remap, width, &tab, slider, &checks, &radio, qty, &country, dialog_open, toast_shown);
+    emit(
+        &mut out,
+        &prog,
+        &remap,
+        width,
+        &tab,
+        slider,
+        &checks,
+        &radio,
+        qty,
+        &country,
+        dialog_open,
+        toast_shown,
+    );
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
-        let Ok(evt) = serde_json::from_str::<HostEvent>(&line) else { continue };
+        let Ok(evt) = serde_json::from_str::<HostEvent>(&line) else {
+            continue;
+        };
         match evt {
             HostEvent::Close => return,
             HostEvent::Init { width: w, .. } => width = w,
@@ -1208,7 +1360,20 @@ fn main() {
             }
             _ => {}
         }
-        emit(&mut out, &prog, &remap, width, &tab, slider, &checks, &radio, qty, &country, dialog_open, toast_shown);
+        emit(
+            &mut out,
+            &prog,
+            &remap,
+            width,
+            &tab,
+            slider,
+            &checks,
+            &radio,
+            qty,
+            &country,
+            dialog_open,
+            toast_shown,
+        );
     }
 }
 
@@ -1228,7 +1393,18 @@ fn emit<W: Write>(
     toast_shown: bool,
 ) {
     if let Ok(s) = serde_json::to_string(&WidgetMsg::Frame {
-        root: build_ui(prog, width, tab, slider, checks, radio, qty, country, dialog_open, toast_shown),
+        root: build_ui(
+            prog,
+            width,
+            tab,
+            slider,
+            checks,
+            radio,
+            qty,
+            country,
+            dialog_open,
+            toast_shown,
+        ),
     }) {
         // swap baked palette hexes for theme token names (quoted JSON
         // strings, so WGSL bodies and text content can't false-match)

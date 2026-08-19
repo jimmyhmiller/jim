@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use claude_bus::client::{BusItem, Subscriber};
 use claude_bus::daemon::Daemon;
-use claude_bus::proto::{encode, ClientFrame, Role};
+use claude_bus::proto::{ClientFrame, Role, encode};
 
 fn spawn_daemon(dir: &std::path::Path) -> PathBuf {
     let socket = dir.join("bus.sock");
@@ -32,7 +32,13 @@ fn spawn_daemon(dir: &std::path::Path) -> PathBuf {
 
 fn publish(socket: &std::path::Path, kind: &str, ts: u64) {
     let mut s = UnixStream::connect(socket).unwrap();
-    s.write_all(&encode(&ClientFrame::Hello { role: Role::Publisher }).unwrap()).unwrap();
+    s.write_all(
+        &encode(&ClientFrame::Hello {
+            role: Role::Publisher,
+        })
+        .unwrap(),
+    )
+    .unwrap();
     s.write_all(
         &encode(&ClientFrame::Publish {
             kind: kind.into(),

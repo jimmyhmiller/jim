@@ -65,11 +65,17 @@ impl SystemFontSource {
     /// `newly_loaded` (the file was pulled off disk on its first codepoint).
     pub fn bytes_for(&mut self, ch: char) -> Option<SystemFontHit> {
         if let Some(&cached) = self.char_cache.get(&ch) {
-            return cached.map(|bytes| SystemFontHit { bytes, newly_loaded: false });
+            return cached.map(|bytes| SystemFontHit {
+                bytes,
+                newly_loaded: false,
+            });
         }
         let (result, newly_loaded) = self.lookup(ch);
         self.char_cache.insert(ch, result);
-        result.map(|bytes| SystemFontHit { bytes, newly_loaded })
+        result.map(|bytes| SystemFontHit {
+            bytes,
+            newly_loaded,
+        })
     }
 
     /// Returns `(bytes, newly_loaded)`. `newly_loaded` is true only when this
@@ -95,14 +101,14 @@ impl SystemFontSource {
         let s_buf = ch.to_string();
         let cfs = CFString::new(&s_buf);
         let utf16_len = s_buf.encode_utf16().count() as isize;
-        let range = CFRange { location: 0, length: utf16_len };
+        let range = CFRange {
+            location: 0,
+            length: utf16_len,
+        };
 
         let fallback = unsafe {
-            let r = CTFontCreateForString(
-                base.as_concrete_TypeRef(),
-                cfs.as_concrete_TypeRef(),
-                range,
-            );
+            let r =
+                CTFontCreateForString(base.as_concrete_TypeRef(), cfs.as_concrete_TypeRef(), range);
             if r.is_null() {
                 return (None, false);
             }

@@ -63,13 +63,13 @@ pub struct Category {
 /// viewport culling via two `partition_point` calls.
 #[derive(Default, Debug, Clone)]
 pub struct SliceTable {
-    pub track:    Vec<TrackId>,
-    pub depth:    Vec<u16>,
+    pub track: Vec<TrackId>,
+    pub depth: Vec<u16>,
     pub start_ns: Vec<u64>,
-    pub dur_ns:   Vec<u64>,
-    pub name:     Vec<StringId>,
+    pub dur_ns: Vec<u64>,
+    pub name: Vec<StringId>,
     pub category: Vec<CategoryId>,
-    pub stack:    Vec<Option<StackId>>,
+    pub stack: Vec<Option<StackId>>,
     /// (track, depth) -> contiguous range `[lo, hi)` into the SoA arrays.
     pub rows: AHashMap<(TrackId, u16), std::ops::Range<u32>>,
 }

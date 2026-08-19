@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use diff_core::{ChangeKind, DiffSet, Hunk, LineKind};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn run() -> ExitCode {
     let args: Vec<String> = crate::sub_args().collect();
@@ -70,7 +70,9 @@ pub fn run() -> ExitCode {
         "unstage-hunk" => cmd_hunk(&named, false),
         "stage-file" => cmd_whole_file(&named, true),
         "unstage-file" => cmd_whole_file(&named, false),
-        other => Err(format!("unknown subcommand '{other}' (see jimctl git --help)")),
+        other => Err(format!(
+            "unknown subcommand '{other}' (see jimctl git --help)"
+        )),
     };
 
     match result {
@@ -113,7 +115,10 @@ fn parse_flags(args: &[String]) -> (Vec<(String, String)>, Vec<String>) {
 }
 
 fn get<'a>(named: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    named.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    named
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 fn has(switches: &[String], key: &str) -> bool {
@@ -241,7 +246,11 @@ fn cmd_log(named: &[(String, String)]) -> Result<Value, String> {
     let limit = get(named, "limit").unwrap_or("20");
     let limit_n: usize = limit.parse().map_err(|_| format!("bad --limit: {limit}"))?;
     let n_arg = format!("-n{limit_n}");
-    let mut args = vec!["log", "--format=%H\u{1f}%s\u{1f}%an\u{1f}%at", n_arg.as_str()];
+    let mut args = vec![
+        "log",
+        "--format=%H\u{1f}%s\u{1f}%an\u{1f}%at",
+        n_arg.as_str(),
+    ];
     let path_arg;
     if let Some(p) = get(named, "path") {
         path_arg = p.to_string();
@@ -365,7 +374,11 @@ fn cmd_diff(named: &[(String, String)], switches: &[String]) -> Result<Value, St
             let head = get(named, "head").unwrap_or("HEAD");
             diff_core::git_ref_range(&repo, base, head).map_err(|e| e.to_string())?
         }
-        other => return Err(format!("bad --mode '{other}' (working|staged|unstaged|range)")),
+        other => {
+            return Err(format!(
+                "bad --mode '{other}' (working|staged|unstaged|range)"
+            ));
+        }
     };
     Ok(json!({ "diff": diffset_json(&set, !has(switches, "no-text")) }))
 }

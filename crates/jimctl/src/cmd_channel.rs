@@ -22,7 +22,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::agent_bus;
 use jim_bus::client;
@@ -147,7 +147,10 @@ fn write_msg(out: &Out, v: &Value) {
 }
 
 fn respond_result(out: &Out, id: Value, result: Value) {
-    write_msg(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+    write_msg(
+        out,
+        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+    );
 }
 
 fn respond_error(out: &Out, id: Value, code: i64, message: &str) {
@@ -531,9 +534,11 @@ fn announce(id: &str, shared: &Shared) {
 /// is what makes dead/stale sessions drop off (a hard-killed session simply
 /// stops refreshing its `ts`).
 fn spawn_heartbeat(id: String, shared: Shared) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(HEARTBEAT_SECS));
-        announce(&id, &shared);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(HEARTBEAT_SECS));
+            announce(&id, &shared);
+        }
     });
 }
 

@@ -105,8 +105,7 @@ fn shim_dir() -> Option<PathBuf> {
 /// call so a daemon launched after a code upgrade picks up updated
 /// integration content automatically (the files are tiny).
 pub fn ensure_installed() -> std::io::Result<PathBuf> {
-    let dir = shim_dir()
-        .ok_or_else(|| std::io::Error::other("no data_dir (HOME unset?)"))?;
+    let dir = shim_dir().ok_or_else(|| std::io::Error::other("no data_dir (HOME unset?)"))?;
     std::fs::create_dir_all(&dir)?;
     write_atomic(&dir.join(".zshenv"), ZSHENV)?;
     write_atomic(&dir.join(".zprofile"), ZPROFILE)?;

@@ -165,8 +165,15 @@ fn set_cwd(args: impl Iterator<Item = String>) -> ExitCode {
     let _ = sock.shutdown(std::net::Shutdown::Write);
 
     match (&project, &cwd) {
-        (Some(p), Some(c)) => println!("jimctl project: project {:?} default_cwd ← {}", p, c.display()),
-        (None, Some(c)) => println!("jimctl project: active project default_cwd ← {}", c.display()),
+        (Some(p), Some(c)) => println!(
+            "jimctl project: project {:?} default_cwd ← {}",
+            p,
+            c.display()
+        ),
+        (None, Some(c)) => println!(
+            "jimctl project: active project default_cwd ← {}",
+            c.display()
+        ),
         (Some(p), None) => println!("jimctl project: project {:?} default_cwd cleared", p),
         (None, None) => println!("jimctl project: active project default_cwd cleared"),
     }

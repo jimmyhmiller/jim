@@ -36,10 +36,10 @@ use bevy::sprite::Anchor;
 use serde_json::Value;
 
 use crate::{
-    content_area, next_pane_z, spawn_pane, ChromeTextStyle, FocusedPane, PaneChrome,
-    PaneChromeOverride, PaneCursorOverride, PaneKindMarker, PaneKindSpec, PaneMouseMode, PanePinned,
-    PaneProject, PaneRect, PaneRegistry, PaneScreenAnchored, PaneTag, PaneViewport,
-    PendingPaneActions, SpawnedPane, MARGIN, MIN_PANE_SIZE, TITLE_H,
+    ChromeTextStyle, FocusedPane, MARGIN, MIN_PANE_SIZE, PaneChrome, PaneChromeOverride,
+    PaneCursorOverride, PaneKindMarker, PaneKindSpec, PaneMouseMode, PanePinned, PaneProject,
+    PaneRect, PaneRegistry, PaneScreenAnchored, PaneTag, PaneViewport, PendingPaneActions,
+    SpawnedPane, TITLE_H, content_area, next_pane_z, spawn_pane,
 };
 
 /// Registry key for the dock container pane kind.
@@ -133,7 +133,10 @@ impl DockNode {
     /// containing split are renormalized; single-child collapse is done
     /// separately by [`collapse`].
     fn remove_leaf(&mut self, target: Entity) -> bool {
-        if let DockNode::Split { children, fracs, .. } = self {
+        if let DockNode::Split {
+            children, fracs, ..
+        } = self
+        {
             if let Some(idx) = children
                 .iter()
                 .position(|c| matches!(c, DockNode::Leaf(e) if *e == target))
@@ -232,7 +235,10 @@ fn insert_beside(node: &mut DockNode, target: Entity, new: Entity, edge: DropEdg
         {
             if *horizontal == want_h {
                 // Same axis: split the target cell's share with the newcomer.
-                let f = fracs.get(idx).copied().unwrap_or(1.0 / children.len() as f32);
+                let f = fracs
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(1.0 / children.len() as f32);
                 fracs[idx] = f * 0.5;
                 let at = if edge.before() { idx } else { idx + 1 };
                 fracs.insert(at, f * 0.5);
@@ -343,7 +349,14 @@ fn walk_layout(
                     let w = avail * fracs.get(i).copied().unwrap_or(1.0 / n as f32);
                     let mut p = path.to_vec();
                     p.push(i);
-                    walk_layout(c, Vec2::new(x, pos.y), Vec2::new(w, size.y), &p, cells, handles);
+                    walk_layout(
+                        c,
+                        Vec2::new(x, pos.y),
+                        Vec2::new(w, size.y),
+                        &p,
+                        cells,
+                        handles,
+                    );
                     if i + 1 < n {
                         handles.push(SplitHandle {
                             path: path.to_vec(),
@@ -363,7 +376,14 @@ fn walk_layout(
                     let h = avail * fracs.get(i).copied().unwrap_or(1.0 / n as f32);
                     let mut p = path.to_vec();
                     p.push(i);
-                    walk_layout(c, Vec2::new(pos.x, y), Vec2::new(size.x, h), &p, cells, handles);
+                    walk_layout(
+                        c,
+                        Vec2::new(pos.x, y),
+                        Vec2::new(size.x, h),
+                        &p,
+                        cells,
+                        handles,
+                    );
                     if i + 1 < n {
                         handles.push(SplitHandle {
                             path: path.to_vec(),
@@ -412,7 +432,9 @@ fn replace_leaf_with_empty(node: &mut DockNode, target: Entity) -> bool {
             *node = DockNode::Empty;
             true
         }
-        DockNode::Split { children, .. } => children.iter_mut().any(|c| replace_leaf_with_empty(c, target)),
+        DockNode::Split { children, .. } => children
+            .iter_mut()
+            .any(|c| replace_leaf_with_empty(c, target)),
         _ => false,
     }
 }
@@ -606,19 +628,29 @@ fn hide_highlight(
 
 // ---------- Kind spawn / snapshot ----------
 
-fn dock_spawn_from_config(world: &mut World, entity: Entity, _content_root: Entity, config: &Value) {
+fn dock_spawn_from_config(
+    world: &mut World,
+    entity: Entity,
+    _content_root: Entity,
+    config: &Value,
+) {
     let collapse_chrome = config
         .get("collapse_chrome")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let template = config.get("template").and_then(|v| v.as_bool()).unwrap_or(false);
+    let template = config
+        .get("template")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     world.entity_mut(entity).insert(Dock {
         root: None,
         collapse_chrome,
         template,
     });
     if let Some(tree) = config.get("tree") {
-        world.entity_mut(entity).insert(PendingDockTree(tree.clone()));
+        world
+            .entity_mut(entity)
+            .insert(PendingDockTree(tree.clone()));
     }
 }
 
@@ -711,10 +743,20 @@ fn dock_on_close(world: &mut World, entity: Entity) {
 
 fn is_free_pane(
     e: Entity,
-    panes: &Query<(Has<Dock>, Has<DockMember>, Has<PanePinned>, Has<PaneScreenAnchored>), With<PaneTag>>,
+    panes: &Query<
+        (
+            Has<Dock>,
+            Has<DockMember>,
+            Has<PanePinned>,
+            Has<PaneScreenAnchored>,
+        ),
+        With<PaneTag>,
+    >,
 ) -> bool {
     match panes.get(e) {
-        Ok((is_dock, is_member, pinned, anchored)) => !is_dock && !is_member && !pinned && !anchored,
+        Ok((is_dock, is_member, pinned, anchored)) => {
+            !is_dock && !is_member && !pinned && !anchored
+        }
         Err(_) => false,
     }
 }
@@ -730,7 +772,11 @@ fn dock_layout(
         // cell reverts to an empty slot; on an ad-hoc dock it's removed.
         let is_template = dock.template;
         if let Some(mut r) = dock.root.take() {
-            let dead: Vec<Entity> = r.leaves().into_iter().filter(|e| alive.get(*e).is_err()).collect();
+            let dead: Vec<Entity> = r
+                .leaves()
+                .into_iter()
+                .filter(|e| alive.get(*e).is_err())
+                .collect();
             if is_template {
                 for d in dead {
                     replace_leaf_with_empty(&mut r, d);
@@ -786,7 +832,9 @@ fn dock_focus_raise(
     } else {
         members.get(f).ok().map(|m| m.dock)
     };
-    let Some(dock_entity) = dock_entity else { return };
+    let Some(dock_entity) = dock_entity else {
+        return;
+    };
 
     let mut max_other = 0.0_f32;
     for (e, r, pinned) in &rects {
@@ -826,7 +874,10 @@ fn collapse_member_chrome(
     mut vis: Query<&mut Visibility>,
 ) {
     for (entity, dm, chrome) in &added {
-        let collapse = docks.get(dm.dock).map(|d| d.collapse_chrome).unwrap_or(true);
+        let collapse = docks
+            .get(dm.dock)
+            .map(|d| d.collapse_chrome)
+            .unwrap_or(true);
         if !collapse {
             continue;
         }
@@ -1009,7 +1060,12 @@ fn dock_drag_track(
     mut docks: Query<&mut Dock>,
     member_q: Query<&DockMember>,
     free_q: Query<
-        (Has<Dock>, Has<DockMember>, Has<PanePinned>, Has<PaneScreenAnchored>),
+        (
+            Has<Dock>,
+            Has<DockMember>,
+            Has<PanePinned>,
+            Has<PaneScreenAnchored>,
+        ),
         With<PaneTag>,
     >,
     pane_rects: Query<
@@ -1180,9 +1236,15 @@ fn edge_in_rect(cur: Vec2, pos: Vec2, size: Vec2) -> DropEdge {
 fn edge_half(pos: Vec2, size: Vec2, edge: DropEdge) -> (Vec2, Vec2) {
     match edge {
         DropEdge::Left => (pos, Vec2::new(size.x * 0.5, size.y)),
-        DropEdge::Right => (pos + Vec2::new(size.x * 0.5, 0.0), Vec2::new(size.x * 0.5, size.y)),
+        DropEdge::Right => (
+            pos + Vec2::new(size.x * 0.5, 0.0),
+            Vec2::new(size.x * 0.5, size.y),
+        ),
         DropEdge::Top => (pos, Vec2::new(size.x, size.y * 0.5)),
-        DropEdge::Bottom => (pos + Vec2::new(0.0, size.y * 0.5), Vec2::new(size.x, size.y * 0.5)),
+        DropEdge::Bottom => (
+            pos + Vec2::new(0.0, size.y * 0.5),
+            Vec2::new(size.x, size.y * 0.5),
+        ),
     }
 }
 
@@ -1217,7 +1279,9 @@ fn dock_snap_apply(world: &mut World) {
     }
     match target.kind {
         DropKind::NewDock { edge } => create_dock_around(world, target.anchor, pane, edge),
-        DropKind::SplitLeaf { leaf, edge } => insert_into_dock(world, target.anchor, leaf, pane, edge),
+        DropKind::SplitLeaf { leaf, edge } => {
+            insert_into_dock(world, target.anchor, leaf, pane, edge)
+        }
         DropKind::FillSlot { path } => fill_dock_slot(world, target.anchor, &path, pane),
     }
 }
@@ -1238,7 +1302,13 @@ fn fill_dock_slot(world: &mut World, dock: Entity, path: &[usize], pane: Entity)
 }
 
 /// Insert `pane` into an existing `dock`, splitting `target_leaf` on `edge`.
-fn insert_into_dock(world: &mut World, dock: Entity, target_leaf: Entity, pane: Entity, edge: DropEdge) {
+fn insert_into_dock(
+    world: &mut World,
+    dock: Entity,
+    target_leaf: Entity,
+    pane: Entity,
+    edge: DropEdge,
+) {
     if let Some(mut d) = world.get_mut::<Dock>(dock) {
         match &mut d.root {
             Some(root) => apply_insert(root, target_leaf, pane, edge),
@@ -1271,7 +1341,11 @@ fn create_dock_around(world: &mut World, anchor: Entity, pane: Entity, edge: Dro
         world,
         DOCK_KIND,
         "Dock",
-        PaneRect { pos: frame_pos, size: frame_size, z },
+        PaneRect {
+            pos: frame_pos,
+            size: frame_size,
+            z,
+        },
         project,
     );
     world.entity_mut(dock).insert(Dock {
@@ -1466,7 +1540,10 @@ pub fn create_dock_template(
             max = max.max(r.pos + r.size);
         }
     }
-    let union_size = (max - min).max(Vec2::new(MIN_PANE_SIZE.x * valid.len() as f32, MIN_PANE_SIZE.y));
+    let union_size = (max - min).max(Vec2::new(
+        MIN_PANE_SIZE.x * valid.len() as f32,
+        MIN_PANE_SIZE.y,
+    ));
     let frame_pos = min - Vec2::new(MARGIN, TITLE_H + MARGIN);
     let frame_size = union_size + Vec2::new(2.0 * MARGIN, TITLE_H + 2.0 * MARGIN);
     let project = world.get::<PaneProject>(valid[0]).map(|p| p.0);
@@ -1476,7 +1553,11 @@ pub fn create_dock_template(
         world,
         DOCK_KIND,
         "Dock",
-        PaneRect { pos: frame_pos, size: frame_size, z },
+        PaneRect {
+            pos: frame_pos,
+            size: frame_size,
+            z,
+        },
         project,
     );
     world.entity_mut(dock).insert(Dock {
@@ -1544,7 +1625,9 @@ fn splitter_drag(
     // Default: no splitter cursor this frame (self-clears when not hovering).
     cursor_override.0 = None;
     let Ok(window) = windows.single() else { return };
-    let Some(cursor) = window.cursor_position() else { return };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
     let cur = viewport.window_to_canvas(cursor);
 
     // Cursor feedback: ↔ over a vertical divider (horizontal split), ↕ over
@@ -1584,7 +1667,9 @@ fn splitter_drag(
         }
     }
 
-    let Some(dock_entity) = split.dock else { return };
+    let Some(dock_entity) = split.dock else {
+        return;
+    };
     if !buttons.pressed(MouseButton::Left) {
         return;
     }
@@ -1613,7 +1698,11 @@ fn splitter_drag(
     // Floor each cell at MIN_PANE_SIZE in pixels (not just MIN_FRAC), so a
     // cell can't be squished below the normal minimum regardless of how
     // many siblings share the split or how large the dock is.
-    let min_dim = if split.horizontal { MIN_PANE_SIZE.x } else { MIN_PANE_SIZE.y };
+    let min_dim = if split.horizontal {
+        MIN_PANE_SIZE.x
+    } else {
+        MIN_PANE_SIZE.y
+    };
     let min_frac = (min_dim / extent.max(1.0)).max(MIN_FRAC).min(pair * 0.49);
     let new_b = (cursor_frac - left_cum).clamp(min_frac, pair - min_frac);
     fracs[b] = new_b;
@@ -1676,7 +1765,8 @@ fn link_restored_docks(
     }
     for (_group, (dock, members)) in groups {
         let Some(dock) = dock else { continue };
-        let slot_to_entity: HashMap<usize, Entity> = members.iter().map(|(s, e)| (*s, *e)).collect();
+        let slot_to_entity: HashMap<usize, Entity> =
+            members.iter().map(|(s, e)| (*s, *e)).collect();
         // Rebuild the tree from the dock's parked JSON (slot indices →
         // entities). Fall back to even columns if the tree is missing.
         let root = trees
@@ -1711,6 +1801,11 @@ pub fn dock_co_members(world: &World, pane: Entity) -> Vec<Entity> {
     };
     world
         .get::<Dock>(dm.dock)
-        .map(|d| d.member_entities().into_iter().filter(|m| *m != pane).collect())
+        .map(|d| {
+            d.member_entities()
+                .into_iter()
+                .filter(|m| *m != pane)
+                .collect()
+        })
         .unwrap_or_default()
 }

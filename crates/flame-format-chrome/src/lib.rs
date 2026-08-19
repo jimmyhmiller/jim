@@ -131,7 +131,8 @@ impl TraceSource for ChromeSource {
                     let proc_id = *process_ids
                         .entry(pid)
                         .or_insert_with(|| builder.add_process(pid, ""));
-                    let thread_id = builder.add_thread(Some(proc_id), tid, name.as_deref().unwrap_or(""));
+                    let thread_id =
+                        builder.add_thread(Some(proc_id), tid, name.as_deref().unwrap_or(""));
                     // Refresh the track's name if we already created one.
                     if let Some(s) = state.get(&(pid, tid)) {
                         let _ = s; // track name not currently mutable post-creation; v2 polish
@@ -153,7 +154,10 @@ impl TraceSource for ChromeSource {
                 let thread = builder.add_thread(Some(proc_id), tid, "");
                 let label = format!("PID {pid} TID {tid}");
                 let track = builder.add_track(TrackKind::Thread(thread), &label, None);
-                ThreadState { track, open_x_end_ns: Vec::new() }
+                ThreadState {
+                    track,
+                    open_x_end_ns: Vec::new(),
+                }
             });
             let track = st.track;
 

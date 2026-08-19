@@ -234,7 +234,10 @@ fn read_inbox(args: Vec<String>) -> ExitCode {
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 eprintln!("jimctl inbox read: parse {}: {}", path.display(), e);
-                PersistedProjects { projects: Vec::new(), active: None }
+                PersistedProjects {
+                    projects: Vec::new(),
+                    active: None,
+                }
             }),
             Err(e) => {
                 eprintln!("jimctl inbox read: read {}: {}", path.display(), e);
@@ -318,7 +321,11 @@ fn read_inbox(args: Vec<String>) -> ExitCode {
         }
         let flag = if m.read { " " } else { "•" };
         let when = format_ts(m.ts);
-        let sender = if m.sender.is_empty() { "external" } else { &m.sender };
+        let sender = if m.sender.is_empty() {
+            "external"
+        } else {
+            &m.sender
+        };
         match &m.subject {
             Some(s) if !s.is_empty() => {
                 println!("{} [{}] {} — {}", flag, when, sender, s);

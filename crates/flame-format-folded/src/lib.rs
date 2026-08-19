@@ -10,9 +10,7 @@
 //! Sample-only (no timestamps, no threads). The builder synthesizes a flame graph
 //! laid out left-to-right by descending weight.
 
-use flame_core::{
-    LoadError, LoadResult, ProfileBuilder, StringId, TraceSource, TrackKind,
-};
+use flame_core::{LoadError, LoadResult, ProfileBuilder, StringId, TraceSource, TrackKind};
 
 pub struct FoldedSource;
 
@@ -53,8 +51,8 @@ impl TraceSource for FoldedSource {
     }
 
     fn load(&self, input: &[u8], builder: &mut ProfileBuilder) -> LoadResult<()> {
-        let text = std::str::from_utf8(input)
-            .map_err(|e| LoadError::Parse(format!("not utf-8: {e}")))?;
+        let text =
+            std::str::from_utf8(input).map_err(|e| LoadError::Parse(format!("not utf-8: {e}")))?;
 
         let process = builder.add_process(0, "samples");
         let thread = builder.add_thread(Some(process), 0, "main");

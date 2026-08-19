@@ -17,6 +17,7 @@ use bevy::{
     color::palettes,
     ecs::VariantDefaults,
     feathers::{
+        FeathersPlugins,
         constants::{fonts, icons},
         containers::*,
         controls::*,
@@ -27,16 +28,16 @@ use bevy::{
         palette,
         rounded_corners::RoundedCorners,
         theme::{ThemeBackgroundColor, ThemedText, UiTheme},
-        tokens, FeathersPlugins,
+        tokens,
     },
-    input_focus::{tab_navigation::TabGroup, AutoFocus, InputFocus},
+    input_focus::{AutoFocus, InputFocus, tab_navigation::TabGroup},
     prelude::*,
     text::{EditableText, TextEdit, TextEditChange},
     ui::{Checked, InteractionDisabled, Selected},
     ui_widgets::{
-        checkbox_self_update, listbox_update_selection, radio_self_update, slider_self_update,
         Activate, ActivateOnPress, RadioGroup, SliderPrecision, SliderStep, SliderValue,
-        ValueChange,
+        ValueChange, checkbox_self_update, listbox_update_selection, radio_self_update,
+        slider_self_update,
     },
     window::SystemCursorIcon,
 };

@@ -28,19 +28,19 @@ use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
-use libghostty_vt::style::RgbColor;
 use jim_pane::{
-    spawn_pane, FocusedPane, PaneContentPressed, PaneFont, PaneKindMarker, PaneRect, PaneRegistry,
-    PaneTag, SpawnedPane, MARGIN, TITLE_H,
+    FocusedPane, MARGIN, PaneContentPressed, PaneFont, PaneKindMarker, PaneRect, PaneRegistry,
+    PaneTag, SpawnedPane, TITLE_H, spawn_pane,
 };
+use libghostty_vt::style::RgbColor;
 use serde_json::Value;
 
 pub mod atlas;
 pub(crate) mod base64;
 pub mod command_watch;
 pub mod daemon_client;
-pub mod osc7;
 pub mod osc52;
+pub mod osc7;
 pub mod pty;
 pub mod selection;
 pub mod term_material;
@@ -52,10 +52,10 @@ pub mod worker;
 pub use jim_daemon::proto as daemon_proto;
 
 use atlas::GlyphAtlas;
-use term_material::{
-    make_cells_image, pack_rgb, GpuCell, TermMaterial, TermMaterialPlugin, TermParams,
-};
 use pty::PtySize;
+use term_material::{
+    GpuCell, TermMaterial, TermMaterialPlugin, TermParams, make_cells_image, pack_rgb,
+};
 use worker::{MouseAction, MouseBtn, SnapCell, WorkerHandle, WorkerMsg};
 
 pub const FONT_SIZE: f32 = 14.0;
@@ -315,11 +315,7 @@ impl TerminalSelection {
     pub fn normalised(&self) -> Option<((i32, i64), (i32, i64))> {
         let (a, h) = (self.anchor?, self.head?);
         let order = (a.1, a.0) <= (h.1, h.0);
-        if order {
-            Some((a, h))
-        } else {
-            Some((h, a))
-        }
+        if order { Some((a, h)) } else { Some((h, a)) }
     }
 }
 
@@ -620,7 +616,15 @@ pub fn build_term_grid(
 ) -> TermGrid {
     // Snapshot atlas geometry up-front so we don't hold the resource
     // borrow across the asset writes below.
-    let (atlas_cols, atlas_slot_w, atlas_slot_h, atlas_stride_w, atlas_stride_h, atlas_dim, atlas_image) = {
+    let (
+        atlas_cols,
+        atlas_slot_w,
+        atlas_slot_h,
+        atlas_stride_w,
+        atlas_stride_h,
+        atlas_dim,
+        atlas_image,
+    ) = {
         let atlas = world.resource::<GlyphAtlas>();
         (
             atlas.cols_per_row(),
@@ -655,11 +659,13 @@ pub fn build_term_grid(
         atlas_stride_w,
         atlas_stride_h,
     };
-    let material_handle = world.resource_mut::<Assets<TermMaterial>>().add(TermMaterial {
-        params,
-        atlas: atlas_image,
-        cells: cells_handle.clone(),
-    });
+    let material_handle = world
+        .resource_mut::<Assets<TermMaterial>>()
+        .add(TermMaterial {
+            params,
+            atlas: atlas_image,
+            cells: cells_handle.clone(),
+        });
 
     // `Rectangle` mesh is centered on its origin; shift it so top-left
     // lands at the content_root origin (matches where the cursor sprite
@@ -862,9 +868,7 @@ fn handle_keyboard(
         // forward-word, matching what macOS Terminal.app and iTerm2 do
         // for Option+arrow. We do this *before* the named-key branch
         // so the regular arrow encoding doesn't fire.
-        if alt
-            && matches!(ev.key_code, KeyCode::ArrowLeft | KeyCode::ArrowRight)
-        {
+        if alt && matches!(ev.key_code, KeyCode::ArrowLeft | KeyCode::ArrowRight) {
             out.push(0x1b);
             out.push(if matches!(ev.key_code, KeyCode::ArrowLeft) {
                 b'b'
@@ -1010,12 +1014,21 @@ fn handle_file_drop(
         let canvas_pt = viewport.window_to_canvas(pt);
         eprintln!(
             "[file-drop] dbg: pt=({:.1},{:.1}) canvas=({:.1},{:.1}) vp(origin=({:.1},{:.1}) pan=({:.1},{:.1}) zoom={:.3}) panes={:?}",
-            pt.x, pt.y, canvas_pt.x, canvas_pt.y,
-            viewport.origin.x, viewport.origin.y, viewport.pan.x, viewport.pan.y, viewport.zoom,
-            visible.iter().map(|(e, r)| (*e, r.pos.x, r.pos.y, r.size.x, r.size.y, r.z)).collect::<Vec<_>>()
+            pt.x,
+            pt.y,
+            canvas_pt.x,
+            canvas_pt.y,
+            viewport.origin.x,
+            viewport.origin.y,
+            viewport.pan.x,
+            viewport.pan.y,
+            viewport.zoom,
+            visible
+                .iter()
+                .map(|(e, r)| (*e, r.pos.x, r.pos.y, r.size.x, r.size.y, r.z))
+                .collect::<Vec<_>>()
         );
-        let Some(target) = jim_pane::topmost_pane_at(canvas_pt, &visible)
-        else {
+        let Some(target) = jim_pane::topmost_pane_at(canvas_pt, &visible) else {
             eprintln!(
                 "[file-drop] no terminal under cursor — ignoring drop of {}",
                 path_buf.display()
@@ -1130,53 +1143,335 @@ fn keycode_to_ctrl_byte(code: KeyCode) -> u8 {
 /// `handle_keyboard`.
 fn keycode_to_base_char(code: KeyCode, shift: bool) -> Option<char> {
     let ch = match code {
-        KeyCode::KeyA => if shift { 'A' } else { 'a' },
-        KeyCode::KeyB => if shift { 'B' } else { 'b' },
-        KeyCode::KeyC => if shift { 'C' } else { 'c' },
-        KeyCode::KeyD => if shift { 'D' } else { 'd' },
-        KeyCode::KeyE => if shift { 'E' } else { 'e' },
-        KeyCode::KeyF => if shift { 'F' } else { 'f' },
-        KeyCode::KeyG => if shift { 'G' } else { 'g' },
-        KeyCode::KeyH => if shift { 'H' } else { 'h' },
-        KeyCode::KeyI => if shift { 'I' } else { 'i' },
-        KeyCode::KeyJ => if shift { 'J' } else { 'j' },
-        KeyCode::KeyK => if shift { 'K' } else { 'k' },
-        KeyCode::KeyL => if shift { 'L' } else { 'l' },
-        KeyCode::KeyM => if shift { 'M' } else { 'm' },
-        KeyCode::KeyN => if shift { 'N' } else { 'n' },
-        KeyCode::KeyO => if shift { 'O' } else { 'o' },
-        KeyCode::KeyP => if shift { 'P' } else { 'p' },
-        KeyCode::KeyQ => if shift { 'Q' } else { 'q' },
-        KeyCode::KeyR => if shift { 'R' } else { 'r' },
-        KeyCode::KeyS => if shift { 'S' } else { 's' },
-        KeyCode::KeyT => if shift { 'T' } else { 't' },
-        KeyCode::KeyU => if shift { 'U' } else { 'u' },
-        KeyCode::KeyV => if shift { 'V' } else { 'v' },
-        KeyCode::KeyW => if shift { 'W' } else { 'w' },
-        KeyCode::KeyX => if shift { 'X' } else { 'x' },
-        KeyCode::KeyY => if shift { 'Y' } else { 'y' },
-        KeyCode::KeyZ => if shift { 'Z' } else { 'z' },
-        KeyCode::Digit1 => if shift { '!' } else { '1' },
-        KeyCode::Digit2 => if shift { '@' } else { '2' },
-        KeyCode::Digit3 => if shift { '#' } else { '3' },
-        KeyCode::Digit4 => if shift { '$' } else { '4' },
-        KeyCode::Digit5 => if shift { '%' } else { '5' },
-        KeyCode::Digit6 => if shift { '^' } else { '6' },
-        KeyCode::Digit7 => if shift { '&' } else { '7' },
-        KeyCode::Digit8 => if shift { '*' } else { '8' },
-        KeyCode::Digit9 => if shift { '(' } else { '9' },
-        KeyCode::Digit0 => if shift { ')' } else { '0' },
-        KeyCode::Minus => if shift { '_' } else { '-' },
-        KeyCode::Equal => if shift { '+' } else { '=' },
-        KeyCode::BracketLeft => if shift { '{' } else { '[' },
-        KeyCode::BracketRight => if shift { '}' } else { ']' },
-        KeyCode::Backslash => if shift { '|' } else { '\\' },
-        KeyCode::Semicolon => if shift { ':' } else { ';' },
-        KeyCode::Quote => if shift { '"' } else { '\'' },
-        KeyCode::Comma => if shift { '<' } else { ',' },
-        KeyCode::Period => if shift { '>' } else { '.' },
-        KeyCode::Slash => if shift { '?' } else { '/' },
-        KeyCode::Backquote => if shift { '~' } else { '`' },
+        KeyCode::KeyA => {
+            if shift {
+                'A'
+            } else {
+                'a'
+            }
+        }
+        KeyCode::KeyB => {
+            if shift {
+                'B'
+            } else {
+                'b'
+            }
+        }
+        KeyCode::KeyC => {
+            if shift {
+                'C'
+            } else {
+                'c'
+            }
+        }
+        KeyCode::KeyD => {
+            if shift {
+                'D'
+            } else {
+                'd'
+            }
+        }
+        KeyCode::KeyE => {
+            if shift {
+                'E'
+            } else {
+                'e'
+            }
+        }
+        KeyCode::KeyF => {
+            if shift {
+                'F'
+            } else {
+                'f'
+            }
+        }
+        KeyCode::KeyG => {
+            if shift {
+                'G'
+            } else {
+                'g'
+            }
+        }
+        KeyCode::KeyH => {
+            if shift {
+                'H'
+            } else {
+                'h'
+            }
+        }
+        KeyCode::KeyI => {
+            if shift {
+                'I'
+            } else {
+                'i'
+            }
+        }
+        KeyCode::KeyJ => {
+            if shift {
+                'J'
+            } else {
+                'j'
+            }
+        }
+        KeyCode::KeyK => {
+            if shift {
+                'K'
+            } else {
+                'k'
+            }
+        }
+        KeyCode::KeyL => {
+            if shift {
+                'L'
+            } else {
+                'l'
+            }
+        }
+        KeyCode::KeyM => {
+            if shift {
+                'M'
+            } else {
+                'm'
+            }
+        }
+        KeyCode::KeyN => {
+            if shift {
+                'N'
+            } else {
+                'n'
+            }
+        }
+        KeyCode::KeyO => {
+            if shift {
+                'O'
+            } else {
+                'o'
+            }
+        }
+        KeyCode::KeyP => {
+            if shift {
+                'P'
+            } else {
+                'p'
+            }
+        }
+        KeyCode::KeyQ => {
+            if shift {
+                'Q'
+            } else {
+                'q'
+            }
+        }
+        KeyCode::KeyR => {
+            if shift {
+                'R'
+            } else {
+                'r'
+            }
+        }
+        KeyCode::KeyS => {
+            if shift {
+                'S'
+            } else {
+                's'
+            }
+        }
+        KeyCode::KeyT => {
+            if shift {
+                'T'
+            } else {
+                't'
+            }
+        }
+        KeyCode::KeyU => {
+            if shift {
+                'U'
+            } else {
+                'u'
+            }
+        }
+        KeyCode::KeyV => {
+            if shift {
+                'V'
+            } else {
+                'v'
+            }
+        }
+        KeyCode::KeyW => {
+            if shift {
+                'W'
+            } else {
+                'w'
+            }
+        }
+        KeyCode::KeyX => {
+            if shift {
+                'X'
+            } else {
+                'x'
+            }
+        }
+        KeyCode::KeyY => {
+            if shift {
+                'Y'
+            } else {
+                'y'
+            }
+        }
+        KeyCode::KeyZ => {
+            if shift {
+                'Z'
+            } else {
+                'z'
+            }
+        }
+        KeyCode::Digit1 => {
+            if shift {
+                '!'
+            } else {
+                '1'
+            }
+        }
+        KeyCode::Digit2 => {
+            if shift {
+                '@'
+            } else {
+                '2'
+            }
+        }
+        KeyCode::Digit3 => {
+            if shift {
+                '#'
+            } else {
+                '3'
+            }
+        }
+        KeyCode::Digit4 => {
+            if shift {
+                '$'
+            } else {
+                '4'
+            }
+        }
+        KeyCode::Digit5 => {
+            if shift {
+                '%'
+            } else {
+                '5'
+            }
+        }
+        KeyCode::Digit6 => {
+            if shift {
+                '^'
+            } else {
+                '6'
+            }
+        }
+        KeyCode::Digit7 => {
+            if shift {
+                '&'
+            } else {
+                '7'
+            }
+        }
+        KeyCode::Digit8 => {
+            if shift {
+                '*'
+            } else {
+                '8'
+            }
+        }
+        KeyCode::Digit9 => {
+            if shift {
+                '('
+            } else {
+                '9'
+            }
+        }
+        KeyCode::Digit0 => {
+            if shift {
+                ')'
+            } else {
+                '0'
+            }
+        }
+        KeyCode::Minus => {
+            if shift {
+                '_'
+            } else {
+                '-'
+            }
+        }
+        KeyCode::Equal => {
+            if shift {
+                '+'
+            } else {
+                '='
+            }
+        }
+        KeyCode::BracketLeft => {
+            if shift {
+                '{'
+            } else {
+                '['
+            }
+        }
+        KeyCode::BracketRight => {
+            if shift {
+                '}'
+            } else {
+                ']'
+            }
+        }
+        KeyCode::Backslash => {
+            if shift {
+                '|'
+            } else {
+                '\\'
+            }
+        }
+        KeyCode::Semicolon => {
+            if shift {
+                ':'
+            } else {
+                ';'
+            }
+        }
+        KeyCode::Quote => {
+            if shift {
+                '"'
+            } else {
+                '\''
+            }
+        }
+        KeyCode::Comma => {
+            if shift {
+                '<'
+            } else {
+                ','
+            }
+        }
+        KeyCode::Period => {
+            if shift {
+                '>'
+            } else {
+                '.'
+            }
+        }
+        KeyCode::Slash => {
+            if shift {
+                '?'
+            } else {
+                '/'
+            }
+        }
+        KeyCode::Backquote => {
+            if shift {
+                '~'
+            } else {
+                '`'
+            }
+        }
         _ => return None,
     };
     Some(ch)
@@ -1302,9 +1597,14 @@ fn handle_terminal_content_press(
         if mouse_tracking_of(&store, ev.pane) && !ev.shift && !ev.force_local {
             continue;
         }
-        let Ok(rect) = rects.get(ev.pane) else { continue };
-        let viewport_cell =
-            pt_to_cell(viewport.window_to_canvas(ev.window_pt), rect, metrics.cell_width);
+        let Ok(rect) = rects.get(ev.pane) else {
+            continue;
+        };
+        let viewport_cell = pt_to_cell(
+            viewport.window_to_canvas(ev.window_pt),
+            rect,
+            metrics.cell_width,
+        );
         let cell = promote_to_absolute(viewport_cell, viewport_offset_of(&store, ev.pane));
         if let Ok(mut sel) = selections.get_mut(ev.pane) {
             sel.anchor = Some(cell);
@@ -1336,7 +1636,9 @@ fn handle_terminal_selection_drag(
         return;
     }
     let Ok(window) = windows.single() else { return };
-    let Some(pt) = window.cursor_position() else { return };
+    let Some(pt) = window.cursor_position() else {
+        return;
+    };
     let pt_canvas = viewport.window_to_canvas(pt);
 
     for (entity, rect, kind, mut sel) in &mut selections {
@@ -1465,9 +1767,8 @@ fn handle_terminal_mouse_report(
     // Shift or Fn (see `jim_pane::ForceLocalSelect`) both force local text
     // selection, so a press under either never starts an app mouse-report
     // gesture — the same override the content-press selection path honors.
-    let shift = keys.pressed(KeyCode::ShiftLeft)
-        || keys.pressed(KeyCode::ShiftRight)
-        || force_local.0;
+    let shift =
+        keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || force_local.0;
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
     let sup = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);
@@ -1502,8 +1803,8 @@ fn handle_terminal_mouse_report(
             term_entities.push(e);
         }
     }
-    let hovered = jim_pane::topmost_pane_at(canvas_pt, &all_panes)
-        .filter(|e| term_entities.contains(e));
+    let hovered =
+        jim_pane::topmost_pane_at(canvas_pt, &all_panes).filter(|e| term_entities.contains(e));
 
     let report = |pane: Entity, action: MouseAction, button: Option<MouseBtn>| {
         let Some((_, rect)) = all_panes.iter().find(|(e, _)| *e == pane) else {
@@ -1740,10 +2041,7 @@ fn sync_grid(
                 let wx = cx as f32 * metrics.cell_width;
                 let wy = -(cy as f32) * LINE_HEIGHT;
                 let wz = 1.0;
-                if t.translation.x != wx
-                    || t.translation.y != wy
-                    || t.translation.z != wz
-                {
+                if t.translation.x != wx || t.translation.y != wy || t.translation.z != wz {
                     t.translation.x = wx;
                     t.translation.y = wy;
                     t.translation.z = wz;
@@ -1766,11 +2064,7 @@ fn sync_grid(
         // Resize the GPU grid: replace the cells image + mesh + uniform
         // params. Cheap because there's only one of each per terminal.
         if pool_changed {
-            let bg_packed = pack_rgb(
-                theme_default_bg.0,
-                theme_default_bg.1,
-                theme_default_bg.2,
-            );
+            let bg_packed = pack_rgb(theme_default_bg.0, theme_default_bg.1, theme_default_bg.2);
             // Replace cells image in place — keep the same Handle so the
             // material doesn't need rebinding.
             if let Some(mut img) = images.get_mut(&grid.cells_image) {
@@ -1810,21 +2104,12 @@ fn sync_grid(
         // slow path produces exactly this value for such a cell.
         let blank_gpu = GpuCell {
             glyph_index: atlas.lookup_or_insert(' ', &mut images, &mut layouts),
-            fg_packed: pack_rgb(
-                theme_default_fg.0,
-                theme_default_fg.1,
-                theme_default_fg.2,
-            ),
-            bg_packed: pack_rgb(
-                theme_default_bg.0,
-                theme_default_bg.1,
-                theme_default_bg.2,
-            ),
+            fg_packed: pack_rgb(theme_default_fg.0, theme_default_fg.1, theme_default_fg.2),
+            bg_packed: pack_rgb(theme_default_bg.0, theme_default_bg.1, theme_default_bg.2),
             flags: 0,
         };
         for r in 0..rows as usize {
-            let row_dirty = force_all
-                || local_dirty_rows.get(r).copied().unwrap_or(true);
+            let row_dirty = force_all || local_dirty_rows.get(r).copied().unwrap_or(true);
             if !row_dirty {
                 continue;
             }
@@ -1862,26 +2147,23 @@ fn sync_grid(
                 // are visually identical to the user's intent, since
                 // the theme picks "the same color the shell would've
                 // shown" anyway.
-                let theme_fg =
-                    if final_fg.r == default_fg.r
-                        && final_fg.g == default_fg.g
-                        && final_fg.b == default_fg.b
-                    {
-                        theme_default_fg
-                    } else {
-                        (final_fg.r, final_fg.g, final_fg.b)
-                    };
-                let theme_bg =
-                    if final_bg.r == default_bg.r
-                        && final_bg.g == default_bg.g
-                        && final_bg.b == default_bg.b
-                    {
-                        theme_default_bg
-                    } else {
-                        (final_bg.r, final_bg.g, final_bg.b)
-                    };
-                let glyph_index =
-                    atlas.lookup_or_insert(cell.ch, &mut images, &mut layouts);
+                let theme_fg = if final_fg.r == default_fg.r
+                    && final_fg.g == default_fg.g
+                    && final_fg.b == default_fg.b
+                {
+                    theme_default_fg
+                } else {
+                    (final_fg.r, final_fg.g, final_fg.b)
+                };
+                let theme_bg = if final_bg.r == default_bg.r
+                    && final_bg.g == default_bg.g
+                    && final_bg.b == default_bg.b
+                {
+                    theme_default_bg
+                } else {
+                    (final_bg.r, final_bg.g, final_bg.b)
+                };
+                let glyph_index = atlas.lookup_or_insert(cell.ch, &mut images, &mut layouts);
                 let gpu = GpuCell {
                     glyph_index,
                     fg_packed: pack_rgb(theme_fg.0, theme_fg.1, theme_fg.2),
@@ -1928,9 +2210,7 @@ fn sync_grid(
         if needs_upload {
             if let Some(mut img) = images.get_mut(&grid.cells_image) {
                 let dst: &mut [GpuCell] = bytemuck::cast_slice_mut(
-                    img.data
-                        .as_mut()
-                        .expect("cells image must have CPU data"),
+                    img.data.as_mut().expect("cells image must have CPU data"),
                 );
                 for (idx, new_cell) in &pending_writes {
                     if let Some(slot) = dst.get_mut(*idx) {

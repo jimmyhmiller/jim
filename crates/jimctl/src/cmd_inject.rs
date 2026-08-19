@@ -47,7 +47,9 @@ fn terminals_path() -> Option<std::path::PathBuf> {
 }
 
 fn load_terminals() -> Vec<LiveTerminalEntry> {
-    let Some(p) = terminals_path() else { return vec![] };
+    let Some(p) = terminals_path() else {
+        return vec![];
+    };
     let Ok(bytes) = std::fs::read(&p) else {
         return vec![];
     };
@@ -80,7 +82,10 @@ fn resolve_session(args: &Args) -> Result<u64, String> {
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     let trimmed: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     if trimmed.len() % 2 != 0 {
-        return Err(format!("--bytes needs an even number of hex chars; got {}", trimmed.len()));
+        return Err(format!(
+            "--bytes needs an even number of hex chars; got {}",
+            trimmed.len()
+        ));
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
     for chunk in trimmed.as_bytes().chunks(2) {

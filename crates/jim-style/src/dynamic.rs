@@ -78,10 +78,7 @@ impl UserBuffer {
         // `Vec4`s, which are themselves four contiguous f32 values
         // (no padding). The total size is exactly USER_BUFFER_BYTES.
         unsafe {
-            std::slice::from_raw_parts_mut(
-                self.slots.as_mut_ptr() as *mut u8,
-                USER_BUFFER_BYTES,
-            )
+            std::slice::from_raw_parts_mut(self.slots.as_mut_ptr() as *mut u8, USER_BUFFER_BYTES)
         }
     }
 }
@@ -214,7 +211,9 @@ pub fn refresh_shader_schemas(
         if !allowed.contains(id) {
             continue;
         }
-        let Some(shader) = shaders.get(*id) else { continue };
+        let Some(shader) = shaders.get(*id) else {
+            continue;
+        };
         let source = match shader_source_str(shader) {
             Some(s) => s,
             None => continue,
@@ -250,8 +249,8 @@ fn shader_source_str(shader: &Shader) -> Option<String> {
 // ============================================================
 
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::visibility::RenderLayers;
 use bevy::camera::ClearColorConfig;
+use bevy::camera::visibility::RenderLayers;
 use bevy::image::Image;
 use bevy::mesh::Mesh2d;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -259,8 +258,8 @@ use bevy::sprite_render::{Material2dPlugin, MeshMaterial2d};
 
 use crate::material::STYLE_SOURCE;
 use crate::script_bridge::{
-    drain_script_msgs, fire_scheduled_events, EventBus, MaskOp, PaneRectSnap, PendingScriptOps,
-    ScriptSnapshot, UniformWrite,
+    EventBus, MaskOp, PaneRectSnap, PendingScriptOps, ScriptSnapshot, UniformWrite,
+    drain_script_msgs, fire_scheduled_events,
 };
 use crate::shader::ActiveProject;
 
@@ -318,11 +317,7 @@ impl Plugin for DynamicMaterialPlugin {
             .init_resource::<PendingScriptOps>()
             .add_systems(
                 Startup,
-                (
-                    ensure_bootstrap_dust_shader,
-                    spawn_overlay_camera,
-                )
-                    .chain(),
+                (ensure_bootstrap_dust_shader, spawn_overlay_camera).chain(),
             )
             .add_systems(
                 Update,
@@ -434,8 +429,12 @@ fn apply_uniform_writes(
 ) {
     let Some(e) = bg.0 else { return };
     let Ok(handle) = handles.get(e) else { return };
-    let Ok(bg_comp) = backgrounds.get(e) else { return };
-    let Some(mut material) = materials.get_mut(&handle.0) else { return };
+    let Ok(bg_comp) = backgrounds.get(e) else {
+        return;
+    };
+    let Some(mut material) = materials.get_mut(&handle.0) else {
+        return;
+    };
     let Some(schema) = schemas.get(bg_comp.shader.id()) else {
         // Schema not loaded yet — drop writes for this frame; script
         // will re-issue them next tick. (Avoids racing the shader's
@@ -468,8 +467,12 @@ fn apply_mask_ops(
 ) {
     let Some(e) = bg.0 else { return };
     let Ok(handle) = handles.get(e) else { return };
-    let Ok(bg_comp) = backgrounds.get(e) else { return };
-    let Some(mut material) = materials.get_mut(&handle.0) else { return };
+    let Ok(bg_comp) = backgrounds.get(e) else {
+        return;
+    };
+    let Some(mut material) = materials.get_mut(&handle.0) else {
+        return;
+    };
     let Some(schema) = schemas.get(bg_comp.shader.id()) else {
         pending.mask_ops.clear();
         return;
@@ -480,7 +483,13 @@ fn apply_mask_ops(
 
     for op in pending.mask_ops.drain(..) {
         match op {
-            MaskOp::Paint { name, x, y, radius, value } => {
+            MaskOp::Paint {
+                name,
+                x,
+                y,
+                radius,
+                value,
+            } => {
                 // Get-or-create the image for this (project, name).
                 let key = (project_id, name.clone());
                 let mask_handle = masks
@@ -549,7 +558,10 @@ fn refresh_snapshot(
             serde_json::json!([window.width() as f64, window.height() as f64]),
         );
         if let Some(c) = window.cursor_position() {
-            uniforms.insert("mouse_world".into(), serde_json::json!([c.x as f64, c.y as f64]));
+            uniforms.insert(
+                "mouse_world".into(),
+                serde_json::json!([c.x as f64, c.y as f64]),
+            );
         }
     }
     if let Some(e) = focused.0
@@ -639,7 +651,9 @@ fn paint_brush(image: &mut Image, x: f32, y: f32, radius: f32, value: f32, win_s
     let x_hi = (cx + r).min(w - 1);
     let y_lo = (cy - r).max(0);
     let y_hi = (cy + r).min(h - 1);
-    let Some(data) = image.data.as_mut() else { return };
+    let Some(data) = image.data.as_mut() else {
+        return;
+    };
     let target = (value.clamp(0.0, 1.0) * 255.0) as u8;
     for y in y_lo..=y_hi {
         let row = (y * w) as usize * 4;

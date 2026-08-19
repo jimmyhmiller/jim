@@ -62,7 +62,11 @@ fn main() {
                     ev.ts,
                     escape(&ev.terminal_session_id),
                     ev.claude_pid,
-                    if ev.payload_json.is_empty() { "null" } else { &ev.payload_json },
+                    if ev.payload_json.is_empty() {
+                        "null"
+                    } else {
+                        &ev.payload_json
+                    },
                 );
                 let _ = writeln!(out, "{}", line);
                 let _ = out.flush();

@@ -321,7 +321,12 @@ fn freedraw_up_left_tracks_cursor_and_does_not_select() {
     }
     ed.handle(up(path[4].0, path[4].1));
 
-    let el = ed.scene().iter_live().last().expect("stroke exists").clone();
+    let el = ed
+        .scene()
+        .iter_live()
+        .last()
+        .expect("stroke exists")
+        .clone();
     let pts = match &el.kind {
         ElementKind::Freedraw(f) => &f.points,
         other => panic!("expected freedraw, got {other:?}"),
@@ -336,7 +341,10 @@ fn freedraw_up_left_tracks_cursor_and_does_not_select() {
         );
     }
     // The pen must not leave a selection (no bounding-box overlay).
-    assert!(ed.selection().is_empty(), "pen stroke should not auto-select");
+    assert!(
+        ed.selection().is_empty(),
+        "pen stroke should not auto-select"
+    );
 }
 
 /// A single-tap freedraw "dot" (zero-size bounding box) can be erased — it has

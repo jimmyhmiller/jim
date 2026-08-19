@@ -35,16 +35,16 @@ use editor_core::selection::{Range, Selection};
 use editor_core::state::EditorState;
 use editor_core::transaction::{Change, Transaction};
 use jim_pane::{
-    spawn_pane, FocusedPane, PaneChrome, PaneContentPressed, PaneFont, PaneKindMarker,
-    PanePlugin, PaneRect, PaneRegistry, PaneTag, SpawnedPane, MARGIN, TITLE_H,
+    FocusedPane, MARGIN, PaneChrome, PaneContentPressed, PaneFont, PaneKindMarker, PanePlugin,
+    PaneRect, PaneRegistry, PaneTag, SpawnedPane, TITLE_H, spawn_pane,
 };
 use serde_json::Value;
 
 pub mod highlight;
 pub mod markdown;
 pub mod wrap;
-use highlight::{color_for, Highlighter, SyntaxPalette};
-use markdown::{wysiwyg_active, MarkdownMode, MdLayout};
+use highlight::{Highlighter, SyntaxPalette, color_for};
+use markdown::{MarkdownMode, MdLayout, wysiwyg_active};
 
 pub const FONT_SIZE: f32 = 16.0;
 pub const LINE_HEIGHT: f32 = 20.0;
@@ -189,7 +189,10 @@ impl Plugin for EditorEmbedPlugin {
             .add_message::<EmbeddedEditorRelease>()
             .add_message::<EmbeddedEditorScroll>()
             .add_message::<EmbeddedEditorSubmit>()
-            .add_systems(Startup, (register_editor_kind, markdown::setup_markdown_fonts))
+            .add_systems(
+                Startup,
+                (register_editor_kind, markdown::setup_markdown_fonts),
+            )
             .add_systems(
                 Update,
                 (
@@ -255,10 +258,7 @@ impl Plugin for EditorPlugin {
             unfocused_mode: bevy::winit::UpdateMode::Continuous,
         })
         .insert_resource(ClearColor(Color::srgb(0.10, 0.11, 0.13)))
-        .add_systems(
-            Startup,
-            (setup_editor_camera, setup_editor_font),
-        )
+        .add_systems(Startup, (setup_editor_camera, setup_editor_font))
         .add_systems(PostStartup, release_os_focus)
         .add_plugins(PanePlugin::default())
         .add_plugins(EditorEmbedPlugin);
@@ -341,7 +341,9 @@ pub fn setup_editor_font(
     // ordering is unreliable across plugins, so push entries from here
     // too. `ensure_initialized` is idempotent.
     jim_style::fonts::ensure_initialized(&mut registry, &mut fonts);
-    let mono_name = theme.str_value(jim_style::tokens::FONT_FAMILY_MONO).to_string();
+    let mono_name = theme
+        .str_value(jim_style::tokens::FONT_FAMILY_MONO)
+        .to_string();
     let font = registry.resolve(&mono_name);
     let measure_bytes = registry.bytes(&mono_name).unwrap_or(EMBEDDED_FONT);
     commands.insert_resource(EditorFont(font.clone()));
@@ -393,11 +395,8 @@ fn populate_editor_pane(
 ) {
     world.entity_mut(entity).insert((
         EditorStateComp(
-            EditorState::new(
-                ropey::Rope::from_str(initial_text),
-                Selection::cursor(0),
-            )
-            .with_indent_unit("    "),
+            EditorState::new(ropey::Rope::from_str(initial_text), Selection::cursor(0))
+                .with_indent_unit("    "),
         ),
         EditorHighlighter(Highlighter::new()),
         LineRows::default(),
@@ -441,7 +440,12 @@ pub struct EditorCaret(pub Entity);
 /// Registry callback — invoked by pane-bevy on restore. The config
 /// blob is whatever `editor_snapshot` produced (currently `{ text,
 /// path }`).
-fn editor_spawn_from_config(world: &mut World, entity: Entity, content_root: Entity, config: &Value) {
+fn editor_spawn_from_config(
+    world: &mut World,
+    entity: Entity,
+    content_root: Entity,
+    config: &Value,
+) {
     let text = config
         .get("text")
         .and_then(|v| v.as_str())
@@ -460,9 +464,10 @@ fn editor_spawn_from_config(world: &mut World, entity: Entity, content_root: Ent
     // wins for path-backed panes too (a snapshot always records the
     // effective state).
     if let Some(enabled) = config.get("markdown").and_then(|v| v.as_bool()) {
-        world
-            .entity_mut(entity)
-            .insert(MarkdownMode { enabled, raw: false });
+        world.entity_mut(entity).insert(MarkdownMode {
+            enabled,
+            raw: false,
+        });
     }
     // Optional pane-title override (a scratch doc has no filename to
     // show, so the caller names it).
@@ -549,7 +554,7 @@ pub fn build_app(initial: &str) -> App {
             );
             world.resource_mut::<FocusedPane>().0 = Some(e);
         })
-            .after(setup_editor_font),
+        .after(setup_editor_font),
     );
     app
 }
@@ -774,9 +779,7 @@ fn sync_editor_lines(
             Some(entity) => {
                 let content_changed = line_q
                     .get(entity)
-                    .map(|lr| {
-                        lr.text != slice || lr.rev != hl.rev || lr.palette_rev != palette.rev
-                    })
+                    .map(|lr| lr.text != slice || lr.rev != hl.rev || lr.palette_rev != palette.rev)
                     .unwrap_or(true);
                 // Invariant: a pooled, visible, non-empty row must own its
                 // glyph spans. If it somehow lost them (e.g. a transient
@@ -785,10 +788,7 @@ fn sync_editor_lines(
                 // so the row would render blank forever until the next real
                 // edit. Detect the empty-children case and force a rebuild
                 // so the portal can never get stuck blank.
-                let spans_missing = children_q
-                    .get(entity)
-                    .map(|c| c.is_empty())
-                    .unwrap_or(true);
+                let spans_missing = children_q.get(entity).map(|c| c.is_empty()).unwrap_or(true);
                 if spans_missing && !content_changed {
                     eprintln!(
                         "[editor] repaired blank row {row} (spans lost; doc unchanged) \
@@ -923,15 +923,13 @@ fn sync_content_root(
 fn sync_caret(
     metrics: Res<EditorMetrics>,
     theme: Res<jim_style::Theme>,
-    editors: Query<
-        (
-            &EditorStateComp,
-            &EditorView,
-            &EditorScroll,
-            Option<&EditorWrapLayout>,
-            Option<&MarkdownMode>,
-        ),
-    >,
+    editors: Query<(
+        &EditorStateComp,
+        &EditorView,
+        &EditorScroll,
+        Option<&EditorWrapLayout>,
+        Option<&MarkdownMode>,
+    )>,
     carets: Query<(Entity, &EditorCaret)>,
     mut t_q: Query<&mut Transform>,
     mut vis_q: Query<&mut Visibility>,
@@ -995,15 +993,13 @@ pub fn char_to_line_col(doc: &ropey::Rope, char_idx: usize) -> (usize, usize) {
 fn sync_selection(
     metrics: Res<EditorMetrics>,
     theme: Res<jim_style::Theme>,
-    editors: Query<
-        (
-            Entity,
-            &EditorStateComp,
-            &EditorView,
-            Option<&EditorWrapLayout>,
-            Option<&MarkdownMode>,
-        ),
-    >,
+    editors: Query<(
+        Entity,
+        &EditorStateComp,
+        &EditorView,
+        Option<&EditorWrapLayout>,
+        Option<&MarkdownMode>,
+    )>,
     existing: Query<(Entity, &SelRect)>,
     mut commands: Commands,
 ) {
@@ -1032,7 +1028,11 @@ fn sync_selection(
             let line_chars = line_char_len(rope, line);
             // Selected column range on this logical line.
             let lo = if line == start_line { start_col } else { 0 };
-            let hi = if line == end_line { end_col } else { line_chars };
+            let hi = if line == end_line {
+                end_col
+            } else {
+                line_chars
+            };
             // A line strictly before the selection end also selects its
             // trailing newline — show a small nub past the line's end.
             let ends_mid_doc = line < end_line;
@@ -1147,7 +1147,9 @@ fn handle_scroll(
         return;
     }
     let Ok(win) = windows.single() else { return };
-    let Some(pt) = win.cursor_position() else { return };
+    let Some(pt) = win.cursor_position() else {
+        return;
+    };
 
     // Topmost pane of ANY kind under the cursor. Bail if it isn't an
     // editor — otherwise scrolling on a widget/terminal that happens
@@ -1157,8 +1159,7 @@ fn handle_scroll(
         .filter(|(_, _, vis)| !matches!(vis, Some(Visibility::Hidden)))
         .map(|(e, r, _)| (e, *r))
         .collect();
-    let Some(editor) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &all_rects)
-    else {
+    let Some(editor) = jim_pane::topmost_pane_at(viewport.window_to_canvas(pt), &all_rects) else {
         return;
     };
     let Ok((_, _, _, _, kind, _, _, _)) = editors.get(editor) else {
@@ -1414,7 +1415,12 @@ fn handle_input(
                 }
             }
         } else if let Some(layout) = wrap_layout {
-            ensure_caret_visible(state, content_area_size_zoomed(rect, zoom), &mut scroll, &layout.0);
+            ensure_caret_visible(
+                state,
+                content_area_size_zoomed(rect, zoom),
+                &mut scroll,
+                &layout.0,
+            );
         }
     }
     let _ = metrics;
@@ -1592,7 +1598,9 @@ fn handle_text_select_drag(
         return;
     }
     let Ok(window) = windows.single() else { return };
-    let Some(pt) = window.cursor_position() else { return };
+    let Some(pt) = window.cursor_position() else {
+        return;
+    };
     let pt_canvas = viewport.window_to_canvas(pt);
 
     for (mut state_comp, rect, scroll, drag, kind, layout, md, md_layout) in &mut editors {
@@ -1603,8 +1611,7 @@ fn handle_text_select_drag(
         let local = jim_pane::pt_to_content_local(pt_canvas, rect);
         let head = if wysiwyg_active(md) {
             let Some(md_layout) = md_layout else { continue };
-            markdown::offset_at_point(md_layout, local.x, local.y + scroll.y)
-                .unwrap_or(anchor)
+            markdown::offset_at_point(md_layout, local.x, local.y + scroll.y).unwrap_or(anchor)
         } else {
             let Some(layout) = layout else { continue };
             let row = ((local.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;

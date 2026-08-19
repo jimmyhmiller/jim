@@ -15,6 +15,9 @@ fn main() {
 
 fn log_events(mut ev: MessageReader<claude_bus_bevy::ClaudeBusEvent>) {
     for e in ev.read() {
-        eprintln!("[probe] seq={} kind={} sess={:?}", e.seq, e.kind, e.terminal_session_id);
+        eprintln!(
+            "[probe] seq={} kind={} sess={:?}",
+            e.seq, e.kind, e.terminal_session_id
+        );
     }
 }

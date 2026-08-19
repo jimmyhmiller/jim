@@ -30,11 +30,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use nix::pty::{openpty, OpenptyResult, Winsize};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{setsid, Pid};
+use nix::pty::{OpenptyResult, Winsize, openpty};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{Pid, setsid};
 
-use crate::proto::{decode, encode, ClientMessage, DaemonMessage};
+use crate::proto::{ClientMessage, DaemonMessage, decode, encode};
 
 /// Rolling history buffer cap. When exceeded, oldest bytes are dropped.
 /// Sized to cover typical scrollback (libghostty caps at 100k lines,
@@ -157,8 +157,7 @@ fn spawn_in_pty(
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let OpenptyResult { master, slave } =
-        openpty(&winsize, None).map_err(std::io::Error::from)?;
+    let OpenptyResult { master, slave } = openpty(&winsize, None).map_err(std::io::Error::from)?;
     let master_fd = master.as_raw_fd();
     let slave_fd = slave.as_raw_fd();
 
@@ -615,16 +614,20 @@ fn run_loop(session_id: u64, command: Vec<String>) -> std::io::Result<()> {
             None
         };
 
-        let has_drainable_work =
-            !state.send_buf.is_empty() || state.replay_offset.is_some();
+        let has_drainable_work = !state.send_buf.is_empty() || state.replay_offset.is_some();
         let timeout_ms = if has_drainable_work && state.client.is_some() {
             1
         } else {
             500
         };
 
-        let poll_ret =
-            unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms) };
+        let poll_ret = unsafe {
+            libc::poll(
+                pollfds.as_mut_ptr(),
+                pollfds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
         if poll_ret < 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::Interrupted {

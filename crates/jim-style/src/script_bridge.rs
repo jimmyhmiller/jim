@@ -12,7 +12,7 @@
 //! frame — no blocking, no waiting on a reply.
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Mutex, OnceLock, RwLock, Arc};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use bevy::prelude::*;
 use serde_json::Value;
@@ -213,12 +213,7 @@ pub fn register_script_host_fns_funct(vm: &mut funct::Funct) {
         let Some(snap) = snapshot() else {
             return Ok(V::Unit);
         };
-        Ok(snap.read(|d| {
-            d.uniforms
-                .get(&name)
-                .map(V::from_json)
-                .unwrap_or(V::Unit)
-        }))
+        Ok(snap.read(|d| d.uniforms.get(&name).map(V::from_json).unwrap_or(V::Unit)))
     });
 
     // ---- mask_paint / mask_fill / mask_clear ----
@@ -293,10 +288,14 @@ pub fn register_script_host_fns_funct(vm: &mut funct::Funct) {
 
     // ---- OkLCh / OkLab color helpers (hex, matching the funct surface) ----
     vm.register3("oklch", |l: f64, c: f64, h: f64| -> String {
-        linear_rgba_to_hex(crate::oklab::oklch_to_linear_srgb(l as f32, c as f32, h as f32))
+        linear_rgba_to_hex(crate::oklab::oklch_to_linear_srgb(
+            l as f32, c as f32, h as f32,
+        ))
     });
     vm.register3("oklab", |l: f64, a: f64, b: f64| -> String {
-        linear_rgba_to_hex(crate::oklab::oklab_to_linear_srgb(l as f32, a as f32, b as f32))
+        linear_rgba_to_hex(crate::oklab::oklab_to_linear_srgb(
+            l as f32, a as f32, b as f32,
+        ))
     });
 
     // ---- theme_contrast(a, b) → OkLab L difference [0, 100] ----
@@ -369,14 +368,34 @@ pub fn drain_script_msgs(
     while let Ok(msg) = rx.try_recv() {
         match msg {
             DynamicMsg::SetUniformF32(n, v) => pending.uniform_writes.push(UniformWrite::F32(n, v)),
-            DynamicMsg::SetUniformVec2(n, v) => pending.uniform_writes.push(UniformWrite::Vec2(n, v)),
-            DynamicMsg::SetUniformVec4(n, v) => pending.uniform_writes.push(UniformWrite::Vec4(n, v)),
-            DynamicMsg::MaskPaint { name, x, y, radius, value } => {
-                pending.mask_ops.push(MaskOp::Paint { name, x, y, radius, value });
+            DynamicMsg::SetUniformVec2(n, v) => {
+                pending.uniform_writes.push(UniformWrite::Vec2(n, v))
+            }
+            DynamicMsg::SetUniformVec4(n, v) => {
+                pending.uniform_writes.push(UniformWrite::Vec4(n, v))
+            }
+            DynamicMsg::MaskPaint {
+                name,
+                x,
+                y,
+                radius,
+                value,
+            } => {
+                pending.mask_ops.push(MaskOp::Paint {
+                    name,
+                    x,
+                    y,
+                    radius,
+                    value,
+                });
             }
             DynamicMsg::MaskFill(n, v) => pending.mask_ops.push(MaskOp::Fill(n, v)),
             DynamicMsg::Emit(k, p) => bus.push(k, p),
-            DynamicMsg::Schedule { delay_secs, kind, payload } => {
+            DynamicMsg::Schedule {
+                delay_secs,
+                kind,
+                payload,
+            } => {
                 scheduled.items.push(ScheduledEvent {
                     fire_at: time.elapsed_secs() + delay_secs.max(0.0),
                     kind,

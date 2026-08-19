@@ -74,7 +74,10 @@ fn parse_flags(args: &[String]) -> (Vec<(String, String)>, Vec<String>) {
 }
 
 fn get<'a>(named: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    named.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    named
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 fn cmd_emit(args: &[String]) -> ExitCode {

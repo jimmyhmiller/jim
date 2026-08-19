@@ -17,9 +17,7 @@
 //! holds.
 
 use ahash::AHashMap;
-use flame_core::{
-    CategoryId, LoadError, LoadResult, ProfileBuilder, TraceSource, TrackKind,
-};
+use flame_core::{CategoryId, LoadError, LoadResult, ProfileBuilder, TraceSource, TrackKind};
 use serde::Deserialize;
 
 pub struct OtelSource;
@@ -175,7 +173,11 @@ impl TraceSource for OtelSource {
             .iter()
             .enumerate()
             .map(|(i, ix)| {
-                let min = ix.iter().map(|&j| spans[j].start_epoch_nanos).min().unwrap_or(0);
+                let min = ix
+                    .iter()
+                    .map(|&j| spans[j].start_epoch_nanos)
+                    .min()
+                    .unwrap_or(0);
                 (i, min)
             })
             .collect();
@@ -248,16 +250,11 @@ impl TraceSource for OtelSource {
                 let start_ns = s.start_epoch_nanos.saturating_sub(t0);
                 // OTel spans with start == end (instant events) get a 1ns
                 // floor so they're still visible/picky.
-                let dur_ns = s
-                    .end_epoch_nanos
-                    .saturating_sub(s.start_epoch_nanos)
-                    .max(1);
+                let dur_ns = s.end_epoch_nanos.saturating_sub(s.start_epoch_nanos).max(1);
                 let end_ns = start_ns + dur_ns;
 
                 let mut depth = tree_depth[k] as usize;
-                while depth < last_end_per_depth.len()
-                    && last_end_per_depth[depth] > start_ns
-                {
+                while depth < last_end_per_depth.len() && last_end_per_depth[depth] > start_ns {
                     depth += 1;
                 }
                 if depth >= last_end_per_depth.len() {
@@ -397,7 +394,9 @@ fn resolve_depth(
     let gi = span_ix[k];
     let depth = match spans[gi].parent_span_id.as_deref() {
         Some(p) => match local.get(p) {
-            Some(&pk) if pk != k => resolve_depth(pk, span_ix, spans, local, memo).saturating_add(1),
+            Some(&pk) if pk != k => {
+                resolve_depth(pk, span_ix, spans, local, memo).saturating_add(1)
+            }
             _ => 0,
         },
         None => 0,
@@ -453,13 +452,13 @@ mod tests {
         OtelSource.load(input, &mut b).unwrap();
         let p = b.finish();
         assert_eq!(p.slices.len(), 2);
-        assert_eq!(p.tracks.len(), 1, "both spans should land on the trace's single track");
+        assert_eq!(
+            p.tracks.len(),
+            1,
+            "both spans should land on the trace's single track"
+        );
         // Two services -> two categories (plus the default "otel" + builder's "default").
-        let svc_names: Vec<&str> = p
-            .categories
-            .iter()
-            .map(|c| p.strings.get(c.name))
-            .collect();
+        let svc_names: Vec<&str> = p.categories.iter().map(|c| p.strings.get(c.name)).collect();
         assert!(svc_names.contains(&"a"));
         assert!(svc_names.contains(&"b"));
     }
@@ -528,7 +527,11 @@ mod tests {
 
         assert_eq!(client_at(0), "c1");
         assert_eq!(client_at(1), "c1", "mid inherits client from root");
-        assert_eq!(client_at(2), "c1", "leaf inherits client from root (not set on leaf)");
+        assert_eq!(
+            client_at(2),
+            "c1",
+            "leaf inherits client from root (not set on leaf)"
+        );
     }
 
     #[test]

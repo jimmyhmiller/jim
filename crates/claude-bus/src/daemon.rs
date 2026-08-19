@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::proto::{decode, encode, BusFrame, ClientFrame, Role};
+use crate::proto::{BusFrame, ClientFrame, Role, decode, encode};
 
 /// Cap on retained events for replay. ~4 KB per event × 4096 ≈ 16 MB
 /// worst case, well under the JSONL file we'd be replaying from anyway.
@@ -62,8 +62,12 @@ struct Stored {
 
 enum ConnState {
     /// Hello not yet received.
-    Anonymous { recv_buf: Vec<u8> },
-    Publisher { recv_buf: Vec<u8> },
+    Anonymous {
+        recv_buf: Vec<u8>,
+    },
+    Publisher {
+        recv_buf: Vec<u8>,
+    },
     Subscriber {
         send_buf: Vec<u8>,
         /// Index into the ring while replaying; `None` once caught up
@@ -153,9 +157,8 @@ impl Daemon {
                 });
             }
 
-            let ret = unsafe {
-                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 1000)
-            };
+            let ret =
+                unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 1000) };
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() != std::io::ErrorKind::Interrupted {
@@ -172,7 +175,9 @@ impl Daemon {
                             let _ = s.set_nonblocking(true);
                             self.conns.push(Conn {
                                 stream: s,
-                                state: ConnState::Anonymous { recv_buf: Vec::new() },
+                                state: ConnState::Anonymous {
+                                    recv_buf: Vec::new(),
+                                },
                             });
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -282,7 +287,9 @@ impl Daemon {
                         // Hello — they're the first Publish frame(s).
                         let recv_buf = match std::mem::replace(
                             &mut self.conns[i].state,
-                            ConnState::Anonymous { recv_buf: Vec::new() },
+                            ConnState::Anonymous {
+                                recv_buf: Vec::new(),
+                            },
                         ) {
                             ConnState::Anonymous { recv_buf } => recv_buf,
                             _ => Vec::new(),
@@ -481,7 +488,11 @@ pub fn daemonize_if_requested() {
     if pid > 0 {
         std::process::exit(0);
     }
-    if let Ok(devnull) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null") {
+    if let Ok(devnull) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+    {
         let fd = devnull.as_raw_fd();
         unsafe {
             libc::dup2(fd, 0);
@@ -490,7 +501,11 @@ pub fn daemonize_if_requested() {
         }
     }
     if let Some(path) = std::env::var_os("CLAUDE_BUS_LOG") {
-        if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let fd = f.as_raw_fd();
             unsafe {
                 libc::dup2(fd, 2);

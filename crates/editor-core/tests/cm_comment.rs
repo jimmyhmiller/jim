@@ -2,8 +2,8 @@
 //! Block-comment + multi-language tests deferred (block needs language config).
 
 use editor_core::comment::{
-    block_comment, block_uncomment, line_comment, line_uncomment, toggle_block_comment,
-    toggle_block_comment_by_line, toggle_line_comment, CommentTokens,
+    CommentTokens, block_comment, block_uncomment, line_comment, line_uncomment,
+    toggle_block_comment, toggle_block_comment_by_line, toggle_line_comment,
 };
 use editor_core::state::EditorState;
 use editor_core::test_dsl::{parse_comment_dsl, render_comment_dsl};
@@ -100,7 +100,13 @@ mod line_comments_slash {
 
     #[test]
     fn toggles_when_cursor_at_beginning_of_line() {
-        check_chain(K, &["line 1\n  |line 2\nline 3\n", "line 1\n  // |line 2\nline 3\n"]);
+        check_chain(
+            K,
+            &[
+                "line 1\n  |line 2\nline 3\n",
+                "line 1\n  // |line 2\nline 3\n",
+            ],
+        );
     }
 
     #[test]
@@ -152,10 +158,7 @@ mod line_comments_slash {
 
         check_chain(
             K,
-            &[
-                "\n|\n  // line 2\n    | \n",
-                "\n|\n  line 2\n    | \n",
-            ],
+            &["\n|\n  // line 2\n    | \n", "\n|\n  line 2\n    | \n"],
         );
 
         check_chain(K, &["\n|\n\n    | \n", "\n|\n\n    | \n"]);
@@ -181,10 +184,7 @@ mod line_comments_slash {
     fn doesnt_include_lines_in_which_a_selection_range_ends() {
         check_chain(
             K,
-            &[
-                "line| 1\nline 2\n|line 3",
-                "// line| 1\n// line 2\n|line 3",
-            ],
+            &["line| 1\nline 2\n|line 3", "// line| 1\n// line 2\n|line 3"],
         );
     }
 
@@ -217,7 +217,11 @@ where
         }
         let expected_idx = if i == docs.len() { docs.len() - 2 } else { i };
         let expected = s_block(docs[expected_idx], open, close);
-        assert_eq!(state.doc.to_string(), expected.doc.to_string(), "step {i} doc");
+        assert_eq!(
+            state.doc.to_string(),
+            expected.doc.to_string(),
+            "step {i} doc"
+        );
         assert_eq!(
             render_comment_dsl(&state),
             render_comment_dsl(&expected),
@@ -296,10 +300,7 @@ mod block_comments_c_style {
         check_block_chain(
             O,
             C,
-            &[
-                "on|e\nt|w|o\nth|ree",
-                "/* on|e\nt|w|o\nth|ree */",
-            ],
+            &["on|e\nt|w|o\nth|ree", "/* on|e\nt|w|o\nth|ree */"],
             toggle_block_comment_by_line,
         );
     }
@@ -440,7 +441,13 @@ mod line_comments_hash {
 
     #[test]
     fn toggles_when_cursor_at_beginning_of_line() {
-        check_chain(K, &["line 1\n  |line 2\nline 3\n", "line 1\n  # |line 2\nline 3\n"]);
+        check_chain(
+            K,
+            &[
+                "line 1\n  |line 2\nline 3\n",
+                "line 1\n  # |line 2\nline 3\n",
+            ],
+        );
     }
 
     #[test]

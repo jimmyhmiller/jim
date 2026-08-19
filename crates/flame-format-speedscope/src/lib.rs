@@ -90,7 +90,9 @@ impl TraceSource for SpeedscopeSource {
     fn detect(&self, input: &[u8], filename: Option<&str>) -> bool {
         let head: &[u8] = &input[..input.len().min(8192)];
         let s = std::str::from_utf8(head).unwrap_or("");
-        if s.contains("speedscope.app/file-format") || s.contains("\"shared\"") && s.contains("\"profiles\"") {
+        if s.contains("speedscope.app/file-format")
+            || s.contains("\"shared\"") && s.contains("\"profiles\"")
+        {
             return true;
         }
         if let Some(name) = filename {
@@ -118,17 +120,40 @@ impl TraceSource for SpeedscopeSource {
         for (i, p) in file.profiles.iter().enumerate() {
             match p {
                 Profile::Evented {
-                    name, unit, start_value, end_value: _, events,
+                    name,
+                    unit,
+                    start_value,
+                    end_value: _,
+                    events,
                 } => {
                     load_evented(
-                        builder, process, i, name.as_deref(), unit, *start_value, events, &frame_map,
+                        builder,
+                        process,
+                        i,
+                        name.as_deref(),
+                        unit,
+                        *start_value,
+                        events,
+                        &frame_map,
                     )?;
                 }
                 Profile::Sampled {
-                    name, unit, start_value: _, end_value: _, samples, weights,
+                    name,
+                    unit,
+                    start_value: _,
+                    end_value: _,
+                    samples,
+                    weights,
                 } => {
                     load_sampled(
-                        builder, process, i, name.as_deref(), unit, samples, weights, &frame_map,
+                        builder,
+                        process,
+                        i,
+                        name.as_deref(),
+                        unit,
+                        samples,
+                        weights,
+                        &frame_map,
                     )?;
                 }
             }
@@ -157,7 +182,9 @@ fn track_for_profile(
     profile_idx: usize,
     name: Option<&str>,
 ) -> TrackId {
-    let label = name.map(String::from).unwrap_or_else(|| format!("profile {profile_idx}"));
+    let label = name
+        .map(String::from)
+        .unwrap_or_else(|| format!("profile {profile_idx}"));
     let thread = builder.add_thread(Some(process), profile_idx as i64, &label);
     builder.add_track(TrackKind::Thread(thread), &label, None)
 }
@@ -253,7 +280,16 @@ fn load_sampled(
         // Close runs deeper than common_prefix.
         for depth in (common_prefix..prev_run.len()).rev() {
             let (frame_idx, start_ns) = prev_run[depth];
-            emit_run(builder, track, depth as u16, frame_idx, frame_map, start_ns, t_ns, category);
+            emit_run(
+                builder,
+                track,
+                depth as u16,
+                frame_idx,
+                frame_map,
+                start_ns,
+                t_ns,
+                category,
+            );
         }
         prev_run.truncate(common_prefix);
 
@@ -268,7 +304,16 @@ fn load_sampled(
     // Close any remaining runs at the end timestamp.
     for depth in (0..prev_run.len()).rev() {
         let (frame_idx, start_ns) = prev_run[depth];
-        emit_run(builder, track, depth as u16, frame_idx, frame_map, start_ns, t_ns, category);
+        emit_run(
+            builder,
+            track,
+            depth as u16,
+            frame_idx,
+            frame_map,
+            start_ns,
+            t_ns,
+            category,
+        );
     }
     Ok(())
 }
@@ -283,9 +328,19 @@ fn emit_run(
     end_ns: u64,
     category: flame_core::CategoryId,
 ) {
-    let Some(&fid) = frame_map.get(frame_idx as usize) else { return };
+    let Some(&fid) = frame_map.get(frame_idx as usize) else {
+        return;
+    };
     let name = builder.stacks_frame_name(fid);
-    builder.add_complete_slice(track, depth, start_ns, end_ns - start_ns, name, category, None);
+    builder.add_complete_slice(
+        track,
+        depth,
+        start_ns,
+        end_ns - start_ns,
+        name,
+        category,
+        None,
+    );
 }
 
 #[cfg(test)]

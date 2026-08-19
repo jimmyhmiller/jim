@@ -8,7 +8,10 @@ pub struct Range {
 
 impl Range {
     pub fn cursor(pos: usize) -> Self {
-        Self { anchor: pos, head: pos }
+        Self {
+            anchor: pos,
+            head: pos,
+        }
     }
 
     pub fn new(anchor: usize, head: usize) -> Self {
@@ -36,7 +39,10 @@ pub struct Selection {
 
 impl Selection {
     pub fn single(range: Range) -> Self {
-        Self { ranges: vec![range], primary: 0 }
+        Self {
+            ranges: vec![range],
+            primary: 0,
+        }
     }
 
     pub fn cursor(pos: usize) -> Self {
@@ -74,8 +80,7 @@ impl Selection {
             let r_forward = r.head >= r.anchor;
             let merge = match groups.last() {
                 Some(g) => {
-                    r.from() < g.to
-                        || (r.from() == g.to && (g.from == g.to || r.is_empty()))
+                    r.from() < g.to || (r.from() == g.to && (g.from == g.to || r.is_empty()))
                 }
                 None => false,
             };
@@ -104,13 +109,22 @@ impl Selection {
             .into_iter()
             .map(|g| {
                 if g.last_forward {
-                    Range { anchor: g.from, head: g.to }
+                    Range {
+                        anchor: g.from,
+                        head: g.to,
+                    }
                 } else {
-                    Range { anchor: g.to, head: g.from }
+                    Range {
+                        anchor: g.to,
+                        head: g.from,
+                    }
                 }
             })
             .collect();
-        Self { ranges: new_ranges, primary: new_primary }
+        Self {
+            ranges: new_ranges,
+            primary: new_primary,
+        }
     }
 
     pub fn primary_range(&self) -> Range {
@@ -129,6 +143,9 @@ impl Selection {
             .iter()
             .map(|r| Range::new(r.anchor.min(len), r.head.min(len)))
             .collect();
-        Self { ranges, primary: self.primary }
+        Self {
+            ranges,
+            primary: self.primary,
+        }
     }
 }

@@ -62,10 +62,7 @@ fn main() {
 
     println!("\nspans:        {}", profile.slices.len());
     println!("traces:       {}", profile.tracks.len());
-    println!(
-        "duration:     {:.3}s",
-        profile.duration_ns() as f64 / 1e9
-    );
+    println!("duration:     {:.3}s", profile.duration_ns() as f64 / 1e9);
     let max_depth = profile.slices.depth.iter().copied().max().unwrap_or(0);
     println!("max depth:    {}", max_depth);
     println!("services:");
@@ -78,10 +75,6 @@ fn main() {
     }
     println!("\nfirst 10 traces by emit order:");
     for t in profile.tracks.iter().take(10) {
-        println!(
-            "  rows={} {}",
-            t.row_count,
-            profile.strings.get(t.name)
-        );
+        println!("  rows={} {}", t.row_count, profile.strings.get(t.name));
     }
 }

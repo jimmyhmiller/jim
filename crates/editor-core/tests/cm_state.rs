@@ -68,7 +68,7 @@ mod editor_selection {
 }
 
 mod char_categorizer {
-    use editor_core::char_class::{categorize, CharCategory};
+    use editor_core::char_class::{CharCategory, categorize};
 
     #[test]
     fn categorises_into_alphanumeric() {

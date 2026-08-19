@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use claude_bus::daemon::Daemon;
-use claude_bus::proto::{decode, encode, BusFrame, ClientFrame, Role};
+use claude_bus::proto::{BusFrame, ClientFrame, Role, decode, encode};
 
 fn spawn_daemon(dir: &std::path::Path) -> (PathBuf, std::thread::JoinHandle<()>) {
     let socket = dir.join("bus.sock");
@@ -95,7 +95,13 @@ fn replay_serves_since_seq() {
 
     // Publish 3 events before any subscriber connects.
     let mut p = UnixStream::connect(&socket).unwrap();
-    p.write_all(&encode(&ClientFrame::Hello { role: Role::Publisher }).unwrap()).unwrap();
+    p.write_all(
+        &encode(&ClientFrame::Hello {
+            role: Role::Publisher,
+        })
+        .unwrap(),
+    )
+    .unwrap();
     for i in 0..3 {
         p.write_all(
             &encode(&ClientFrame::Publish {
@@ -125,7 +131,14 @@ fn replay_serves_since_seq() {
 
     let events = read_n_events(&mut s, 2, Duration::from_secs(2));
     match (&events[0], &events[1]) {
-        (BusFrame::Event { seq: s1, kind: k1, .. }, BusFrame::Event { seq: s2, kind: k2, .. }) => {
+        (
+            BusFrame::Event {
+                seq: s1, kind: k1, ..
+            },
+            BusFrame::Event {
+                seq: s2, kind: k2, ..
+            },
+        ) => {
             assert_eq!(*s1, 1);
             assert_eq!(k1, "k1");
             assert_eq!(*s2, 2);
@@ -161,7 +174,12 @@ fn read_n_events(s: &mut UnixStream, n: usize, timeout: Duration) -> Vec<BusFram
             }
         }
         if Instant::now() > deadline {
-            panic!("timed out waiting for {} events (got {}); buf={:?}", n, out.len(), buf);
+            panic!(
+                "timed out waiting for {} events (got {}); buf={:?}",
+                n,
+                out.len(),
+                buf
+            );
         }
         let r = s.read(&mut tmp).expect("read");
         if r == 0 {

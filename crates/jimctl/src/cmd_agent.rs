@@ -20,7 +20,7 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::agent_bus;
 
@@ -89,7 +89,10 @@ fn parse_flags(args: &[String]) -> (Vec<(String, String)>, Vec<String>) {
 }
 
 fn get<'a>(named: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    named.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    named
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 fn cmd_roster(args: &[String]) -> ExitCode {
@@ -116,7 +119,10 @@ fn cmd_roster(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     for (sid, info) in &live {
-        let label = info.get("label").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let label = info
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
         let cwd = info.get("cwd").and_then(Value::as_str).unwrap_or("");
         match label {
             Some(l) => println!("{sid} — \"{l}\"  {cwd}"),
@@ -171,14 +177,20 @@ fn cmd_recv(args: &[String]) -> ExitCode {
     let id = id.to_string();
     let as_json = switches.iter().any(|s| s == "json");
     let announce = !switches.iter().any(|s| s == "no-announce");
-    let label = get(&named, "name").map(str::to_string).unwrap_or_else(agent_bus::default_label);
+    let label = get(&named, "name")
+        .map(str::to_string)
+        .unwrap_or_else(agent_bus::default_label);
 
     install_signal_handlers();
     if announce {
         agent_bus::announce(&id, &label);
-        eprintln!("jimctl agent recv: `{id}` (\"{label}\") live; streaming agent.inbox.{id} + agent.all. Ctrl-C to stop.");
+        eprintln!(
+            "jimctl agent recv: `{id}` (\"{label}\") live; streaming agent.inbox.{id} + agent.all. Ctrl-C to stop."
+        );
     } else {
-        eprintln!("jimctl agent recv: streaming agent.inbox.{id} + agent.all (no roster announce). Ctrl-C to stop.");
+        eprintln!(
+            "jimctl agent recv: streaming agent.inbox.{id} + agent.all (no roster announce). Ctrl-C to stop."
+        );
     }
 
     let stdout = std::io::stdout();
@@ -196,7 +208,11 @@ fn cmd_recv(args: &[String]) -> ExitCode {
                 });
                 let _ = writeln!(out, "{line}");
             } else {
-                let scope = if msg.topic == "agent.all" { " (broadcast)" } else { "" };
+                let scope = if msg.topic == "agent.all" {
+                    " (broadcast)"
+                } else {
+                    ""
+                };
                 let _ = writeln!(out, "{}{scope}: {}", msg.from, msg.text);
             }
             let _ = out.flush();
@@ -216,7 +232,9 @@ fn cmd_announce(args: &[String]) -> ExitCode {
         eprintln!("jimctl agent announce: --id is required");
         return ExitCode::from(2);
     };
-    let label = get(&named, "name").map(str::to_string).unwrap_or_else(agent_bus::default_label);
+    let label = get(&named, "name")
+        .map(str::to_string)
+        .unwrap_or_else(agent_bus::default_label);
     // A one-shot announce records the caller's long-lived pid (via --pid) so
     // the sweep tracks the *real* process, not this short-lived jimctl. Absent
     // → our own pid (fine when the caller keeps re-announcing).
@@ -249,7 +267,13 @@ fn cmd_tombstone(args: &[String]) -> ExitCode {
 
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as extern "C" fn(i32) as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as extern "C" fn(i32) as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(i32) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(i32) as libc::sighandler_t,
+        );
     }
 }

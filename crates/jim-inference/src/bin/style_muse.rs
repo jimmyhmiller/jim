@@ -17,7 +17,11 @@ fn main() {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(4)
                 .clamp(1, 12);
-            let mode = args.get(2).map(|s| s.as_str()).unwrap_or("auto").to_string();
+            let mode = args
+                .get(2)
+                .map(|s| s.as_str())
+                .unwrap_or("auto")
+                .to_string();
             let note = args.get(3..).map(|s| s.join(" ")).unwrap_or_default();
             muse::next_batch(count, &mode, &note)
         }

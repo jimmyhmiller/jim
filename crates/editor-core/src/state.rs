@@ -4,7 +4,7 @@ use crate::comment::CommentTokens;
 use crate::history::History;
 use crate::indent::IndentRules;
 use crate::selection::{Range, Selection};
-use crate::transaction::{map_pos, Transaction};
+use crate::transaction::{Transaction, map_pos};
 
 #[derive(Debug, Clone)]
 pub struct EditorState {

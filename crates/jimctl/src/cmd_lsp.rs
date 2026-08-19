@@ -33,7 +33,11 @@ pub fn run() -> ExitCode {
     };
     match sub.as_str() {
         "ensure" => one_shot(&args[1..], |_| Ok(Op::Ensure)),
-        "symbols" => one_shot(&args[1..], |a| Ok(Op::Symbols { file: need_file(a)? })),
+        "symbols" => one_shot(&args[1..], |a| {
+            Ok(Op::Symbols {
+                file: need_file(a)?,
+            })
+        }),
         "outline" => one_shot(&args[1..], |_| Ok(Op::Outline)),
         "types" => one_shot(&args[1..], |_| Ok(Op::TypeOutline)),
         "impls" => one_shot(&args[1..], |a| {
@@ -86,10 +90,7 @@ pub fn run() -> ExitCode {
 /// Resolve the workspace root for this invocation: `--root` if given, else the
 /// target file's location, else the current directory. Then connect to (or
 /// spawn) the daemon and run one request.
-fn one_shot(
-    args: &[String],
-    build: impl FnOnce(&Parsed) -> Result<Op, String>,
-) -> ExitCode {
+fn one_shot(args: &[String], build: impl FnOnce(&Parsed) -> Result<Op, String>) -> ExitCode {
     let parsed = Parsed::from(args);
     let op = match build(&parsed) {
         Ok(op) => op,
@@ -220,7 +221,10 @@ fn cmd_rpc(args: &[String]) -> ExitCode {
         if line.trim().is_empty() {
             continue;
         }
-        if writeln!(writer, "{line}").and_then(|_| writer.flush()).is_err() {
+        if writeln!(writer, "{line}")
+            .and_then(|_| writer.flush())
+            .is_err()
+        {
             break;
         }
     }
@@ -260,7 +264,12 @@ impl Parsed {
                 }
             }
         }
-        Self { file, root, range, pos }
+        Self {
+            file,
+            root,
+            range,
+            pos,
+        }
     }
 }
 

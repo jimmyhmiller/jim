@@ -3,16 +3,16 @@
 //! content mouse events and keyboard shortcuts drive it, and its draw-command
 //! output is tessellated into the pane's `content_root` each time it changes.
 
-use bevy::input::keyboard::{Key as BKey, KeyboardInput};
 use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key as BKey, KeyboardInput};
 use bevy::prelude::*;
 use bevy::sprite_render::ColorMaterial;
 
 use std::collections::HashSet;
 
 use jim_pane::{
-    spawn_pane_from_registry, FocusedPane, KeyboardOwner, PaneChrome, PaneContentDragged,
-    PaneContentPressed, PaneContentReleased, PaneFont, PaneKindSpec, PaneRect, PaneRegistry,
+    FocusedPane, KeyboardOwner, PaneChrome, PaneContentDragged, PaneContentPressed,
+    PaneContentReleased, PaneFont, PaneKindSpec, PaneRect, PaneRegistry, spawn_pane_from_registry,
 };
 
 use serde_json::Value;
@@ -20,8 +20,8 @@ use whiteboard_core::element::{Element, ElementKind};
 use whiteboard_core::interaction::{InputEvent, Key as WbKey, Modifiers, PointerButton, Tool};
 use whiteboard_core::{ElementId, Point};
 
-use crate::island::{island_hit, Island, IslandAction};
-use crate::render::{render_scene_into, WbRendered};
+use crate::island::{Island, IslandAction, island_hit};
+use crate::render::{WbRendered, render_scene_into};
 use crate::{ToolStyle, WbEditor};
 
 pub const PANE_KIND: &str = "whiteboard";
@@ -143,8 +143,12 @@ fn apply_island(wp: &mut WhiteboardPane, action: IslandAction) {
         IslandAction::Color(c) => wp.style.stroke_color = c,
         IslandAction::Width(w) => wp.style.stroke_width = w,
         IslandAction::Clear => {
-            let ids: Vec<ElementId> =
-                wp.editor.scene().iter_live().map(|e| e.id.clone()).collect();
+            let ids: Vec<ElementId> = wp
+                .editor
+                .scene()
+                .iter_live()
+                .map(|e| e.id.clone())
+                .collect();
             if !ids.is_empty() {
                 wp.editor.select(ids);
                 wp.editor.delete_selection();
@@ -311,15 +315,18 @@ fn whiteboard_keyboard(
                             false
                         }
                         "x" => wp.editor.cut(),
-                        "v" => {
-                            !wp.editor
-                                .paste(whiteboard_core::Vec2::new(12.0, 12.0))
-                                .is_empty()
-                        }
+                        "v" => !wp
+                            .editor
+                            .paste(whiteboard_core::Vec2::new(12.0, 12.0))
+                            .is_empty(),
                         "d" => !wp.editor.duplicate_selection().is_empty(),
                         "a" => {
-                            let ids: Vec<ElementId> =
-                                wp.editor.scene().iter_live().map(|e| e.id.clone()).collect();
+                            let ids: Vec<ElementId> = wp
+                                .editor
+                                .scene()
+                                .iter_live()
+                                .map(|e| e.id.clone())
+                                .collect();
                             wp.editor.select(ids);
                             true
                         }

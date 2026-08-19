@@ -64,7 +64,9 @@ pub fn run() -> ExitCode {
             }
             other => {
                 eprintln!("jimctl dock: unexpected arg `{}`", other);
-                eprintln!("usage: jimctl dock --project P [--title T ...] [--template T] [--empty [--slots N]]");
+                eprintln!(
+                    "usage: jimctl dock --project P [--title T ...] [--template T] [--empty [--slots N]]"
+                );
                 return ExitCode::from(2);
             }
         }

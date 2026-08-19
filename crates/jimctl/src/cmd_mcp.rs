@@ -23,7 +23,7 @@
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::agent_bus;
 
@@ -122,10 +122,16 @@ fn write_msg(out: &io::Stdout, v: &Value) {
     let _ = o.flush();
 }
 fn respond(out: &io::Stdout, id: Value, result: Value) {
-    write_msg(out, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+    write_msg(
+        out,
+        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+    );
 }
 fn error(out: &io::Stdout, id: Value, code: i64, message: &str) {
-    write_msg(out, &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }));
+    write_msg(
+        out,
+        &json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }),
+    );
 }
 
 fn tool_schemas() -> Vec<Value> {
@@ -191,8 +197,7 @@ fn tool_send(self_id: &str, args: &Value) -> Value {
         return tool_text("jim_send requires non-empty `to` and `text`", true);
     }
     // Accept "all", "agent:<id>", "topic:<name>", or a bare id (→ that inbox).
-    let topic = agent_bus::resolve_topic(to)
-        .unwrap_or_else(|| format!("agent.inbox.{to}"));
+    let topic = agent_bus::resolve_topic(to).unwrap_or_else(|| format!("agent.inbox.{to}"));
     let payload = json!({ "from": self_id, "text": text });
     match agent_bus::publish(&topic, payload, false, self_id) {
         Ok(()) => tool_text(&format!("sent to {topic}"), false),
@@ -211,14 +216,21 @@ fn tool_roster(self_id: &str) -> Value {
                 continue;
             }
         }
-        let label = info.get("label").and_then(Value::as_str).filter(|s| !s.is_empty());
+        let label = info
+            .get("label")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
         let cwd = info.get("cwd").and_then(Value::as_str).unwrap_or("");
         match label {
             Some(l) => lines.push(format!("{sid} — \"{l}\"  {cwd}")),
             None => lines.push(format!("{sid}  {cwd}")),
         }
     }
-    let out = if lines.is_empty() { "no other agents on the bus".to_string() } else { lines.join("\n") };
+    let out = if lines.is_empty() {
+        "no other agents on the bus".to_string()
+    } else {
+        lines.join("\n")
+    };
     tool_text(&out, false)
 }
 

@@ -160,7 +160,10 @@ pub fn undo_selection(state: &EditorState) -> Option<EditorState> {
     let prev = state.history.selection_undo.last().cloned()?;
     let mut new_state = state.clone();
     new_state.history.selection_undo.pop();
-    new_state.history.selection_redo.push(state.selection.clone());
+    new_state
+        .history
+        .selection_redo
+        .push(state.selection.clone());
     new_state.selection = prev;
     Some(new_state)
 }
@@ -169,7 +172,10 @@ pub fn redo_selection(state: &EditorState) -> Option<EditorState> {
     let next = state.history.selection_redo.last().cloned()?;
     let mut new_state = state.clone();
     new_state.history.selection_redo.pop();
-    new_state.history.selection_undo.push(state.selection.clone());
+    new_state
+        .history
+        .selection_undo
+        .push(state.selection.clone());
     new_state.selection = next;
     Some(new_state)
 }

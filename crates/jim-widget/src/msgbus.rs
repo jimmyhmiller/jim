@@ -185,7 +185,8 @@ fn pump_widget_messages(
                     if payload.is_null() {
                         bus.retained.remove(&key); // tombstone
                     } else {
-                        bus.retained.insert(key, (payload.clone(), msg.sender.clone()));
+                        bus.retained
+                            .insert(key, (payload.clone(), msg.sender.clone()));
                     }
                 }
                 observed.write(BusMessageObserved {

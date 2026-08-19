@@ -156,7 +156,10 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     };
     let wgsl = assemble_wgsl(&shader.wgsl_body);
-    eprintln!("--- generated WGSL ---\n{wgsl}\n--- uniforms used: {:?} ---", shader.used);
+    eprintln!(
+        "--- generated WGSL ---\n{wgsl}\n--- uniforms used: {:?} ---",
+        shader.used
+    );
 
     // ---- write the shader where the AssetServer can load it ----
     let asset_dir = std::env::temp_dir().join("glaze_shader_demo_assets");
@@ -214,7 +217,11 @@ fn setup(
             ..Default::default()
         },
     });
-    commands.spawn((bevy::mesh::Mesh2d(mesh), MeshMaterial2d(mat), Transform::default()));
+    commands.spawn((
+        bevy::mesh::Mesh2d(mesh),
+        MeshMaterial2d(mat),
+        Transform::default(),
+    ));
 }
 
 fn animate(

@@ -2,9 +2,9 @@
 //! Each test mirrors an `it(...)` from upstream, same `(before, after)` shape.
 
 use editor_core::commands::{
-    delete_group_backward, delete_group_forward, delete_trailing_whitespace, indent_less,
+    Command, delete_group_backward, delete_group_forward, delete_trailing_whitespace, indent_less,
     indent_more, indent_selection, insert_newline_and_indent, insert_newline_keep_indent,
-    move_line_down, move_line_up, Command,
+    move_line_down, move_line_up,
 };
 use editor_core::state::EditorState;
 use editor_core::test_dsl::{parse, render};
@@ -92,11 +92,7 @@ mod indent_less_tests {
 
     #[test]
     fn takes_tabs_into_account() {
-        run(
-            "   \tone|\n  \ttwo|",
-            indent_less,
-            "  one|\n  two|",
-        );
+        run("   \tone|\n  \ttwo|", indent_less, "  one|\n  two|");
     }
 
     #[test]
@@ -178,7 +174,11 @@ mod insert_newline_and_indent_tests {
 
     #[test]
     fn can_explode_brackets() {
-        run("let x = [|]", insert_newline_and_indent, "let x = [\n  |\n]");
+        run(
+            "let x = [|]",
+            insert_newline_and_indent,
+            "let x = [\n  |\n]",
+        );
     }
 
     #[test]
@@ -430,11 +430,7 @@ mod move_line_down_tests {
 
     #[test]
     fn preserves_multiple_cursors_on_a_single_line() {
-        run(
-            "one\nt|w|o|\nthree",
-            move_line_down,
-            "one\nthree\nt|w|o|",
-        );
+        run("one\nt|w|o|\nthree", move_line_down, "one\nthree\nt|w|o|");
     }
 
     #[test]

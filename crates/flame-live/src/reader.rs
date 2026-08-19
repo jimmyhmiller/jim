@@ -73,8 +73,8 @@ pub fn read_ndjson_stream<R: BufRead>(
         if line.trim().is_empty() {
             continue;
         }
-        let event: LiveEvent = serde_json::from_str(&line)
-            .map_err(|e| ReadError::Decode(format!("json: {e}")))?;
+        let event: LiveEvent =
+            serde_json::from_str(&line).map_err(|e| ReadError::Decode(format!("json: {e}")))?;
         if !on_event(event) {
             return Ok(());
         }

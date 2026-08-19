@@ -47,7 +47,12 @@ impl StackTable {
             return id;
         }
         let id = FrameId(self.frames.len() as u32);
-        self.frames.push(Frame { name, file, line, addr });
+        self.frames.push(Frame {
+            name,
+            file,
+            line,
+            addr,
+        });
         self.frame_dedup.insert(key, id);
         id
     }
@@ -62,7 +67,11 @@ impl StackTable {
             None => 0,
         };
         let id = StackId(self.nodes.len() as u32);
-        self.nodes.push(StackNode { frame, parent, depth });
+        self.nodes.push(StackNode {
+            frame,
+            parent,
+            depth,
+        });
         self.node_dedup.insert(key, id);
         id
     }

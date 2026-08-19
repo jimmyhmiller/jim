@@ -94,7 +94,9 @@ pub enum BlockKind {
     Heading(u8), // 1..=6
     CodeBlock,
     BlockQuote,
-    ListItem { ordered: bool },
+    ListItem {
+        ordered: bool,
+    },
     ThematicBreak,
 }
 
@@ -336,7 +338,10 @@ fn classify_line(line: &LineSpan, indent: usize, body: &str) -> Block {
         return Block {
             kind: BlockKind::Blank,
             indent: 0,
-            lines: vec![RenderLine { runs, src: src.clone() }],
+            lines: vec![RenderLine {
+                runs,
+                src: src.clone(),
+            }],
             src,
             lang: None,
         };
@@ -374,7 +379,10 @@ fn classify_line(line: &LineSpan, indent: usize, body: &str) -> Block {
         return Block {
             kind: BlockKind::Heading(level),
             indent: 0,
-            lines: vec![RenderLine { runs, src: src.clone() }],
+            lines: vec![RenderLine {
+                runs,
+                src: src.clone(),
+            }],
             src,
             lang: None,
         };
@@ -397,7 +405,10 @@ fn classify_line(line: &LineSpan, indent: usize, body: &str) -> Block {
         return Block {
             kind: BlockKind::BlockQuote,
             indent: (indent / 2) as u8,
-            lines: vec![RenderLine { runs, src: src.clone() }],
+            lines: vec![RenderLine {
+                runs,
+                src: src.clone(),
+            }],
             src,
             lang: None,
         };
@@ -418,7 +429,10 @@ fn classify_line(line: &LineSpan, indent: usize, body: &str) -> Block {
         return Block {
             kind: BlockKind::ListItem { ordered },
             indent: (indent / 2) as u8,
-            lines: vec![RenderLine { runs, src: src.clone() }],
+            lines: vec![RenderLine {
+                runs,
+                src: src.clone(),
+            }],
             src,
             lang: None,
         };
@@ -429,7 +443,10 @@ fn classify_line(line: &LineSpan, indent: usize, body: &str) -> Block {
     Block {
         kind: BlockKind::Paragraph,
         indent: 0,
-        lines: vec![RenderLine { runs, src: src.clone() }],
+        lines: vec![RenderLine {
+            runs,
+            src: src.clone(),
+        }],
         src,
         lang: None,
     }
@@ -694,7 +711,10 @@ mod tests {
         }
         // total chars accounted for (minus the phantom final newline).
         let total = source.chars().count();
-        assert!(cursor == total + 1 || cursor == total, "coverage tail {source:?}: {cursor} vs {total}");
+        assert!(
+            cursor == total + 1 || cursor == total,
+            "coverage tail {source:?}: {cursor} vs {total}"
+        );
     }
 
     #[test]

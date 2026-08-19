@@ -3,24 +3,24 @@
 //! fixtures using the same `|`/`<...>` DSL as `cm_commands.rs`.
 
 use editor_core::commands::{
-    add_cursor_above, add_cursor_below, copy_line_down, copy_line_up, cursor_char_backward,
-    cursor_char_backward_logical, cursor_char_forward, cursor_char_forward_logical,
-    cursor_char_left, cursor_char_right, cursor_doc_end, cursor_doc_start, cursor_group_backward,
-    cursor_group_forward, cursor_group_left, cursor_group_right, cursor_line_boundary_backward,
-    cursor_line_boundary_forward, cursor_line_boundary_left, cursor_line_boundary_right,
-    cursor_line_down, cursor_line_end, cursor_line_start, cursor_line_up, cursor_matching_bracket,
-    cursor_subword_left, cursor_subword_right, cursor_word_left, cursor_word_right,
-    delete_char_backward, delete_char_backward_strict, delete_char_forward, delete_line,
-    delete_line_boundary_backward, delete_line_boundary_forward, delete_to_line_end,
-    delete_to_line_start, indent_with_tab, insert_blank_line, insert_tab, select_all,
-    select_char_backward, select_char_forward, select_char_left, select_char_right,
-    select_doc_end, select_doc_start, select_group_backward, select_group_forward,
-    select_group_left, select_group_right, select_line, select_line_boundary_backward,
-    select_line_boundary_forward, select_line_boundary_left, select_line_boundary_right,
-    select_line_down, select_line_end, select_line_start, select_line_up,
-    select_matching_bracket, select_next_occurrence, select_subword_right, select_word_left,
-    select_word_right, simplify_selection, split_line, split_selection_by_line, toggle_comment,
-    transpose_chars, Command,
+    Command, add_cursor_above, add_cursor_below, copy_line_down, copy_line_up,
+    cursor_char_backward, cursor_char_backward_logical, cursor_char_forward,
+    cursor_char_forward_logical, cursor_char_left, cursor_char_right, cursor_doc_end,
+    cursor_doc_start, cursor_group_backward, cursor_group_forward, cursor_group_left,
+    cursor_group_right, cursor_line_boundary_backward, cursor_line_boundary_forward,
+    cursor_line_boundary_left, cursor_line_boundary_right, cursor_line_down, cursor_line_end,
+    cursor_line_start, cursor_line_up, cursor_matching_bracket, cursor_subword_left,
+    cursor_subword_right, cursor_word_left, cursor_word_right, delete_char_backward,
+    delete_char_backward_strict, delete_char_forward, delete_line, delete_line_boundary_backward,
+    delete_line_boundary_forward, delete_to_line_end, delete_to_line_start, indent_with_tab,
+    insert_blank_line, insert_tab, select_all, select_char_backward, select_char_forward,
+    select_char_left, select_char_right, select_doc_end, select_doc_start, select_group_backward,
+    select_group_forward, select_group_left, select_group_right, select_line,
+    select_line_boundary_backward, select_line_boundary_forward, select_line_boundary_left,
+    select_line_boundary_right, select_line_down, select_line_end, select_line_start,
+    select_line_up, select_matching_bracket, select_next_occurrence, select_subword_right,
+    select_word_left, select_word_right, simplify_selection, split_line, split_selection_by_line,
+    toggle_comment, transpose_chars,
 };
 use editor_core::test_dsl::{parse, render};
 
@@ -361,11 +361,7 @@ mod split_selection_tests {
     #[test]
     fn splits_multi_line_range_into_one_per_line() {
         // <ab\ncd\nef> spans 3 lines.
-        run(
-            "<ab\ncd\nef>",
-            split_selection_by_line,
-            "<ab>\n<cd>\n<ef>",
-        );
+        run("<ab\ncd\nef>", split_selection_by_line, "<ab>\n<cd>\n<ef>");
     }
 
     #[test]
@@ -559,11 +555,7 @@ mod tab_tests {
 
     #[test]
     fn indent_with_tab_indents_multiline_selection() {
-        run(
-            "<a\nb\nc>",
-            indent_with_tab,
-            "  <a\n  b\n  c>",
-        );
+        run("<a\nb\nc>", indent_with_tab, "  <a\n  b\n  c>");
     }
 
     #[test]
@@ -660,8 +652,16 @@ mod alias_tests {
 
     #[test]
     fn line_boundary_aliases() {
-        run("foo\nb|ar\nbaz", cursor_line_boundary_backward, "foo\n|bar\nbaz");
-        run("foo\nb|ar\nbaz", cursor_line_boundary_forward, "foo\nbar|\nbaz");
+        run(
+            "foo\nb|ar\nbaz",
+            cursor_line_boundary_backward,
+            "foo\n|bar\nbaz",
+        );
+        run(
+            "foo\nb|ar\nbaz",
+            cursor_line_boundary_forward,
+            "foo\nbar|\nbaz",
+        );
         run("foo\nba|r", select_line_boundary_backward, "foo\n<ba>r");
         run("foo\nb|ar", select_line_boundary_forward, "foo\nb<ar>");
     }

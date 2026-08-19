@@ -40,7 +40,10 @@ pub fn canonical_root(root: &Path) -> PathBuf {
 
 /// Stable 16-hex repo id derived from the canonicalized root path.
 pub fn repo_id(root: &Path) -> String {
-    format!("{:016x}", fnv1a(&canonical_root(root).display().to_string()))
+    format!(
+        "{:016x}",
+        fnv1a(&canonical_root(root).display().to_string())
+    )
 }
 
 /// Widget→widget announcement topic: "I mutated this repo, re-read it if
@@ -129,7 +132,10 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 /// Like [`git`] but a failure just yields `None` (for optional facts
 /// like "is there an upstream").
 fn git_opt(root: &Path, args: &[&str]) -> Option<String> {
-    git(root, args).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    git(root, args)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Resolve the worktree root containing `start` (`git rev-parse
@@ -146,7 +152,11 @@ pub fn git_dir(root: &Path) -> Option<PathBuf> {
 
 /// The shared git dir (equals [`git_dir`] for the main worktree).
 pub fn git_common_dir(root: &Path) -> Option<PathBuf> {
-    git_opt(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).map(PathBuf::from)
+    git_opt(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(PathBuf::from)
 }
 
 fn parse_worktrees(root: &Path) -> Vec<WorktreeInfo> {
@@ -174,7 +184,12 @@ fn parse_worktrees(root: &Path) -> Vec<WorktreeInfo> {
             if let Some(sha) = line.strip_prefix("HEAD ") {
                 wt.head = sha.to_string();
             } else if let Some(branch) = line.strip_prefix("branch ") {
-                wt.branch = Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).to_string());
+                wt.branch = Some(
+                    branch
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(branch)
+                        .to_string(),
+                );
             } else if line == "locked" || line.starts_with("locked ") {
                 wt.locked = true;
             }
@@ -216,20 +231,26 @@ pub fn compute_repo_state(root: &Path) -> Result<RepoState, String> {
     );
 
     let (ahead, behind) = if upstream.is_some() {
-        git_opt(&root, &["rev-list", "--left-right", "--count", "@{u}...HEAD"])
-            .and_then(|s| {
-                let mut it = s.split_whitespace();
-                let behind = it.next()?.parse::<u32>().ok()?;
-                let ahead = it.next()?.parse::<u32>().ok()?;
-                Some((ahead, behind))
-            })
-            .unwrap_or((0, 0))
+        git_opt(
+            &root,
+            &["rev-list", "--left-right", "--count", "@{u}...HEAD"],
+        )
+        .and_then(|s| {
+            let mut it = s.split_whitespace();
+            let behind = it.next()?.parse::<u32>().ok()?;
+            let ahead = it.next()?.parse::<u32>().ok()?;
+            Some((ahead, behind))
+        })
+        .unwrap_or((0, 0))
     } else {
         (0, 0)
     };
 
     let (mut staged, mut unstaged, mut untracked, mut conflicted) = (0u32, 0u32, 0u32, 0u32);
-    if let Ok(raw) = git(&root, &["status", "--porcelain", "-z", "--untracked-files=all"]) {
+    if let Ok(raw) = git(
+        &root,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    ) {
         let mut fields = raw.split('\0').filter(|s| !s.is_empty());
         while let Some(entry) = fields.next() {
             if entry.len() < 3 {
@@ -241,7 +262,8 @@ pub fn compute_repo_state(root: &Path) -> Result<RepoState, String> {
             if x == 'R' || x == 'C' {
                 let _ = fields.next();
             }
-            let is_conflict = x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D');
+            let is_conflict =
+                x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D');
             if x == '?' && y == '?' {
                 untracked += 1;
             } else if is_conflict {
@@ -267,8 +289,8 @@ pub fn compute_repo_state(root: &Path) -> Result<RepoState, String> {
         .map(|d| d.join("rebase-merge").exists() || d.join("rebase-apply").exists())
         .unwrap_or(false);
 
-    let last_commit = git_opt(&root, &["log", "-1", "--format=%H%x1f%s%x1f%an%x1f%at"])
-        .and_then(|s| {
+    let last_commit =
+        git_opt(&root, &["log", "-1", "--format=%H%x1f%s%x1f%an%x1f%at"]).and_then(|s| {
             let mut it = s.split('\u{1f}');
             Some(CommitInfo {
                 sha: it.next()?.to_string(),
@@ -315,8 +337,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let run = |args: &[&str]| {
-            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         run(&["init", "-q", "-b", "main"]);
         run(&["config", "user.email", "t@t"]);

@@ -29,12 +29,12 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// How many envelope samples to emit per second (independent of cpal's
 /// callback buffer size). ~30/s is plenty for a smooth scrolling waveform
@@ -223,10 +223,7 @@ fn touch_keepalive(st: &AudioState) {
 
 /// How long since the capture was last polled/started.
 fn idle_elapsed(st: &AudioState) -> Duration {
-    st.last_poll
-        .lock()
-        .map(|g| g.elapsed())
-        .unwrap_or_default()
+    st.last_poll.lock().map(|g| g.elapsed()).unwrap_or_default()
 }
 
 /// Stop the stream and finalize the WAV. Returns the file path.
@@ -643,9 +640,5 @@ pub fn is_recording() -> bool {
 }
 
 pub fn status() -> String {
-    state()
-        .status
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default()
+    state().status.lock().map(|g| g.clone()).unwrap_or_default()
 }

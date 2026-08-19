@@ -48,7 +48,12 @@ fn aggregate_render_emits_instances() {
         eprintln!("no wgpu adapter; skipping");
         return;
     };
-    let mut r = Renderer::new(&device, &queue, wgpu::TextureFormat::Rgba8UnormSrgb, (1200, 700));
+    let mut r = Renderer::new(
+        &device,
+        &queue,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        (1200, 700),
+    );
     r.set_profile(Arc::new(build_profile()));
     r.rebuild_instances();
     let time_ordered = r.instances.len();
@@ -62,7 +67,10 @@ fn aggregate_render_emits_instances() {
         "AGGREGATED instances: {aggregated}, layout={:?}, viewport start={} npp={} size={:?}",
         r.layout_mode, r.viewport.start_ns, r.viewport.ns_per_pixel, r.viewport.size_px
     );
-    assert!(aggregated > 0, "AGGREGATED emitted ZERO instances (everything disappears)");
+    assert!(
+        aggregated > 0,
+        "AGGREGATED emitted ZERO instances (everything disappears)"
+    );
 
     // The viewport must actually frame the aggregated slices (laid out 0-based),
     // not be clamped away to the profile's absolute time range.
@@ -71,7 +79,10 @@ fn aggregate_render_emits_instances() {
     assert!(
         r.viewport.start_ns <= agg_end as f64 && view_end >= agg_start as f64,
         "viewport [{}, {}] does not overlap aggregated range [{}, {}] — slices stranded off-screen",
-        r.viewport.start_ns, view_end, agg_start, agg_end
+        r.viewport.start_ns,
+        view_end,
+        agg_start,
+        agg_end
     );
 
     // Hovering the aggregated "a" bar must report the SUMMED duration (220 ns),

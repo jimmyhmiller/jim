@@ -13,7 +13,7 @@ use bevy::sprite::Anchor;
 use bevy::sprite_render::{AlphaMode2d, ColorMaterial, MeshMaterial2d};
 
 use jim_pane::{
-    content_area, ChromeStyle, ChromeTextStyle, PaneChrome, PaneContentHovered, PaneFont, PaneRect,
+    ChromeStyle, ChromeTextStyle, PaneChrome, PaneContentHovered, PaneFont, PaneRect, content_area,
 };
 
 use whiteboard_core::interaction::Tool;
@@ -278,26 +278,68 @@ fn build_island(
         let (panel, btns) = layout(content, &theme.palette);
 
         // Backdrop panel: a subtle border behind a translucent fill.
-        if let Some(m) = buttons::rounded_rect_mesh(panel.0 - 1.0, panel.1 - 1.0, panel.2 + 2.0, panel.3 + 2.0, 11.0) {
-            spawn_mesh(m, theme.cell_active.with_alpha(0.5), Z_PANEL, content_root, &mut meshes, &mut materials, &mut commands);
+        if let Some(m) = buttons::rounded_rect_mesh(
+            panel.0 - 1.0,
+            panel.1 - 1.0,
+            panel.2 + 2.0,
+            panel.3 + 2.0,
+            11.0,
+        ) {
+            spawn_mesh(
+                m,
+                theme.cell_active.with_alpha(0.5),
+                Z_PANEL,
+                content_root,
+                &mut meshes,
+                &mut materials,
+                &mut commands,
+            );
         }
         if let Some(m) = buttons::rounded_rect_mesh(panel.0, panel.1, panel.2, panel.3, 10.0) {
-            spawn_mesh(m, Color::srgba(0.10, 0.10, 0.12, 0.93), Z_PANEL + 0.0005, content_root, &mut meshes, &mut materials, &mut commands);
+            spawn_mesh(
+                m,
+                Color::srgba(0.10, 0.10, 0.12, 0.93),
+                Z_PANEL + 0.0005,
+                content_root,
+                &mut meshes,
+                &mut materials,
+                &mut commands,
+            );
         }
 
         for b in &btns {
             let active = is_active(&b.action, &wp.style);
             // Cell fill.
-            let cell_color = if active { theme.cell_active } else { theme.cell };
+            let cell_color = if active {
+                theme.cell_active
+            } else {
+                theme.cell
+            };
             if let Some(m) = buttons::rounded_rect_mesh(b.x, b.y, b.w, b.h, 5.0) {
-                spawn_mesh(m, cell_color, Z_CELL, content_root, &mut meshes, &mut materials, &mut commands);
+                spawn_mesh(
+                    m,
+                    cell_color,
+                    Z_CELL,
+                    content_root,
+                    &mut meshes,
+                    &mut materials,
+                    &mut commands,
+                );
             }
             // Content.
             match b.action {
                 IslandAction::Tool(t) => {
                     if let Some(icon) = buttons::tool_icon(t) {
                         for m in buttons::icon_meshes(icon, b.x, b.y, b.w, b.h, 2.2) {
-                            spawn_mesh(m, theme.label, Z_ICON, content_root, &mut meshes, &mut materials, &mut commands);
+                            spawn_mesh(
+                                m,
+                                theme.label,
+                                Z_ICON,
+                                content_root,
+                                &mut meshes,
+                                &mut materials,
+                                &mut commands,
+                            );
                         }
                     }
                 }
@@ -310,18 +352,42 @@ fn build_island(
                         b.h - 2.0 * inset,
                         4.0,
                     ) {
-                        spawn_mesh(m, buttons::wb_to_color(c), Z_ICON, content_root, &mut meshes, &mut materials, &mut commands);
+                        spawn_mesh(
+                            m,
+                            buttons::wb_to_color(c),
+                            Z_ICON,
+                            content_root,
+                            &mut meshes,
+                            &mut materials,
+                            &mut commands,
+                        );
                     }
                 }
                 IslandAction::Width(w) => {
                     if let Some(m) = buttons::width_sample_mesh(b.x, b.y, b.w, b.h, w as f32) {
-                        spawn_mesh(m, theme.label, Z_ICON, content_root, &mut meshes, &mut materials, &mut commands);
+                        spawn_mesh(
+                            m,
+                            theme.label,
+                            Z_ICON,
+                            content_root,
+                            &mut meshes,
+                            &mut materials,
+                            &mut commands,
+                        );
                     }
                 }
                 IslandAction::Clear => {
                     // Trash icon (square at left) + "Clear" label.
                     for m in buttons::icon_meshes(Icon::Trash, b.x, b.y, b.h, b.h, 2.0) {
-                        spawn_mesh(m, theme.label, Z_ICON, content_root, &mut meshes, &mut materials, &mut commands);
+                        spawn_mesh(
+                            m,
+                            theme.label,
+                            Z_ICON,
+                            content_root,
+                            &mut meshes,
+                            &mut materials,
+                            &mut commands,
+                        );
                     }
                     commands.spawn((
                         Text2d::new("Clear"),
@@ -369,15 +435,12 @@ fn island_tooltip(
         let hit = if ev.local_pt.x > 100_000.0 {
             None
         } else {
-            island
-                .buttons
-                .iter()
-                .position(|b| {
-                    ev.local_pt.x >= b.x
-                        && ev.local_pt.x <= b.x + b.w
-                        && ev.local_pt.y >= b.y
-                        && ev.local_pt.y <= b.y + b.h
-                })
+            island.buttons.iter().position(|b| {
+                ev.local_pt.x >= b.x
+                    && ev.local_pt.x <= b.x + b.w
+                    && ev.local_pt.y >= b.y
+                    && ev.local_pt.y <= b.y + b.h
+            })
         };
         if hit == island.tooltip_for {
             continue;

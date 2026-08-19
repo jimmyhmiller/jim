@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use bevy::prelude::*;
 
 use crate::oklab;
-use crate::theme::{parse_color_string, ActiveThemePath, Theme, ThemeChanged, TokenValue};
+use crate::theme::{ActiveThemePath, Theme, ThemeChanged, TokenValue, parse_color_string};
 
 /// Snapshot of the live theme tokens, keyed by name.
 type Snapshot = HashMap<String, TokenValue>;
@@ -70,10 +70,7 @@ fn publish_initial_snapshot(theme: Res<Theme>) {
     publish(&theme);
 }
 
-fn publish_snapshot_on_change(
-    mut events: MessageReader<ThemeChanged>,
-    theme: Res<Theme>,
-) {
+fn publish_snapshot_on_change(mut events: MessageReader<ThemeChanged>, theme: Res<Theme>) {
     if events.read().last().is_none() {
         return;
     }
@@ -293,7 +290,10 @@ pub fn register_theme_host_fns_funct(vm: &mut funct::Funct) {
     vm.register4(
         "theme_set_oklch",
         move |name: String, l: f64, c: f64, h: f64| {
-            let _ = tx.send(ThemeWrite::SetColor(name, format!("oklch({}, {}, {})", l, c, h)));
+            let _ = tx.send(ThemeWrite::SetColor(
+                name,
+                format!("oklch({}, {}, {})", l, c, h),
+            ));
         },
     );
     let tx = TX.get().unwrap().lock().unwrap().clone();

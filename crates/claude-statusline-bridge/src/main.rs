@@ -222,8 +222,7 @@ fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let terminal_session_id =
-        std::env::var("EDITOR_IDEA_TERMINAL_SESSION_ID").unwrap_or_default();
+    let terminal_session_id = std::env::var("EDITOR_IDEA_TERMINAL_SESSION_ID").unwrap_or_default();
 
     // Claude Code invokes us as its direct child, so getppid() is
     // Claude Code's PID. Safe everywhere we run (unix only).

@@ -28,9 +28,9 @@ use bevy::math::URect;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
+use swash::FontRef;
 use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::Format;
-use swash::FontRef;
 
 /// Atlas texture is 1024×1024. Fits ~1700 glyphs at our cell size.
 /// Picked smaller than the obvious 2048² choice because every novel-glyph
@@ -263,8 +263,22 @@ impl GlyphAtlas {
         let mut layout = TextureAtlasLayout::new_empty(UVec2::splat(ATLAS_DIM));
         // Register slot 0 (blank, all-transparent) and slot 1 (tofu) so
         // indices line up with what the shader samples.
-        layout.add_texture(slot_rect_for(BLANK_SLOT, slot_w, slot_h, stride_w, stride_h, cols_per_row));
-        layout.add_texture(slot_rect_for(TOFU_SLOT, slot_w, slot_h, stride_w, stride_h, cols_per_row));
+        layout.add_texture(slot_rect_for(
+            BLANK_SLOT,
+            slot_w,
+            slot_h,
+            stride_w,
+            stride_h,
+            cols_per_row,
+        ));
+        layout.add_texture(slot_rect_for(
+            TOFU_SLOT,
+            slot_w,
+            slot_h,
+            stride_w,
+            stride_h,
+            cols_per_row,
+        ));
         let layout_handle = layouts.add(layout);
 
         let mut atlas = Self {
@@ -357,12 +371,7 @@ impl GlyphAtlas {
         )
         .or_else(|| {
             let bytes = self.system_fallback.font_bytes_for(ch)?;
-            rasterize_in_font(
-                &mut self.scale_context,
-                bytes,
-                self.font_size_logical,
-                ch,
-            )
+            rasterize_in_font(&mut self.scale_context, bytes, self.font_size_logical, ch)
         });
 
         let Some((raster_data, placement)) = raster else {

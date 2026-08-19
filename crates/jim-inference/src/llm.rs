@@ -119,8 +119,8 @@ impl LlmConfig {
     /// Resolve config from environment. Returns `MissingApiKey` if no
     /// usable key is found in any of the recognised env vars.
     pub fn from_env() -> Result<Self, LlmError> {
-        let base_url = std::env::var("LLM_BASE_URL")
-            .unwrap_or_else(|_| "https://api.deepseek.com/v1".into());
+        let base_url =
+            std::env::var("LLM_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com/v1".into());
         let api_key = std::env::var("LLM_API_KEY")
             .ok()
             .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
@@ -280,13 +280,22 @@ pub struct Msg {
 
 impl Msg {
     pub fn system(s: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: s.into() }
+        Self {
+            role: "system".into(),
+            content: s.into(),
+        }
     }
     pub fn user(s: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: s.into() }
+        Self {
+            role: "user".into(),
+            content: s.into(),
+        }
     }
     pub fn assistant(s: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: s.into() }
+        Self {
+            role: "assistant".into(),
+            content: s.into(),
+        }
     }
 }
 
@@ -301,7 +310,10 @@ pub fn chat_json(cfg: &LlmConfig, messages: &[Msg], temperature: f32) -> Result<
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let msgs: Vec<ChatMessage> = messages
         .iter()
-        .map(|m| ChatMessage { role: &m.role, content: &m.content })
+        .map(|m| ChatMessage {
+            role: &m.role,
+            content: &m.content,
+        })
         .collect();
     let body = ChatRequest {
         model: &cfg.model,

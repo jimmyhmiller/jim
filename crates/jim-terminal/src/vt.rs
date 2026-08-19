@@ -37,11 +37,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use libghostty_vt::{
-    terminal::{
-        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, SizeReportSize,
-        PrimaryDeviceAttributes, SecondaryDeviceAttributes, TertiaryDeviceAttributes,
-    },
     Terminal, TerminalOptions,
+    terminal::{
+        ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+        PrimaryDeviceAttributes, SecondaryDeviceAttributes, SizeReportSize,
+        TertiaryDeviceAttributes,
+    },
 };
 
 pub const APP_NAME: &str = "terminal-bevy";

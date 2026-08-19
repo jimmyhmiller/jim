@@ -6,15 +6,15 @@
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 
 use claude_bus::daemon::Daemon;
-use claude_bus::proto::{encode, ClientFrame, Role};
+use claude_bus::proto::{ClientFrame, Role, encode};
 use claude_bus_bevy::{BusEventPlugin, ClaudeBusEvent};
 
 fn spawn_daemon(dir: &std::path::Path) -> PathBuf {
@@ -42,7 +42,13 @@ fn spawn_daemon(dir: &std::path::Path) -> PathBuf {
 
 fn publish(socket: &std::path::Path, kind: &str, ts: u64) {
     let mut s = UnixStream::connect(socket).unwrap();
-    s.write_all(&encode(&ClientFrame::Hello { role: Role::Publisher }).unwrap()).unwrap();
+    s.write_all(
+        &encode(&ClientFrame::Hello {
+            role: Role::Publisher,
+        })
+        .unwrap(),
+    )
+    .unwrap();
     s.write_all(
         &encode(&ClientFrame::Publish {
             kind: kind.into(),

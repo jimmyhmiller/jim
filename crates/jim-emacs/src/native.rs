@@ -31,12 +31,12 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite::Anchor;
 
-use jim_pane::{PaneKindMarker, PaneRect, PaneRegistry, MARGIN, TITLE_H};
+use jim_pane::{MARGIN, PaneKindMarker, PaneRect, PaneRegistry, TITLE_H};
 use serde_json::Value;
 
+use swash::FontRef;
 use swash::scale::{Render, ScaleContext, Source};
 use swash::zeno::Format;
-use swash::FontRef;
 
 /// Stable identifier for native emacs panes.
 pub const PANE_KIND: &str = "emacs-native";
@@ -51,9 +51,20 @@ const FB_SCALE: i64 = 2;
 
 #[derive(Clone, Debug)]
 enum Op {
-    FrameSize { w: i32, h: i32 },
-    ClearFrame { bg: u32 },
-    ClearArea { x: i32, y: i32, w: i32, h: i32, bg: u32 },
+    FrameSize {
+        w: i32,
+        h: i32,
+    },
+    ClearFrame {
+        bg: u32,
+    },
+    ClearArea {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        bg: u32,
+    },
     Run {
         x: i32,
         y: i32,
@@ -64,13 +75,32 @@ enum Op {
         bg: u32,
         glyphs: Vec<u16>,
     },
-    Cursor { x: i32, y: i32, w: i32, h: i32, kind: i32 },
-    Font { path: String, px: i32, asc: i32, desc: i32 },
+    Cursor {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        kind: i32,
+    },
+    Font {
+        path: String,
+        px: i32,
+        asc: i32,
+        desc: i32,
+    },
     /// Shift a framebuffer region vertically by `dy` (Emacs's scroll
     /// optimization): copy (x,y,w,h) to (x, y+dy, w, h).
-    Scroll { x: i32, y: i32, w: i32, h: i32, dy: i32 },
+    Scroll {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        dy: i32,
+    },
     /// The frame's title (buffer name + mode) for the pane title bar.
-    Title { text: String },
+    Title {
+        text: String,
+    },
     Flush,
 }
 
@@ -99,7 +129,9 @@ fn parse_op(line: &str) -> Option<(u32, Op)> {
             w: kvi(&fields, "w"),
             h: kvi(&fields, "h"),
         },
-        "clear-frame" => Op::ClearFrame { bg: kvhex(&fields, "bg") },
+        "clear-frame" => Op::ClearFrame {
+            bg: kvhex(&fields, "bg"),
+        },
         "clear-area" => Op::ClearArea {
             x: kvi(&fields, "x"),
             y: kvi(&fields, "y"),
@@ -156,7 +188,11 @@ fn parse_op(line: &str) -> Option<(u32, Op)> {
         },
         "title" => Op::Title {
             // Everything after "title f=N " — may contain spaces.
-            text: line.splitn(3, char::is_whitespace).nth(2).unwrap_or("").to_string(),
+            text: line
+                .splitn(3, char::is_whitespace)
+                .nth(2)
+                .unwrap_or("")
+                .to_string(),
         },
         "flush" => Op::Flush,
         _ => return None, // frame-delete: ignored
@@ -185,8 +221,11 @@ static EMACS_CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// graceful `AppExit` — which is what runs `kill_emacs_on_app_exit`,
 /// layout persistence, etc. Overriding it with SIG_DFL + re-raise would
 /// trade the orphan bug for a broken graceful shutdown.
-static PREV_SIG_HANDLERS: [AtomicUsize; 3] =
-    [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+static PREV_SIG_HANDLERS: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 fn prev_handler_slot(sig: i32) -> Option<usize> {
     match sig {
@@ -564,7 +603,9 @@ fn conn_loop(
         if line.starts_with("frame-new") {
             let fields: Vec<&str> = line.split_whitespace().collect();
             let fid = kv(&fields, "f").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let split = kv(&fields, "split").and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+            let split = kv(&fields, "split")
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0);
             if fid != 0 && split != 0 {
                 split_hints.lock().expect("split_hints").insert(fid, split);
             }
@@ -588,7 +629,9 @@ fn emacs_binary() -> PathBuf {
     if let Some(p) = std::env::var_os("JIM_EMACS_BIN") {
         return PathBuf::from(p);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join("Documents/Code/emacs-jim/src/emacs")
 }
 
@@ -623,8 +666,7 @@ impl EmacsNativeStore {
     /// frame. Returns false if there's no live emacs, `pane` isn't a known
     /// emacs frame, or the control channel isn't connected yet.
     pub fn send_open_file(&self, pane: Entity, path: &str) -> bool {
-        let (Some(conn), Some(&fid)) = (self.shared.as_ref(), self.frame_of_pane.get(&pane))
-        else {
+        let (Some(conn), Some(&fid)) = (self.shared.as_ref(), self.frame_of_pane.get(&pane)) else {
             return false;
         };
         conn.send_open_file(fid, path)
@@ -826,10 +868,7 @@ impl Plugin for EmacsNativePlugin {
 /// On `AppExit`, terminate the shared emacs child so a normal jim quit
 /// never leaves it running. Complements `Drop for SharedConn` (which may
 /// not run on every teardown ordering) and the signal handler.
-fn kill_emacs_on_app_exit(
-    mut exit: MessageReader<AppExit>,
-    mut store: ResMut<EmacsNativeStore>,
-) {
+fn kill_emacs_on_app_exit(mut exit: MessageReader<AppExit>, mut store: ResMut<EmacsNativeStore>) {
     if exit.read().next().is_none() {
         return;
     }
@@ -874,19 +913,18 @@ fn reconcile_frames(world: &mut World) {
 
     // The pane the split was issued from (the split's anchor).
     let source = world.resource::<jim_pane::FocusedPane>().0;
-    let (base_rect, project) = match source
-        .and_then(|f| world.get::<PaneRect>(f).copied().map(|r| (f, r)))
-    {
-        Some((f, r)) => (r, world.get::<jim_pane::PaneProject>(f).map(|p| p.0)),
-        None => (
-            PaneRect {
-                pos: Vec2::new(80.0, 80.0),
-                size: Vec2::new(820.0, 560.0),
-                z: 1.0,
-            },
-            None,
-        ),
-    };
+    let (base_rect, project) =
+        match source.and_then(|f| world.get::<PaneRect>(f).copied().map(|r| (f, r))) {
+            Some((f, r)) => (r, world.get::<jim_pane::PaneProject>(f).map(|p| p.0)),
+            None => (
+                PaneRect {
+                    pos: Vec2::new(80.0, 80.0),
+                    size: Vec2::new(820.0, 560.0),
+                    z: 1.0,
+                },
+                None,
+            ),
+        };
 
     for (i, id) in orphans.into_iter().enumerate() {
         // Split direction hint (1=right, 2=below); 0/none → floating.
@@ -936,7 +974,9 @@ fn flush_pending_creates(mut store: ResMut<EmacsNativeStore>) {
     let Some(conn) = store.shared.as_ref() else {
         return;
     };
-    store.pending_create.retain(|&id| !conn.send_create_frame(id));
+    store
+        .pending_create
+        .retain(|&id| !conn.send_create_frame(id));
 }
 
 /// Keep each Emacs frame sized to its pane's content area. Sends a
@@ -945,7 +985,12 @@ fn flush_pending_creates(mut store: ResMut<EmacsNativeStore>) {
 /// logical px == Emacs frame px (the sprite renders 1:1 logical).
 fn sync_native_resize(
     store: Res<EmacsNativeStore>,
-    panes: Query<(Entity, &PaneRect, &PaneKindMarker, Option<&jim_pane::PaneChromeOverride>)>,
+    panes: Query<(
+        Entity,
+        &PaneRect,
+        &PaneKindMarker,
+        Option<&jim_pane::PaneChromeOverride>,
+    )>,
     mut last: Local<std::collections::HashMap<Entity, (i32, i32)>>,
 ) {
     let Some(conn) = store.shared.as_ref() else {
@@ -981,7 +1026,12 @@ fn handle_native_wheel(
     windows: Query<&Window>,
     viewport: Res<jim_pane::PaneViewport>,
     store: Res<EmacsNativeStore>,
-    panes: Query<(Entity, &PaneRect, &PaneKindMarker, Option<&jim_pane::PaneChromeOverride>)>,
+    panes: Query<(
+        Entity,
+        &PaneRect,
+        &PaneKindMarker,
+        Option<&jim_pane::PaneChromeOverride>,
+    )>,
     mut accum: Local<f32>,
 ) {
     use bevy::input::mouse::MouseScrollUnit;
@@ -1007,7 +1057,9 @@ fn handle_native_wheel(
 
     // Route to the native pane under the cursor.
     let Ok(win) = windows.single() else { return };
-    let Some(cur) = win.cursor_position() else { return };
+    let Some(cur) = win.cursor_position() else {
+        return;
+    };
     let canvas = viewport.window_to_canvas(cur);
     let visible: Vec<(Entity, PaneRect)> = panes
         .iter()
@@ -1017,7 +1069,9 @@ fn handle_native_wheel(
     let Some(pane) = jim_pane::topmost_pane_at(canvas, &visible) else {
         return;
     };
-    let Ok((rect, ov)) = panes.get(pane).map(|(_, r, _, ov)| (r, ov)) else { return };
+    let Ok((rect, ov)) = panes.get(pane).map(|(_, r, _, ov)| (r, ov)) else {
+        return;
+    };
     let Some(&fid) = store.frame_of_pane.get(&pane) else {
         return;
     };
@@ -1069,13 +1123,18 @@ fn handle_native_mouse(
     // and region selection in Emacs).
     if let Some((pane, lx, ly)) = *pressed {
         if buttons.pressed(MouseButton::Left) {
-            if let (Ok(win), Ok((rect, ov)), Some(&fid)) =
-                (windows.single(), rects.get(pane), store.frame_of_pane.get(&pane))
-            {
+            if let (Ok(win), Ok((rect, ov)), Some(&fid)) = (
+                windows.single(),
+                rects.get(pane),
+                store.frame_of_pane.get(&pane),
+            ) {
                 if let Some(cur) = win.cursor_position() {
                     let canvas = viewport.window_to_canvas(cur);
-                    let local =
-                        jim_pane::pt_to_content_local_th(canvas, rect, jim_pane::override_title_h(ov));
+                    let local = jim_pane::pt_to_content_local_th(
+                        canvas,
+                        rect,
+                        jim_pane::override_title_h(ov),
+                    );
                     let (x, y) = (local.x as i32, local.y as i32);
                     if (x, y) != (lx, ly) {
                         conn.send_motion(fid, x, y);
@@ -1118,8 +1177,7 @@ fn handle_native_keyboard(
     if !owner.allows_pane(target) {
         return;
     }
-    let (Some(conn), Some(&fid)) = (store.shared.as_ref(), store.frame_of_pane.get(&target))
-    else {
+    let (Some(conn), Some(&fid)) = (store.shared.as_ref(), store.frame_of_pane.get(&target)) else {
         return;
     };
 
@@ -1187,7 +1245,11 @@ fn handle_native_keyboard(
         };
         if let Some(code) = named {
             // For a plain space, drop shift so it doesn't read as S-SPC.
-            let m = if code == 32 { modbits & !0b100 } else { modbits };
+            let m = if code == 32 {
+                modbits & !0b100
+            } else {
+                modbits
+            };
             conn.send_key(fid, code, m);
             continue;
         }
@@ -1226,7 +1288,12 @@ fn register_native_kind(mut registry: ResMut<PaneRegistry>) {
     });
 }
 
-fn native_spawn_from_config(world: &mut World, entity: Entity, content_root: Entity, config: &Value) {
+fn native_spawn_from_config(
+    world: &mut World,
+    entity: Entity,
+    content_root: Entity,
+    config: &Value,
+) {
     let session_id = config
         .get("session_id")
         .and_then(|v| v.as_u64())
@@ -1238,7 +1305,10 @@ fn native_spawn_from_config(world: &mut World, entity: Entity, content_root: Ent
         });
     // Set by reconcile_frames when Emacs itself created the frame (a
     // split/pop-up); the pane adopts that id instead of allocating one.
-    let adopt = config.get("adopt_frame_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+    let adopt = config
+        .get("adopt_frame_id")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
     populate_native_pane(world, entity, content_root, session_id, adopt);
 }
 
@@ -1290,8 +1360,12 @@ pub fn populate_native_pane(
         }
     };
     let bg_bytes = {
-        let s = Color::LinearRgba(world.resource::<jim_style::Theme>().color(jim_style::tokens::BG))
-            .to_srgba();
+        let s = Color::LinearRgba(
+            world
+                .resource::<jim_style::Theme>()
+                .color(jim_style::tokens::BG),
+        )
+        .to_srgba();
         [
             (s.red.clamp(0.0, 1.0) * 255.0) as u8,
             (s.green.clamp(0.0, 1.0) * 255.0) as u8,
@@ -1463,7 +1537,10 @@ fn sync_emacs_frames(
         // Take this frame's pending ops from the shared queue.
         let ops: Vec<Op> = {
             let mut guard = conn.frame_ops.lock().expect("frame_ops lock");
-            guard.get_mut(&frame.frame_id).map(std::mem::take).unwrap_or_default()
+            guard
+                .get_mut(&frame.frame_id)
+                .map(std::mem::take)
+                .unwrap_or_default()
         };
         if ops.is_empty() {
             continue;
@@ -1526,7 +1603,14 @@ fn sync_emacs_frames(
                     bg,
                 ),
                 Op::Run {
-                    x, y, w, h, asc, fg, bg, glyphs,
+                    x,
+                    y,
+                    w,
+                    h,
+                    asc,
+                    fg,
+                    bg,
+                    glyphs,
                 } => {
                     // Background box for the run first (Emacs's own run
                     // height, so the block cursor fills the whole cell).
@@ -1584,11 +1668,8 @@ fn sync_emacs_frames(
 
         // Live buffer identity in the pane title bar.
         if let Some(title) = new_title {
-            commands
-                .entity(entity)
-                .insert(jim_pane::PaneTitle(title));
+            commands.entity(entity).insert(jim_pane::PaneTitle(title));
         }
     }
     let _ = (MARGIN, TITLE_H);
 }
-

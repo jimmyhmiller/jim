@@ -87,7 +87,9 @@ fn maintains_content_during_random_editing() {
         *seed
     }
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
-    let mut text: String = (0..200).map(|_| ('a' as u8 + (rng(&mut seed) % 26) as u8) as char).collect();
+    let mut text: String = (0..200)
+        .map(|_| ('a' as u8 + (rng(&mut seed) % 26) as u8) as char)
+        .collect();
     let mut doc = Rope::from_str(&text);
     for _ in 0..100 {
         let len = doc.len_chars();
@@ -118,7 +120,13 @@ fn returns_correct_strings_for_slice() {
     }
     let doc = Rope::from_str(&text);
     // A few deterministic slices.
-    for (from, to) in [(0, 5), (10, 50), (200, 250), (0, doc.len_chars()), (100, 100)] {
+    for (from, to) in [
+        (0, 5),
+        (10, 50),
+        (200, 250),
+        (0, doc.len_chars()),
+        (100, 100),
+    ] {
         assert_eq!(doc.slice(from..to).to_string(), text[from..to]);
     }
 }

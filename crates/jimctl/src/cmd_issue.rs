@@ -110,7 +110,8 @@ impl Args {
         let mut it = crate::sub_args();
         while let Some(arg) = it.next() {
             let mut take = |name: &str| -> Result<String, String> {
-                it.next().ok_or_else(|| format!("{} requires a value", name))
+                it.next()
+                    .ok_or_else(|| format!("{} requires a value", name))
             };
             match arg.as_str() {
                 "-h" | "--help" => {

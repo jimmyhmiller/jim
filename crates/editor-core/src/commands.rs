@@ -35,16 +35,17 @@ fn line_starts_in_range(state: &EditorState, range: Range) -> Vec<usize> {
     // trailing line — it's the convention in CM6 (a selection ending at the
     // start of the next line shouldn't indent that next line).
     let to = range.to();
-    let to_line = if range.is_empty() || to == doc.line_to_char(doc.char_to_line(to)) && to > range.from() {
-        let l = doc.char_to_line(to);
-        if l > from_line && to == doc.line_to_char(l) {
-            l - 1
+    let to_line =
+        if range.is_empty() || to == doc.line_to_char(doc.char_to_line(to)) && to > range.from() {
+            let l = doc.char_to_line(to);
+            if l > from_line && to == doc.line_to_char(l) {
+                l - 1
+            } else {
+                l
+            }
         } else {
-            l
-        }
-    } else {
-        doc.char_to_line(to)
-    };
+            doc.char_to_line(to)
+        };
     (from_line..=to_line).map(|l| doc.line_to_char(l)).collect()
 }
 
@@ -90,10 +91,16 @@ pub fn indent_more(state: &EditorState) -> Option<Transaction> {
     }
     let unit = &state.indent_unit;
     let unit_len = unit.chars().count() as isize;
-    let changes: Vec<Change> = starts.iter().map(|&pos| Change::insert(pos, unit)).collect();
+    let changes: Vec<Change> = starts
+        .iter()
+        .map(|&pos| Change::insert(pos, unit))
+        .collect();
     let shifts: Vec<(usize, isize)> = starts.iter().map(|&pos| (pos, unit_len)).collect();
     let selection = rebuild_selection(state, &shifts);
-    Some(Transaction { changes, selection: Some(selection) })
+    Some(Transaction {
+        changes,
+        selection: Some(selection),
+    })
 }
 
 /// Returns the (first_line, last_line) pair covered by `range`. Lines are
@@ -147,10 +154,7 @@ fn last_real_line(doc: &ropey::Rope) -> usize {
     let lines = doc.len_lines();
     if lines == 0 {
         0
-    } else if doc.len_chars() > 0
-        && doc.char(doc.len_chars() - 1) == '\n'
-        && lines >= 2
-    {
+    } else if doc.len_chars() > 0 && doc.char(doc.len_chars() - 1) == '\n' && lines >= 2 {
         lines - 2
     } else {
         lines - 1
@@ -239,14 +243,13 @@ pub fn move_line_up(state: &EditorState) -> Option<Transaction> {
 
         // Special case: block was at end of doc without trailing newline; the
         // line above contributes its newline.
-        let (new_block, new_above) =
-            if !block_text.ends_with('\n') && above_text.ends_with('\n') {
-                let nb = format!("{}\n", block_text);
-                let na = above_text[..above_text.len() - 1].to_string();
-                (nb, na)
-            } else {
-                (block_text.clone(), above_text.clone())
-            };
+        let (new_block, new_above) = if !block_text.ends_with('\n') && above_text.ends_with('\n') {
+            let nb = format!("{}\n", block_text);
+            let na = above_text[..above_text.len() - 1].to_string();
+            (nb, na)
+        } else {
+            (block_text.clone(), above_text.clone())
+        };
 
         let new_block_len = new_block.chars().count();
         let new_above_len = new_above.chars().count();
@@ -321,14 +324,13 @@ pub fn move_line_down(state: &EditorState) -> Option<Transaction> {
 
         // Special case: below is the doc-final line lacking a trailing newline.
         // Transfer the newline from the moving block to keep line structure.
-        let (new_below, new_block) =
-            if !below_text.ends_with('\n') && block_text.ends_with('\n') {
-                let nb = format!("{}\n", below_text);
-                let nbk = block_text[..block_text.len() - 1].to_string();
-                (nb, nbk)
-            } else {
-                (below_text.clone(), block_text.clone())
-            };
+        let (new_below, new_block) = if !below_text.ends_with('\n') && block_text.ends_with('\n') {
+            let nb = format!("{}\n", below_text);
+            let nbk = block_text[..block_text.len() - 1].to_string();
+            (nb, nbk)
+        } else {
+            (below_text.clone(), block_text.clone())
+        };
 
         let new_below_len = new_below.chars().count();
         let new_block_len = new_block.chars().count();
@@ -461,13 +463,8 @@ fn find_group_end_backward(doc: &Rope, p: usize) -> usize {
 
 fn delete_by_group(state: &EditorState, forward: bool) -> Option<Transaction> {
     let doc = &state.doc;
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
 
     let mut changes = Vec::new();
@@ -539,13 +536,8 @@ fn delete_by(
     find_other_end: impl Fn(&Rope, usize) -> usize,
 ) -> Option<Transaction> {
     let doc = &state.doc;
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
 
     let mut changes = Vec::new();
@@ -606,9 +598,7 @@ pub fn delete_to_line_end(state: &EditorState) -> Option<Transaction> {
 
 /// Delete from each cursor back to the start of its line.
 pub fn delete_to_line_start(state: &EditorState) -> Option<Transaction> {
-    delete_by(state, false, |doc, p| {
-        doc.line_to_char(doc.char_to_line(p))
-    })
+    delete_by(state, false, |doc, p| doc.line_to_char(doc.char_to_line(p)))
 }
 
 /// Duplicate each line containing a selection (or a cursor) and place the
@@ -666,7 +656,10 @@ fn copy_lines(state: &EditorState, up: bool) -> Option<Transaction> {
         shifts.push((block_start, insert_chars));
     }
     let selection = rebuild_selection(state, &shifts);
-    Some(Transaction { changes, selection: Some(selection) })
+    Some(Transaction {
+        changes,
+        selection: Some(selection),
+    })
 }
 
 /// Swap the character before each cursor with the one after. Mirrors emacs
@@ -676,13 +669,8 @@ fn copy_lines(state: &EditorState, up: bool) -> Option<Transaction> {
 pub fn transpose_chars(state: &EditorState) -> Option<Transaction> {
     let doc = &state.doc;
     let mut changes = Vec::new();
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
     let mut new_positions: Vec<(usize, usize)> = Vec::new();
     let shift: isize = 0;
@@ -759,7 +747,10 @@ pub fn delete_line(state: &EditorState) -> Option<Transaction> {
     if changes.is_empty() {
         return None;
     }
-    Some(Transaction { changes, selection: None })
+    Some(Transaction {
+        changes,
+        selection: None,
+    })
 }
 
 // ---- Bracket matching --------------------------------------------------
@@ -791,7 +782,12 @@ fn scan_open_to_close(doc: &Rope, start: usize, open: char, close: char) -> Opti
     None
 }
 
-fn scan_close_to_open(doc: &Rope, start_exclusive: usize, open: char, close: char) -> Option<usize> {
+fn scan_close_to_open(
+    doc: &Rope,
+    start_exclusive: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
     let mut depth = 1isize;
     let mut i = start_exclusive;
     while i > 0 {
@@ -822,8 +818,7 @@ fn find_matching_bracket(state: &EditorState, pos: usize) -> Option<usize> {
         }
         None
     };
-    let (bracket_pos, c) = pick(pos)
-        .or_else(|| if pos > 0 { pick(pos - 1) } else { None })?;
+    let (bracket_pos, c) = pick(pos).or_else(|| if pos > 0 { pick(pos - 1) } else { None })?;
     if let Some(close) = state.indent_rules.matching_close(c) {
         scan_open_to_close(doc, bracket_pos + 1, c, close)
     } else if let Some(open) = matching_open_for(state, c) {
@@ -872,13 +867,8 @@ pub fn select_matching_bracket(state: &EditorState) -> Option<Transaction> {
 /// Insert a `\n` at each cursor; the cursor stays *before* the newline so the
 /// effect is "an empty line opens up below me" — Ctrl-O / Cmd-Enter style.
 pub fn insert_blank_line(state: &EditorState) -> Option<Transaction> {
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
 
     let mut changes = Vec::new();
@@ -1168,19 +1158,29 @@ fn move_lines(state: &EditorState, delta_lines: isize, extend: bool) -> Option<T
             let col = r.head - doc.line_to_char(line);
             let target_line_signed = line as isize + delta_lines;
             if target_line_signed < 0 {
-                if extend { return Range::new(r.anchor, 0); }
+                if extend {
+                    return Range::new(r.anchor, 0);
+                }
                 return Range::cursor(0);
             }
             let target_line = (target_line_signed as usize).min(last);
             let target_start = doc.line_to_char(target_line);
             let target_end = if target_line + 1 < doc.len_lines() {
                 let next = doc.line_to_char(target_line + 1);
-                if next > 0 && doc.char(next - 1) == '\n' { next - 1 } else { next }
+                if next > 0 && doc.char(next - 1) == '\n' {
+                    next - 1
+                } else {
+                    next
+                }
             } else {
                 doc.len_chars()
             };
             let pos = (target_start + col).min(target_end);
-            if extend { Range::new(r.anchor, pos) } else { Range::cursor(pos) }
+            if extend {
+                Range::new(r.anchor, pos)
+            } else {
+                Range::cursor(pos)
+            }
         })
         .collect();
     let new_sel = Selection::new(new_ranges, state.selection.primary);
@@ -1211,13 +1211,8 @@ pub fn select_line_down(state: &EditorState) -> Option<Transaction> {
 /// Insert a literal `\t` at every cursor (replacing any selection). Mirrors
 /// CM6's `insertTab` for the cursor-only case.
 pub fn insert_tab(state: &EditorState) -> Option<Transaction> {
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
     let mut changes = Vec::new();
     let mut new_positions: Vec<(usize, usize)> = Vec::new();
@@ -1564,7 +1559,11 @@ pub fn split_selection_by_line(state: &EditorState) -> Option<Transaction> {
             } else {
                 doc.len_chars()
             };
-            let seg_from = if line == from_line { r.from() } else { line_start };
+            let seg_from = if line == from_line {
+                r.from()
+            } else {
+                line_start
+            };
             let seg_to = if line == to_line { r.to() } else { line_end };
             if seg_from <= seg_to {
                 new_ranges.push(Range::new(seg_from, seg_to));
@@ -1613,7 +1612,9 @@ fn add_cursor_vertical(state: &EditorState, above: bool) -> Option<Transaction> 
         } else {
             None
         };
-        let Some(target_line) = target_line else { continue };
+        let Some(target_line) = target_line else {
+            continue;
+        };
         if !above && target_line >= last_real_line(doc) + 1 {
             continue;
         }
@@ -1647,13 +1648,8 @@ fn add_cursor_vertical(state: &EditorState, above: bool) -> Option<Transaction> 
 /// Insert a newline at each cursor without moving the cursor (cursor stays
 /// before the inserted `\n`). Mirrors CM6's `splitLine`.
 pub fn split_line(state: &EditorState) -> Option<Transaction> {
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
 
     let mut changes = Vec::new();
@@ -1729,7 +1725,9 @@ pub fn select_char_right(state: &EditorState) -> Option<Transaction> {
 }
 
 pub fn cursor_line_start(state: &EditorState) -> Option<Transaction> {
-    move_each(state, false, |p, s| s.doc.line_to_char(s.doc.char_to_line(p)))
+    move_each(state, false, |p, s| {
+        s.doc.line_to_char(s.doc.char_to_line(p))
+    })
 }
 
 pub fn cursor_line_end(state: &EditorState) -> Option<Transaction> {
@@ -1750,7 +1748,9 @@ pub fn cursor_line_end(state: &EditorState) -> Option<Transaction> {
 }
 
 pub fn select_line_start(state: &EditorState) -> Option<Transaction> {
-    move_each(state, true, |p, s| s.doc.line_to_char(s.doc.char_to_line(p)))
+    move_each(state, true, |p, s| {
+        s.doc.line_to_char(s.doc.char_to_line(p))
+    })
 }
 
 pub fn select_line_end(state: &EditorState) -> Option<Transaction> {
@@ -1789,7 +1789,9 @@ pub fn select_doc_end(state: &EditorState) -> Option<Transaction> {
 
 /// Read the leading whitespace string from a line.
 fn leading_ws(line: &str) -> String {
-    line.chars().take_while(|c| *c == ' ' || *c == '\t').collect()
+    line.chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
 }
 
 /// Last non-whitespace char in `s`, or None.
@@ -1808,9 +1810,7 @@ fn first_non_ws(s: &str) -> Option<char> {
 /// with an "open" bracket.
 fn indent_after(state: &EditorState, prev_text: &str) -> String {
     let mut indent = leading_ws(prev_text);
-    if last_non_ws(prev_text)
-        .map_or(false, |c| state.indent_rules.open.contains(&c))
-    {
+    if last_non_ws(prev_text).map_or(false, |c| state.indent_rules.open.contains(&c)) {
         indent.push_str(&state.indent_unit);
     }
     indent
@@ -1819,13 +1819,8 @@ fn indent_after(state: &EditorState, prev_text: &str) -> String {
 pub fn insert_newline_and_indent(state: &EditorState) -> Option<Transaction> {
     let doc = &state.doc;
     let n = state.selection.ranges.len();
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
 
     let mut changes = Vec::with_capacity(n);
@@ -1847,8 +1842,7 @@ pub fn insert_newline_and_indent(state: &EditorState) -> Option<Transaction> {
                     action.delete_to,
                     action.insert,
                 ));
-                let new_pos =
-                    (action.delete_from as isize + shift + cursor_offset) as usize;
+                let new_pos = (action.delete_from as isize + shift + cursor_offset) as usize;
                 new_positions.push((orig_idx, new_pos));
                 shift += insert_chars - removed;
                 continue;
@@ -1875,7 +1869,10 @@ pub fn insert_newline_and_indent(state: &EditorState) -> Option<Transaction> {
                 let prev_start = doc.line_to_char(line_idx - 1);
                 let prev_end = doc.line_to_char(line_idx);
                 let prev_text: String = doc.slice(prev_start..prev_end).to_string();
-                let prev_no_nl = prev_text.strip_suffix('\n').unwrap_or(&prev_text).to_string();
+                let prev_no_nl = prev_text
+                    .strip_suffix('\n')
+                    .unwrap_or(&prev_text)
+                    .to_string();
                 indent_after(state, &prev_no_nl)
             };
             let insert = format!("\n{}", indent);
@@ -2035,15 +2032,20 @@ pub fn indent_selection(state: &EditorState) -> Option<Transaction> {
                     .take_while(|c| *c == ' ' || *c == '\t')
                     .count();
                 let rest: String = prev_no_nl.chars().skip(prev_old_ws_chars).collect();
-                prev_text = format!("{}{}{}", new_ws, rest, if prev_text.ends_with('\n') { "\n" } else { "" });
+                prev_text = format!(
+                    "{}{}{}",
+                    new_ws,
+                    rest,
+                    if prev_text.ends_with('\n') { "\n" } else { "" }
+                );
             }
             let prev_no_nl = prev_text.strip_suffix('\n').unwrap_or(&prev_text);
             if prev_no_nl.chars().all(char::is_whitespace) {
                 continue;
             }
             prev_indent_str = leading_ws(prev_no_nl);
-            prev_ends_with_open = last_non_ws(prev_no_nl)
-                .map_or(false, |c| state.indent_rules.open.contains(&c));
+            prev_ends_with_open =
+                last_non_ws(prev_no_nl).map_or(false, |c| state.indent_rules.open.contains(&c));
             break;
         }
 
@@ -2076,7 +2078,10 @@ pub fn indent_selection(state: &EditorState) -> Option<Transaction> {
     // *original* leading whitespace, this snaps them to right after the new
     // leading whitespace — which is what CM6's "moves the cursor ahead of
     // the indentation" test expects.
-    Some(Transaction { changes, selection: None })
+    Some(Transaction {
+        changes,
+        selection: None,
+    })
 }
 
 pub fn insert_newline_keep_indent(state: &EditorState) -> Option<Transaction> {
@@ -2084,13 +2089,8 @@ pub fn insert_newline_keep_indent(state: &EditorState) -> Option<Transaction> {
     let n = state.selection.ranges.len();
 
     // Process ranges left-to-right so we can track cumulative position shift.
-    let mut indexed: Vec<(usize, Range)> = state
-        .selection
-        .ranges
-        .iter()
-        .copied()
-        .enumerate()
-        .collect();
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
     indexed.sort_by_key(|(_, r)| r.from());
 
     let mut changes = Vec::with_capacity(n);
@@ -2167,7 +2167,10 @@ pub fn delete_trailing_whitespace(state: &EditorState) -> Option<Transaction> {
     if changes.is_empty() {
         None
     } else {
-        Some(Transaction { changes, selection: None })
+        Some(Transaction {
+            changes,
+            selection: None,
+        })
     }
 }
 
@@ -2194,10 +2197,7 @@ pub fn indent_less(state: &EditorState) -> Option<Transaction> {
     let mut shifts: Vec<(usize, isize)> = Vec::new();
     for &start in &unique_line_starts(state) {
         let line = state.doc.line(state.doc.char_to_line(start));
-        let ws_count: usize = line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .count();
+        let ws_count: usize = line.chars().take_while(|c| *c == ' ' || *c == '\t').count();
         if ws_count == 0 {
             continue;
         }
@@ -2219,6 +2219,9 @@ pub fn indent_less(state: &EditorState) -> Option<Transaction> {
         None
     } else {
         let selection = rebuild_selection(state, &shifts);
-        Some(Transaction { changes, selection: Some(selection) })
+        Some(Transaction {
+            changes,
+            selection: Some(selection),
+        })
     }
 }

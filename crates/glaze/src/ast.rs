@@ -95,7 +95,10 @@ pub enum Expr {
     /// `#rrggbb`
     Hex(String),
     /// `oklch(L C H [/ a])` / `oklab(L a b [/ alpha])`
-    Color { space: String, nums: Vec<f64> },
+    Color {
+        space: String,
+        nums: Vec<f64>,
+    },
     /// a bare identifier: a token ref, a variant param, or a symbol/keyword
     Ident(String),
     Unary(char, Box<Expr>),

@@ -75,7 +75,7 @@ pub fn run() -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("HOME not set; cannot locate bus socket"))?;
     let retained = retained_path()
         .ok_or_else(|| std::io::Error::other("HOME not set; cannot locate retained store"))?;
-    let pid = pid_path()
-        .ok_or_else(|| std::io::Error::other("HOME not set; cannot locate pid file"))?;
+    let pid =
+        pid_path().ok_or_else(|| std::io::Error::other("HOME not set; cannot locate pid file"))?;
     daemon::run(socket, retained, pid)
 }

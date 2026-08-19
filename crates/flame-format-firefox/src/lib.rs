@@ -215,7 +215,11 @@ impl TraceSource for FirefoxSource {
             .categories
             .iter()
             .map(|c| {
-                let name = if c.name.is_empty() { "uncategorized" } else { &c.name };
+                let name = if c.name.is_empty() {
+                    "uncategorized"
+                } else {
+                    &c.name
+                };
                 builder.intern_category(name)
             })
             .collect();
@@ -262,24 +266,23 @@ impl TraceSource for FirefoxSource {
                 local_strings = thread.string_array.as_deref().unwrap_or(&[]);
                 strings = local_strings;
                 stack_table = thread.stack_table.as_ref().ok_or_else(|| {
-                    LoadError::Parse(format!(
-                        "thread {tid}: missing stackTable (and no shared)"
-                    ))
+                    LoadError::Parse(format!("thread {tid}: missing stackTable (and no shared)"))
                 })?;
-                frame_table = thread.frame_table.as_ref().ok_or_else(|| {
-                    LoadError::Parse(format!("thread {tid}: missing frameTable"))
-                })?;
-                func_table = thread.func_table.as_ref().ok_or_else(|| {
-                    LoadError::Parse(format!("thread {tid}: missing funcTable"))
-                })?;
+                frame_table = thread
+                    .frame_table
+                    .as_ref()
+                    .ok_or_else(|| LoadError::Parse(format!("thread {tid}: missing frameTable")))?;
+                func_table = thread
+                    .func_table
+                    .as_ref()
+                    .ok_or_else(|| LoadError::Parse(format!("thread {tid}: missing funcTable")))?;
             }
 
             // Pre-intern frames: for each FrameTable entry, resolve func -> string.
             let mut frame_ids = Vec::with_capacity(frame_table.length);
             for fi in 0..frame_table.length {
                 let func_idx = *frame_table.func.get(fi).unwrap_or(&0) as usize;
-                let name_idx =
-                    *func_table.name.get(func_idx).unwrap_or(&0) as usize;
+                let name_idx = *func_table.name.get(func_idx).unwrap_or(&0) as usize;
                 let name = strings.get(name_idx).map(|s| s.as_str()).unwrap_or("?");
                 let file_str = func_table
                     .file_name
@@ -345,11 +348,7 @@ impl TraceSource for FirefoxSource {
 
                 next_frames.clear();
                 if let Some(Some(stack_idx)) = stacks.get(i).copied().map(Some).flatten() {
-                    walk_stack_root_first(
-                        stack_idx,
-                        stack_table,
-                        &mut next_frames,
-                    );
+                    walk_stack_root_first(stack_idx, stack_table, &mut next_frames);
                 }
 
                 // Find longest common prefix with prev.
@@ -379,10 +378,7 @@ impl TraceSource for FirefoxSource {
 
                 // Open new runs for the deeper part of next.
                 for &fi in &next_frames[common..] {
-                    let fid = frame_ids
-                        .get(fi as usize)
-                        .copied()
-                        .unwrap_or(frame_ids[0]);
+                    let fid = frame_ids.get(fi as usize).copied().unwrap_or(frame_ids[0]);
                     open_runs.push((fid, t_ns));
                     max_depth = max_depth.max(open_runs.len() as u16);
                 }
@@ -411,9 +407,8 @@ impl TraceSource for FirefoxSource {
             // Markers — emit Interval markers (phase=1) on a sibling track.
             if let Some(markers) = &thread.markers {
                 if markers.length > 0 {
-                    let marker_track = emit_marker_track(
-                        builder, proc, &label, markers, strings, &category_ids,
-                    );
+                    let marker_track =
+                        emit_marker_track(builder, proc, &label, markers, strings, &category_ids);
                     let _ = marker_track; // populated inside helper
                 }
             }
@@ -479,7 +474,10 @@ fn emit_marker_track(
     for i in 0..m.length {
         let phase = *m.phase.get(i).unwrap_or(&0);
         let name_idx = *m.name.get(i).unwrap_or(&0) as usize;
-        let name = strings.get(name_idx).map(|s| s.as_str()).unwrap_or("marker");
+        let name = strings
+            .get(name_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("marker");
         let cat = m
             .category
             .get(i)
@@ -526,5 +524,6 @@ fn ms_to_ns(ms: f64) -> u64 {
 }
 
 fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
-    v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    v.as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
 }

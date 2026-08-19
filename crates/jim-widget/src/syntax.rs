@@ -73,7 +73,12 @@ thread_local! {
 /// Resolve a language id or file extension to a canonical grammar key.
 /// Add grammars by adding a crate dep + an arm here and in [`make_lang`].
 fn canon_lang(lang: &str) -> Option<&'static str> {
-    match lang.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+    match lang
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "rust" | "rs" => Some("rust"),
         "json" => Some("json"),
         _ => None,
@@ -84,7 +89,9 @@ fn make_lang(key: &str) -> Option<LangState> {
     match key {
         "rust" => {
             let mut parser = Parser::new();
-            parser.set_language(&tree_sitter_rust::LANGUAGE.into()).ok()?;
+            parser
+                .set_language(&tree_sitter_rust::LANGUAGE.into())
+                .ok()?;
             let query = Query::new(
                 &tree_sitter_rust::LANGUAGE.into(),
                 tree_sitter_rust::HIGHLIGHTS_QUERY,
@@ -94,7 +101,9 @@ fn make_lang(key: &str) -> Option<LangState> {
         }
         "json" => {
             let mut parser = Parser::new();
-            parser.set_language(&tree_sitter_json::LANGUAGE.into()).ok()?;
+            parser
+                .set_language(&tree_sitter_json::LANGUAGE.into())
+                .ok()?;
             let query = Query::new(
                 &tree_sitter_json::LANGUAGE.into(),
                 tree_sitter_json::HIGHLIGHTS_QUERY,

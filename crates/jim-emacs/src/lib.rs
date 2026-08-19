@@ -30,8 +30,8 @@ use jim_pane::{FocusedPane, PaneKindMarker, PaneRect, PaneRegistry};
 use jim_terminal::pty::PtySize;
 use jim_terminal::worker::{WorkerHandle, WorkerMsg};
 use jim_terminal::{
-    build_term_grid, grid_size_for_rect, TerminalCursor, TerminalData, TerminalSession,
-    TerminalStore, LINE_HEIGHT,
+    LINE_HEIGHT, TerminalCursor, TerminalData, TerminalSession, TerminalStore, build_term_grid,
+    grid_size_for_rect,
 };
 
 pub mod native;
@@ -433,53 +433,335 @@ fn plain_nav_key(code: KeyCode) -> Option<&'static [u8]> {
 /// Base US-QWERTY character for a physical key (see the Meta path above).
 pub(crate) fn base_char(code: KeyCode, shift: bool) -> Option<char> {
     let ch = match code {
-        KeyCode::KeyA => if shift { 'A' } else { 'a' },
-        KeyCode::KeyB => if shift { 'B' } else { 'b' },
-        KeyCode::KeyC => if shift { 'C' } else { 'c' },
-        KeyCode::KeyD => if shift { 'D' } else { 'd' },
-        KeyCode::KeyE => if shift { 'E' } else { 'e' },
-        KeyCode::KeyF => if shift { 'F' } else { 'f' },
-        KeyCode::KeyG => if shift { 'G' } else { 'g' },
-        KeyCode::KeyH => if shift { 'H' } else { 'h' },
-        KeyCode::KeyI => if shift { 'I' } else { 'i' },
-        KeyCode::KeyJ => if shift { 'J' } else { 'j' },
-        KeyCode::KeyK => if shift { 'K' } else { 'k' },
-        KeyCode::KeyL => if shift { 'L' } else { 'l' },
-        KeyCode::KeyM => if shift { 'M' } else { 'm' },
-        KeyCode::KeyN => if shift { 'N' } else { 'n' },
-        KeyCode::KeyO => if shift { 'O' } else { 'o' },
-        KeyCode::KeyP => if shift { 'P' } else { 'p' },
-        KeyCode::KeyQ => if shift { 'Q' } else { 'q' },
-        KeyCode::KeyR => if shift { 'R' } else { 'r' },
-        KeyCode::KeyS => if shift { 'S' } else { 's' },
-        KeyCode::KeyT => if shift { 'T' } else { 't' },
-        KeyCode::KeyU => if shift { 'U' } else { 'u' },
-        KeyCode::KeyV => if shift { 'V' } else { 'v' },
-        KeyCode::KeyW => if shift { 'W' } else { 'w' },
-        KeyCode::KeyX => if shift { 'X' } else { 'x' },
-        KeyCode::KeyY => if shift { 'Y' } else { 'y' },
-        KeyCode::KeyZ => if shift { 'Z' } else { 'z' },
-        KeyCode::Digit1 => if shift { '!' } else { '1' },
-        KeyCode::Digit2 => if shift { '@' } else { '2' },
-        KeyCode::Digit3 => if shift { '#' } else { '3' },
-        KeyCode::Digit4 => if shift { '$' } else { '4' },
-        KeyCode::Digit5 => if shift { '%' } else { '5' },
-        KeyCode::Digit6 => if shift { '^' } else { '6' },
-        KeyCode::Digit7 => if shift { '&' } else { '7' },
-        KeyCode::Digit8 => if shift { '*' } else { '8' },
-        KeyCode::Digit9 => if shift { '(' } else { '9' },
-        KeyCode::Digit0 => if shift { ')' } else { '0' },
-        KeyCode::Minus => if shift { '_' } else { '-' },
-        KeyCode::Equal => if shift { '+' } else { '=' },
-        KeyCode::BracketLeft => if shift { '{' } else { '[' },
-        KeyCode::BracketRight => if shift { '}' } else { ']' },
-        KeyCode::Backslash => if shift { '|' } else { '\\' },
-        KeyCode::Semicolon => if shift { ':' } else { ';' },
-        KeyCode::Quote => if shift { '"' } else { '\'' },
-        KeyCode::Comma => if shift { '<' } else { ',' },
-        KeyCode::Period => if shift { '>' } else { '.' },
-        KeyCode::Slash => if shift { '?' } else { '/' },
-        KeyCode::Backquote => if shift { '~' } else { '`' },
+        KeyCode::KeyA => {
+            if shift {
+                'A'
+            } else {
+                'a'
+            }
+        }
+        KeyCode::KeyB => {
+            if shift {
+                'B'
+            } else {
+                'b'
+            }
+        }
+        KeyCode::KeyC => {
+            if shift {
+                'C'
+            } else {
+                'c'
+            }
+        }
+        KeyCode::KeyD => {
+            if shift {
+                'D'
+            } else {
+                'd'
+            }
+        }
+        KeyCode::KeyE => {
+            if shift {
+                'E'
+            } else {
+                'e'
+            }
+        }
+        KeyCode::KeyF => {
+            if shift {
+                'F'
+            } else {
+                'f'
+            }
+        }
+        KeyCode::KeyG => {
+            if shift {
+                'G'
+            } else {
+                'g'
+            }
+        }
+        KeyCode::KeyH => {
+            if shift {
+                'H'
+            } else {
+                'h'
+            }
+        }
+        KeyCode::KeyI => {
+            if shift {
+                'I'
+            } else {
+                'i'
+            }
+        }
+        KeyCode::KeyJ => {
+            if shift {
+                'J'
+            } else {
+                'j'
+            }
+        }
+        KeyCode::KeyK => {
+            if shift {
+                'K'
+            } else {
+                'k'
+            }
+        }
+        KeyCode::KeyL => {
+            if shift {
+                'L'
+            } else {
+                'l'
+            }
+        }
+        KeyCode::KeyM => {
+            if shift {
+                'M'
+            } else {
+                'm'
+            }
+        }
+        KeyCode::KeyN => {
+            if shift {
+                'N'
+            } else {
+                'n'
+            }
+        }
+        KeyCode::KeyO => {
+            if shift {
+                'O'
+            } else {
+                'o'
+            }
+        }
+        KeyCode::KeyP => {
+            if shift {
+                'P'
+            } else {
+                'p'
+            }
+        }
+        KeyCode::KeyQ => {
+            if shift {
+                'Q'
+            } else {
+                'q'
+            }
+        }
+        KeyCode::KeyR => {
+            if shift {
+                'R'
+            } else {
+                'r'
+            }
+        }
+        KeyCode::KeyS => {
+            if shift {
+                'S'
+            } else {
+                's'
+            }
+        }
+        KeyCode::KeyT => {
+            if shift {
+                'T'
+            } else {
+                't'
+            }
+        }
+        KeyCode::KeyU => {
+            if shift {
+                'U'
+            } else {
+                'u'
+            }
+        }
+        KeyCode::KeyV => {
+            if shift {
+                'V'
+            } else {
+                'v'
+            }
+        }
+        KeyCode::KeyW => {
+            if shift {
+                'W'
+            } else {
+                'w'
+            }
+        }
+        KeyCode::KeyX => {
+            if shift {
+                'X'
+            } else {
+                'x'
+            }
+        }
+        KeyCode::KeyY => {
+            if shift {
+                'Y'
+            } else {
+                'y'
+            }
+        }
+        KeyCode::KeyZ => {
+            if shift {
+                'Z'
+            } else {
+                'z'
+            }
+        }
+        KeyCode::Digit1 => {
+            if shift {
+                '!'
+            } else {
+                '1'
+            }
+        }
+        KeyCode::Digit2 => {
+            if shift {
+                '@'
+            } else {
+                '2'
+            }
+        }
+        KeyCode::Digit3 => {
+            if shift {
+                '#'
+            } else {
+                '3'
+            }
+        }
+        KeyCode::Digit4 => {
+            if shift {
+                '$'
+            } else {
+                '4'
+            }
+        }
+        KeyCode::Digit5 => {
+            if shift {
+                '%'
+            } else {
+                '5'
+            }
+        }
+        KeyCode::Digit6 => {
+            if shift {
+                '^'
+            } else {
+                '6'
+            }
+        }
+        KeyCode::Digit7 => {
+            if shift {
+                '&'
+            } else {
+                '7'
+            }
+        }
+        KeyCode::Digit8 => {
+            if shift {
+                '*'
+            } else {
+                '8'
+            }
+        }
+        KeyCode::Digit9 => {
+            if shift {
+                '('
+            } else {
+                '9'
+            }
+        }
+        KeyCode::Digit0 => {
+            if shift {
+                ')'
+            } else {
+                '0'
+            }
+        }
+        KeyCode::Minus => {
+            if shift {
+                '_'
+            } else {
+                '-'
+            }
+        }
+        KeyCode::Equal => {
+            if shift {
+                '+'
+            } else {
+                '='
+            }
+        }
+        KeyCode::BracketLeft => {
+            if shift {
+                '{'
+            } else {
+                '['
+            }
+        }
+        KeyCode::BracketRight => {
+            if shift {
+                '}'
+            } else {
+                ']'
+            }
+        }
+        KeyCode::Backslash => {
+            if shift {
+                '|'
+            } else {
+                '\\'
+            }
+        }
+        KeyCode::Semicolon => {
+            if shift {
+                ':'
+            } else {
+                ';'
+            }
+        }
+        KeyCode::Quote => {
+            if shift {
+                '"'
+            } else {
+                '\''
+            }
+        }
+        KeyCode::Comma => {
+            if shift {
+                '<'
+            } else {
+                ','
+            }
+        }
+        KeyCode::Period => {
+            if shift {
+                '>'
+            } else {
+                '.'
+            }
+        }
+        KeyCode::Slash => {
+            if shift {
+                '?'
+            } else {
+                '/'
+            }
+        }
+        KeyCode::Backquote => {
+            if shift {
+                '~'
+            } else {
+                '`'
+            }
+        }
         _ => return None,
     };
     Some(ch)

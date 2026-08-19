@@ -102,10 +102,7 @@ fn isolated_apply_skips_join() {
 fn puts_cursor_after_change_on_redo() {
     // Mirrors CM6: insert "!" at position 3 with explicit cursor at 4,
     // then move cursor elsewhere, undo, redo, expect cursor back at 4.
-    let state = EditorState::new(
-        ropey::Rope::from_str("one\n\ntwo"),
-        Selection::cursor(0),
-    );
+    let state = EditorState::new(ropey::Rope::from_str("one\n\ntwo"), Selection::cursor(0));
     // Insert "!" at 3 with explicit selection at 4.
     let tr = Transaction::new()
         .change(Change::insert(3, "!"))
@@ -171,9 +168,8 @@ fn restores_selection_on_undo_redo_undo() {
     // making doc "1\n2\n3." with cursor at 6, then move cursor elsewhere,
     // then undo / redo / undo and verify selection bounces back correctly.
     let state = mk_state("1\n2\n3");
-    let move_to = |st: &EditorState, p: usize| {
-        st.apply(&Transaction::new().select(Selection::cursor(p)))
-    };
+    let move_to =
+        |st: &EditorState, p: usize| st.apply(&Transaction::new().select(Selection::cursor(p)));
 
     let state = move_to(&state, 5);
     let tr = Transaction::new()
@@ -221,9 +217,7 @@ fn undo_selection_steps_back_through_selection_changes() {
 fn undo_selection_doesnt_touch_doc() {
     let state = mk_state("hello");
     let state = type_end(&state, " world");
-    let move_state = state.apply_with_history(
-        &Transaction::new().select(Selection::cursor(0)),
-    );
+    let move_state = state.apply_with_history(&Transaction::new().select(Selection::cursor(0)));
     assert_eq!(move_state.doc.to_string(), "hello world");
     let undone = undo_selection(&move_state).expect("undo sel");
     // Doc unchanged.

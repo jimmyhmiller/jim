@@ -18,7 +18,7 @@ use std::process::ExitCode;
 
 use bevy::app::AppExit;
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::sprite::Anchor;
 use bevy::window::{ExitCondition, WindowPlugin, WindowResolution};
 use jim_pane::{PanePlugin, PaneRect};
@@ -103,10 +103,7 @@ fn main() -> ExitCode {
         wait_frames,
     })
     .init_resource::<ProbeState>()
-    .add_systems(
-        Startup,
-        setup.after(jim_editor::setup_editor_font),
-    )
+    .add_systems(Startup, setup.after(jim_editor::setup_editor_font))
     .add_systems(Update, capture);
 
     app.run();

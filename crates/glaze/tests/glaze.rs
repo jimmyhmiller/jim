@@ -2,7 +2,10 @@ use glaze::{GlazeError, Layer, Length, Value, parse};
 use std::collections::HashMap;
 
 fn variant(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 const SHEET: &str = include_str!("../examples/atelier.glz");
@@ -27,8 +30,12 @@ fn token_alias_resolves_through_layers() {
 #[test]
 fn variant_selects_fill_color() {
     let prog = parse(SHEET).unwrap();
-    let primary = prog.resolve("button", &variant(&[("intent", "primary")]), &[]).unwrap();
-    let danger = prog.resolve("button", &variant(&[("intent", "danger")]), &[]).unwrap();
+    let primary = prog
+        .resolve("button", &variant(&[("intent", "primary")]), &[])
+        .unwrap();
+    let danger = prog
+        .resolve("button", &variant(&[("intent", "danger")]), &[])
+        .unwrap();
     let fill = |c: &glaze::CompiledStyle| match c.layers[0] {
         Layer::Fill(rgba) => rgba,
         _ => panic!("first layer should be a fill"),
@@ -43,13 +50,19 @@ fn variant_selects_fill_color() {
 #[test]
 fn discrete_state_overlays_apply() {
     let prog = parse(SHEET).unwrap();
-    let base = prog.resolve("button", &variant(&[("intent", "primary")]), &[]).unwrap();
-    let hover = prog.resolve("button", &variant(&[("intent", "primary")]), &["hover"]).unwrap();
+    let base = prog
+        .resolve("button", &variant(&[("intent", "primary")]), &[])
+        .unwrap();
+    let hover = prog
+        .resolve("button", &variant(&[("intent", "primary")]), &["hover"])
+        .unwrap();
     // base has one fill; :hover adds a second fill overlay
     assert_eq!(base.layers.len(), 1);
     assert_eq!(hover.layers.len(), 2);
 
-    let focus = prog.resolve("button", &variant(&[("intent", "primary")]), &["focus"]).unwrap();
+    let focus = prog
+        .resolve("button", &variant(&[("intent", "primary")]), &["focus"])
+        .unwrap();
     assert!(matches!(focus.layers.last(), Some(Layer::Border { width, .. }) if *width == 2.0));
 }
 
@@ -81,7 +94,9 @@ fn shader_layer_compiles_to_wgsl_with_staging() {
         "#,
     )
     .unwrap();
-    let compiled = prog.resolve("glow", &variant(&[("intent", "primary")]), &[]).unwrap();
+    let compiled = prog
+        .resolve("glow", &variant(&[("intent", "primary")]), &[])
+        .unwrap();
     // base fill + a shader layer
     assert_eq!(compiled.layers.len(), 2);
     let shader = match compiled.layers.last().unwrap() {
@@ -97,9 +112,15 @@ fn shader_layer_compiles_to_wgsl_with_staging() {
     assert!(w.contains("u.time"), "wgsl:\n{w}");
     assert!(w.contains("u.hover"), "wgsl:\n{w}");
     assert!(w.contains("let pulse ="), "the dynamic let survives:\n{w}");
-    assert!(w.contains("vec4<f32>(1") || w.contains("vec4<f32>(1.0"), "static vec4 folded:\n{w}");
+    assert!(
+        w.contains("vec4<f32>(1") || w.contains("vec4<f32>(1.0"),
+        "static vec4 folded:\n{w}"
+    );
     // no per-frame builtin leaked into a CPU constant
-    assert!(!w.contains("smoothstep(0.0, 1.0, hover)"), "hover must be u.hover:\n{w}");
+    assert!(
+        !w.contains("smoothstep(0.0, 1.0, hover)"),
+        "hover must be u.hover:\n{w}"
+    );
 }
 
 #[test]
@@ -118,8 +139,16 @@ fn fully_static_shader_folds_to_a_constant_return() {
         other => panic!("got {other:?}"),
     };
     assert!(shader.used.is_empty(), "static shader needs no uniforms");
-    assert!(shader.wgsl_body.contains("return vec4<f32>("), "folded:\n{}", shader.wgsl_body);
-    assert!(!shader.wgsl_body.contains("u."), "no uniform refs:\n{}", shader.wgsl_body);
+    assert!(
+        shader.wgsl_body.contains("return vec4<f32>("),
+        "folded:\n{}",
+        shader.wgsl_body
+    );
+    assert!(
+        !shader.wgsl_body.contains("u."),
+        "no uniform refs:\n{}",
+        shader.wgsl_body
+    );
 }
 
 #[test]
@@ -137,7 +166,9 @@ fn swizzles_lower_to_member_access() {
     )
     .unwrap();
     let c = prog.resolve("s", &variant(&[]), &[]).unwrap();
-    let Layer::Shader(sh) = &c.layers[0] else { panic!("expected shader layer") };
+    let Layer::Shader(sh) = &c.layers[0] else {
+        panic!("expected shader layer")
+    };
     let w = &sh.wgsl_body;
     assert!(w.contains("u.resolution.x"), "{w}");
     assert!(w.contains("u.resolution.y"), "{w}");
@@ -176,8 +207,12 @@ fn responsive_when_flips_direction() {
         "#,
     )
     .unwrap();
-    let wide = prog.resolve_at("bar", &variant(&[]), &[], 800.0, 600.0).unwrap();
-    let narrow = prog.resolve_at("bar", &variant(&[]), &[], 400.0, 600.0).unwrap();
+    let wide = prog
+        .resolve_at("bar", &variant(&[]), &[], 800.0, 600.0)
+        .unwrap();
+    let narrow = prog
+        .resolve_at("bar", &variant(&[]), &[], 400.0, 600.0)
+        .unwrap();
     assert_eq!(wide.box_.flex_direction, Some(glaze::Dir::Row));
     assert_eq!(narrow.box_.flex_direction, Some(glaze::Dir::Column));
     // plain resolve() uses an infinite viewport → no breakpoint fires
@@ -217,7 +252,9 @@ fn function_inlines_into_shader() {
     )
     .unwrap();
     let c = prog.resolve("s", &variant(&[]), &[]).unwrap();
-    let Layer::Shader(sh) = &c.layers[0] else { panic!() };
+    let Layer::Shader(sh) = &c.layers[0] else {
+        panic!()
+    };
     assert!(sh.wgsl_body.contains("in.uv"), "{}", sh.wgsl_body);
     assert!(sh.wgsl_body.contains("smoothstep"), "{}", sh.wgsl_body);
     assert!(sh.used.contains(&glaze::Builtin::Uv));
@@ -334,7 +371,13 @@ fn shadow_and_inset_shadow_carry_params() {
     let prog = parse(STOPS).unwrap();
     let c = prog.resolve("shadows", &variant(&[]), &[]).unwrap();
     match &c.layers[0] {
-        Layer::Shadow { blur, offset_y, spread, inset, .. } => {
+        Layer::Shadow {
+            blur,
+            offset_y,
+            spread,
+            inset,
+            ..
+        } => {
             assert_eq!((*blur, *offset_y, *spread), (12.0, 4.0, 2.0));
             assert!(!inset);
         }
@@ -410,8 +453,11 @@ fn slot_inherits_top_level_let() {
 fn slot_state_overlay_applies_within_part() {
     let prog = parse(SLOTTED).unwrap();
     let off = prog.resolve_slots("bar", &variant(&[]), &[]).unwrap();
-    let on = prog.resolve_slots("bar", &variant(&[]), &["active"]).unwrap();
-    let fill_color = |s: &glaze::CompiledSlots| match s.slot("fill").unwrap().layers.last().unwrap() {
+    let on = prog
+        .resolve_slots("bar", &variant(&[]), &["active"])
+        .unwrap();
+    let fill_color = |s: &glaze::CompiledSlots| match s.slot("fill").unwrap().layers.last().unwrap()
+    {
         Layer::Fill(c) => *c,
         other => panic!("expected fill, got {other:?}"),
     };
@@ -422,7 +468,9 @@ fn slot_state_overlay_applies_within_part() {
 #[test]
 fn nested_parts_are_rejected() {
     let prog = parse(SLOTTED).unwrap();
-    let err = prog.resolve_slots("bad_nest", &variant(&[]), &[]).unwrap_err();
+    let err = prog
+        .resolve_slots("bad_nest", &variant(&[]), &[])
+        .unwrap_err();
     assert!(matches!(err, GlazeError::Parse(_)), "got {err:?}");
 }
 

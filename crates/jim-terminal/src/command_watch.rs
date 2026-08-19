@@ -145,7 +145,9 @@ impl CommandWatcher {
         };
         match kind {
             "C" => {
-                if let Some(cmd) = crate::base64::decode(rest).and_then(|b| String::from_utf8(b).ok()) {
+                if let Some(cmd) =
+                    crate::base64::decode(rest).and_then(|b| String::from_utf8(b).ok())
+                {
                     let cmd = cmd.trim().to_string();
                     self.pending = (!cmd.is_empty()).then_some(cmd);
                 }

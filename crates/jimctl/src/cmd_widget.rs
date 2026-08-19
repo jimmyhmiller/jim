@@ -200,19 +200,13 @@ impl Args {
                     );
                 }
                 "--pos" | "--position" => {
-                    let raw = it
-                        .next()
-                        .ok_or_else(|| format!("{} requires x,y", arg))?;
-                    position = Some(
-                        parse_pair(&raw).ok_or_else(|| format!("{} expects x,y", arg))?,
-                    );
+                    let raw = it.next().ok_or_else(|| format!("{} requires x,y", arg))?;
+                    position =
+                        Some(parse_pair(&raw).ok_or_else(|| format!("{} expects x,y", arg))?);
                 }
                 "--size" => {
-                    let raw = it
-                        .next()
-                        .ok_or_else(|| format!("{} requires w,h", arg))?;
-                    size =
-                        Some(parse_pair(&raw).ok_or_else(|| format!("{} expects w,h", arg))?);
+                    let raw = it.next().ok_or_else(|| format!("{} requires w,h", arg))?;
+                    size = Some(parse_pair(&raw).ok_or_else(|| format!("{} expects w,h", arg))?);
                 }
                 "--" => {
                     argv_mode = true;

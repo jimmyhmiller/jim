@@ -7,18 +7,18 @@
 //! and spawns a single editor entity wired up as the focused target.
 //! No window, no rendering, no fonts.
 
-use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
 use bevy::input::InputPlugin;
+use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::prelude::*;
-use jim_editor::{
-    EditorHighlighter, EditorMetrics, EditorScroll, EditorStateComp, HeadlessEditorPlugin,
-    LineRows, TextDragAnchor, PANE_KIND,
-};
-use jim_editor::highlight::Highlighter;
-use jim_pane::{FocusedPane, PaneKindMarker, PaneRect, PaneTag};
 use editor_core::selection::Selection;
 use editor_core::state::EditorState;
+use jim_editor::highlight::Highlighter;
+use jim_editor::{
+    EditorHighlighter, EditorMetrics, EditorScroll, EditorStateComp, HeadlessEditorPlugin,
+    LineRows, PANE_KIND, TextDragAnchor,
+};
+use jim_pane::{FocusedPane, PaneKindMarker, PaneRect, PaneTag};
 use ropey::Rope;
 
 fn make_app(initial: &str) -> App {
@@ -71,11 +71,7 @@ fn press(app: &mut App, key_code: KeyCode, logical: Key) {
 fn press_char(app: &mut App, c: char) {
     let mut buf = [0u8; 4];
     let s = c.encode_utf8(&mut buf);
-    press(
-        app,
-        KeyCode::KeyA,
-        Key::Character(s.into()),
-    );
+    press(app, KeyCode::KeyA, Key::Character(s.into()));
 }
 
 fn read_state(app: &mut App) -> EditorState {

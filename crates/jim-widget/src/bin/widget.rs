@@ -223,12 +223,8 @@ enum IpcRequest {
 
 fn connect_socket() -> Result<UnixStream, String> {
     let sock = socket_path().ok_or("$HOME not set; can't locate socket")?;
-    UnixStream::connect(&sock).map_err(|e| {
-        format!(
-            "connect {}: {e} (is the editor running?)",
-            sock.display()
-        )
-    })
+    UnixStream::connect(&sock)
+        .map_err(|e| format!("connect {}: {e} (is the editor running?)", sock.display()))
 }
 
 fn send_request(req: &IpcRequest) -> Result<UnixStream, String> {
@@ -338,14 +334,8 @@ fn cmd_projects(json: bool) -> Result<(), String> {
         .unwrap_or(1);
     for p in entries {
         let id = p.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
-        let name = p
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let active = p
-            .get("active")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let active = p.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
         let marker = if active { "*" } else { " " };
         let tag = if active { "  (active)" } else { "" };
         println!("{marker} {id:>id_w$}  {name}{tag}", id_w = id_w);
@@ -401,8 +391,8 @@ fn cmd_agent() -> Result<(), String> {
             .map(|c| c.display().to_string())
             .unwrap_or_else(|_| p.display().to_string())
     };
-    let widgets_dir = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".jim").join("widgets"));
+    let widgets_dir =
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".jim").join("widgets"));
     let widgets_str = widgets_dir
         .as_ref()
         .map(|p| p.display().to_string())
@@ -611,12 +601,7 @@ fn variant_names(root: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn render_tagged_enum(
-    out: &mut impl Write,
-    root: &Value,
-    tag_field: &str,
-    only: Option<&str>,
-) {
+fn render_tagged_enum(out: &mut impl Write, root: &Value, tag_field: &str, only: Option<&str>) {
     let one_of = root.get("oneOf").and_then(|v| v.as_array());
     let Some(one_of) = one_of else {
         writeln!(out, "(no variants)").ok();
@@ -636,7 +621,10 @@ fn render_tagged_enum(
         {
             continue;
         }
-        let desc = sub.get("description").and_then(|d| d.as_str()).unwrap_or("");
+        let desc = sub
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
         writeln!(out).ok();
         writeln!(out, "  {{\"{tag_field}\": \"{tag}\", …}}").ok();
         if !desc.is_empty() {
@@ -868,7 +856,9 @@ fn cmd_init(name: &str, force: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&path).map_err(|e| e.to_string())?.permissions();
+        let mut perms = fs::metadata(&path)
+            .map_err(|e| e.to_string())?
+            .permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).map_err(|e| e.to_string())?;
     }

@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::agent_bus;
 
@@ -73,15 +73,24 @@ pub fn run() -> ExitCode {
     // the agent would be on no bus at all, silently).
     if let Some(ext) = extension_path() {
         if !ext.exists() {
-            eprintln!("jimctl pi: jim-bus extension not installed at {}.", ext.display());
+            eprintln!(
+                "jimctl pi: jim-bus extension not installed at {}.",
+                ext.display()
+            );
             eprintln!("  install it:  cp integrations/pi/jim-bus.ts ~/.pi/agent/extensions/");
             return ExitCode::from(1);
         }
     }
 
     unsafe {
-        libc::signal(libc::SIGINT, on_signal as extern "C" fn(i32) as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_signal as extern "C" fn(i32) as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            on_signal as extern "C" fn(i32) as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            on_signal as extern "C" fn(i32) as libc::sighandler_t,
+        );
     }
 
     eprintln!(
@@ -128,7 +137,10 @@ pub fn run() -> ExitCode {
             }
             while let Ok(msg) = rx.try_recv() {
                 let cmd = json!({ "type": "prompt", "message": msg }).to_string();
-                if writeln!(stdin, "{cmd}").and_then(|_| stdin.flush()).is_err() {
+                if writeln!(stdin, "{cmd}")
+                    .and_then(|_| stdin.flush())
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -208,7 +220,9 @@ fn local_stdin_loop(id: String, name: String, tx: mpsc::Sender<String>) {
                 SHUTDOWN.store(true, Ordering::SeqCst);
                 break;
             }
-            _ if t.starts_with('/') => println!("commands: /who, /quit (type a line to prompt the agent)"),
+            _ if t.starts_with('/') => {
+                println!("commands: /who, /quit (type a line to prompt the agent)")
+            }
             _ => {
                 if tx.send(t.to_string()).is_err() {
                     break;

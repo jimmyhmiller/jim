@@ -10,9 +10,9 @@ use bevy::sprite_render::{AlphaMode2d, ColorMaterial, MeshMaterial2d};
 use crate::buttons::{self, ButtonTheme};
 
 use jim_pane::{
-    spawn_pane_from_registry, ChromeStyle, ChromeTextStyle, PaneChrome, PaneContentNoClip,
-    PaneContentPressed, PaneFont, PaneHotZones, PaneKindSpec, PaneRect, PaneRegistry,
-    PaneScreenAnchored, PaneTag, PaneViewportReaders,
+    ChromeStyle, ChromeTextStyle, PaneChrome, PaneContentNoClip, PaneContentPressed, PaneFont,
+    PaneHotZones, PaneKindSpec, PaneRect, PaneRegistry, PaneScreenAnchored, PaneTag,
+    PaneViewportReaders, spawn_pane_from_registry,
 };
 
 use serde_json::Value;
@@ -212,7 +212,12 @@ pub fn spawn_toolbar(world: &mut World, screen_pos: Vec2, project: Option<u64>) 
 }
 
 /// A grid of color swatches; returns the y past the grid.
-fn swatch_grid(out: &mut Vec<Button>, y: f32, colors: &[WbColor], to_action: fn(WbColor) -> Action) -> f32 {
+fn swatch_grid(
+    out: &mut Vec<Button>,
+    y: f32,
+    colors: &[WbColor],
+    to_action: fn(WbColor) -> Action,
+) -> f32 {
     for (i, c) in colors.iter().enumerate() {
         let col = i % COLS;
         let row = i / COLS;
@@ -259,19 +264,31 @@ fn layout(stroke_palette: &[WbColor]) -> (Vec<Button>, Vec<Label>) {
     y += tool_rows as f32 * (CELL + GAP) + GAP;
 
     // Stroke color swatches.
-    labels.push(Label { x: PAD, y, text: "Stroke" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Stroke",
+    });
     y += LABEL_H;
     y = swatch_grid(&mut out, y, stroke_palette, Action::Color);
 
     // Fill / background swatches.
-    labels.push(Label { x: PAD, y, text: "Fill" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Fill",
+    });
     y += LABEL_H;
     y = swatch_grid(&mut out, y, &bg_palette(), Action::Background);
 
     let full_w = COLS as f32 * CELL + (COLS as f32 - 1.0) * GAP;
 
     // Fill pattern style (Excalidraw's three: hachure / cross-hatch / solid).
-    labels.push(Label { x: PAD, y, text: "Fill style" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Fill style",
+    });
     y += LABEL_H;
     y = button_row(
         &mut out,
@@ -285,7 +302,11 @@ fn layout(stroke_palette: &[WbColor]) -> (Vec<Button>, Vec<Label>) {
     );
 
     // Stroke width.
-    labels.push(Label { x: PAD, y, text: "Stroke width" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Stroke width",
+    });
     y += LABEL_H;
     for (i, w) in [1.0_f64, 3.0, 6.0].iter().enumerate() {
         out.push(Button {
@@ -299,7 +320,11 @@ fn layout(stroke_palette: &[WbColor]) -> (Vec<Button>, Vec<Label>) {
     y += CELL * 0.7 + GAP * 2.0;
 
     // Stroke style.
-    labels.push(Label { x: PAD, y, text: "Stroke style" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Stroke style",
+    });
     y += LABEL_H;
     y = button_row(
         &mut out,
@@ -313,7 +338,11 @@ fn layout(stroke_palette: &[WbColor]) -> (Vec<Button>, Vec<Label>) {
     );
 
     // Sloppiness (roughness).
-    labels.push(Label { x: PAD, y, text: "Sloppiness" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Sloppiness",
+    });
     y += LABEL_H;
     y = button_row(
         &mut out,
@@ -327,7 +356,11 @@ fn layout(stroke_palette: &[WbColor]) -> (Vec<Button>, Vec<Label>) {
     );
 
     // Opacity (presets).
-    labels.push(Label { x: PAD, y, text: "Opacity" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Opacity",
+    });
     y += LABEL_H;
     y = button_row(
         &mut out,
@@ -341,7 +374,11 @@ fn layout(stroke_palette: &[WbColor]) -> (Vec<Button>, Vec<Label>) {
     );
 
     // Layers (z-order), applied to the selection.
-    labels.push(Label { x: PAD, y, text: "Layers" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Layers",
+    });
     y += LABEL_H;
     y = button_row(
         &mut out,
@@ -356,7 +393,11 @@ fn layout(stroke_palette: &[WbColor]) -> (Vec<Button>, Vec<Label>) {
     );
 
     // Actions on the selection.
-    labels.push(Label { x: PAD, y, text: "Actions" });
+    labels.push(Label {
+        x: PAD,
+        y,
+        text: "Actions",
+    });
     y += LABEL_H;
     y = button_row(&mut out, y, full_w, &[Action::Duplicate, Action::Delete]);
 
@@ -536,16 +577,40 @@ fn build_ui(
         for b in &buttons {
             let active = is_active(&b.action, ts);
             // Button cell.
-            let bg = if active { theme.cell_active } else { theme.cell };
+            let bg = if active {
+                theme.cell_active
+            } else {
+                theme.cell
+            };
             if let Some(m) = buttons::rounded_rect_mesh(b.x, b.y, b.w, b.h, 5.0) {
-                spawn_mesh(m, bg, 0.01, content_root, cache, &mut cursor, meshes, materials, commands);
+                spawn_mesh(
+                    m,
+                    bg,
+                    0.01,
+                    content_root,
+                    cache,
+                    &mut cursor,
+                    meshes,
+                    materials,
+                    commands,
+                );
             }
             // Content.
             match b.action {
                 Action::Tool(t) => {
                     if let Some(icon) = buttons::tool_icon(t) {
                         for m in buttons::icon_meshes(icon, b.x, b.y, b.w, b.h, 2.2) {
-                            spawn_mesh(m, theme.label, 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
+                            spawn_mesh(
+                                m,
+                                theme.label,
+                                0.02,
+                                content_root,
+                                cache,
+                                &mut cursor,
+                                meshes,
+                                materials,
+                                commands,
+                            );
                         }
                     }
                 }
@@ -558,7 +623,17 @@ fn build_ui(
                         b.h - 2.0 * inset,
                         4.0,
                     ) {
-                        spawn_mesh(m, buttons::wb_to_color(c), 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
+                        spawn_mesh(
+                            m,
+                            buttons::wb_to_color(c),
+                            0.02,
+                            content_root,
+                            cache,
+                            &mut cursor,
+                            meshes,
+                            materials,
+                            commands,
+                        );
                     }
                 }
                 Action::Background(c) => {
@@ -573,14 +648,50 @@ fn build_ui(
                         // "No fill" — an outlined empty swatch (border ring over
                         // the cell bg) so it reads as transparent, not a color.
                         if let Some(m) = buttons::rounded_rect_mesh(sx, sy, sw, sh, 4.0) {
-                            spawn_mesh(m, theme.label.with_alpha(0.5), 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
+                            spawn_mesh(
+                                m,
+                                theme.label.with_alpha(0.5),
+                                0.02,
+                                content_root,
+                                cache,
+                                &mut cursor,
+                                meshes,
+                                materials,
+                                commands,
+                            );
                         }
                         let r = 1.5;
-                        if let Some(m) = buttons::rounded_rect_mesh(sx + r, sy + r, sw - 2.0 * r, sh - 2.0 * r, 3.0) {
-                            spawn_mesh(m, bg, 0.03, content_root, cache, &mut cursor, meshes, materials, commands);
+                        if let Some(m) = buttons::rounded_rect_mesh(
+                            sx + r,
+                            sy + r,
+                            sw - 2.0 * r,
+                            sh - 2.0 * r,
+                            3.0,
+                        ) {
+                            spawn_mesh(
+                                m,
+                                bg,
+                                0.03,
+                                content_root,
+                                cache,
+                                &mut cursor,
+                                meshes,
+                                materials,
+                                commands,
+                            );
                         }
                     } else if let Some(m) = buttons::rounded_rect_mesh(sx, sy, sw, sh, 4.0) {
-                        spawn_mesh(m, buttons::wb_to_color(c), 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
+                        spawn_mesh(
+                            m,
+                            buttons::wb_to_color(c),
+                            0.02,
+                            content_root,
+                            cache,
+                            &mut cursor,
+                            meshes,
+                            materials,
+                            commands,
+                        );
                     }
                 }
                 Action::Fill(f) => {
@@ -595,7 +706,17 @@ fn build_ui(
                 }
                 Action::Width(w) => {
                     if let Some(m) = buttons::width_sample_mesh(b.x, b.y, b.w, b.h, w as f32) {
-                        spawn_mesh(m, theme.label, 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
+                        spawn_mesh(
+                            m,
+                            theme.label,
+                            0.02,
+                            content_root,
+                            cache,
+                            &mut cursor,
+                            meshes,
+                            materials,
+                            commands,
+                        );
                     }
                 }
                 Action::StrokeStyle(s) => {
@@ -617,7 +738,14 @@ fn build_ui(
                     glyph(b, t, font, theme.label, content_root, commands);
                 }
                 Action::Opacity(o) => {
-                    glyph(b, &format!("{}", o as i32), font, theme.label, content_root, commands);
+                    glyph(
+                        b,
+                        &format!("{}", o as i32),
+                        font,
+                        theme.label,
+                        content_root,
+                        commands,
+                    );
                 }
                 Action::ZOrder(z) => {
                     let t = match z {
@@ -632,7 +760,17 @@ fn build_ui(
                 Action::Delete => glyph(b, "Del", font, theme.label, content_root, commands),
                 Action::Clear => {
                     for m in buttons::icon_meshes(buttons::Icon::Trash, b.x, b.y, b.h, b.h, 2.0) {
-                        spawn_mesh(m, theme.label, 0.02, content_root, cache, &mut cursor, meshes, materials, commands);
+                        spawn_mesh(
+                            m,
+                            theme.label,
+                            0.02,
+                            content_root,
+                            cache,
+                            &mut cursor,
+                            meshes,
+                            materials,
+                            commands,
+                        );
                     }
                     commands.spawn((
                         Text2d::new("Clear"),
@@ -644,7 +782,11 @@ fn build_ui(
                         TextColor(theme.label),
                         Anchor::CENTER_LEFT,
                         PaneContentNoClip,
-                        Transform::from_xyz(b.x + b.h + 2.0, -(b.y + b.h * 0.5), 0.03 + CONTENT_Z_LIFT),
+                        Transform::from_xyz(
+                            b.x + b.h + 2.0,
+                            -(b.y + b.h * 0.5),
+                            0.03 + CONTENT_Z_LIFT,
+                        ),
                         ToolbarUi,
                         ChildOf(content_root),
                     ));

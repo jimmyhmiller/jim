@@ -16,15 +16,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use bevy::prelude::*;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
-use crate::state::StyleDataDir;
 use crate::StyleErrors;
+use crate::state::StyleDataDir;
 
 /// Stable identifier for an engine-known token. Constants live in the
 /// [`tokens`] module so widget code references them as
@@ -71,7 +71,10 @@ impl Theme {
         match self.tokens.get(id.0) {
             Some(TokenValue::Color(c)) => *c,
             Some(other) => panic!("theme token {:?} is not a Color: {:?}", id.0, other),
-            None => panic!("theme token {:?} is missing (default theme is incomplete)", id.0),
+            None => panic!(
+                "theme token {:?} is missing (default theme is incomplete)",
+                id.0
+            ),
         }
     }
 
@@ -79,7 +82,10 @@ impl Theme {
         match self.tokens.get(id.0) {
             Some(TokenValue::F32(v)) => *v,
             Some(other) => panic!("theme token {:?} is not an F32: {:?}", id.0, other),
-            None => panic!("theme token {:?} is missing (default theme is incomplete)", id.0),
+            None => panic!(
+                "theme token {:?} is missing (default theme is incomplete)",
+                id.0
+            ),
         }
     }
 
@@ -87,7 +93,10 @@ impl Theme {
         match self.tokens.get(id.0) {
             Some(TokenValue::Bool(v)) => *v,
             Some(other) => panic!("theme token {:?} is not a Bool: {:?}", id.0, other),
-            None => panic!("theme token {:?} is missing (default theme is incomplete)", id.0),
+            None => panic!(
+                "theme token {:?} is missing (default theme is incomplete)",
+                id.0
+            ),
         }
     }
 
@@ -95,7 +104,10 @@ impl Theme {
         match self.tokens.get(id.0) {
             Some(TokenValue::Str(s)) => s.as_str(),
             Some(other) => panic!("theme token {:?} is not a Str: {:?}", id.0, other),
-            None => panic!("theme token {:?} is missing (default theme is incomplete)", id.0),
+            None => panic!(
+                "theme token {:?} is missing (default theme is incomplete)",
+                id.0
+            ),
         }
     }
 
@@ -356,8 +368,7 @@ pub mod tokens {
 /// default look without depending on any on-disk preset. The same
 /// bytes are also seeded to `~/.jim/styles/atelier/theme.ft`
 /// at first launch so the preset picker has an entry for it.
-pub const ATELIER_DEFAULT_THEME: &str =
-    include_str!("../assets/themes/atelier.ft");
+pub const ATELIER_DEFAULT_THEME: &str = include_str!("../assets/themes/atelier.ft");
 
 fn default_tokens() -> HashMap<String, TokenValue> {
     parse_theme_str(ATELIER_DEFAULT_THEME)
@@ -489,7 +500,10 @@ fn parse_func_call(s: &str, name: &str) -> Option<String> {
 }
 
 fn split_args(s: &str) -> Vec<&str> {
-    s.split(',').map(str::trim).filter(|p| !p.is_empty()).collect()
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 fn parse_oklch_args(s: &str) -> Result<LinearRgba, String> {
@@ -501,7 +515,9 @@ fn parse_oklch_args(s: &str) -> Result<LinearRgba, String> {
     let c: f32 = parts[1].parse().map_err(|e| format!("oklch C: {}", e))?;
     let h: f32 = parts[2].parse().map_err(|e| format!("oklch h: {}", e))?;
     let alpha: f32 = if parts.len() == 4 {
-        parts[3].parse().map_err(|e| format!("oklch alpha: {}", e))?
+        parts[3]
+            .parse()
+            .map_err(|e| format!("oklch alpha: {}", e))?
     } else {
         1.0
     };
@@ -519,7 +535,9 @@ fn parse_oklab_args(s: &str) -> Result<LinearRgba, String> {
     let a: f32 = parts[1].parse().map_err(|e| format!("oklab a: {}", e))?;
     let b: f32 = parts[2].parse().map_err(|e| format!("oklab b: {}", e))?;
     let alpha: f32 = if parts.len() == 4 {
-        parts[3].parse().map_err(|e| format!("oklab alpha: {}", e))?
+        parts[3]
+            .parse()
+            .map_err(|e| format!("oklab alpha: {}", e))?
     } else {
         1.0
     };
@@ -555,7 +573,12 @@ pub fn parse_hex_color(s: &str) -> Result<LinearRgba, String> {
             &expanded
         }
         6 | 8 => s,
-        n => return Err(format!("expected #rgb, #rgba, #rrggbb, or #rrggbbaa, got {} chars ({:?})", n, s)),
+        n => {
+            return Err(format!(
+                "expected #rgb, #rgba, #rrggbb, or #rrggbbaa, got {} chars ({:?})",
+                n, s
+            ));
+        }
     };
     let bytes = (0..hex.len())
         .step_by(2)
@@ -593,10 +616,8 @@ pub struct ThemePlugin;
 
 impl Plugin for ThemePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ActiveThemePath>().add_systems(
-            Update,
-            (sync_watch_path, drain_watch_events).chain(),
-        );
+        app.init_resource::<ActiveThemePath>()
+            .add_systems(Update, (sync_watch_path, drain_watch_events).chain());
     }
 }
 
@@ -642,20 +663,21 @@ fn sync_watch_path(
     };
     let (tx, rx) = mpsc::channel::<PathBuf>();
     let watched = path.clone();
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let Ok(event) = res else { return };
-        for p in event.paths {
-            if p == watched {
-                let _ = tx.send(p);
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let Ok(event) = res else { return };
+            for p in event.paths {
+                if p == watched {
+                    let _ = tx.send(p);
+                }
             }
-        }
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            errors.theme_error = Some(format!("watcher: {}", e));
-            return;
-        }
-    };
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                errors.theme_error = Some(format!("watcher: {}", e));
+                return;
+            }
+        };
     if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
         errors.theme_error = Some(format!("watch {:?}: {}", parent, e));
         return;
@@ -740,8 +762,16 @@ const AUDIT_PAIRS: &[(&str, TokenId, TokenId)] = &[
     ("syntax keyword", tokens::SYNTAX_KEYWORD, tokens::BG),
     ("input text", tokens::INPUT_TEXT, tokens::INPUT_BG),
     ("button label", tokens::BUTTON_LABEL, tokens::BUTTON_BG),
-    ("button primary", tokens::BUTTON_PRIMARY_LABEL, tokens::BUTTON_PRIMARY_BG),
-    ("chrome title", tokens::CHROME_TITLE_FOCUSED, tokens::PANE_BG),
+    (
+        "button primary",
+        tokens::BUTTON_PRIMARY_LABEL,
+        tokens::BUTTON_PRIMARY_BG,
+    ),
+    (
+        "chrome title",
+        tokens::CHROME_TITLE_FOCUSED,
+        tokens::PANE_BG,
+    ),
     ("radial label", tokens::RADIAL_LABEL, tokens::RADIAL_WEDGE),
 ];
 

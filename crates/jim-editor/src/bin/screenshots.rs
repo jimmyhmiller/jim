@@ -9,15 +9,13 @@
 use std::path::PathBuf;
 
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy::window::PrimaryWindow;
-use jim_editor::{
-    build_app, setup_editor_font, spawn_editor_pane, EditorScroll, EditorStateComp,
-};
-use jim_pane::{FocusedPane, PaneRect};
 use editor_core::selection::{Range, Selection};
 use editor_core::state::EditorState;
 use editor_core::transaction::Transaction;
+use jim_editor::{EditorScroll, EditorStateComp, build_app, setup_editor_font, spawn_editor_pane};
+use jim_pane::{FocusedPane, PaneRect};
 use ropey::Rope;
 
 const WARMUP_FRAMES: u32 = 30;

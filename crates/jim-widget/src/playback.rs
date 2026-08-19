@@ -46,11 +46,11 @@
 use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// `seek_ms` sentinel meaning "no pending seek".
 const NO_SEEK: i64 = i64::MIN;
@@ -388,11 +388,7 @@ impl Edited {
             .filter_map(|&(from, to)| {
                 let a = ms_to_s(from).min(n);
                 let b = ms_to_s(to).min(n);
-                if b > a {
-                    Some((a, b, from))
-                } else {
-                    None
-                }
+                if b > a { Some((a, b, from)) } else { None }
             })
             .collect();
 
@@ -493,12 +489,12 @@ impl Edited {
 /// WSOLA (Waveform-Similarity Overlap-Add) pitch-preserving time-stretch over
 /// the [`Edited`] timeline. Window/hop sized from the device rate.
 struct Wsola {
-    w: usize,         // analysis/synthesis window length
-    hs: usize,        // synthesis hop (output advance per frame) = w/2
-    delta: usize,     // cross-correlation search radius around the ideal hop
-    hann: Vec<f32>,   // synthesis window
-    ola: Vec<f32>,    // length-w overlap-add accumulator of not-yet-emitted output
-    read: f64,        // current analysis read position, in edited samples
+    w: usize,       // analysis/synthesis window length
+    hs: usize,      // synthesis hop (output advance per frame) = w/2
+    delta: usize,   // cross-correlation search radius around the ideal hop
+    hann: Vec<f32>, // synthesis window
+    ola: Vec<f32>,  // length-w overlap-add accumulator of not-yet-emitted output
+    read: f64,      // current analysis read position, in edited samples
 }
 
 impl Wsola {
@@ -619,12 +615,7 @@ fn generator(st: Arc<PlayState>, ed: Edited, start_edit: usize) {
 
 /// 1× path: copy a block straight through (sample-perfect, no WSOLA artifacts).
 /// Keeps `wsola.read` synced so a later speed change resumes cleanly.
-fn produce_passthrough(
-    st: &PlayState,
-    ed: &Edited,
-    pos_edit: &mut f64,
-    wsola: &mut Wsola,
-) -> bool {
+fn produce_passthrough(st: &PlayState, ed: &Edited, pos_edit: &mut f64, wsola: &mut Wsola) -> bool {
     const BLOCK: usize = 512;
     let start = *pos_edit as usize;
     if start >= ed.len {
@@ -689,7 +680,17 @@ fn produce_wsola(
 fn decode(path: &str, rate: u32) -> Result<Vec<f32>, String> {
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args([
-        "-v", "error", "-i", path, "-ar", &rate.to_string(), "-ac", "1", "-f", "f32le", "-",
+        "-v",
+        "error",
+        "-i",
+        path,
+        "-ar",
+        &rate.to_string(),
+        "-ac",
+        "1",
+        "-f",
+        "f32le",
+        "-",
     ]);
     // Finder/Dock-launched `.app` inherits launchd's minimal PATH (no
     // /opt/homebrew/bin), so resolve ffmpeg via the same augmented PATH the
@@ -702,7 +703,8 @@ fn decode(path: &str, rate: u32) -> Result<Vec<f32>, String> {
     let mut child = cmd.spawn().map_err(|e| format!("spawn ffmpeg: {e}"))?;
     let mut buf = Vec::new();
     if let Some(mut out) = child.stdout.take() {
-        out.read_to_end(&mut buf).map_err(|e| format!("read: {e}"))?;
+        out.read_to_end(&mut buf)
+            .map_err(|e| format!("read: {e}"))?;
     }
     let status = child.wait().map_err(|e| format!("wait: {e}"))?;
     if !status.success() {
@@ -806,7 +808,8 @@ pub fn start(start_ms: f64, clips: Vec<(f64, f64)>, speed: f64) -> bool {
     let st = state();
     {
         let g = st.source.lock();
-        let ok = matches!(&g, Ok(o) if matches!(&**o, Some(s) if !s.loading && !s.samples.is_empty()));
+        let ok =
+            matches!(&g, Ok(o) if matches!(&**o, Some(s) if !s.loading && !s.samples.is_empty()));
         if !ok {
             return false;
         }

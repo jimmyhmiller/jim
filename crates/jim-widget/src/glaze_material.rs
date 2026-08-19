@@ -452,7 +452,9 @@ mod tests {
     #[test]
     fn body_reads_clock_detects_time_and_dt() {
         assert!(body_reads_clock("return vec4<f32>(u.time, 0.0, 0.0, 1.0);"));
-        assert!(body_reads_clock("let a = u.dt * 2.0;\nreturn vec4<f32>(a);"));
+        assert!(body_reads_clock(
+            "let a = u.dt * 2.0;\nreturn vec4<f32>(a);"
+        ));
         // static shaders that read other builtins must NOT be treated as animated
         assert!(!body_reads_clock(
             "return vec4<f32>(u.hover, u.focus, u.size.x, 1.0);"
@@ -464,8 +466,12 @@ mod tests {
     fn body_reads_clock_ignores_identifier_extensions() {
         // A hypothetical future field that merely starts with `dt`/`time` must
         // not be mistaken for the clock fields.
-        assert!(!body_reads_clock("return vec4<f32>(u.dtscale, 0.0, 0.0, 1.0);"));
-        assert!(!body_reads_clock("return vec4<f32>(u.timeline, 0.0, 0.0, 1.0);"));
+        assert!(!body_reads_clock(
+            "return vec4<f32>(u.dtscale, 0.0, 0.0, 1.0);"
+        ));
+        assert!(!body_reads_clock(
+            "return vec4<f32>(u.timeline, 0.0, 0.0, 1.0);"
+        ));
     }
 
     #[test]

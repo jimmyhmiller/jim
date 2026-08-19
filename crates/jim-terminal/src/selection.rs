@@ -13,8 +13,8 @@
 //! with newlines — so a selection spanning content scrolled off-screen
 //! copies in full. See `WorkerMsg::ExtractText`.
 
-use std::sync::mpsc;
 use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use arboard::Clipboard;
@@ -26,8 +26,8 @@ use jim_pane::{FocusedPane, PaneChrome, PaneKindMarker, PaneTag};
 
 use crate::worker::WorkerMsg;
 use crate::{
-    MonoMetrics, SelectionOverlayCache, TermGrid, TerminalSelection, TerminalStore, LINE_HEIGHT,
-    PANE_KIND,
+    LINE_HEIGHT, MonoMetrics, PANE_KIND, SelectionOverlayCache, TermGrid, TerminalSelection,
+    TerminalStore,
 };
 
 // Selection color now driven by theme tokens::SELECTION (look up
@@ -66,7 +66,13 @@ fn render_selection_overlays(
     theme: Res<jim_style::Theme>,
     store: Res<TerminalStore>,
     mut q: Query<
-        (Entity, &PaneChrome, &TermGrid, &mut TerminalSelection, &PaneKindMarker),
+        (
+            Entity,
+            &PaneChrome,
+            &TermGrid,
+            &mut TerminalSelection,
+            &PaneKindMarker,
+        ),
         With<PaneTag>,
     >,
 ) {
@@ -118,7 +124,13 @@ fn render_selection_overlays(
         let offset: i64 = store
             .map
             .get(&entity)
-            .map(|d| d.worker.snapshot.lock().expect("snapshot lock").viewport_offset as i64)
+            .map(|d| {
+                d.worker
+                    .snapshot
+                    .lock()
+                    .expect("snapshot lock")
+                    .viewport_offset as i64
+            })
             .unwrap_or(0);
 
         // Skip the whole despawn/respawn if every input that determines the
@@ -336,7 +348,9 @@ fn copy_paste_keys(
             }
             KeyCode::KeyV => {
                 let Some(target) = focused.0 else { continue };
-                let Some(data) = store.map.get(&target) else { continue };
+                let Some(data) = store.map.get(&target) else {
+                    continue;
+                };
                 let text = clip
                     .clipboard
                     .lock()
@@ -352,4 +366,3 @@ fn copy_paste_keys(
         }
     }
 }
-

@@ -9,14 +9,35 @@ use whiteboard_core::interaction::{InputEvent, Modifiers, PointerButton, Tool};
 use whiteboard_core::text::MonospaceMeasurer;
 
 type Ed = Editor<MonospaceMeasurer>;
-fn editor() -> Ed { Editor::new(MonospaceMeasurer::default()) }
-fn down(x: f64, y: f64) -> InputEvent { InputEvent::PointerDown { pos: Point::new(x,y), button: PointerButton::Primary, mods: Modifiers::default() } }
-fn mv(x: f64, y: f64) -> InputEvent { InputEvent::PointerMove { pos: Point::new(x,y), mods: Modifiers::default() } }
-fn up(x: f64, y: f64) -> InputEvent { InputEvent::PointerUp { pos: Point::new(x,y), button: PointerButton::Primary, mods: Modifiers::default() } }
+fn editor() -> Ed {
+    Editor::new(MonospaceMeasurer::default())
+}
+fn down(x: f64, y: f64) -> InputEvent {
+    InputEvent::PointerDown {
+        pos: Point::new(x, y),
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    }
+}
+fn mv(x: f64, y: f64) -> InputEvent {
+    InputEvent::PointerMove {
+        pos: Point::new(x, y),
+        mods: Modifiers::default(),
+    }
+}
+fn up(x: f64, y: f64) -> InputEvent {
+    InputEvent::PointerUp {
+        pos: Point::new(x, y),
+        button: PointerButton::Primary,
+        mods: Modifiers::default(),
+    }
+}
 
 fn arrow_end(ed: &Ed, id: &ElementId) -> Point {
     let a = ed.scene().get(id).unwrap();
-    let ElementKind::Arrow(d) = &a.kind else { panic!() };
+    let ElementKind::Arrow(d) = &a.kind else {
+        panic!()
+    };
     let l = *d.points.last().unwrap();
     Point::new(a.x + l.x, a.y + l.y)
 }
@@ -26,7 +47,13 @@ fn arrow_end(ed: &Ed, id: &ElementId) -> Point {
 fn bound_arrow_follows_live_during_drag() {
     let mut ed = editor();
     ed.add_element(Element::new(
-        ElementId::from("box"), 1, 300.0, 200.0, 100.0, 60.0, ElementKind::Rectangle,
+        ElementId::from("box"),
+        1,
+        300.0,
+        200.0,
+        100.0,
+        60.0,
+        ElementKind::Rectangle,
     ));
     // Draw an arrow whose end binds to the box's left edge.
     ed.set_tool(Tool::Arrow);
@@ -34,8 +61,13 @@ fn bound_arrow_follows_live_during_drag() {
     ed.handle(mv(250.0, 230.0));
     ed.handle(mv(305.0, 232.0)); // onto the box's left edge so the end binds
     ed.handle(up(305.0, 232.0));
-    let arrow = ed.scene().iter_live()
-        .find(|e| matches!(e.kind, ElementKind::Arrow(_))).unwrap().id.clone();
+    let arrow = ed
+        .scene()
+        .iter_live()
+        .find(|e| matches!(e.kind, ElementKind::Arrow(_)))
+        .unwrap()
+        .id
+        .clone();
     let before = arrow_end(&ed, &arrow);
 
     // Grab the box and drag it right; sample the arrow end MID-drag.
@@ -62,8 +94,13 @@ fn arrow_selected_by_outline_not_bounding_box() {
     ed.handle(down(100.0, 100.0));
     ed.handle(mv(200.0, 200.0));
     ed.handle(up(300.0, 300.0));
-    let arrow = ed.scene().iter_live()
-        .find(|e| matches!(e.kind, ElementKind::Arrow(_))).unwrap().id.clone();
+    let arrow = ed
+        .scene()
+        .iter_live()
+        .find(|e| matches!(e.kind, ElementKind::Arrow(_)))
+        .unwrap()
+        .id
+        .clone();
 
     // Click far from the line but inside the bbox: should NOT select.
     ed.set_tool(Tool::Select);

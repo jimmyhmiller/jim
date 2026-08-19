@@ -4,11 +4,7 @@
 //! part of terminal mouse support that can't be driven by a real click in
 //! a headless test, so we pin the escape-sequence contract here.
 
-use libghostty_vt::{
-    key, mouse,
-    terminal::Mode,
-    Terminal, TerminalOptions,
-};
+use libghostty_vt::{Terminal, TerminalOptions, key, mouse, terminal::Mode};
 
 const CELL_W: u32 = 8;
 const CELL_H: u32 = 16;
@@ -50,7 +46,11 @@ fn cell_center(col: u16, row: u16) -> mouse::Position {
     }
 }
 
-fn event(action: mouse::Action, button: Option<mouse::Button>, pos: mouse::Position) -> mouse::Event<'static> {
+fn event(
+    action: mouse::Action,
+    button: Option<mouse::Button>,
+    pos: mouse::Position,
+) -> mouse::Event<'static> {
     let mut ev = mouse::Event::new().expect("event");
     ev.set_action(action);
     ev.set_button(button);
@@ -74,7 +74,10 @@ fn tracking_flag_follows_decset() {
     // Disabling returns to no tracking (mirrors the snapshot flag flipping
     // back so the main thread resumes local selection).
     term.vt_write(b"\x1b[?1000l");
-    assert!(!term.is_mouse_tracking().unwrap(), "1000l turns tracking off");
+    assert!(
+        !term.is_mouse_tracking().unwrap(),
+        "1000l turns tracking off"
+    );
 }
 
 #[test]
@@ -82,7 +85,10 @@ fn button_motion_mode_detected() {
     let mut term = new_terminal();
     term.vt_write(b"\x1b[?1002h\x1b[?1006h");
     assert!(term.is_mouse_tracking().unwrap());
-    assert!(term.mode(Mode::BUTTON_MOUSE).unwrap(), "1002 = drag reporting");
+    assert!(
+        term.mode(Mode::BUTTON_MOUSE).unwrap(),
+        "1002 = drag reporting"
+    );
 }
 
 #[test]
@@ -94,7 +100,11 @@ fn sgr_left_press_and_release_bytes() {
     let mut enc = encoder_for(&term, true);
     let mut out = Vec::new();
     enc.encode_to_vec(
-        &event(mouse::Action::Press, Some(mouse::Button::Left), cell_center(2, 1)),
+        &event(
+            mouse::Action::Press,
+            Some(mouse::Button::Left),
+            cell_center(2, 1),
+        ),
         &mut out,
     )
     .unwrap();
@@ -104,7 +114,11 @@ fn sgr_left_press_and_release_bytes() {
     let mut out = Vec::new();
     enc.set_any_button_pressed(false);
     enc.encode_to_vec(
-        &event(mouse::Action::Release, Some(mouse::Button::Left), cell_center(2, 1)),
+        &event(
+            mouse::Action::Release,
+            Some(mouse::Button::Left),
+            cell_center(2, 1),
+        ),
         &mut out,
     )
     .unwrap();

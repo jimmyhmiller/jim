@@ -23,8 +23,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
 use jim_widget::protocol::{Align, Element, HostEvent, Weight, WidgetMsg};
+use serde::Deserialize;
 
 /// How often we redraw. Claude Code's statusLine fires every ~300ms,
 /// so 500ms gives us at-most-one-frame lag on changes without spinning.
@@ -141,8 +141,12 @@ fn load_feed() -> Vec<FeedEntry> {
 }
 
 fn load_terminals() -> Vec<LiveTerminalEntry> {
-    let Some(path) = terminals_path() else { return vec![] };
-    let Ok(bytes) = fs::read(&path) else { return vec![] };
+    let Some(path) = terminals_path() else {
+        return vec![];
+    };
+    let Ok(bytes) = fs::read(&path) else {
+        return vec![];
+    };
     serde_json::from_slice::<LiveTerminals>(&bytes)
         .map(|t| t.terminals)
         .unwrap_or_default()
@@ -183,7 +187,9 @@ fn build_frame(rows_by_project: &BTreeMap<String, Vec<Row>>, content_w: f32) -> 
                 },
                 Element::Text {
                     wrap: true,
-                    value: "Configure ~/.claude/settings.json statusLine to claude-statusline-bridge".into(),
+                    value:
+                        "Configure ~/.claude/settings.json statusLine to claude-statusline-bridge"
+                            .into(),
                     color: Some("#888".into()),
                     size: Some(11.0),
                     weight: None,
@@ -274,10 +280,7 @@ fn build_frame(rows_by_project: &BTreeMap<String, Vec<Row>>, content_w: f32) -> 
 /// dropped. PID-liveness alone is too permissive: `claude` processes
 /// orphaned by a closed pane keep running for a long time and would
 /// otherwise haunt the bars.
-fn build_rows(
-    feed: &[FeedEntry],
-    terminals: &[LiveTerminalEntry],
-) -> BTreeMap<String, Vec<Row>> {
+fn build_rows(feed: &[FeedEntry], terminals: &[LiveTerminalEntry]) -> BTreeMap<String, Vec<Row>> {
     let mut by_id: std::collections::HashMap<String, &LiveTerminalEntry> =
         std::collections::HashMap::new();
     for t in terminals {

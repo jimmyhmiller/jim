@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::Value;
 
-use claude_bus::proto::{encode, ClientFrame, Role};
+use claude_bus::proto::{ClientFrame, Role, encode};
 
 const MAX_PAYLOAD_BYTES: usize = 3072;
 
@@ -65,7 +65,9 @@ fn read_payload() -> Value {
 /// realistic offender is the full text of a `UserPromptSubmit`; we
 /// drop it to a short prefix when needed. Other hooks fit comfortably.
 fn shrink_payload(mut payload: Value, headroom: usize) -> Value {
-    let serialized_len = serde_json::to_string(&payload).map(|s| s.len()).unwrap_or(0);
+    let serialized_len = serde_json::to_string(&payload)
+        .map(|s| s.len())
+        .unwrap_or(0);
     if serialized_len <= headroom {
         return payload;
     }
@@ -117,7 +119,9 @@ fn try_publish_to_bus(
     // stall for seconds.
     let _ = s.set_write_timeout(Some(Duration::from_millis(200)));
 
-    let hello = match encode(&ClientFrame::Hello { role: Role::Publisher }) {
+    let hello = match encode(&ClientFrame::Hello {
+        role: Role::Publisher,
+    }) {
         Ok(b) => b,
         Err(_) => return false,
     };
@@ -172,8 +176,7 @@ fn main() {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let claude_pid = unsafe { libc::getppid() } as u32;
-    let terminal_session_id =
-        std::env::var("EDITOR_IDEA_TERMINAL_SESSION_ID").unwrap_or_default();
+    let terminal_session_id = std::env::var("EDITOR_IDEA_TERMINAL_SESSION_ID").unwrap_or_default();
 
     let payload = read_payload();
     let payload = shrink_payload(payload, MAX_PAYLOAD_BYTES);
