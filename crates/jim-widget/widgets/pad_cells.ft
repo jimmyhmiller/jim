@@ -1,0 +1,536 @@
+// pad_cells.ft — one cell of a notebook, rendered as widget Elements.
+//
+// Everything except charts and graphs lives here (those carry enough geometry
+// to want their own modules). Each renderer takes the parsed `cell` record
+// straight out of the log and returns one Element.
+//
+// Two host natives do the heavy lifting: `md_parse` gives real CommonMark
+// blocks with styled inline runs, and `highlight` gives per-line syntax spans.
+// Neither is reimplemented here.
+import "host"
+import { ink, ink_muted, rule, accent, surface, surface_alt, paper,
+         col_info, col_success, col_warn, col_error,
+         font_body, font_heading, font_mono,
+         size_heading, size_body, size_small, size_tiny, size_mono,
+         gap_block, alpha } from "pad_theme"
+import { number, compact, fixed } from "pad_fmt"
+import { cell_type, cell_str, cell_num, cell_arr, cell_rec } from "pad_log"
+
+// ---- small helpers ----------------------------------------------------------
+
+fn text(value, size, color) = { kind: "text", value: value, size: size, color: color,
+                                family: font_body() }
+
+fn mono(value, size, color) = { kind: "text", value: value, size: size, color: color,
+                                family: font_mono(), wrap: false }
+
+export fn note(msg) = text(msg, size_small(), ink_muted())
+
+// A cell that can't be drawn says so in place, at the size of the cell it
+// replaces. Silence would leave a hole in the document with no way to tell
+// whether the writer or the reader is at fault.
+export fn cell_error(what, detail) {
+    { kind: "frame", pad: 12.0, gap: 4.0,
+      style: { background: alpha(col_error(), 26), radius: "6",
+               border: { color: alpha(col_error(), 90), width: 1.0 } },
+      children: [
+          { kind: "text", value: what, size: size_small(), weight: "bold",
+            color: col_error(), family: font_body() },
+          { kind: "text", value: detail, size: size_small(), color: ink_muted(),
+            family: font_mono() },
+      ] }
+}
+
+fn str_of(v) {
+    let t = typeof(v)
+    if t == "Str" { return v }
+    if t == "Int" { return number(to_float(v)) }
+    if t == "Float" { return number(v) }
+    if t == "Bool" { return if v { "true" } else { "false" } }
+    if t == "Unit" { return "" }
+    str(v)
+}
+
+fn is_num(v) = typeof(v) == "Int" or typeof(v) == "Float"
+
+// ---- markdown ---------------------------------------------------------------
+
+// `md_parse` runs `[{ kind, level, ordered, indent, lang, lines: [[run]] }]`,
+// with each run carrying { value, bold, italic, code, strike, link }. Runs drop
+// almost straight into a `richtext` element — the one thing to add is what each
+// style should LOOK like.
+fn run_to_span(r, base_size, base_color) {
+    let value = unwrap_or(get(r, "value"), "")
+    let is_code = unwrap_or(get(r, "code"), false)
+    let is_link = unwrap_or(get(r, "link"), false)
+    let bold = unwrap_or(get(r, "bold"), false)
+    let italic = unwrap_or(get(r, "italic"), false)
+    let color = if is_link { accent() } else { base_color }
+    let mut span = { value: value, size: base_size, color: color, italic: italic }
+    if bold { span = assoc(span, "weight", "bold") }
+    // Inline code sits a hair smaller so a mono run doesn't tower over the
+    // serif line it's set in.
+    if is_code {
+        span = assoc(span, "family", font_mono())
+        span = assoc(span, "size", base_size - 1.5)
+        span = assoc(span, "color", if is_link { accent() } else { ink() })
+    } else {
+        span = assoc(span, "family", font_body())
+    }
+    span
+}
+
+fn runs_of_line(line, size, color) {
+    let mut out = []
+    for r in line { out = push(out, run_to_span(r, size, color)) }
+    out
+}
+
+// Join a block's lines into one wrapped paragraph, with the source's own line
+// breaks preserved as hard breaks.
+fn block_runs(block, size, color) {
+    let lines = unwrap_or(get(block, "lines"), [])
+    let mut out = []
+    let mut first = true
+    for line in lines {
+        if not first { out = push(out, { value: "\n", size: size, color: color }) }
+        first = false
+        for r in runs_of_line(line, size, color) { out = push(out, r) }
+    }
+    out
+}
+
+fn block_plain(block) {
+    let lines = unwrap_or(get(block, "lines"), [])
+    let mut out = ""
+    let mut first = true
+    for line in lines {
+        if not first { out = out + "\n" }
+        first = false
+        for r in line { out = out + unwrap_or(get(r, "value"), "") }
+    }
+    out
+}
+
+fn heading_block(block) {
+    let level = unwrap_or(get(block, "level"), 1)
+    let size = size_heading(level)
+    let head = { kind: "richtext", runs: block_runs(block, size, ink()), size: size,
+                 family: font_heading() }
+    // A rule under the top two levels, the way a report sets its sections.
+    if level <= 2 {
+        { kind: "vstack", gap: 6.0, children: [head, { kind: "divider" }],
+          style: { margin: { top: 12.0, right: 0.0, bottom: 0.0, left: 0.0 } } }
+    } else {
+        { kind: "vstack", gap: 0.0, children: [head],
+          style: { margin: { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 } } }
+    }
+}
+
+fn list_block(block) {
+    let ordered = unwrap_or(get(block, "ordered"), false)
+    let indent = unwrap_or(get(block, "indent"), 0)
+    let marker = if ordered { "•" } else { "•" }
+    { kind: "hstack", gap: 8.0, align: "start",
+      style: { margin: { top: 0.0, right: 0.0, bottom: 0.0,
+                         left: 10.0 + to_float(indent) * 14.0 } },
+      children: [
+          text(marker, size_body(), ink_muted()),
+          { kind: "frame", style: { flex_grow: 1.0, flex_shrink: 1.0 }, children: [
+              { kind: "richtext", runs: block_runs(block, size_body(), ink()),
+                size: size_body(), family: font_body() },
+          ] },
+      ] }
+}
+
+fn quote_block(block) {
+    { kind: "hstack", gap: 12.0, align: "stretch", children: [
+        { kind: "frame", children: [],
+          style: { background: alpha(accent(), 120), width: "2", radius: "1" } },
+        { kind: "frame", style: { flex_grow: 1.0, flex_shrink: 1.0 }, children: [
+            { kind: "richtext", runs: block_runs(block, size_body(), ink_muted()),
+              size: size_body(), family: font_body() },
+        ] },
+    ] }
+}
+
+// A fenced block inside markdown gets the same treatment as a `code` cell.
+fn fence_block(block) {
+    let lang = unwrap_or(get(block, "lang"), "")
+    code_body(block_plain(block), if typeof(lang) == "Str" { lang } else { "" })
+}
+
+export fn render_markdown(cell) {
+    let source = cell_str(cell, "source", "")
+    if trim(source) == "" { return note("(empty markdown cell)") }
+    let blocks = md_parse(source)
+    let mut kids = []
+    for b in blocks {
+        let kind = unwrap_or(get(b, "kind"), "")
+        if kind == "blank" { continue }
+        if kind == "heading" { kids = push(kids, heading_block(b)) continue }
+        if kind == "code-block" { kids = push(kids, fence_block(b)) continue }
+        if kind == "block-quote" { kids = push(kids, quote_block(b)) continue }
+        if kind == "list-item" { kids = push(kids, list_block(b)) continue }
+        if kind == "thematic-break" { kids = push(kids, { kind: "divider" }) continue }
+        kids = push(kids, { kind: "richtext", runs: block_runs(b, size_body(), ink()),
+                            size: size_body(), family: font_body() })
+    }
+    if len(kids) == 0 { return note("(empty markdown cell)") }
+    { kind: "vstack", gap: gap_block(), children: kids }
+}
+
+// ---- callout ----------------------------------------------------------------
+
+fn callout_color(level) {
+    if level == "success" { return col_success() }
+    if level == "warn" { return col_warn() }
+    if level == "error" { return col_error() }
+    col_info()
+}
+
+fn callout_mark(level) {
+    if level == "success" { return "✓" }
+    if level == "warn" { return "!" }
+    if level == "error" { return "×" }
+    "i"
+}
+
+export fn render_callout(cell) {
+    let level = cell_str(cell, "level", "info")
+    let color = callout_color(level)
+    let body = cell_str(cell, "source", "")
+    { kind: "hstack", gap: 12.0, align: "stretch",
+      style: { background: alpha(color, 22), radius: "6",
+               padding: { top: 12.0, right: 14.0, bottom: 12.0, left: 12.0 } },
+      children: [
+          { kind: "frame", children: [],
+            style: { background: color, width: "2", radius: "1" } },
+          { kind: "vstack", gap: 6.0, style: { flex_grow: 1.0, flex_shrink: 1.0 },
+            children: [
+                { kind: "hstack", gap: 8.0, align: "center", children: [
+                    { kind: "text", value: callout_mark(level), size: size_small(),
+                      weight: "bold", color: color, family: font_mono() },
+                    { kind: "text", value: to_upper(level), size: size_tiny(),
+                      weight: "bold", color: color, family: font_body() },
+                ] },
+                render_markdown({ source: body }),
+            ] },
+      ] }
+}
+
+// ---- code -------------------------------------------------------------------
+
+// Map a highlight span's kind onto a theme syntax token.
+fn syntax_color(kind) {
+    let c = theme_syntax(kind)
+    if c == "" { ink() } else { c }
+}
+
+extern fn theme_get(token)
+
+fn theme_syntax(kind) {
+    let c = theme_get("syntax_" + kind)
+    if typeof(c) == "Str" { c } else { "" }
+}
+
+fn code_line(spans) {
+    if len(spans) == 0 { return { kind: "text", value: " ", size: size_mono(),
+                                  color: ink(), family: font_mono(), wrap: false } }
+    let mut runs = []
+    for s in spans {
+        let value = unwrap_or(get(s, "text"), "")
+        let kind = unwrap_or(get(s, "kind"), "default")
+        runs = push(runs, { value: value, size: size_mono(), family: font_mono(),
+                            color: syntax_color(kind) })
+    }
+    { kind: "richtext", runs: runs, size: size_mono(), family: font_mono(),
+      wrap: false }
+}
+
+fn code_body(source, lang) {
+    // `highlight` returns one entry per line; an unknown language comes back
+    // as a single "default" span per line, which is exactly the plain-text
+    // rendering we want anyway.
+    let lines = highlight(source, lang)
+    let mut kids = []
+    for spans in lines { kids = push(kids, code_line(spans)) }
+    if len(kids) == 0 { kids = push(kids, mono(source, size_mono(), ink())) }
+    { kind: "frame", gap: 1.0,
+      style: { background: surface_alt(), radius: "6",
+               padding: { top: 12.0, right: 14.0, bottom: 12.0, left: 14.0 } },
+      children: kids }
+}
+
+export fn render_code(cell) {
+    let source = cell_str(cell, "source", "")
+    let lang = cell_str(cell, "language", "")
+    let title = cell_str(cell, "title", "")
+    let body = code_body(source, lang)
+    if title == "" { return body }
+    { kind: "vstack", gap: 6.0, children: [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "text", value: title, size: size_tiny(), color: ink_muted(),
+              family: font_mono() },
+            { kind: "frame", children: [], style: { flex_grow: 1.0 } },
+            if lang == "" { { kind: "spacer", size: 0.0 } }
+            else { { kind: "badge", value: lang, color: alpha(accent(), 40) } },
+        ] },
+        body,
+    ] }
+}
+
+// ---- table ------------------------------------------------------------------
+
+export fn render_table(cell) {
+    let columns = cell_arr(cell, "columns")
+    let rows = cell_arr(cell, "rows")
+    if len(columns) == 0 { return cell_error("table", "the cell has no columns") }
+
+    // Numbers align right, everything else left — decided per column from the
+    // first row that has a value there, so a column of counts reads as a
+    // column of counts.
+    let mut cols = []
+    let mut ci = 0
+    while ci < len(columns) {
+        let numeric = column_is_numeric(rows, ci)
+        cols = push(cols, { header: str_of(columns[ci]),
+                            align: if numeric { "end" } else { "start" } })
+        ci = ci + 1
+    }
+    let mut out_rows = []
+    for r in rows {
+        let mut cells = []
+        let mut i = 0
+        while i < len(columns) {
+            cells = push(cells, str_of(unwrap_or(get(r, i), "")))
+            i = i + 1
+        }
+        out_rows = push(out_rows, cells)
+    }
+    let table = { kind: "table", columns: cols, rows: out_rows, zebra: false }
+    let title = cell_str(cell, "title", "")
+    if title == "" { return table }
+    { kind: "vstack", gap: 8.0, children: [caption(title), table] }
+}
+
+fn column_is_numeric(rows, ci) {
+    for r in rows {
+        let v = unwrap_or(get(r, ci), "")
+        if typeof(v) == "Unit" { continue }
+        if is_num(v) { return true }
+        if typeof(v) == "Str" and v != "" { return false }
+    }
+    false
+}
+
+// A figure caption: small, muted, above the thing it names.
+export fn caption(s) = { kind: "text", value: s, size: size_tiny(),
+                         color: ink_muted(), family: font_body() }
+
+// ---- stats ------------------------------------------------------------------
+
+// A delta's sign decides its color, and `up_is_good` decides what the sign
+// means — a rising error rate is not good news.
+fn delta_color(delta, up_is_good) {
+    let s = trim(str_of(delta))
+    if s == "" { return ink_muted() }
+    let down = starts_with(s, "-") or starts_with(s, "−")
+    let up = starts_with(s, "+")
+    if not (up or down) { return ink_muted() }
+    let good = if up { up_is_good } else { not up_is_good }
+    if good { col_success() } else { col_error() }
+}
+
+// A sparkline drawn as one path — the shape of the trend, no axis, no labels.
+fn spark(values, width, height) {
+    if len(values) < 2 { return { kind: "spacer", size: 0.0 } }
+    let mut lo = to_float(values[0])
+    let mut hi = lo
+    for v in values {
+        let f = to_float(v)
+        if f < lo { lo = f }
+        if f > hi { hi = f }
+    }
+    let span = if hi - lo < 0.000001 { 1.0 } else { hi - lo }
+    let step = width / to_float(len(values) - 1)
+    let mut d = ""
+    let mut i = 0
+    while i < len(values) {
+        let x = to_float(i) * step
+        let y = height - (to_float(values[i]) - lo) / span * height
+        d = d + (if i == 0 { "M " } else { " L " }) + fixed(x, 2) + " " + fixed(y, 2)
+        i = i + 1
+    }
+    { kind: "canvas", style: { width: str(to_int(width)), height: str(to_int(height)) },
+      children: [ { kind: "path", id: "spark", d: d, stroke: alpha(accent(), 200),
+                    stroke_width: 1.5, cap: "round", join: "round" } ] }
+}
+
+fn stat_tile(item) {
+    let label = str_of(unwrap_or(get(item, "label"), ""))
+    let value = unwrap_or(get(item, "value"), "")
+    let value_text = if is_num(value) { compact(to_float(value)) } else { str_of(value) }
+    let delta = unwrap_or(get(item, "delta"), "")
+    let up_is_good = unwrap_or(get(item, "up_is_good"), true)
+    let sparkline = unwrap_or(get(item, "spark"), [])
+
+    let mut kids = [
+        { kind: "text", value: to_upper(label), size: size_tiny(), color: ink_muted(),
+          family: font_body() },
+        { kind: "text", value: value_text, size: 26.0, color: ink(),
+          family: font_heading() },
+    ]
+    if str_of(delta) != "" {
+        kids = push(kids, { kind: "text", value: str_of(delta), size: size_small(),
+                            color: delta_color(delta, up_is_good), family: font_mono() })
+    }
+    if typeof(sparkline) == "List" and len(sparkline) >= 2 {
+        kids = push(kids, spark(sparkline, 90.0, 22.0))
+    }
+    { kind: "vstack", gap: 4.0, children: kids,
+      style: { flex_grow: 1.0, flex_shrink: 1.0, min_width: "110" } }
+}
+
+export fn render_stats(cell) {
+    let items = cell_arr(cell, "items")
+    if len(items) == 0 { return cell_error("stats", "the cell has no tiles") }
+    let mut tiles = []
+    for it in items { tiles = push(tiles, stat_tile(it)) }
+    { kind: "hstack", gap: 28.0, align: "start", children: tiles }
+}
+
+// ---- json -------------------------------------------------------------------
+//
+// Rendered as an indented tree. Collapsing is the notebook shell's business
+// (it owns the click state), so this takes the open-path set as an argument.
+
+fn json_leaf_color(v) {
+    let t = typeof(v)
+    if t == "Str" { return theme_or(ink(), "syntax_string") }
+    if t == "Int" or t == "Float" { return theme_or(ink(), "syntax_constant") }
+    if t == "Bool" { return theme_or(ink(), "syntax_keyword") }
+    ink_muted()
+}
+
+fn theme_or(fb, token) {
+    let c = theme_get(token)
+    if typeof(c) == "Str" { c } else { fb }
+}
+
+fn json_leaf_text(v) {
+    let t = typeof(v)
+    if t == "Str" { return "\"" + v + "\"" }
+    if t == "Unit" { return "null" }
+    str_of(v)
+}
+
+fn is_container(v) = typeof(v) == "Record" or typeof(v) == "List"
+
+fn container_summary(v, open) {
+    if typeof(v) == "List" {
+        let n = len(v)
+        return if open { "[" } else { "[ " + str(n) + (if n == 1 { " item" } else { " items" }) + " ]" }
+    }
+    let n = len(keys(v))
+    if open { "{" } else { "{ " + str(n) + (if n == 1 { " key" } else { " keys" }) + " }" }
+}
+
+// One row per line, with a toggle on containers. `path` identifies the node so
+// the shell can remember which ones are open.
+fn json_rows(value, label, path, depth, open_paths, out0) {
+    let mut out = out0
+    let indent = 12.0 + to_float(depth) * 14.0
+    let open = has(open_paths, path)
+    if is_container(value) {
+        let head = { kind: "list-item", id: "json:" + path, gap: 6.0,
+                     style: { padding: { top: 1.0, right: 6.0, bottom: 1.0, left: indent } },
+                     children: [
+                         mono(if open { "▾" } else { "▸" }, size_mono(), ink_muted()),
+                         if label == "" { { kind: "spacer", size: 0.0 } }
+                         else { mono(label + ":", size_mono(), ink_muted()) },
+                         mono(container_summary(value, open), size_mono(), ink_muted()),
+                     ] }
+        out = push(out, head)
+        if not open { return out }
+        if typeof(value) == "List" {
+            let mut i = 0
+            for child in value {
+                out = json_rows(child, str(i), path + "/" + str(i), depth + 1, open_paths, out)
+                i = i + 1
+            }
+        } else {
+            // funct hands back record keys already sorted, so a json tree
+            // reads alphabetically rather than in the document's own order.
+            for k in keys(value) {
+                out = json_rows(unwrap_or(get(value, k), ""), k, path + "/" + k,
+                                depth + 1, open_paths, out)
+            }
+        }
+        return out
+    }
+    let mut runs = []
+    if label != "" {
+        runs = push(runs, { value: label + ": ", size: size_mono(), family: font_mono(),
+                            color: ink_muted() })
+    }
+    runs = push(runs, { value: json_leaf_text(value), size: size_mono(),
+                        family: font_mono(), color: json_leaf_color(value) })
+    push(out, { kind: "frame", pad: 0.0,
+                style: { padding: { top: 1.0, right: 6.0, bottom: 1.0, left: indent } },
+                children: [ { kind: "richtext", runs: runs, size: size_mono(),
+                              family: font_mono(), wrap: false } ] })
+}
+
+export fn render_json(cell, id, open_paths) {
+    let value = unwrap_or(get(cell, "value"), "")
+    let rows = json_rows(value, "", id, 0, open_paths, [])
+    let body = { kind: "vstack", gap: 0.0, children: rows,
+                 style: { background: surface_alt(), radius: "6",
+                          padding: { top: 8.0, right: 8.0, bottom: 8.0, left: 0.0 } } }
+    let title = cell_str(cell, "title", "")
+    if title == "" { return body }
+    { kind: "vstack", gap: 8.0, children: [caption(title), body] }
+}
+
+// The paths a freshly-rendered json cell starts with open: the root, so the
+// reader sees structure rather than a single collapsed brace.
+export fn json_default_open(id) = assoc({}, id, true)
+
+// ---- image ------------------------------------------------------------------
+
+export fn render_image(cell) {
+    let src = cell_str(cell, "src", "")
+    if src == "" { return cell_error("image", "the cell has no `src`") }
+    let img = { kind: "image", path: src, fit: "contain",
+                style: { width: "100%", max_height: "420", radius: "4" } }
+    let cap = cell_str(cell, "caption", "")
+    if cap == "" { return img }
+    { kind: "vstack", gap: 8.0, children: [img, caption(cap)] }
+}
+
+// ---- comment ----------------------------------------------------------------
+
+export fn render_comment(cell) {
+    let author = cell_str(cell, "author", "anon")
+    let body = cell_str(cell, "body", "")
+    let target = cell_str(cell, "target", "")
+    { kind: "hstack", gap: 10.0, align: "stretch",
+      style: { padding: { top: 8.0, right: 10.0, bottom: 8.0, left: 10.0 },
+               background: surface(), radius: "6" },
+      children: [
+          { kind: "frame", children: [],
+            style: { background: alpha(ink_muted(), 90), width: "2", radius: "1" } },
+          { kind: "vstack", gap: 4.0, style: { flex_grow: 1.0, flex_shrink: 1.0 },
+            children: [
+                { kind: "hstack", gap: 8.0, align: "center", children: [
+                    { kind: "text", value: author, size: size_tiny(), weight: "bold",
+                      color: ink_muted(), family: font_body() },
+                    if target == "" { { kind: "spacer", size: 0.0 } }
+                    else { { kind: "text", value: "on " + target, size: size_tiny(),
+                             color: ink_muted(), family: font_mono() } },
+                ] },
+                render_markdown({ source: body }),
+            ] },
+      ] }
+}

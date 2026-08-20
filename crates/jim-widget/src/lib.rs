@@ -70,6 +70,7 @@ pub mod subprocess;
 pub mod syntax;
 pub mod system_font;
 pub mod text_fallback;
+pub mod vector;
 
 pub use msgbus::{BusMessageObserved, PendingMsg, WidgetMsgBus};
 
@@ -3480,6 +3481,7 @@ fn rerender_widgets(
                 0.0,
                 &pane_font.0,
                 &fonts,
+                Color::from(w_theme.color(jim_style::tokens::PANE_BG)),
             );
         } else {
             let ctx = render::LayoutCtx {
@@ -3521,6 +3523,7 @@ fn rerender_widgets(
                     region.z + 0.005,
                     &pane_font.0,
                     &fonts,
+                    Color::from(w_theme.color(jim_style::tokens::PANE_BG)),
                 );
             }
             let new_max = (consumed.y - content_size.y).max(0.0);
@@ -3551,7 +3554,7 @@ fn rerender_widgets(
 /// depth so its drawing lands inside the flex box and above its
 /// background.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn render_canvas_items(
+pub fn render_canvas_items(
     commands: &mut Commands,
     images: &mut Assets<Image>,
     cache: &mut WidgetImageCache,
@@ -3561,6 +3564,9 @@ pub(crate) fn render_canvas_items(
     z_base: f32,
     default_font: &Handle<Font>,
     fonts: &jim_style::FontRegistry,
+    // What a translucent `Path` fill/stroke composites against — see the
+    // `alpha_mode` note in the Path arm.
+    surface: Color,
 ) {
     for item in items {
         match item {
@@ -3657,6 +3663,75 @@ pub(crate) fn render_canvas_items(
                     Visibility::Inherited,
                 ));
             }
+            CanvasItem::Path {
+                id,
+                d,
+                fill,
+                stroke,
+                stroke_width,
+                cap,
+                join,
+                bg,
+                z,
+            } => {
+                let parsed = match crate::vector::parse(d) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        eprintln!("[widget] canvas path {id:?}: {e}");
+                        continue;
+                    }
+                };
+                let ground = bg
+                    .as_deref()
+                    .and_then(parse_canvas_color)
+                    .unwrap_or(surface);
+                let paint = |spec: &Option<String>| -> Option<Color> {
+                    let raw = parse_canvas_color(spec.as_deref()?)?;
+                    Some(crate::script_widget::flatten_alpha(raw, ground))
+                };
+                let mut layers: Vec<(Mesh, Color, f32)> = Vec::new();
+                if let Some(color) = paint(fill) {
+                    if let Some(mesh) = crate::vector::fill_mesh(&parsed.path) {
+                        layers.push((mesh, color, 0.0));
+                    }
+                }
+                if let Some(color) = paint(stroke) {
+                    if let Some(mesh) =
+                        crate::vector::stroke_mesh(&parsed.path, *stroke_width, *cap, *join)
+                    {
+                        layers.push((mesh, color, 0.0005));
+                    }
+                }
+                for (mesh, color, dz) in layers {
+                    let e = commands
+                        .spawn((
+                            ChildOf(content_root),
+                            Transform::from_xyz(origin.x, -origin.y, z_base + *z + dz),
+                            Visibility::Inherited,
+                            bevy::camera::visibility::NoFrustumCulling,
+                        ))
+                        .id();
+                    // Deferred insert — see the matching note in
+                    // `script_widget::diff_render`.
+                    commands.queue(move |world: &mut World| {
+                        let mesh_h = world.resource_mut::<Assets<Mesh>>().add(mesh);
+                        let mat_h = world
+                            .resource_mut::<Assets<bevy::sprite_render::ColorMaterial>>()
+                            .add(bevy::sprite_render::ColorMaterial {
+                                color,
+                                alpha_mode: bevy::sprite_render::AlphaMode2d::Opaque,
+                                ..default()
+                            });
+                        if let Ok(mut ec) = world.get_entity_mut(e) {
+                            ec.insert((
+                                bevy::mesh::Mesh2d(mesh_h),
+                                bevy::sprite_render::MeshMaterial2d(mat_h),
+                            ));
+                        }
+                    });
+                }
+            }
         }
     }
 }
@@ -3675,6 +3750,12 @@ pub(crate) fn canvas_anchor_to_bevy(a: CanvasAnchor) -> bevy::sprite::Anchor {
 /// the same syntax as `protocol::parse_hex_color` plus an optional
 /// alpha byte. Returns None on malformed input so callers can fall
 /// back to a default.
+/// `script_widget::flatten_alpha` for the `path_probe` binary, which checks
+/// that what lands on screen equals what real alpha blending would produce.
+pub fn flatten_alpha_for_probe(c: Color, ground: Color) -> Color {
+    script_widget::flatten_alpha(c, ground)
+}
+
 pub(crate) fn parse_canvas_color(s: &str) -> Option<Color> {
     let s = s.strip_prefix('#').unwrap_or(s);
     match s.len() {

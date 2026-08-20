@@ -30,7 +30,7 @@ one.
 > A finer-grained `dashboard: <group>` also exists (named pane groups,
 > stage 4) for revealing a hand-picked subset. It works, but it is not the
 > primary path — naming a project is. See `pane_groups` vs
-> `project_region`.
+> `live_views`.
 
 That is the whole design. Everything below is what it costs.
 
@@ -294,35 +294,152 @@ Each stage stands alone.
    (Caveat that shaped the design: the *retained backlog* replayed to a
    late joiner does NOT surface as `BusMessageObserved` — which is why a
    publisher must announce its state on start, as `deck.ft` does.)
-4b. ✅ **`project_region.rs` — a whole project inside a slide.** The real
+4b. ✅ **`live_views.rs` — a whole project inside a slide.** The real
    answer to "show me a project", and the primary demo path. A slide's
    `project:` directive publishes `pane.project {name, inset}`; the app
-   fits that project's canvas bounding box into a region of the
-   publishing pane and draws its panes there, live.
+   draws that project's panes, live, in a region of the publishing pane.
 
-   Mechanism, both parts already existed: `PaneVisualScale` scales a pane
-   about its top-left **without touching `PaneRect::size`** (so a terminal
-   shrinks visually instead of re-wrapping) and is already folded into
-   both `position_panes` and the per-pane camera; `PaneScreenAnchored`
-   makes `PaneRect::pos` window pixels, so a guest pane can be placed in
-   screen space without inheriting the host project's pan/zoom. Exposé
-   uses the same scale-don't-resize trick.
+   **A live view is a virtual window onto the project.** It mirrors a
+   window-sized rectangle of that project's canvas, at that project's own
+   saved pan and zoom. So an embedded project shows the same field of view
+   you get by switching to it — just smaller. `application: true` is the
+   identical operation with the whole window as the source rect, so layer
+   zero (sidebar, canvas background) comes along.
+
+   **A project view FILLS its region; the app mirror letterboxes.** A
+   slide's live area is a wide strip, and fitting a window-shaped source
+   inside it left the project in a small centred box surrounded by dead
+   bars — which reads as "it just zoomed out and shows nothing". A project
+   view therefore scales to cover its region and centres the crop: as large
+   as the region can show, framing less canvas. The whole-application
+   mirror keeps the letterbox, because cropping the window would be a lie
+   about what the app looks like.
+
+   **A host is never drawn inside its own view.** The whole-app mirror used
+   to make an exception ("show the app, including the slide"), which is
+   backwards in the case that matters: while presenting, the deck covers
+   the entire window, so a faithful mirror is a picture of the slide you
+   are already looking at. Excluding the host shows the workspace as it
+   looks *behind* the deck.
+
+   Two rejected alternatives, both tried: fitting the project's **pane
+   bounding box** reads as zoomed way out and re-frames every time a pane
+   moves; a **1:1 crop** anchored at the canvas origin (what the first
+   implementation actually did) shows the top-left corner and clips away
+   every pane sitting further right or down.
 
    The region is anchored to the *publishing* pane by decoding the bus
    `sender` id (`rw<entity-bits>`) back to an entity — a widget has no
    idea where it sits on screen, so `inset` is expressed as fractions of
    its own pane.
 
-   The later view-tree work completed that refactor: input resolves through
-   the deepest `View`, then filters pane targets by that view's project.
-   Clicking, dragging, scrolling, focusing and typing in a slide therefore
-   operate on the real guest panes.
+   The view-tree work completes it: input resolves through the deepest
+   `View`, then filters pane targets by that view's project **and skips the
+   view's host chain** (`Views::is_host_of`). Both halves are needed: the
+   press path only ever filtered *pinned* panes by project, so a click
+   inside a live view was taken by the host pane — and a presenting deck
+   covers the whole window at `z = 500`, so it won every time and the
+   embedded project was decorative. Clicking,
+   dragging, scrolling, focusing and typing in a slide therefore operate
+   on the real guest panes. Cmd+scroll inside a view pans the project it
+   frames (Cmd+Opt+scroll zooms) — the guest's own saved pan/zoom, so a
+   pan done in a slide is still there when you switch to the project.
 
-5. **`present.rs` — BUILT** — fullscreen, chrome hiding, deck-pane-fills-display,
-   global key chords, Esc. Test the monitor-cascade hazard hard.
-6. **Polish — BUILT FOR V1** — named groups and docks provide dashboard
-   layouts. Speaker-notes UI and incremental build reveals remain optional
-   follow-up features rather than blockers for presenting.
+   Cameras are ordered by a dense running counter in `[76_000, 79_999]`:
+   above every window pane camera (which top out at 75_150) and below the
+   overlay cameras, so an embedded project can never cover a menu. A
+   `z`-derived order collides, and colliding orders make Bevy log
+   "unpredictable render results" every frame.
+
+4c. ✅ **`application:` is NOT a region — the deck steps aside.**
+
+   The first implementation mirrored the whole window into the slide, and
+   it never worked. The reason is structural, not a bug list: a mirror of
+   the ACTIVE project is a copy of something already on screen. The same
+   pane entities get two camera sets, two input mappings, and a z-order
+   decided by camera order rather than by anything meaningful. Everything
+   that went wrong followed from that — ghosting, dead clicks, z flicker,
+   and a full duplicate render every frame.
+
+   What it does now: while presenting, an `application:` slide **hides the
+   deck**. You are looking at the real, live application — once, fully
+   interactive, at native resolution, for free. `⌘⇧→` / `⌘⇧←` still
+   advance, because navigation goes straight to the deck's worker and does
+   not need the deck visible. The next slide's publish brings it back.
+
+   Two consequences worth stating plainly:
+
+   - **Full screen only.** In a floating pane an `application:` slide does
+     nothing at all. "The whole app" inside a pane could only ever be a
+     thumbnail of what is already behind the pane — the mirror that failed.
+   - **The sidebar is chrome.** Hidden for the duration of a talk, so it
+     never sits down the left edge of a slide. An `application:` slide can
+     ask for it back with `<!-- sidebar: true -->` when the demo is about
+     the app's own navigation. A hidden sidebar also takes no clicks — it
+     used to stay live in an invisible strip under the slide.
+
+5. ✅ **`present.rs` — presentation mode.** F5 hands the whole window to
+   one deck. "Whole window" is literal, and three separate things had to be
+   true for it:
+   - **The clip region opens.** `PaneCanvasRegion` clips every pane camera
+     at `sidebar.width`, so a deck resized to the window rect was laid out
+     full width and *rendered* clipped — the left of every slide missing.
+     `publish_canvas_region` now drops the gutter (and the sidebar's input
+     block zone) while a talk is running. `PaneViewport.origin` deliberately
+     does NOT move: it is the canvas↔window mapping, and shifting it would
+     slide every pane sideways when the talk started.
+   - **The chrome goes.** Title bar, close button, border, shadow hidden and
+     a zero-height `PaneChromeOverride` inserted, mirroring what a docked
+     cell does. The pane rect then grows by `MARGIN` on every side so the
+     *content* — the slide — is exactly the window. A slideshow with a title
+     bar and an 8px frame does not read as a slideshow.
+   - **Keys follow focus.** Space/PageUp/PageDown used to be grabbed
+     app-wide, so clicking into a terminal you were demoing meant every
+     arrow advanced the slide. Now a focused non-deck pane owns the
+     keyboard outright; Escape hands it back to the deck, and Escape with
+     the deck focused ends the talk.
+
+   Still open: real `Action`s + `KeyChord`s (`present.toggle` / `next` /
+   `prev` / `exit`) instead of a hardcoded F5, and `WindowMode` fullscreen
+   (the deck fills the window, not the display).
+6. **Polish — PARTIAL.** Named groups and docks provide dashboard layouts.
+   The live-view inset is still one layout (heading band + screen, or
+   full-bleed when the slide has no body) rather than
+   `layout: full|bottom|right`. Speaker-notes UI and incremental build
+   reveals remain follow-ups.
+
+### The slide master
+
+`deck.ft` owns layout as FRACTIONS of the pane (margins, the heading band
+above a live view); `deck.glz` owns colour, type sizes and surface
+treatment. That split is load-bearing. Type already scaled from the
+1280×720 reference, but padding was fixed pixels from the stylesheet — so
+in a 600px pane, 72px of margin on each side ate the slide while the text
+shrank to a third of its reference size. Both must scale, or a deck only
+looks right at one size.
+
+Two related layout facts, learned the hard way:
+
+- **The root must ask for the height.** A widget root fills the pane's
+  width automatically but is content-tall unless it says
+  `height: "100%"` — so the slide's background was a band across the
+  middle of the pane with pane colour above and below it.
+- **`text` / `richtext` / `spacer` carry no `style`.** Flex behaviour —
+  a fixed width, no shrinking, growing to fill — needs a `frame` wrapper.
+  Style fields set directly on those elements are silently dropped.
+
+### Saying when a live view is empty
+
+A live view is a hole punched in a slide, and a hole with nothing behind
+it looks exactly like a broken one. Pointing a slide at a project with no
+panes (or at a name that doesn't resolve) produced a silent void.
+
+The host knows both facts, so it says them: `live_views` publishes
+`pane.project.status.<widget id>` (retained, global channel) with
+`{host, name, found, panes, whole_app}`, and `deck.ft` renders "«X» has no
+panes to show" / "No project named «X»" inside the screen frame. The
+per-host topic matters — the bus retains one payload per topic, so two
+decks sharing a topic would overwrite each other's answer.
 
 Stage 4 is where the ambition actually lands, and it's the one with no
 existing precedent to copy.

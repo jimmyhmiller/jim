@@ -243,6 +243,13 @@ impl Plugin for CanvasPlugin {
                 Update,
                 publish_canvas_region
                     .after(crate::projects::sidebar_input)
+                    // ...and after this frame's pan/zoom is applied, so the
+                    // root view and `PaneViewport` describe the SAME frame
+                    // that `position_panes` and the live-view cameras are
+                    // about to be aimed with. Without it, three readers of
+                    // pan state could be a frame apart from each other in a
+                    // schedule-arbitrary way — the smear during a pan.
+                    .after(CanvasInputSet)
                     .before(jim_pane::PaneViewportReaders),
             )
             .add_systems(PostUpdate, sync_origin_indicators);
@@ -329,9 +336,10 @@ pub fn zoom_reset_active(world: &mut World) {
 /// Tell pane-bevy where the canvas is, so per-pane cameras clip their
 /// viewports to that region. Anything drawn by the main camera (the
 /// sidebar) outside this region sits visually on top of the panes.
-fn publish_canvas_region(
+pub(crate) fn publish_canvas_region(
     windows: Query<&Window>,
     sidebar: Res<Sidebar>,
+    presentation: Res<crate::present::Presentation>,
     view: Res<CanvasView>,
     projects: Res<Projects>,
     nav: Res<crate::canvas_pane::CanvasNav>,
@@ -345,8 +353,23 @@ fn publish_canvas_region(
     let Ok(window) = windows.single() else {
         return;
     };
+    // Presenting hands the whole window to the deck, so the pane-camera
+    // clip region has to be the whole window too — including the strip the
+    // sidebar occupies. `PaneViewport.origin` deliberately does NOT move:
+    // it's the canvas↔window mapping, and shifting it would slide every
+    // pane sideways the moment a talk started.
+    // The gutter follows the SIDEBAR, not the presentation. While a deck
+    // covers the window there is no sidebar and panes may use its strip;
+    // but a stepped-aside slide shows the real app WITH its sidebar, and
+    // opening the clip region there let every pane camera draw straight
+    // over it — the sidebar looked like it was behind the canvas.
+    let gutter = if presentation.sidebar_visible() {
+        sidebar.width
+    } else {
+        0.0
+    };
     let want = PaneCanvasRegion {
-        min: Vec2::new(sidebar.width, 0.0),
+        min: Vec2::new(gutter, 0.0),
         max: Vec2::new(window.width(), window.height()),
         active: true,
     };
@@ -357,10 +380,12 @@ fn publish_canvas_region(
     // happens to live under the sidebar in screen space.
     let sidebar_rect = Rect {
         min: Vec2::ZERO,
-        max: Vec2::new(sidebar.width, window.height()),
+        max: Vec2::new(gutter, window.height()),
     };
     block_zones.0.clear();
-    block_zones.0.push(sidebar_rect);
+    if gutter > 0.0 {
+        block_zones.0.push(sidebar_rect);
+    }
 
     // Publish active project's view as PaneViewport — pane-bevy reads
     // it to position/scale panes and to convert cursor↔canvas.
@@ -453,11 +478,16 @@ fn handle_pan_zoom_input(
     let level = (active, nav.level(active));
 
     // Sidebar (or any host block-zone) eats canvas input.
-    let in_block_zone = pt.x < sidebar.width
-        || block_zones
-            .0
-            .iter()
-            .any(|r| pt.x >= r.min.x && pt.x <= r.max.x && pt.y >= r.min.y && pt.y <= r.max.y);
+    //
+    // Read the sidebar's width from the published block zones rather than
+    // from `Sidebar` directly: while presenting there is no sidebar and
+    // `publish_canvas_region` clears the zone, but a raw `pt.x <
+    // sidebar.width` test kept an INVISIBLE dead band down the left of
+    // every slide where pans and pinches silently died.
+    let in_block_zone = block_zones
+        .0
+        .iter()
+        .any(|r| pt.x >= r.min.x && pt.x <= r.max.x && pt.y >= r.min.y && pt.y <= r.max.y);
 
     // ----- Wheel: cmd+scroll = canvas pan, cmd+opt+scroll = canvas zoom -----
     //

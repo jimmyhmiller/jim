@@ -1,0 +1,589 @@
+// pad_graph.ft — Graphviz DOT diagrams: parse, lay out, draw.
+//
+// Three separable pieces, in order:
+//   parse_dot  — a DOT subset -> { nodes, edges, rankdir }
+//   layout     — layered (Sugiyama-ish) placement: rank, order, position
+//   render_graph — canvas items
+//
+// The first two are pure and take their text measurement as a callback, so
+// `funct pad_graph_test.ft` can exercise the layout with a stub measurer. A
+// diagram whose edges connect the wrong boxes looks plausible, so the layout
+// is worth testing rather than eyeballing.
+//
+// The DOT subset is deliberate: node and edge statements, `a -> b -> c`
+// chains, `[label="…"]` attributes, and `rankdir`. Anything outside it —
+// subgraphs, clusters, ports — is reported as a clear error rather than
+// half-drawn.
+import "host"
+import { fixed } from "pad_fmt"
+import { ink, ink_muted, rule, accent, surface_alt, paper,
+         font_body, font_mono, size_small, size_tiny, alpha } from "pad_theme"
+import { cell_str } from "pad_log"
+import { cell_error, caption } from "pad_cells"
+import { move_to, line_to } from "pad_scale"
+
+// ---- tokenizer --------------------------------------------------------------
+
+fn is_ident_char(c) = contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.", c)
+
+fn is_space(c) = c == " " or c == "\t" or c == "\n"
+
+// -> { ok, tokens: [{ t, v }], error }. Token kinds: "id", "str", "sym".
+export fn tokenize(src) {
+    let cs = chars(src)
+    let n = len(cs)
+    let mut i = 0
+    let mut out = []
+    while i < n {
+        let c = cs[i]
+        if is_space(c) { i = i + 1  continue }
+        // Comments: // to end of line, and /* … */.
+        if c == "/" and i + 1 < n and cs[i + 1] == "/" {
+            while i < n and cs[i] != "\n" { i = i + 1 }
+            continue
+        }
+        if c == "/" and i + 1 < n and cs[i + 1] == "*" {
+            i = i + 2
+            while i + 1 < n and not (cs[i] == "*" and cs[i + 1] == "/") { i = i + 1 }
+            i = i + 2
+            continue
+        }
+        if c == "#" {
+            while i < n and cs[i] != "\n" { i = i + 1 }
+            continue
+        }
+        if c == "\"" {
+            let mut v = ""
+            i = i + 1
+            while i < n and cs[i] != "\"" {
+                if cs[i] == "\\" and i + 1 < n {
+                    // \n inside a DOT label is a line break; \" and \\ are the
+                    // characters themselves.
+                    let nx = cs[i + 1]
+                    if nx == "n" { v = v + "\n" } else { v = v + nx }
+                    i = i + 2
+                    continue
+                }
+                v = v + cs[i]
+                i = i + 1
+            }
+            if i >= n { return { ok: false, tokens: [], error: "a quoted string is never closed" } }
+            i = i + 1
+            out = push(out, { t: "str", v: v })
+            continue
+        }
+        if c == "-" and i + 1 < n and (cs[i + 1] == ">" or cs[i + 1] == "-") {
+            out = push(out, { t: "sym", v: "->" })
+            i = i + 2
+            continue
+        }
+        if is_ident_char(c) {
+            let mut v = ""
+            while i < n and is_ident_char(cs[i]) { v = v + cs[i]  i = i + 1 }
+            out = push(out, { t: "id", v: v })
+            continue
+        }
+        out = push(out, { t: "sym", v: c })
+        i = i + 1
+    }
+    { ok: true, tokens: out, error: "" }
+}
+
+// ---- parser -----------------------------------------------------------------
+
+fn tok_at(toks, i) = if i < len(toks) { toks[i] } else { { t: "eof", v: "" } }
+
+fn is_value(tk) = tk.t == "id" or tk.t == "str"
+
+// Node/edge attribute list `[k=v, k=v]` starting at `i` (the `[`).
+// -> { attrs, next }
+fn parse_attrs(toks, i0) {
+    let mut attrs = {}
+    let mut i = i0 + 1
+    while i < len(toks) {
+        let tk = tok_at(toks, i)
+        if tk.t == "sym" and tk.v == "]" { return { attrs: attrs, next: i + 1 } }
+        if tk.t == "sym" { i = i + 1  continue }
+        let key = tk.v
+        let eq = tok_at(toks, i + 1)
+        if eq.t == "sym" and eq.v == "=" {
+            let val = tok_at(toks, i + 2)
+            if is_value(val) { attrs = assoc(attrs, key, val.v) }
+            i = i + 3
+        } else {
+            // A bare word in an attribute list (`[bold]`) has no value; keep
+            // it as a flag rather than losing the position.
+            attrs = assoc(attrs, key, "")
+            i = i + 1
+        }
+    }
+    { attrs: attrs, next: i }
+}
+
+fn ensure_node(g, name) {
+    if has(g.index, name) { return g }
+    let idx = len(g.nodes)
+    { ..g,
+      index: assoc(g.index, name, idx),
+      nodes: push(g.nodes, { id: name, label: name, shape: "box" }) }
+}
+
+fn node_at(g, name) = g.nodes[unwrap_or(get(g.index, name), 0)]
+
+fn set_node_attrs(g0, name, attrs) {
+    let g = ensure_node(g0, name)
+    let idx = unwrap_or(get(g.index, name), 0)
+    let mut node = g.nodes[idx]
+    if has(attrs, "label") { node = assoc(node, "label", unwrap_or(get(attrs, "label"), name)) }
+    if has(attrs, "shape") { node = assoc(node, "shape", unwrap_or(get(attrs, "shape"), "box")) }
+    { ..g, nodes: assoc(g.nodes, idx, node) }
+}
+
+// Parse a DOT source into { ok, directed, rankdir, nodes, edges, error }.
+export fn parse_dot(src) {
+    let tk = tokenize(src)
+    if not tk.ok { return { ok: false, error: tk.error, nodes: [], edges: [], rankdir: "TB" } }
+    let toks = tk.tokens
+    if len(toks) == 0 { return { ok: false, error: "the graph is empty", nodes: [], edges: [], rankdir: "TB" } }
+
+    let head = tok_at(toks, 0)
+    let directed = head.v == "digraph"
+    if not (head.v == "digraph" or head.v == "graph" or head.v == "strict") {
+        return { ok: false, error: "a DOT graph starts with `digraph` or `graph`, not `${head.v}`",
+                 nodes: [], edges: [], rankdir: "TB" }
+    }
+    // Skip past the optional name to the opening brace.
+    let mut i = 1
+    while i < len(toks) and not (tok_at(toks, i).t == "sym" and tok_at(toks, i).v == "{") { i = i + 1 }
+    if i >= len(toks) { return { ok: false, error: "the graph has no `{`", nodes: [], edges: [], rankdir: "TB" } }
+    i = i + 1
+
+    let mut g = { index: {}, nodes: [], edges: [], rankdir: "TB" }
+    while i < len(toks) {
+        let tk0 = tok_at(toks, i)
+        if tk0.t == "eof" { break }
+        if tk0.t == "sym" {
+            if tk0.v == "}" { break }
+            // Stray separators between statements.
+            i = i + 1
+            continue
+        }
+        if tk0.v == "subgraph" or tk0.v == "cluster" {
+            return { ..g, ok: false,
+                     error: "subgraphs aren't drawn yet — flatten the graph or split it into two diagrams" }
+        }
+        // `rankdir=LR` and other graph-level attributes.
+        let nxt = tok_at(toks, i + 1)
+        if nxt.t == "sym" and nxt.v == "=" {
+            let val = tok_at(toks, i + 2)
+            if tk0.v == "rankdir" and is_value(val) { g = { ..g, rankdir: to_upper(val.v) } }
+            i = i + 3
+            continue
+        }
+        // `node [...]` / `edge [...]` defaults: accepted and ignored, so a
+        // graph that sets them still draws.
+        if (tk0.v == "node" or tk0.v == "edge" or tk0.v == "graph") and nxt.t == "sym" and nxt.v == "[" {
+            let a = parse_attrs(toks, i + 1)
+            i = a.next
+            continue
+        }
+        if not is_value(tk0) { i = i + 1  continue }
+
+        // A node, or a chain of edges: a -> b -> c [label="x"]
+        let mut chain = [tk0.v]
+        g = ensure_node(g, tk0.v)
+        let mut j = i + 1
+        while true {
+            let t = tok_at(toks, j)
+            if t.t == "sym" and t.v == "->" {
+                let target = tok_at(toks, j + 1)
+                if not is_value(target) {
+                    return { ..g, ok: false, error: "an edge after `${chain[len(chain) - 1]}` has no target" }
+                }
+                g = ensure_node(g, target.v)
+                chain = push(chain, target.v)
+                j = j + 2
+                continue
+            }
+            break
+        }
+        let mut attrs = {}
+        let after = tok_at(toks, j)
+        if after.t == "sym" and after.v == "[" {
+            let a = parse_attrs(toks, j)
+            attrs = a.attrs
+            j = a.next
+        }
+        if len(chain) == 1 {
+            g = set_node_attrs(g, chain[0], attrs)
+        } else {
+            let label = if has(attrs, "label") { unwrap_or(get(attrs, "label"), "") } else { "" }
+            let mut k = 0
+            while k < len(chain) - 1 {
+                g = { ..g, edges: push(g.edges, { from: chain[k], to: chain[k + 1], label: label }) }
+                k = k + 1
+            }
+        }
+        i = j
+    }
+    { ok: true, error: "", directed: directed, rankdir: g.rankdir,
+      nodes: g.nodes, edges: g.edges, index: g.index }
+}
+
+// ---- layout -----------------------------------------------------------------
+
+fn idx_of(g, name) = unwrap_or(get(g.index, name), -1)
+
+// Rank every node by longest path from a source, ignoring edges that close a
+// cycle. A cyclic graph still lays out — it just doesn't get to push its
+// back edges downward forever.
+export fn assign_ranks(n, edges) {
+    // Iterative DFS marking back edges (color: 0 unseen, 1 on stack, 2 done).
+    let mut color = []
+    let mut i = 0
+    while i < n { color = push(color, 0)  i = i + 1 }
+    let mut adj = []
+    i = 0
+    while i < n { adj = push(adj, [])  i = i + 1 }
+    for e in edges {
+        if e.f >= 0 and e.t >= 0 {
+            adj = assoc(adj, e.f, push(adj[e.f], e.t))
+        }
+    }
+    let mut forward = []
+    let mut root = 0
+    while root < n {
+        if color[root] != 0 { root = root + 1  continue }
+        // Each frame is [node, next-child-index].
+        let mut stack = [[root, 0]]
+        color = assoc(color, root, 1)
+        while len(stack) > 0 {
+            let top = stack[len(stack) - 1]
+            let u = top[0]
+            let ci = top[1]
+            let kids = adj[u]
+            if ci >= len(kids) {
+                color = assoc(color, u, 2)
+                stack = slice(stack, 0, len(stack) - 1)
+                continue
+            }
+            stack = assoc(stack, len(stack) - 1, [u, ci + 1])
+            let v = kids[ci]
+            // color 1 = still on the stack = this edge closes a cycle.
+            if color[v] == 1 { continue }
+            forward = push(forward, [u, v])
+            if color[v] == 0 {
+                color = assoc(color, v, 1)
+                stack = push(stack, [v, 0])
+            }
+        }
+        root = root + 1
+    }
+    let mut rank = []
+    i = 0
+    while i < n { rank = push(rank, 0)  i = i + 1 }
+    let mut changed = true
+    let mut guard = 0
+    while changed and guard < n * n + 16 {
+        changed = false
+        guard = guard + 1
+        for fe in forward {
+            if rank[fe[1]] < rank[fe[0]] + 1 {
+                rank = assoc(rank, fe[1], rank[fe[0]] + 1)
+                changed = true
+            }
+        }
+    }
+    rank
+}
+
+fn max_of(xs, d) {
+    let mut m = d
+    for x in xs { if x > m { m = x } }
+    m
+}
+
+// Barycenter sweeps: order each rank by the average position of its
+// neighbours in the rank above, which is the cheap standard way to cut edge
+// crossings.
+fn order_ranks(rows0, edges, sweeps) {
+    let mut rows = rows0
+    let mut s = 0
+    while s < sweeps {
+        let mut r = 1
+        while r < len(rows) {
+            let above = rows[r - 1]
+            let mut keyed = []
+            let mut i = 0
+            while i < len(rows[r]) {
+                let node = rows[r][i]
+                let mut sum = 0.0
+                let mut count = 0
+                for e in edges {
+                    if e.t != node { continue }
+                    match index_of(above, e.f) {
+                        Some(pos) => { sum = sum + to_float(pos)  count = count + 1  0 }
+                        None => 0
+                    }
+                }
+                // A node with no parent in the rank above keeps its place
+                // rather than jumping to the left edge.
+                let key = if count > 0 { sum / to_float(count) } else { to_float(i) }
+                keyed = push(keyed, { key: key, node: node })
+                i = i + 1
+            }
+            let sorted = sort_by(keyed, (a) => a.key)
+            let mut out = []
+            for k in sorted { out = push(out, k.node) }
+            rows = assoc(rows, r, out)
+            r = r + 1
+        }
+        s = s + 1
+    }
+    rows
+}
+
+fn label_lines(label) = split(label, "\n")
+
+// Node box size from its label. `measure` is passed in so the layout can be
+// tested without the host's font metrics.
+fn node_box(node, measure) {
+    let lines = label_lines(node.label)
+    let mut widest = 0.0
+    for l in lines {
+        let w = measure(l)
+        if w > widest { widest = w }
+    }
+    { w: max(widest + 24.0, 54.0), h: max(to_float(len(lines)) * 17.0 + 16.0, 32.0) }
+}
+
+// Place every node. Returns { ok, w, h, nodes: [{…, x, y, w, h}], edges }.
+// `x, y` is the box's top-left in canvas coordinates.
+export fn layout(g, measure) {
+    let n = len(g.nodes)
+    if n == 0 { return { ok: false, error: "the graph has no nodes", w: 0.0, h: 0.0, nodes: [], edges: [] } }
+    let mut edges = []
+    for e in g.edges {
+        edges = push(edges, { f: idx_of(g, e.from), t: idx_of(g, e.to), label: e.label })
+    }
+    let rank = assign_ranks(n, edges)
+    let n_ranks = max_of(rank, 0) + 1
+
+    let mut rows = []
+    let mut r = 0
+    while r < n_ranks { rows = push(rows, [])  r = r + 1 }
+    let mut i = 0
+    while i < n {
+        rows = assoc(rows, rank[i], push(rows[rank[i]], i))
+        i = i + 1
+    }
+    rows = order_ranks(rows, edges, 4)
+
+    let mut boxes = []
+    i = 0
+    while i < n { boxes = push(boxes, node_box(g.nodes[i], measure))  i = i + 1 }
+
+    // LR lays ranks left-to-right; anything else stacks them top-to-bottom.
+    let lr = g.rankdir == "LR" or g.rankdir == "RL"
+    let gap_within = 26.0
+    let gap_between = 58.0
+
+    let mut placed = []
+    i = 0
+    while i < n { placed = push(placed, { x: 0.0, y: 0.0, w: 0.0, h: 0.0 })  i = i + 1 }
+
+    let mut cross = 0.0       // running offset along the rank axis
+    let mut extent = 0.0      // widest rank, across the other axis
+    r = 0
+    while r < n_ranks {
+        // The rank's thickness: the biggest box along the stacking axis.
+        let mut thick = 0.0
+        for node in rows[r] {
+            let b = boxes[node]
+            let t = if lr { b.w } else { b.h }
+            if t > thick { thick = t }
+        }
+        let mut along = 0.0
+        for node in rows[r] {
+            let b = boxes[node]
+            if lr {
+                placed = assoc(placed, node, { x: cross, y: along, w: b.w, h: b.h })
+                along = along + b.h + gap_within
+            } else {
+                placed = assoc(placed, node, { x: along, y: cross, w: b.w, h: b.h })
+                along = along + b.w + gap_within
+            }
+        }
+        if along - gap_within > extent { extent = along - gap_within }
+        cross = cross + thick + gap_between
+        r = r + 1
+    }
+
+    // Center each rank across the other axis, so the diagram reads as a shape
+    // rather than a left-justified list.
+    r = 0
+    while r < n_ranks {
+        let mut used = 0.0
+        for node in rows[r] {
+            let p = placed[node]
+            used = used + (if lr { p.h } else { p.w }) + gap_within
+        }
+        used = used - gap_within
+        let shift = (extent - used) / 2.0
+        for node in rows[r] {
+            let p = placed[node]
+            placed = assoc(placed, node,
+                           if lr { { ..p, y: p.y + shift } } else { { ..p, x: p.x + shift } })
+        }
+        r = r + 1
+    }
+
+    let mut out_nodes = []
+    i = 0
+    while i < n {
+        let p = placed[i]
+        out_nodes = push(out_nodes, { ..(g.nodes[i]), x: p.x, y: p.y, w: p.w, h: p.h })
+        i = i + 1
+    }
+    let total_cross = cross - gap_between
+    { ok: true, error: "",
+      w: if lr { total_cross } else { extent },
+      h: if lr { extent } else { total_cross },
+      lr: lr, nodes: out_nodes, edges: edges }
+}
+
+// ---- drawing ----------------------------------------------------------------
+
+fn anchor_points(a, b, lr) {
+    if lr {
+        return { x0: a.x + a.w, y0: a.y + a.h / 2.0, x1: b.x, y1: b.y + b.h / 2.0 }
+    }
+    { x0: a.x + a.w / 2.0, y0: a.y + a.h, x1: b.x + b.w / 2.0, y1: b.y }
+}
+
+// A cubic that leaves the source and enters the target along the rank axis, so
+// edges meet boxes head-on instead of at a slant.
+fn edge_path(p, lr) {
+    let dx = p.x1 - p.x0
+    let dy = p.y1 - p.y0
+    if lr {
+        let c = dx * 0.5
+        return move_to(p.x0, p.y0) + " C " + fixed(p.x0 + c, 2) + " " + fixed(p.y0, 2) +
+               " " + fixed(p.x1 - c, 2) + " " + fixed(p.y1, 2) +
+               " " + fixed(p.x1, 2) + " " + fixed(p.y1, 2)
+    }
+    let c = dy * 0.5
+    move_to(p.x0, p.y0) + " C " + fixed(p.x0, 2) + " " + fixed(p.y0 + c, 2) +
+        " " + fixed(p.x1, 2) + " " + fixed(p.y1 - c, 2) +
+        " " + fixed(p.x1, 2) + " " + fixed(p.y1, 2)
+}
+
+fn arrow_head(x, y, lr, size) {
+    if lr {
+        return move_to(x, y) + line_to(x - size, y - size * 0.55) +
+               line_to(x - size, y + size * 0.55) + " Z"
+    }
+    move_to(x, y) + line_to(x - size * 0.55, y - size) + line_to(x + size * 0.55, y - size) + " Z"
+}
+
+fn node_shape_path(nd) {
+    if nd.shape == "circle" or nd.shape == "ellipse" {
+        let rx = nd.w / 2.0
+        let ry = nd.h / 2.0
+        let cx = nd.x + rx
+        let cy = nd.y + ry
+        return move_to(cx - rx, cy) +
+            " A " + fixed(rx, 2) + " " + fixed(ry, 2) + " 0 1 1 " + fixed(cx + rx, 2) + " " + fixed(cy, 2) +
+            " A " + fixed(rx, 2) + " " + fixed(ry, 2) + " 0 1 1 " + fixed(cx - rx, 2) + " " + fixed(cy, 2) + " Z"
+    }
+    if nd.shape == "diamond" {
+        let cx = nd.x + nd.w / 2.0
+        let cy = nd.y + nd.h / 2.0
+        return move_to(cx, nd.y) + line_to(nd.x + nd.w, cy) +
+               line_to(cx, nd.y + nd.h) + line_to(nd.x, cy) + " Z"
+    }
+    // Rounded rectangle — the default box.
+    let r = 5.0
+    let x = nd.x
+    let y = nd.y
+    let w = nd.w
+    let h = nd.h
+    move_to(x + r, y) + line_to(x + w - r, y) +
+        " Q " + fixed(x + w, 2) + " " + fixed(y, 2) + " " + fixed(x + w, 2) + " " + fixed(y + r, 2) +
+        line_to(x + w, y + h - r) +
+        " Q " + fixed(x + w, 2) + " " + fixed(y + h, 2) + " " + fixed(x + w - r, 2) + " " + fixed(y + h, 2) +
+        line_to(x + r, y + h) +
+        " Q " + fixed(x, 2) + " " + fixed(y + h, 2) + " " + fixed(x, 2) + " " + fixed(y + h - r, 2) +
+        line_to(x, y + r) +
+        " Q " + fixed(x, 2) + " " + fixed(y, 2) + " " + fixed(x + r, 2) + " " + fixed(y, 2) + " Z"
+}
+
+fn graph_path(id, d, fill, stroke, w) {
+    let mut it = { kind: "path", id: id, d: d, bg: paper() }
+    if fill != "" { it = assoc(it, "fill", fill) }
+    if stroke != "" {
+        it = assoc(it, "stroke", stroke)
+        it = assoc(it, "stroke_width", w)
+        it = assoc(it, "cap", "round")
+        it = assoc(it, "join", "round")
+    }
+    it
+}
+
+export fn render_graph(cell, width) {
+    let dot = cell_str(cell, "dot", "")
+    if trim(dot) == "" { return cell_error("graph", "the cell has no DOT source") }
+    let g = parse_dot(dot)
+    if not g.ok { return cell_error("graph", g.error) }
+    let laid = layout(g, (s) => measure_text(s, size_small()))
+    if not laid.ok { return cell_error("graph", laid.error) }
+
+    let pad = 12.0
+    let mut items = []
+    // Edges first, so a box always covers the line arriving at it.
+    let mut i = 0
+    for e in laid.edges {
+        if e.f < 0 or e.t < 0 { continue }
+        let a = laid.nodes[e.f]
+        let b = laid.nodes[e.t]
+        let p = anchor_points({ x: a.x + pad, y: a.y + pad, w: a.w, h: a.h },
+                              { x: b.x + pad, y: b.y + pad, w: b.w, h: b.h }, laid.lr)
+        items = push(items, graph_path("e" + str(i), edge_path(p, laid.lr), "",
+                                      alpha(ink_muted(), 170), 1.4))
+        items = push(items, graph_path("a" + str(i), arrow_head(p.x1, p.y1, laid.lr, 6.0),
+                                      alpha(ink_muted(), 200), "", 0.0))
+        if e.label != "" {
+            items = push(items, { kind: "text", id: "el" + str(i),
+                                  x: (p.x0 + p.x1) / 2.0, y: (p.y0 + p.y1) / 2.0,
+                                  value: e.label, size: size_tiny(), color: ink_muted(),
+                                  anchor: "center", family: font_body() })
+        }
+        i = i + 1
+    }
+    i = 0
+    for nd in laid.nodes {
+        let box = { ..nd, x: nd.x + pad, y: nd.y + pad }
+        items = push(items, graph_path("n" + str(i), node_shape_path(box), surface_alt(),
+                                      alpha(rule(), 220), 1.0))
+        let lines = label_lines(nd.label)
+        let mut li = 0
+        let start_y = box.y + box.h / 2.0 - to_float(len(lines) - 1) * 8.5
+        while li < len(lines) {
+            items = push(items, { kind: "text", id: "nl" + str(i) + "_" + str(li),
+                                  x: box.x + box.w / 2.0, y: start_y + to_float(li) * 17.0,
+                                  value: lines[li], size: size_small(), color: ink(),
+                                  anchor: "center", family: font_body() })
+            li = li + 1
+        }
+        i = i + 1
+    }
+
+    let canvas_h = laid.h + 2.0 * pad
+    let body = { kind: "canvas", children: items,
+                 style: { width: "100%", height: str(to_int(canvas_h)) } }
+    let title = cell_str(cell, "title", "")
+    // A diagram wider than the pane is left at its natural size and clipped
+    // rather than squashed — an illegible diagram is worse than a cropped one.
+    if title == "" { return body }
+    { kind: "vstack", gap: 8.0, children: [caption(title), body] }
+}

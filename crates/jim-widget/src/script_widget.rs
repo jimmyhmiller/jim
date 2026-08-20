@@ -115,6 +115,22 @@ use crate::{
 
 pub const PANE_KIND: &str = "script_widget";
 
+/// Keep drawing this widget even while it is hidden.
+///
+/// A hidden widget normally stops rendering — the pane is off screen, so
+/// evaluating `render` and rebuilding its entity tree is work for nobody,
+/// and that is the single biggest CPU win on a busy canvas. But a pane that
+/// will be revealed AT A SPECIFIC MOMENT has to be correct when it arrives,
+/// not start building then: a presenting deck hidden for an `application:`
+/// slide would otherwise begin its next render only after the host revealed
+/// it, so returning to an ordinary slide showed a stale frame while the new
+/// one was still being drawn.
+///
+/// Use sparingly — one pane, for the length of a presentation, is the case
+/// this exists for.
+#[derive(Component)]
+pub struct RenderWhileHidden;
+
 /// Frame cadence used **only when a widget has opted into animation**
 /// via `set_animating(true)`. Idle widgets receive no Tick at all; the
 /// main thread checks `WorkerSlots::animating` before sending one. So
@@ -1629,6 +1645,20 @@ fn forward_keys_to_workers(
     if kind.0 != PANE_KIND || input_focus.is_some() {
         return;
     }
+    // A MODIFIED arrow is a chord, not widget input. Forwarding it anyway
+    // meant ⌘⇧→ hit a focused deck twice — once through this path and once
+    // through the `present.next` action — so a presentation advanced TWO
+    // slides going forward and one coming back, which reads as "back is
+    // broken" the moment the extra slide is one that looks the same.
+    if keys.pressed(KeyCode::SuperLeft)
+        || keys.pressed(KeyCode::SuperRight)
+        || keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight)
+        || keys.pressed(KeyCode::AltLeft)
+        || keys.pressed(KeyCode::AltRight)
+    {
+        return;
+    }
     for (code, name) in [
         (KeyCode::ArrowLeft, "ArrowLeft"),
         (KeyCode::ArrowRight, "ArrowRight"),
@@ -1658,6 +1688,7 @@ fn forward_inputs_to_workers(
         &mut ScriptWidget,
         Option<&Visibility>,
         Option<&jim_pane::PaneChromeOverride>,
+        Has<RenderWhileHidden>,
     )>,
 ) {
     // A palette edit only updates the shared theme snapshot; canvas
@@ -1690,7 +1721,7 @@ fn forward_inputs_to_workers(
         .collect();
 
     let now = std::time::Instant::now();
-    for (kind, rect, mut w, vis, chrome_ov) in &mut widgets {
+    for (kind, rect, mut w, vis, chrome_ov, always_render) in &mut widgets {
         if kind.0 != PANE_KIND {
             continue;
         }
@@ -1711,10 +1742,26 @@ fn forward_inputs_to_workers(
         //
         // Store BEFORE the wake: the channel send/recv establishes the
         // happens-before that lets the worker's loop observe the fresh `true`.
-        let is_hidden = matches!(vis, Some(Visibility::Hidden));
+        // `RenderWhileHidden` opts a pane OUT of the gate: it keeps drawing
+        // even when nobody can see it, so it is correct the instant it is
+        // revealed. A presenting deck needs this. Hidden on an
+        // `application:` slide, its render would otherwise not even START
+        // until the host revealed it again — the reveal and the render ran
+        // in series, so coming back to an ordinary slide showed a stale
+        // frame while the new one was still being built. That is the "text
+        // takes a moment to appear coming out of a live slide".
+        let is_hidden = matches!(vis, Some(Visibility::Hidden)) && !always_render;
         w.handle.slots.visible.store(!is_hidden, Ordering::Release);
         if !is_hidden && !w.was_visible {
             w.handle.send(HostToWorker::SetVisible { visible: true });
+            // Wake the reactive loop. A frame published while the pane was
+            // hidden was skipped by `apply_latest_frames` WITHOUT consuming
+            // it, and the wakeup that came with it has long since been
+            // spent — so the app could sit asleep holding a stale tree until
+            // some unrelated input arrived. That is why a revealed slide
+            // only painted when you released the modifier you were holding:
+            // the key-up was the unrelated input.
+            crate::request_main_loop_wakeup();
         }
         w.was_visible = !is_hidden;
 
@@ -1837,6 +1884,7 @@ fn apply_latest_frames(
         Option<&crate::WidgetInputFocus>,
         Option<&Visibility>,
         Option<&jim_pane::PaneChromeOverride>,
+        Has<RenderWhileHidden>,
     )>,
     children_q: Query<&Children>,
 ) {
@@ -1862,6 +1910,7 @@ fn apply_latest_frames(
         input_focus,
         vis,
         chrome_ov,
+        always_render,
     ) in &mut q
     {
         if kind.0 != PANE_KIND {
@@ -1878,7 +1927,10 @@ fn apply_latest_frames(
         // canvas diffing are preserved and it is applied exactly once, in order
         // (frame_gen is monotonic; `applied_frame_gen` never moves ahead of a
         // frame we actually applied).
-        if matches!(vis, Some(Visibility::Hidden)) {
+        // `RenderWhileHidden` opts out: build the tree now so it is ready
+        // the instant the pane is shown. The entities are hidden, so this
+        // costs layout but draws nothing.
+        if matches!(vis, Some(Visibility::Hidden)) && !always_render {
             continue;
         }
         let current_gen = w.handle.slots.frame_gen.load(Ordering::Acquire);
@@ -1967,6 +2019,14 @@ fn apply_latest_frames(
                         CanvasItem::Text {
                             y, size, anchor, ..
                         } => canvas_item_bottom(*y, size.unwrap_or(14.0), *anchor),
+                        // A path carries its extent in its data. Parsing it
+                        // here (rather than caching) keeps the item stateless;
+                        // this pass only runs for TOP-LEVEL canvas widgets,
+                        // where scroll bounds are the host's to infer.
+                        CanvasItem::Path { d, .. } => match crate::vector::parse(d) {
+                            Ok(Some(parsed)) => parsed.bottom(),
+                            _ => 0.0,
+                        },
                     };
                     if bottom > extent {
                         extent = bottom;
@@ -1998,6 +2058,7 @@ fn apply_latest_frames(
                     0.0,
                     &pane_font.0,
                     &fonts,
+                    canvas_surface(&theme),
                 );
             }
             // Flow layout (vstack / hstack / text / button / divider /
@@ -2145,6 +2206,7 @@ fn apply_latest_frames(
                         0.009 / (region.items.len().max(1) as f32),
                         &pane_font.0,
                         &fonts,
+                        canvas_surface(&theme),
                     );
                 }
                 // Update scroll bounds based on what the render
@@ -2337,6 +2399,35 @@ fn canvas_item_bottom(y: f32, h: f32, anchor: CanvasAnchor) -> f32 {
 /// Compared to despawn-everything-then-respawn this saves the ECS
 /// from churning hundreds of entities every frame in a busy garden.
 #[allow(clippy::too_many_arguments)]
+/// Background a translucent canvas-path color is composited against, when the
+/// item doesn't name one itself. `pane_bg` is what a chart drawn on a plain
+/// widget pane actually sits on.
+fn canvas_surface(theme: &jim_style::Theme) -> Color {
+    Color::from(theme.color(jim_style::tokens::PANE_BG))
+}
+
+/// Composite `c` over `ground` (source-over), returning an opaque color.
+///
+/// Paths render with an opaque material — see the `alpha_mode` note in the
+/// Path arm — so translucency has to be resolved on the CPU. For the case this
+/// exists to serve (an area chart's 15%-alpha fill over a flat pane) the result
+/// is exactly what blending would have produced.
+pub(crate) fn flatten_alpha(c: Color, ground: Color) -> Color {
+    let src = c.to_linear();
+    let dst = ground.to_linear();
+    let a = src.alpha.clamp(0.0, 1.0);
+    if a >= 1.0 {
+        return c;
+    }
+    LinearRgba::new(
+        src.red * a + dst.red * (1.0 - a),
+        src.green * a + dst.green * (1.0 - a),
+        src.blue * a + dst.blue * (1.0 - a),
+        1.0,
+    )
+    .into()
+}
+
 fn diff_render(
     commands: &mut Commands,
     images: &mut Assets<Image>,
@@ -2364,6 +2455,10 @@ fn diff_render(
     order_eps: f32,
     default_font: &Handle<Font>,
     fonts: &jim_style::FontRegistry,
+    // What a translucent `Path` fill/stroke composites against. Paths render
+    // with an OPAQUE material (Bevy 0.19 drops blend-mode `Mesh2d` on per-pane
+    // cameras), so alpha is flattened against this instead of the GPU doing it.
+    surface: Color,
 ) {
     let dbg = std::env::var("CANVAS_DIFF_DBG").is_ok();
     let mut dbg_spawn_text: Vec<String> = Vec::new();
@@ -2375,6 +2470,7 @@ fn diff_render(
             CanvasItem::Sprite { id, .. } => id.as_str(),
             CanvasItem::Rect { id, .. } => id.as_str(),
             CanvasItem::Text { id, .. } => id.as_str(),
+            CanvasItem::Path { id, .. } => id.as_str(),
         };
         // Items are contractually required to carry a unique id, but be
         // defensive: an empty id (or accidental duplicate of "") would
@@ -2658,6 +2754,104 @@ fn diff_render(
                         }
                     }
                 }
+            }
+            CanvasItem::Path {
+                d,
+                fill,
+                stroke,
+                stroke_width,
+                cap,
+                join,
+                bg,
+                z,
+                ..
+            } => {
+                let parsed = match crate::vector::parse(d) {
+                    Ok(Some(p)) => p,
+                    // Empty data describes nothing; that's a legitimate way for
+                    // a widget to say "no marks this frame".
+                    Ok(None) => continue,
+                    Err(e) => {
+                        eprintln!("[widget] canvas path {id:?}: {e}");
+                        continue;
+                    }
+                };
+                let ground = bg
+                    .as_deref()
+                    .and_then(parse_canvas_color)
+                    .unwrap_or(surface);
+                let paint = |spec: &Option<String>| -> Option<Color> {
+                    let raw = parse_canvas_color(spec.as_deref()?)?;
+                    Some(flatten_alpha(raw, ground))
+                };
+                // Fill first, stroke over it — the SVG paint order, and what an
+                // outlined area chart or a donut segment with a gap ring needs.
+                let mut layers: Vec<(Mesh, Color, f32)> = Vec::new();
+                if let Some(color) = paint(fill) {
+                    if let Some(mesh) = crate::vector::fill_mesh(&parsed.path) {
+                        layers.push((mesh, color, 0.0));
+                    }
+                }
+                if let Some(color) = paint(stroke) {
+                    if let Some(mesh) =
+                        crate::vector::stroke_mesh(&parsed.path, *stroke_width, *cap, *join)
+                    {
+                        layers.push((mesh, color, 0.0005));
+                    }
+                }
+                if layers.is_empty() {
+                    continue;
+                }
+                // One parent per item so `sprite_entities` keeps its
+                // one-entity-per-id contract; the fill/stroke meshes are its
+                // children and go away with it on the recursive despawn.
+                let parent = commands
+                    .spawn((
+                        ChildOf(content_root),
+                        Transform::from_xyz(origin.x, -origin.y, z_base + *z + order_z),
+                        Visibility::Inherited,
+                    ))
+                    .id();
+                for (mesh, color, dz) in layers {
+                    let child = commands
+                        .spawn((
+                            ChildOf(parent),
+                            Transform::from_xyz(0.0, 0.0, dz),
+                            Visibility::Inherited,
+                            // The pane floats far out in world z and the mesh
+                            // AABB is computed from vertices that the pane
+                            // camera then re-projects; culling has been the
+                            // wrong answer here before (jim-whiteboard's
+                            // toolbar), so opt out.
+                            bevy::camera::visibility::NoFrustumCulling,
+                        ))
+                        .id();
+                    // Deferred insert, mirroring the button-mesh path above: in
+                    // Bevy 0.19 bundle-spawning `Mesh2d` alongside `ChildOf`
+                    // can skip the `Mesh2d` visibility-class required-component
+                    // hook, and the entity then never renders.
+                    commands.queue(move |world: &mut World| {
+                        let mesh_h = world.resource_mut::<Assets<Mesh>>().add(mesh);
+                        let mat_h = world
+                            .resource_mut::<Assets<bevy::sprite_render::ColorMaterial>>()
+                            .add(bevy::sprite_render::ColorMaterial {
+                                color,
+                                // NOT Blend: Bevy 0.19 drops blend-mode
+                                // ColorMaterial meshes on per-pane cameras
+                                // entirely. Alpha is flattened into `color`
+                                // above instead.
+                                alpha_mode: bevy::sprite_render::AlphaMode2d::Opaque,
+                                ..default()
+                            });
+                        if let Ok(mut ec) = world.get_entity_mut(child) {
+                            ec.insert((
+                                bevy::mesh::Mesh2d(mesh_h),
+                                bevy::sprite_render::MeshMaterial2d(mat_h),
+                            ));
+                        }
+                    });
+                }
+                sprite_entities.insert(id, parent);
             }
         }
     }

@@ -36,66 +36,84 @@ use jim_whiteboard::{
     CanvasDrawActive, CanvasEdit, ClearCanvasRequested, WbEditor, WbToolState, ZOrder, new_editor,
 };
 
+use crate::canvas::LevelKey;
+use crate::canvas_pane::{BreadcrumbState, CanvasNav};
 use crate::projects::Projects;
+
+/// The `(project, nested-canvas)` surface the user is currently looking at.
+/// Every board lookup keys on this — a nested canvas is its own pan/zoom
+/// surface with its own panes, so it gets its own drawing board rather than
+/// sharing (and scribbling on) the project root's.
+fn active_level(projects: &Projects, nav: &CanvasNav) -> Option<LevelKey> {
+    let project = projects.active?;
+    Some((project, nav.level(project)))
+}
 
 /// Z of the background board on layer 0 — behind panes (their cameras draw over
 /// the main camera) and behind the sidebar (z ≥ 0), but in front of the canvas
 /// backdrop.
 const Z_BG: f32 = -1.0;
 
-/// Per-project background boards, lazily created/loaded.
+/// Per-level background boards, lazily created/loaded. Keyed by
+/// [`LevelKey`] — `(project, canvas)` — so each nested canvas draws on its
+/// own board instead of inheriting the project root's strokes.
 #[derive(Resource, Default)]
 pub struct BackgroundBoards {
-    boards: HashMap<u64, WbEditor>,
-    loaded: HashSet<u64>,
+    boards: HashMap<LevelKey, WbEditor>,
+    loaded: HashSet<LevelKey>,
 }
 
 impl BackgroundBoards {
-    fn board_mut(&mut self, project: u64) -> &mut WbEditor {
-        if self.loaded.insert(project) {
+    fn board_mut(&mut self, level: LevelKey) -> &mut WbEditor {
+        if self.loaded.insert(level) {
             let mut editor = new_editor();
-            if let Some(els) = load_board(project) {
+            if let Some(els) = load_board(level) {
                 for el in els {
                     editor.scene_mut().insert(el);
                 }
             }
-            self.boards.insert(project, editor);
+            self.boards.insert(level, editor);
         }
-        self.boards.entry(project).or_insert_with(new_editor)
+        self.boards.entry(level).or_insert_with(new_editor)
     }
 }
 
-/// Remembers each project's last-used canvas tool. `WbToolState` is a single
+/// Remembers each level's last-used canvas tool. `WbToolState` is a single
 /// global resource (the floating toolbar mutates it), so without this the tool
 /// bleeds across projects — pick Draw in one project and every other project's
-/// canvas is in Draw mode too. We swap the tool in/out when the active project
+/// canvas is in Draw mode too. We swap the tool in/out when the visible level
 /// changes; color/width stay shared (only the tool was reported as leaking).
+/// Keyed by [`LevelKey`] so descending into a nested canvas is the same kind
+/// of context switch as changing project.
 #[derive(Resource, Default)]
-struct ProjectTools {
-    by_project: HashMap<u64, Tool>,
-    current: Option<u64>,
+struct LevelTools {
+    by_level: HashMap<LevelKey, Tool>,
+    current: Option<LevelKey>,
 }
 
-/// Swap the active canvas tool in/out of [`ProjectTools`] whenever the active
-/// project changes, so each project keeps its own tool. Runs before the input
-/// systems so the swap is in effect before any draw/select this frame.
-fn sync_project_tool(
+/// Swap the active canvas tool in/out of [`LevelTools`] whenever the visible
+/// `(project, canvas)` level changes, so each level keeps its own tool. Runs
+/// before the input systems so the swap is in effect before any draw/select
+/// this frame.
+fn sync_level_tool(
     projects: Res<Projects>,
+    nav: Res<CanvasNav>,
     mut ts: ResMut<WbToolState>,
-    mut stash: ResMut<ProjectTools>,
+    mut stash: ResMut<LevelTools>,
 ) {
-    if stash.current == projects.active {
+    let level = active_level(&projects, &nav);
+    if stash.current == level {
         return;
     }
     if let Some(prev) = stash.current {
-        stash.by_project.insert(prev, ts.0.tool);
+        stash.by_level.insert(prev, ts.0.tool);
     }
-    if let Some(now) = projects.active {
-        // Unvisited project → Tool::default() (Select), so entering a project
+    if let Some(now) = level {
+        // Unvisited level → Tool::default() (Select), so entering a canvas
         // never silently leaves you in Draw mode.
-        ts.0.tool = stash.by_project.get(&now).copied().unwrap_or_default();
+        ts.0.tool = stash.by_level.get(&now).copied().unwrap_or_default();
     }
-    stash.current = projects.active;
+    stash.current = level;
 }
 
 /// The single root entity that all background geometry is parented under. Its
@@ -111,7 +129,7 @@ struct BgState {
     drawing: bool,
     /// Force a rebuild next frame.
     dirty: bool,
-    last_project: Option<u64>,
+    last_level: Option<LevelKey>,
     last_pan: Vec2,
     last_zoom: f32,
     last_origin: Vec2,
@@ -124,18 +142,26 @@ fn bg_dir() -> Option<PathBuf> {
     Some(d)
 }
 
-fn board_path(project: u64) -> Option<PathBuf> {
-    Some(bg_dir()?.join(format!("bg-{project}.json")))
+/// Root canvases keep the original `bg-<project>.json` name so boards drawn
+/// before nested canvases existed still load; nested canvases get their own
+/// file per canvas id.
+fn board_path((project, canvas): LevelKey) -> Option<PathBuf> {
+    let dir = bg_dir()?;
+    Some(if canvas == 0 {
+        dir.join(format!("bg-{project}.json"))
+    } else {
+        dir.join(format!("bg-{project}-c{canvas}.json"))
+    })
 }
 
-fn load_board(project: u64) -> Option<Vec<Element>> {
-    let path = board_path(project)?;
+fn load_board(level: LevelKey) -> Option<Vec<Element>> {
+    let path = board_path(level)?;
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice::<Vec<Element>>(&bytes).ok()
 }
 
-fn save_board(project: u64, editor: &WbEditor) {
-    let Some(path) = board_path(project) else {
+fn save_board(level: LevelKey, editor: &WbEditor) {
+    let Some(path) = board_path(level) else {
         return;
     };
     // Pane proxies are ephemeral (re-synced from live panes each frame); never
@@ -193,8 +219,9 @@ fn modifiers(keys: &ButtonInput<KeyCode>) -> Modifiers {
 /// switches tools, and the sidebar gutter is off-limits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CanvasPress {
-    /// Not in canvas-draw mode (toolbar closed) or on the sidebar gutter —
-    /// leave the press to the normal pane systems (drag/resize/focus).
+    /// Not in canvas-draw mode (toolbar closed), or on host chrome (the
+    /// sidebar gutter / the nested-canvas breadcrumb) — leave the press to
+    /// the normal pane + chrome systems (drag/resize/focus, ascend).
     Ignore,
     /// Press is on the toolbar — let the pane/toolbar systems handle it so it
     /// switches tools instead of drawing.
@@ -220,9 +247,9 @@ fn decide_canvas_press(
     tool_claims_surface: bool,
     over_toolbar: bool,
     over_pane: bool,
-    on_sidebar: bool,
+    on_chrome: bool,
 ) -> CanvasPress {
-    if !canvas_active || on_sidebar {
+    if !canvas_active || on_chrome {
         CanvasPress::Ignore
     } else if over_toolbar {
         // Always switch tools — never draw on the toolbar.
@@ -318,6 +345,7 @@ fn background_input(
     ts: Res<WbToolState>,
     canvas_active: Res<CanvasDrawActive>,
     projects: Res<Projects>,
+    nav: Res<CanvasNav>,
     viewport: Res<PaneViewport>,
     windows: Query<&Window>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -325,6 +353,7 @@ fn background_input(
     mut consumed: ResMut<InputConsumed>,
     mut boards: ResMut<BackgroundBoards>,
     mut state: ResMut<BgState>,
+    breadcrumb: Res<BreadcrumbState>,
     toolbars: Query<(&PaneRect, Option<&Visibility>), With<jim_whiteboard::toolbar::ToolbarPane>>,
     panes: Query<(&PaneRect, Option<&Visibility>, Has<PaneScreenAnchored>), With<PaneTag>>,
 ) {
@@ -339,7 +368,7 @@ fn background_input(
         state.drawing = false;
         return;
     }
-    let Some(project) = projects.active else {
+    let Some(level) = active_level(&projects, &nav) else {
         return;
     };
     let Ok(window) = windows.single() else {
@@ -353,7 +382,7 @@ fn background_input(
 
     // Sync the board's viewport to the canvas pan/zoom so editor screen-space ==
     // window-space-minus-origin.
-    let board = boards.board_mut(project);
+    let board = boards.board_mut(level);
     board.set_viewport(WbViewport {
         scroll: WbVec2::new(viewport.pan.x as f64, viewport.pan.y as f64),
         zoom: viewport.zoom.max(0.0001) as f64,
@@ -366,7 +395,11 @@ fn background_input(
             tool_claims_surface(ts.tool),
             over_toolbar(cursor, &toolbars),
             over_pane(cursor, &viewport, &panes),
-            cursor.x < origin.x,
+            // Host chrome: the sidebar gutter, and the breadcrumb strip that
+            // is the only pointer route out of a nested canvas. Claiming a
+            // breadcrumb click for the board (a marquee, with Select) left
+            // the `↑` dead while Draw Tools were open.
+            cursor.x < origin.x || breadcrumb.hit(cursor),
         );
         if route != CanvasPress::Board {
             // Toolbar click, pane drag (Select/Pan), or sidebar — let the pane
@@ -397,13 +430,14 @@ fn background_input(
         });
         state.drawing = false;
         state.dirty = true;
-        save_board(project, board);
+        save_board(level, board);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_background(
     projects: Res<Projects>,
+    nav: Res<CanvasNav>,
     viewport: Res<PaneViewport>,
     windows: Query<&Window>,
     boards: Res<BackgroundBoards>,
@@ -424,10 +458,13 @@ fn render_background(
     };
     let win = Vec2::new(window.width(), window.height());
     let origin = viewport.origin;
-    let project = projects.active;
+    let level = active_level(&projects, &nav);
 
     // Decide whether anything changed that requires a re-tessellation.
-    let view_changed = state.last_project != project
+    // Tracking the full level (not just the project) is what makes
+    // descending into / ascending out of a nested canvas swap the drawing
+    // even when the two levels happen to share a pan/zoom.
+    let view_changed = state.last_level != level
         || state.last_pan != viewport.pan
         || (state.last_zoom - viewport.zoom).abs() > 1e-4
         || state.last_origin != origin
@@ -436,7 +473,7 @@ fn render_background(
         return;
     }
     state.dirty = false;
-    state.last_project = project;
+    state.last_level = level;
     state.last_pan = viewport.pan;
     state.last_zoom = viewport.zoom;
     state.last_origin = origin;
@@ -455,10 +492,10 @@ fn render_background(
         }
     }
 
-    let Some(project) = project else {
+    let Some(level) = level else {
         return;
     };
-    let Some(board) = boards.boards.get(&project) else {
+    let Some(board) = boards.boards.get(&level) else {
         return;
     };
     // `render_with_overlay` adds the selection box / endpoint handles and — the
@@ -477,11 +514,13 @@ fn render_background(
     );
 }
 
-/// Wipe the active project's background board when the canvas toolbar's "Clear"
-/// button is pressed.
+/// Wipe the visible level's background board when the canvas toolbar's "Clear"
+/// button is pressed. Scoped to the level you're looking at, so clearing
+/// inside a nested canvas can't wipe the project root's drawing.
 fn handle_clear_canvas(
     mut events: MessageReader<ClearCanvasRequested>,
     projects: Res<Projects>,
+    nav: Res<CanvasNav>,
     mut boards: ResMut<BackgroundBoards>,
     mut state: ResMut<BgState>,
 ) {
@@ -492,10 +531,10 @@ fn handle_clear_canvas(
     if !any {
         return;
     }
-    let Some(project) = projects.active else {
+    let Some(level) = active_level(&projects, &nav) else {
         return;
     };
-    let board = boards.board_mut(project);
+    let board = boards.board_mut(level);
     // Clear the user's drawing but leave the pane proxies (re-synced anyway).
     let ids: Vec<ElementId> = board
         .scene()
@@ -508,16 +547,17 @@ fn handle_clear_canvas(
         board.delete_selection();
     }
     state.dirty = true;
-    save_board(project, board);
+    save_board(level, board);
 }
 
-/// Mirror every live, visible canvas pane into the active project's background
+/// Mirror every live, visible canvas pane into the visible level's background
 /// board as an invisible, locked proxy `Rectangle`, so canvas-drawn arrows can
 /// bind to panes. When a pane moves, its proxy moves and any bound arrow's
 /// endpoint is recomputed to follow it. Only arrows the user explicitly bound
 /// (by drawing onto a pane) move; freehand strokes and shapes stay fixed.
 fn sync_pane_proxies(
     projects: Res<Projects>,
+    nav: Res<CanvasNav>,
     canvas_active: Res<CanvasDrawActive>,
     mut boards: ResMut<BackgroundBoards>,
     mut state: ResMut<BgState>,
@@ -531,15 +571,18 @@ fn sync_pane_proxies(
         With<PaneTag>,
     >,
 ) {
-    let Some(project) = projects.active else {
+    let Some(level) = active_level(&projects, &nav) else {
         return;
     };
     // Only maintain proxies once a board exists (user has drawn) or while the
     // canvas toolbar is open — don't conjure empty boards just by viewing.
-    if !boards.boards.contains_key(&project) && !canvas_active.0 {
+    if !boards.boards.contains_key(&level) && !canvas_active.0 {
         return;
     }
-    let board = boards.board_mut(project);
+    // Panes on other levels are `Visibility::Hidden` (see
+    // `projects::sync_visibility`), so the visibility filter below already
+    // restricts proxies to this level's panes.
+    let board = boards.board_mut(level);
 
     // Desired proxy rects (canvas-space == board scene-space) from live panes.
     let mut desired: HashMap<ElementId, (f64, f64, f64, f64)> = HashMap::new();
@@ -650,6 +693,7 @@ fn background_keyboard(
     canvas_active: Res<CanvasDrawActive>,
     focused: Res<FocusedPane>,
     projects: Res<Projects>,
+    nav: Res<CanvasNav>,
     keys: Res<ButtonInput<KeyCode>>,
     pane_kinds: Query<&jim_pane::PaneKindMarker>,
     mut key_events: MessageReader<KeyboardInput>,
@@ -671,7 +715,7 @@ fn background_keyboard(
         key_events.clear();
         return;
     }
-    let Some(project) = projects.active else {
+    let Some(level) = active_level(&projects, &nav) else {
         key_events.clear();
         return;
     };
@@ -682,7 +726,7 @@ fn background_keyboard(
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
 
     let mods = modifiers(&keys);
-    let board = boards.board_mut(project);
+    let board = boards.board_mut(level);
     let mut changed = false;
     for ev in key_events.read() {
         if ev.state != ButtonState::Pressed {
@@ -739,17 +783,18 @@ fn background_keyboard(
     }
     if changed {
         state.dirty = true;
-        save_board(project, board);
+        save_board(level, board);
     }
 }
 
-/// Apply a toolbar [`CanvasEdit`] to the active project's board: style edits hit
+/// Apply a toolbar [`CanvasEdit`] to the visible level's board: style edits hit
 /// every selected element (Excalidraw "select and change"); layer/duplicate/
 /// delete are selection operations. Property edits also updated `WbToolState` at
 /// the toolbar, so the next new element inherits them too.
 fn apply_canvas_edit(
     mut edits: MessageReader<CanvasEdit>,
     projects: Res<Projects>,
+    nav: Res<CanvasNav>,
     mut boards: ResMut<BackgroundBoards>,
     mut state: ResMut<BgState>,
 ) {
@@ -757,10 +802,10 @@ fn apply_canvas_edit(
     if pending.is_empty() {
         return;
     }
-    let Some(project) = projects.active else {
+    let Some(level) = active_level(&projects, &nav) else {
         return;
     };
-    let board = boards.board_mut(project);
+    let board = boards.board_mut(level);
     let mut changed = false;
     for edit in pending {
         // Snapshot selection ids first so the per-element mutable borrow is free.
@@ -836,7 +881,7 @@ fn apply_canvas_edit(
     }
     if changed {
         state.dirty = true;
-        save_board(project, board);
+        save_board(level, board);
     }
 }
 
@@ -846,9 +891,9 @@ impl Plugin for WhiteboardBackgroundPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BackgroundBoards>()
             .init_resource::<BgState>()
-            .init_resource::<ProjectTools>()
+            .init_resource::<LevelTools>()
             .add_systems(Startup, setup_background_root)
-            .add_systems(Update, (sync_project_tool, background_keyboard).chain())
+            .add_systems(Update, (sync_level_tool, background_keyboard).chain())
             // Canvas input MUST run before the pane systems so a claimed press
             // sets `InputConsumed` before `handle_pane_mouse` reads it — that
             // ordering is what removes the old who-owns-the-click race.
@@ -874,7 +919,7 @@ mod tests {
     use whiteboard_core::interaction::Tool;
 
     // Args, in order: (canvas_active, tool_claims_surface, over_toolbar,
-    // over_pane, on_sidebar). Each test maps to a bug the user reported.
+    // over_pane, on_chrome). Each test maps to a bug the user reported.
 
     #[test]
     fn toolbar_closed_lets_panes_work() {
@@ -938,6 +983,22 @@ mod tests {
 
     #[test]
     fn sidebar_gutter_is_off_limits() {
+        assert_eq!(
+            decide_canvas_press(true, true, false, false, true),
+            CanvasPress::Ignore
+        );
+    }
+
+    #[test]
+    fn breadcrumb_stays_clickable_while_drawing() {
+        // "Couldn't press ↑ to get out of a nested canvas with the drawing
+        // tools active": host chrome (`on_chrome`) wins over the board for
+        // EVERY tool — with Select the press used to start a marquee, with a
+        // draw tool a stroke, either way eating the only pointer route up.
+        assert_eq!(
+            decide_canvas_press(true, false, false, false, true),
+            CanvasPress::Ignore
+        );
         assert_eq!(
             decide_canvas_press(true, true, false, false, true),
             CanvasPress::Ignore

@@ -1,0 +1,252 @@
+// pad.ft — a live notebook pane: charts, tables, diagrams and prose that
+// appear as a terminal writes them.
+//
+//   jimctl pad new incident-42
+//   jimctl widget -k script_widget --params '{"notebook":"incident-42"}' pad.ft
+//   jimctl pad md "# Checkout latency spike"
+//
+// The notebook is a JSONL log in ~/.jim/pads/<name>.jsonl (see pad_log.ft).
+// This pane reads that file and reduces it to cells. `jimctl pad` rings a
+// doorbell on the bus topic `pad.<name>` after each append, and the pane
+// re-reads — the file is the data, the bus is only the signal, which is why a
+// notebook survives a GUI restart and a pane opened late still sees the whole
+// document.
+//
+// Params (all optional):
+//   notebook  — which notebook to show. Defaults to whatever
+//               `jimctl pad use` last selected.
+import "host"
+import { reduce, cell_type, cell_str, is_known } from "pad_log"
+import { render_markdown, render_callout, render_code, render_table,
+         render_stats, render_json, render_image, render_comment,
+         cell_error, note, caption, json_default_open } from "pad_cells"
+import { render_chart } from "pad_chart"
+import { render_graph } from "pad_graph"
+import { ink, ink_muted, rule, accent, paper, surface_alt,
+         font_body, font_heading, font_mono,
+         size_body, size_small, size_tiny, gap_cell, pad_page, alpha } from "pad_theme"
+
+// ---- state ------------------------------------------------------------------
+
+fn init_state() = {
+    notebook: "",
+    cells: [],
+    errors: [],
+    // Paths of open nodes in json cells, keyed "cellid/key/0/…".
+    open: {},
+    loaded: false,
+    load_error: "",
+    w: 720.0,
+    h: 540.0,
+}
+
+let state = atom(init_state())
+
+// A persisted snapshot from a previous run can be Unit (or missing keys added
+// since), and `s.field` on a Unit faults. Everything reads through here.
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+fn set(next) { reset!(state, next) }
+
+// ---- params + paths ---------------------------------------------------------
+
+fn param(k, d) {
+    if typeof(params) != "Record" { return d }
+    let v = unwrap_or(get(params, k), d)
+    if typeof(v) == "Unit" { d } else { v }
+}
+
+fn home() = host_env("HOME")
+
+fn pads_dir() = home() + "/.jim/pads"
+
+fn notebook_path(name) = pads_dir() + "/" + name + ".jsonl"
+
+fn read_text(path) {
+    let r = read_file(path)
+    if typeof(r) != "Record" { return { ok: false, text: "", error: "read_file failed" } }
+    { ok: unwrap_or(get(r, "ok"), false),
+      text: unwrap_or(get(r, "text"), ""),
+      error: unwrap_or(get(r, "error"), "") }
+}
+
+// Which notebook this pane is showing: an explicit param wins, otherwise the
+// one `jimctl pad use` selected, otherwise the default name the CLI writes to.
+fn resolve_notebook() {
+    let explicit = param("notebook", "")
+    if explicit != "" { return explicit }
+    let st = read_text(pads_dir() + "/state.json")
+    if st.ok {
+        let parsed = unwrap_or(json_parse(st.text), 0)
+        if typeof(parsed) == "Record" {
+            let cur = unwrap_or(get(parsed, "current"), "")
+            if typeof(cur) == "Str" and cur != "" { return cur }
+        }
+    }
+    "scratch"
+}
+
+// ---- loading ----------------------------------------------------------------
+
+fn load(s0) {
+    let s = s0
+    let name = if s.notebook == "" { resolve_notebook() } else { s.notebook }
+    let path = notebook_path(name)
+    let f = read_text(path)
+    if not f.ok {
+        // A notebook that doesn't exist yet is not an error — it's the empty
+        // state, and the pane says how to fill it.
+        return { ..s, notebook: name, cells: [], errors: [], loaded: true,
+                 load_error: "" }
+    }
+    let r = reduce(f.text)
+    { ..s, notebook: name, cells: r.cells, errors: r.errors, loaded: true,
+      load_error: "" }
+}
+
+fn reload() {
+    set(load(cur_state()))
+    request_render()
+}
+
+// ---- lifecycle --------------------------------------------------------------
+
+fn on_init() { reload() }
+
+fn on_start() { reload() }
+
+fn on_resize(w, h) {
+    let s = cur_state()
+    set({ ..s, w: w, h: h })
+    request_render()
+}
+
+// The doorbell. `jimctl pad` publishes { notebook, op, id } on `pad.<name>`
+// after every append; the payload is a signal, not the data — we re-read the
+// log rather than trusting a message to carry the cell.
+fn on_message(topic, payload, sender) {
+    let s = cur_state()
+    let name = if s.notebook == "" { resolve_notebook() } else { s.notebook }
+    if topic != "pad." + name { return }
+    reload()
+}
+
+// Clicks: the only interactive thing in a notebook is a json tree's
+// disclosure triangles.
+fn on_click(id) {
+    if not starts_with(id, "json:") { return }
+    let path = slice(id, 5, len(id) - 5)
+    let s = cur_state()
+    let open = if has(s.open, path) { dissoc(s.open, path) } else { assoc(s.open, path, true) }
+    set({ ..s, open: open })
+    request_render()
+}
+
+// ---- cell dispatch ----------------------------------------------------------
+
+fn render_cell(entry, s) {
+    let cell = entry.cell
+    let t = cell_type(cell)
+    if t == "markdown" { return render_markdown(cell) }
+    if t == "callout"  { return render_callout(cell) }
+    if t == "code"     { return render_code(cell) }
+    if t == "table"    { return render_table(cell) }
+    if t == "stats"    { return render_stats(cell) }
+    if t == "chart"    { return render_chart(cell, s.w - 2.0 * pad_page()) }
+    if t == "graph"    { return render_graph(cell, s.w - 2.0 * pad_page()) }
+    if t == "json"     { return render_json(cell, entry.id, s.open) }
+    if t == "image"    { return render_image(cell) }
+    if t == "comment"  { return render_comment(cell) }
+    // A cell this pane doesn't know is visible, not skipped: the notebook was
+    // probably written by a newer `jimctl pad` than this widget.
+    cell_error("unknown cell type “" + t + "”",
+               "cell " + entry.id + " — this pane doesn't know how to draw it")
+}
+
+// ---- chrome -----------------------------------------------------------------
+
+fn header(s) {
+    { kind: "hstack", gap: 10.0, align: "center", children: [
+        { kind: "text", value: s.notebook, size: size_small(), weight: "bold",
+          color: ink_muted(), family: font_mono() },
+        { kind: "frame", children: [], style: { flex_grow: 1.0 } },
+        { kind: "text", value: cell_count_label(len(s.cells)), size: size_tiny(),
+          color: ink_muted(), family: font_body() },
+    ] }
+}
+
+fn cell_count_label(n) {
+    if n == 0 { return "empty" }
+    if n == 1 { return "1 cell" }
+    str(n) + " cells"
+}
+
+fn empty_state(s) {
+    { kind: "vstack", gap: 10.0,
+      style: { margin: { top: 40.0, right: 0.0, bottom: 0.0, left: 0.0 } },
+      children: [
+          { kind: "text", value: "Nothing in this notebook yet", size: 17.0,
+            color: ink(), family: font_heading() },
+          { kind: "text",
+            value: "Write to it from any terminal — the pane updates as the command returns.",
+            size: size_body(), color: ink_muted(), family: font_body() },
+          { kind: "frame", pad: 14.0, gap: 4.0,
+            style: { background: surface_alt(), radius: "6" },
+            children: [
+                { kind: "text", value: "jimctl pad md \"# " + s.notebook + "\"",
+                  size: 12.5, color: ink(), family: font_mono(), wrap: false },
+                { kind: "text",
+                  value: "jimctl pad stats '[{\"label\":\"p95\",\"value\":\"412ms\"}]'",
+                  size: 12.5, color: ink(), family: font_mono(), wrap: false },
+                { kind: "text",
+                  value: "jimctl pad chart '{\"type\":\"bar\",\"categories\":[\"a\",\"b\"],\"series\":[{\"values\":[3,5]}]}'",
+                  size: 12.5, color: ink(), family: font_mono(), wrap: false },
+            ] },
+      ] }
+}
+
+// Malformed lines are surfaced at the top of the document rather than dropped,
+// so a writer that emits a bad record finds out.
+fn error_banner(errors) {
+    let mut kids = [
+        { kind: "text", value: "This notebook has lines that could not be read",
+          size: size_small(), weight: "bold", color: ink(), family: font_body() },
+    ]
+    let mut shown = 0
+    for e in errors {
+        if shown >= 5 { break }
+        kids = push(kids, { kind: "text", value: e, size: size_tiny(),
+                            color: ink_muted(), family: font_mono() })
+        shown = shown + 1
+    }
+    if len(errors) > shown {
+        kids = push(kids, { kind: "text",
+                            value: "…and " + str(len(errors) - shown) + " more",
+                            size: size_tiny(), color: ink_muted(), family: font_body() })
+    }
+    { kind: "frame", pad: 12.0, gap: 4.0, children: kids,
+      style: { background: alpha(ink_muted(), 24), radius: "6" } }
+}
+
+// ---- render -----------------------------------------------------------------
+
+fn render(w, h) {
+    let s0 = cur_state()
+    // First frame after a spawn arrives before any lifecycle handler has run.
+    let s = if s0.loaded { { ..s0, w: w, h: h } } else { load({ ..s0, w: w, h: h }) }
+    set(s)
+
+    let mut kids = [header(s)]
+    if len(s.errors) > 0 { kids = push(kids, error_banner(s.errors)) }
+    if len(s.cells) == 0 {
+        kids = push(kids, empty_state(s))
+    } else {
+        for entry in s.cells { kids = push(kids, render_cell(entry, s)) }
+    }
+    { kind: "vstack", gap: gap_cell(), children: kids,
+      style: { padding: { top: pad_page(), right: pad_page(),
+                          bottom: pad_page() * 2.0, left: pad_page() } } }
+}

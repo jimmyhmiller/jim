@@ -1,0 +1,176 @@
+// pad_log.ft — the notebook model: a JSONL log of records, reduced to cells.
+//
+// A notebook on disk is one JSON object per line in ~/.jim/pads/<name>.jsonl.
+// Reducing the records in order yields the document. That's the whole data
+// model — there is no server and no session state, so anything that can append
+// a line (a terminal, an agent, `jimctl pad`) can drive the notebook, and a
+// pane that opens later just reads the file from the top.
+//
+//   {"op":"update","id":"c3f9","ts":1786909149011,
+//    "cell":{"type":"markdown","source":"# Hi"}}
+//   {"op":"remove","id":"c3f9"}
+//   {"op":"clear"}
+//
+// `update` on an unknown id APPENDS, so a writer never has to know whether a
+// cell exists yet — that's what makes `pad stats --id migrated` able to both
+// create and refresh a live counter.
+//
+// Pure module: no host natives, no side effects — importable and testable with
+// the standalone `funct` CLI (see pad_log_test.ft).
+
+// ---- record parsing ---------------------------------------------------------
+
+fn get_str(r, k, d) {
+    let v = unwrap_or(get(r, k), d)
+    if typeof(v) == "Str" { v } else { d }
+}
+
+// One line -> { ok: true, rec } | { ok: false, error }. A blank line is
+// skipped rather than reported: the log is append-only text, and a trailing
+// newline is normal.
+export fn parse_line(line) {
+    let t = trim(line)
+    if t == "" { return { ok: false, skip: true, error: "" } }
+    let parsed = json_parse(t)
+    let rec = unwrap_or(parsed, 0)
+    if typeof(rec) != "Record" {
+        return { ok: false, skip: false, error: "line is not a JSON object: ${trunc_for_error(t)}" }
+    }
+    let op = get_str(rec, "op", "")
+    if op == "" {
+        return { ok: false, skip: false, error: "record has no `op`: ${trunc_for_error(t)}" }
+    }
+    if op != "add" and op != "update" and op != "remove" and op != "clear" {
+        return { ok: false, skip: false, error: "unknown op `${op}` (expected add, update, remove or clear)" }
+    }
+    if op == "add" or op == "update" {
+        let id = get_str(rec, "id", "")
+        if id == "" {
+            return { ok: false, skip: false, error: "`${op}` record has no `id`" }
+        }
+        let cell = unwrap_or(get(rec, "cell"), 0)
+        if typeof(cell) != "Record" {
+            return { ok: false, skip: false, error: "`${op}` record for `${id}` has no `cell` object" }
+        }
+        if get_str(cell, "type", "") == "" {
+            return { ok: false, skip: false, error: "cell `${id}` has no `type`" }
+        }
+    }
+    if op == "remove" and get_str(rec, "id", "") == "" {
+        return { ok: false, skip: false, error: "`remove` record has no `id`" }
+    }
+    { ok: true, skip: false, error: "", rec: rec }
+}
+
+fn trunc_for_error(s) = if len(s) > 60 { slice(s, 0, 60) + "…" } else { s }
+
+// ---- reduction --------------------------------------------------------------
+
+fn index_of_id(cells, id) {
+    let mut i = 0
+    while i < len(cells) {
+        if cells[i].id == id { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Apply one parsed record to a cell list, returning the new list.
+export fn apply(cells, rec) {
+    let op = get_str(rec, "op", "")
+    if op == "clear" { return [] }
+    let id = get_str(rec, "id", "")
+    if op == "remove" {
+        let at = index_of_id(cells, id)
+        if at < 0 { return cells }
+        return concat_arr(slice(cells, 0, at), slice(cells, at + 1, len(cells) - at - 1))
+    }
+    // add / update
+    let cell = unwrap_or(get(rec, "cell"), {})
+    let entry = { id: id, cell: cell, ts: unwrap_or(get(rec, "ts"), 0) }
+    let at = index_of_id(cells, id)
+    // Update in place when the id is known — that's how a widget keeps one
+    // progress figure current instead of appending a hundred of them.
+    if at >= 0 { return assoc(cells, at, entry) }
+    push(cells, entry)
+}
+
+fn concat_arr(a, b) {
+    let mut out = a
+    for x in b { out = push(out, x) }
+    out
+}
+
+// Reduce a whole log. Returns { cells, errors } — a malformed line never
+// throws away the rest of the notebook, it just reports itself.
+export fn reduce(text) {
+    let mut cells = []
+    let mut errors = []
+    let mut n = 0
+    for line in split(text, "\n") {
+        n = n + 1
+        let p = parse_line(line)
+        if p.ok {
+            cells = apply(cells, p.rec)
+        } else {
+            if not p.skip { errors = push(errors, "line ${n}: ${p.error}") }
+        }
+    }
+    { cells: cells, errors: errors }
+}
+
+// ---- cell accessors ---------------------------------------------------------
+//
+// `type` is a funct keyword, so a cell's kind can't be read as `cell.type`;
+// it comes out of the parsed JSON by name instead.
+
+export fn cell_type(cell) = get_str(cell, "type", "")
+
+export fn cell_str(cell, key, dflt) = get_str(cell, key, dflt)
+
+export fn cell_num(cell, key, dflt) {
+    let v = unwrap_or(get(cell, key), dflt)
+    if typeof(v) == "Int" or typeof(v) == "Float" { to_float(v) } else { dflt }
+}
+
+// funct's `typeof` calls an array a "List".
+export fn cell_arr(cell, key) {
+    let v = unwrap_or(get(cell, key), [])
+    if typeof(v) == "List" { v } else { [] }
+}
+
+export fn cell_rec(cell, key) {
+    let v = unwrap_or(get(cell, key), {})
+    if typeof(v) == "Record" { v } else { {} }
+}
+
+// Every cell type this notebook knows how to draw. A cell of any other type
+// renders as a visible error rather than vanishing, so a newer writer talking
+// to an older pane is obvious instead of silent.
+export fn known_types() = ["markdown", "callout", "code", "table", "chart",
+                           "stats", "json", "image", "graph", "comment"]
+
+export fn is_known(cell) {
+    let t = cell_type(cell)
+    for k in known_types() { if k == t { return true } }
+    false
+}
+
+// ---- writing ----------------------------------------------------------------
+
+// Serialize one record for appending. The widget writes comments back to the
+// log this way; everything else is written by `jimctl pad`.
+export fn record_line(op, id, cell, ts) {
+    let mut r = { op: op }
+    if id != "" { r = assoc(r, "id", id) }
+    if ts > 0 { r = assoc(r, "ts", ts) }
+    if typeof(cell) == "Record" { r = assoc(r, "cell", cell) }
+    // `json_stringify` returns Ok/Err. A record we just built ourselves can't
+    // fail to serialize, so an Err here means the caller handed us something
+    // unserializable — say so instead of appending a blank line to the log.
+    let out = unwrap_or(json_stringify(r), "")
+    if out == "" {
+        fail("pad_log.record_line: could not serialize a `${op}` record for `${id}`")
+    }
+    out
+}

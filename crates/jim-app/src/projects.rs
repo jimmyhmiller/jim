@@ -735,6 +735,10 @@ impl Plugin for ProjectsPlugin {
                     project_drag,
                     sidebar_hover,
                     sidebar_layout,
+                    // After the layout rebuild (which respawns the entities)
+                    // and before input, so a hidden sidebar is both unseen
+                    // and unclickable in the same frame.
+                    sync_sidebar_visibility,
                     sidebar_input,
                     rename_keyboard,
                     apply_pending_actions,
@@ -1339,10 +1343,34 @@ pub struct ClickTracker {
     last_time: f64,
 }
 
+/// Show or hide the whole sidebar.
+///
+/// The sidebar is chrome: during a talk it must not sit down the left edge
+/// of every slide, and on an `application:` slide it is only wanted when
+/// the demo is about the app's own navigation. `SidebarEntity` is
+/// despawned and respawned by `layout_sidebar` on every rebuild, so this
+/// runs every frame rather than on change — it is a handful of writes.
+pub fn sync_sidebar_visibility(
+    presentation: Res<crate::present::Presentation>,
+    mut sidebar_entities: Query<&mut Visibility, With<SidebarEntity>>,
+) {
+    let want = if presentation.sidebar_visible() {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut vis in &mut sidebar_entities {
+        if *vis != want {
+            *vis = want;
+        }
+    }
+}
+
 pub fn sidebar_input(
     windows: Query<&Window>,
     buttons: Res<ButtonInput<MouseButton>>,
     consumed: Res<InputConsumed>,
+    presentation: Res<crate::present::Presentation>,
     sidebar: Res<Sidebar>,
     time: Res<Time>,
     hits: Query<(&SidebarHit, &SidebarBounds)>,
@@ -1351,6 +1379,13 @@ pub fn sidebar_input(
     mut tracker: Local<ClickTracker>,
 ) {
     if consumed.0 {
+        return;
+    }
+    // A hidden sidebar takes no clicks. Without this it stayed live at its
+    // real window coordinates underneath a slide, eating presses in an
+    // invisible strip — and on a slide showing the app, a stray hit would
+    // switch project out from under the talk.
+    if !presentation.sidebar_visible() {
         return;
     }
     if !buttons.just_pressed(MouseButton::Left) {
@@ -2024,9 +2059,10 @@ pub fn sync_visibility(
     projects: Res<Projects>,
     nav: Res<crate::canvas_pane::CanvasNav>,
     groups: Res<crate::pane_groups::VisibleGroups>,
-    viewed: Res<crate::live_views::ViewedProjects>,
+    presentation: Res<crate::present::Presentation>,
     mut panes: Query<
         (
+            Entity,
             &PaneProject,
             Option<&jim_pane::PaneCanvas>,
             Option<&jim_pane::PaneGroup>,
@@ -2036,26 +2072,38 @@ pub fn sync_visibility(
     >,
 ) {
     let active = projects.active;
-    // The nested-canvas level currently visible in the active project.
-    // A pane shows only when it's in the active project AND sits on that
-    // exact level (root = 0 / no marker) — descending swaps the visible
-    // set without moving any pane.
-    let active_level = active.map(|p| nav.level(p)).unwrap_or(0);
-    for (m, canvas, group, mut vis) in &mut panes {
+    let presenting = presentation.active();
+    for (entity, m, canvas, group, mut vis) in &mut panes {
+        // The deck holding the window is chrome for the duration of a talk:
+        // it is screen-anchored, covers the display, and must survive the
+        // presenter switching projects inside the live view on the slide.
+        // Without this, clicking the mirrored sidebar hid the very deck
+        // doing the presenting.
+        if presenting == Some(entity) {
+            // ...unless this slide hands the window to the real application,
+            // in which case the deck gets out of the way entirely.
+            let want = if presentation.stepped_aside() {
+                Visibility::Hidden
+            } else {
+                Visibility::Inherited
+            };
+            if *vis != want {
+                *vis = want;
+            }
+            continue;
+        }
         let pane_level = canvas.map_or(0, |c| c.0);
         // Third visibility dimension, orthogonal to project and canvas
         // level: a pane in a named group also needs that group revealed
         // (see `pane_groups`). Ungrouped panes are unaffected.
-        // A full project/application view means the whole project, including
-        // panes that are normally parked in a reveal-only dashboard group.
-        let group_ok = viewed.0.contains(&m.0) || group.is_none_or(|g| groups.is_visible(&g.0));
-        let project_visible = Some(m.0) == active || viewed.0.contains(&m.0);
-        let level_visible = if Some(m.0) == active {
-            pane_level == active_level
-        } else {
-            // Embedded project views currently frame the root canvas.
-            pane_level == 0
-        };
+        let group_ok = group.is_none_or(|g| groups.is_visible(&g.0));
+        let project_visible = Some(m.0) == active;
+        // A pane shows only when it sits on the nested-canvas level its
+        // own project is parked on (root = 0 / no marker) — descending
+        // swaps the visible set without moving any pane. An embedded
+        // project view is a window onto that project as you left it, so
+        // it frames that project's level too, not a hardcoded root.
+        let level_visible = pane_level == nav.level(m.0);
         let want = if project_visible && level_visible && group_ok {
             Visibility::Inherited
         } else {

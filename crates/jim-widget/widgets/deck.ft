@@ -3,43 +3,80 @@
 //   jimctl widget --kind script_widget --title Talk \
 //       --params '{"path":"~/talks/jim.md"}' deck.ft
 //
+//   F5 presents: the deck takes the whole window, its pane chrome
+//   disappears, and the slide IS the screen. Escape ends the show (or, if
+//   you clicked into a live pane on a slide, hands the keyboard back to the
+//   deck first).
+//
 // FORMAT
 //   ---            a line of exactly `---` separates slides. (Use `***`
 //                  for a horizontal RULE inside a slide — `---` is taken.)
 //   front matter   an opening `---` block at the very top of the file sets
 //                  deck-wide keys: `style: path/to.glz`, `title: …`
+//                  (the title shows in the footer of every slide).
 //   <!-- k: v -->  per-slide directives, stripped from the rendered body.
-//                  `layout: title`   picks the Glaze variant.
+//                  `layout: title`   centres the slide's content and gives
+//                                    it an accent rule — a chapter break.
 //                  `project: Name`   shows that PROJECT's whole canvas —
 //                                    its real terminals, widgets, editors —
 //                                    live in the lower part of the slide.
-//                                    This is the demo path.
-//                  `application: true` shows the complete current Jim app,
-//                                    including sidebar and canvas chrome.
-//                  `footer: true` opts this slide into the progress bar and
-//                                    slide count. Slides are clean by default.
+//                                    It is REAL: click a terminal in it and
+//                                    type. This is the demo path.
+//                  `application: true` hands the window to the REAL app:
+//                                    the deck hides itself and you are
+//                                    looking at Jim, live and fully
+//                                    interactive. Slide keys still work
+//                                    (⌘⇧→ / ⌘⇧←). FULL SCREEN ONLY — in a
+//                                    floating pane it does nothing, because
+//                                    "the whole app" inside a pane can only
+//                                    be a thumbnail of what is already
+//                                    behind it.
+//                  `sidebar: true`   on an `application:` slide, keep the
+//                                    sidebar on screen. Off by default: the
+//                                    slide is about the workspace, not the
+//                                    chrome.
+//                  `footer: true`    shows the progress bar + slide count
+//                                    on this slide. Off by default — a talk
+//                                    shouldn't wear presenter furniture
+//                                    unless you ask for it.
 //                  `dashboard: name` reveals a named pane group instead,
 //                                    when you want a hand-picked subset
 //                                    (see `jimctl group`).
 //   ::: notes      speaker notes; stripped from the body, kept on the slide.
 //   :::
 //
+// A slide with `project:`/`application:` and NO body is full-bleed: the
+// live view fills the whole slide. Give it a heading and the live view
+// drops into a framed screen below it.
+//
+// LAYOUT
+//   The slide master lives in this file as FRACTIONS of the pane (margins,
+//   the heading band above a live view) and the type scale lives in
+//   deck.glz in reference pixels, authored against 1280x720 and multiplied
+//   by the pane's scale. So a deck keeps its proportions in a small pane
+//   and window-filling on a projector — no fixed pixel padding to swallow a
+//   small slide.
+//
 // STYLING
-//   Box styling comes from `glaze(...)`, typography from `glaze_token(...)`
-//   — see deck.glz. Sizes there are authored against a 1280x720 reference
-//   slide and scaled to the pane here, so a slide looks the same in a small
-//   pane and window-filling presentation mode. Save the .glz and the deck reloads.
+//   Colour, type sizes and surface treatment come from `glaze(...)` /
+//   `glaze_token(...)` — see deck.glz. Save the .glz and the deck reloads.
 //
 // NAVIGATION
-//   →/↓/click advance, ←/↑/shift-click go back, Home/End jump to the ends.
-//   Each move publishes `deck.slide` (retained) so other panes can follow.
+//   →/↓/space advance, ←/↑ go back, Home/End jump to the ends, all while
+//   the deck holds focus. While presenting, ⌘⇧→ / ⌘⇧← work from ANYWHERE,
+//   including with a live pane on the slide focused. Clicking does NOT
+//   advance: slides carry live panes you need to click on. Each move
+//   publishes `deck.slide` (retained) so other panes can follow.
 import "host"
 
 // Reference slide the .glz sizes are authored against.
 fn ref_w() = 1280.0
 fn ref_h() = 720.0
 
-fn init_state() = { i: 0 }
+// `live` holds the host's answer about the current live view (see
+// `pane.project.status` in jim-app/src/live_views.rs): which project it
+// framed, whether that project exists, and how many panes are in it.
+fn init_state() = { i: 0, live: {} }
 let state = atom(init_state())
 
 fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
@@ -72,8 +109,8 @@ fn sample() =
     "Text keeps its **bold**, *italic* and `inline code` because slides\n" +
     "render through `md_parse` into rich text runs.\n" +
     "\n" +
-    "- one bullet\n" +
-    "- another with a `code span`\n" +
+    "- headings, lists and quotes get their own rhythm\n" +
+    "- the slide is a shape, so it fits any pane\n" +
     "\n" +
     "---\n" +
     "\n" +
@@ -85,7 +122,42 @@ fn sample() =
     "let deck = Deck::from_markdown(path);\n" +
     "```\n" +
     "\n" +
-    "Save the stylesheet and this slide restyles itself.\n"
+    "Save the stylesheet and this slide restyles itself.\n" +
+    "\n" +
+    "---\n" +
+    "<!-- application: true -->\n" +
+    "\n" +
+    "## This is not a screenshot\n" +
+    "\n" +
+    "The editor below is running. Click a terminal and type in it.\n" +
+    "\n" +
+    "::: notes\n" +
+    "Type something. That is the whole demo.\n" +
+    ":::\n" +
+    "\n" +
+    "---\n" +
+    "<!-- application: true -->\n"
+
+// Parsing the deck is the expensive thing this widget does: `md_parse` on
+// every block of every slide, inside a fuel-sliced VM. It used to run on
+// EVERY render and EVERY keypress — `parse_deck(source())` appeared in
+// `render`, `goto` and `on_key` — so each arrow key re-read the file from
+// disk and re-parsed the whole talk twice. That is what made slides take a
+// visible moment to appear.
+//
+// Memoize on the source TEXT rather than caching blindly: reading a few KB
+// is cheap next to parsing it, and comparing the text keeps live editing of
+// the .md working — save the file and the next render reparses exactly once.
+let deck_cache = atom({ src: (), deck: () })
+
+fn deck_now() {
+    let src = source()
+    let c = @deck_cache
+    if typeof(c) == "Record" and c.src == src { return c.deck }
+    let d = parse_deck(src)
+    reset!(deck_cache, { src: src, deck: d })
+    d
+}
 
 fn source() {
     let path = param("path", "")
@@ -194,16 +266,48 @@ fn parse_deck(text) {
 }
 
 // ---------------------------------------------------------------- styling
+//
+// THE SLIDE MASTER
+//
+// Every box metric here is a FRACTION of the pane, and every type size is
+// the reference size scaled by `scale_for`. That combination is what makes
+// one deck look right in a 500px pane and window-filling at 2560px: a slide
+// is a shape, not a pixel layout. (Fixed-pixel padding was the old bug —
+// 72px of margin inside a 600px pane ate the slide, while the type shrank
+// to a third, so slides looked tiny and lost in a box.)
+
+// Slide margins, as a fraction of the pane.
+fn pad_x_frac() = 0.062
+fn pad_y_frac() = 0.085
+// Bottom margin is tighter than the top: optical centring. Text hangs from
+// the top of a slide, so an equal bottom margin reads as bottom-heavy.
+fn pad_b_frac() = 0.062
+// On a slide with a live view, the band above it that holds the heading.
+fn band_frac() = 0.28
 
 // Uniform scale from the reference slide to this pane. Slides are RESIZED,
 // never zoomed: canvas zoom scales already-rasterized glyphs (blurry), so
 // the deck re-lays-out at native size and multiplies the type scale instead.
 fn scale_for(w, h) {
     let s = min(w / ref_w(), h / ref_h())
-    if s < 0.2 { 0.2 } else if s > 4.0 { 4.0 } else { s }
+    if s < 0.25 { 0.25 } else if s > 4.0 { 4.0 } else { s }
+}
+
+fn style_path() = param("style", host_env("HOME") + "/.jim/widgets/deck.glz")
+
+// The host can call `render` BEFORE `on_start` (a restored pane paints on
+// its first frame), and every size and colour here comes from the
+// stylesheet — so without this the first render faults with "no stylesheet
+// loaded" and the deck comes up blank. Loading is idempotent and cheap;
+// `on_start` still reloads unconditionally so saving the .glz restyles a
+// live deck.
+fn ensure_style() {
+    if not glaze_loaded() { glaze_load_file(style_path()) }
 }
 
 fn sz(token, scale) = glaze_token(token) * scale
+
+fn edges(t, r, b, l) = { top: t, right: r, bottom: b, left: l }
 
 // ----------------------------------------------------------- run mapping
 
@@ -234,6 +338,13 @@ fn block_runs(block, size, scale) {
 fn rich(runs, size, color) =
     { kind: "richtext", runs: runs, size: size, color: color }
 
+// `text` / `richtext` / `spacer` have no `style` of their own (see
+// protocol.rs), so anything that needs flex behaviour — a fixed width, no
+// shrinking, growing to fill — gets a Frame around it.
+fn boxed(style, child) = { kind: "frame", gap: 0.0, style: style, children: [child] }
+
+fn fixed(child) = boxed({ flex_shrink: 0.0 }, child)
+
 fn heading_size(level, scale) {
     if level == 1 { return sz("size_h1", scale) }
     if level == 2 { return sz("size_h2", scale) }
@@ -257,84 +368,191 @@ fn render_block(block, scale) {
     let body = sz("size_body", scale)
     let fg = glaze_token("fg")
 
-    if kind == "blank" { return { kind: "spacer", size: body * 0.4 } }
     if kind == "thematic-break" { return { kind: "divider" } }
     if kind == "heading" {
         let size = heading_size(block.level, scale)
         return rich(block_runs(block, size, scale), size, fg)
     }
     if kind == "code-block" {
-        return { kind: "frame", gap: 2.0, style: glaze("code_block"),
+        return { kind: "frame", gap: body * 0.18,
+                 style: { ..glaze("code_block"),
+                          padding: edges(body * 0.7, body * 0.9, body * 0.7, body * 0.9),
+                          radius: str(body * 0.4) },
                  children: code_lines(block, scale) }
     }
     if kind == "block-quote" {
-        return { kind: "hstack", gap: body * 0.6, align: "stretch", children: [
-            { kind: "frame", style: glaze("quote_rule"), children: [] },
+        return { kind: "hstack", gap: body * 0.7, align: "stretch", children: [
+            { kind: "frame",
+              style: { ..glaze("quote_rule"), width: str(body * 0.16),
+                       radius: str(body * 0.08), flex_shrink: 0.0 },
+              children: [] },
             rich(block_runs(block, body, scale), body, glaze_token("fg_muted")),
         ]}
     }
     if kind == "list-item" {
         let bullet = if unwrap_or(get(block, "ordered"), false) { "1." } else { "•" }
-        return { kind: "hstack", gap: body * 0.5, align: "start", children: [
-            { kind: "text", value: bullet, size: body, color: glaze_token("accent"),
-              style: { width: str(body), flex_shrink: 0.0 } },
+        let indent = to_float(unwrap_or(get(block, "indent"), 0)) * body * 1.2
+        return { kind: "hstack", gap: body * 0.55, align: "start",
+                 style: { padding: edges(0.0, 0.0, 0.0, indent) },
+                 children: [
+            boxed({ width: str(body * 0.9), flex_shrink: 0.0 },
+                  { kind: "text", value: bullet, size: body,
+                    color: glaze_token("accent"), wrap: false }),
             rich(block_runs(block, body, scale), body, fg),
         ]}
     }
     rich(block_runs(block, body, scale), body, fg)
 }
 
-// A thin progress bar + "n / total", so you always know where you are.
-// The fill is a percentage-width child of the track, so it re-measures
-// with the pane instead of being computed against a stale width.
-fn footer(i, total, scale) {
+// Blocks with a vertical rhythm instead of a uniform gap.
+//
+// Markdown turns a blank line into a `blank` block, and the old renderer
+// drew BOTH that spacer and the stack's gap — so spacing came out doubled
+// in some places and single in others depending on how the source happened
+// to be typed. Here blank blocks are dropped and space is decided by what
+// meets what: a heading gets air above it, list items pack tightly.
+fn space_between(prev, next, body) {
+    if prev == "" { return 0.0 }
+    if next == "heading" { return body * 1.25 }
+    if prev == "heading" { return body * 0.65 }
+    if prev == "list-item" and next == "list-item" { return body * 0.35 }
+    body * 0.6
+}
+
+fn render_blocks(blocks, scale) {
+    let body = sz("size_body", scale)
+    let mut out = []
+    let mut prev = ""
+    for b in blocks {
+        if b.kind == "blank" { continue }
+        let gap = space_between(prev, b.kind, body)
+        if gap > 0.0 { out = push(out, { kind: "spacer", size: gap }) }
+        out = push(out, render_block(b, scale))
+        prev = b.kind
+    }
+    out
+}
+
+// ------------------------------------------------------------ furniture
+
+// A hairline progress bar, the deck's title, and "n / total". Shown by
+// default — knowing where you are in a talk is what makes a deck feel like
+// a deck — and turned off per slide with `<!-- footer: false -->`.
+fn footer(title, i, total, scale) {
     let pct = 100.0 * (to_float(i) + 1.0) / to_float(total)
-    { kind: "hstack", gap: 12.0, align: "center", style: glaze("footer"), children: [
+    let note = sz("size_note", scale)
+    { kind: "hstack", gap: note * 1.2, align: "center", style: glaze("footer"), children: [
+        fixed({ kind: "text", value: title, size: note,
+                color: glaze_token("fg_faint"), wrap: false }),
         { kind: "frame",
-          style: { ..glaze("footer_bar"), flex_grow: 1.0 },
+          style: { ..glaze("footer_bar"), flex_grow: 1.0, height: str(note * 0.16),
+                   radius: str(note * 0.08) },
           children: [
             { kind: "frame",
-              style: { ..glaze("footer_fill"), width: str(pct) + "%" },
+              style: { ..glaze("footer_fill"), width: str(pct) + "%",
+                       height: str(note * 0.16), radius: str(note * 0.08) },
               children: [] },
           ]},
-        { kind: "text", value: str(i + 1) + " / " + str(total),
-          size: sz("size_note", scale), color: glaze_token("fg_muted") },
+        fixed({ kind: "text", value: str(i + 1) + " / " + str(total),
+                size: note, color: glaze_token("fg_muted"), wrap: false }),
     ]}
 }
 
+// A `spacer` takes only a size, so "push everything after me to the
+// bottom" is an empty growing Frame.
+fn spacer_grow() = { kind: "frame", gap: 0.0, style: { flex_grow: 1.0 }, children: [] }
+
+// The frame a live project view is painted into by the host.
+//
+// The host draws the project THROUGH this pane (its cameras sit above the
+// widget's own content), so this element is the mat around the picture, not
+// the picture: a recessed surface and a hairline border, which is what makes
+// the embedded workspace read as a screen on the slide instead of a hole cut
+// out of it. Its rect must agree with the inset `publish` sends — both come
+// from the same fractions, which is the only reason they line up.
 // ----------------------------------------------------------------- render
 
 fn clamp_index(i, n) = if i < 0 { 0 } else if i >= n { n - 1 } else { i }
 
+fn is_on(v) = v == "true" or v == "yes" or v == "1"
+
+fn slide_live(slide) {
+    let proj = unwrap_or(get(slide.dirs, "project"), "")
+    let app = unwrap_or(get(slide.dirs, "application"), "")
+    proj != "" or is_on(app)
+}
+
+
 fn render(w, h) {
+    ensure_style()
     let s = cur_state()
-    let deck = parse_deck(source())
+    let deck = deck_now()
     let total = len(deck.slides)
     let i = clamp_index(s.i, total)
     let slide = deck.slides[i]
     let scale = scale_for(w, h)
+    let body = sz("size_body", scale)
     let layout = unwrap_or(get(slide.dirs, "layout"), "content")
-    let footer_value = unwrap_or(get(slide.dirs, "footer"), "")
-    let show_footer = footer_value == "true" or footer_value == "yes" or footer_value == "1"
+    let title = unwrap_or(get(deck.meta, "title"), "")
+    let footer_dir = unwrap_or(get(slide.dirs, "footer"), "")
+    let has_body = trim(slide.body) != ""
+    let live = slide_live(slide)
+    // OPT-IN. A slide counter on every slide is presenter furniture, and a
+    // talk shouldn't wear it by default — you ask for it with
+    // `<!-- footer: true -->`. Asking is absolute: it shows on a one-slide
+    // deck too, which is the only way `footer: true` can mean anything
+    // there. A live slide never shows it — nothing overlaps a demo.
+
+    let show_footer = is_on(footer_dir) and not live
 
     let blocks = md_parse(slide.body)
-    let mut kids = []
-    for b in blocks { kids = push(kids, render_block(b, scale)) }
+    let kids = render_blocks(blocks, scale)
 
-    // A title slide centers its content block; a content slide starts at
-    // the top so successive slides don't jump around.
-    let content = { kind: "vstack", gap: sz("size_body", scale) * 0.45,
-                    style: { flex_grow: 1.0 }, children: kids }
+    // The slide surface fills the pane. Without an explicit height the root
+    // is content-tall, so the slide background ended up as a band across the
+    // middle of the pane with the pane's own colour above and below it —
+    // "the slides don't take up the full height".
+    let base = { ..glaze_at("slide", { layout: layout }, [], w, h),
+                 width: "100%", height: "100%" }
 
-    { kind: "vstack", gap: sz("size_body", scale) * 0.6,
-      style: glaze_at("slide", { layout: layout }, [], w, h),
-      children: [
-        if layout == "title" { { kind: "spacer", size: 1.0, style: { flex_grow: 1.0 } } }
-        else { { kind: "spacer", size: 0.0 } },
+    // A live slide draws NOTHING. The host is about to hide this pane and
+    // show the real application, so anything drawn here is a frame or two of
+    // flicker on the way out — which is exactly what the "nothing is there"
+    // text turned out to be. It survived from the embedded-mirror model,
+    // where the host painted the project through a hole in the slide and the
+    // deck had to explain an empty hole. There is no hole any more.
+    if live {
+        return { kind: "vstack", gap: 0.0, style: base, children: [] }
+    }
+
+    let content = { kind: "vstack", gap: 0.0, children: kids }
+    let padded = { ..base, padding: edges(h * pad_y_frac(), w * pad_x_frac(),
+                                          h * pad_b_frac(), w * pad_x_frac()) }
+
+    // A title slide is centred in the slide; a content slide hangs from the
+    // top so successive slides don't jump around, with the footer pinned to
+    // the bottom by the growing spacer between them.
+    if layout == "title" {
+        return { kind: "vstack", gap: 0.0, style: padded, children: [
+            spacer_grow(),
+            { kind: "frame", gap: 0.0,
+              style: { ..glaze("title_rule"), width: str(body * 2.4),
+                       height: str(body * 0.18), radius: str(body * 0.09) },
+              children: [] },
+            { kind: "spacer", size: body * 1.1 },
+            content,
+            spacer_grow(),
+            if show_footer { footer(title, i, total, scale) }
+            else { { kind: "spacer", size: 0.0 } },
+        ]}
+    }
+
+    { kind: "vstack", gap: 0.0, style: padded, children: [
         content,
-        if show_footer { footer(i, total, scale) }
+        spacer_grow(),
+        if show_footer { footer(title, i, total, scale) }
         else { { kind: "spacer", size: 0.0 } },
-      ]}
+    ]}
 }
 
 // ------------------------------------------------------------- navigation
@@ -354,7 +572,6 @@ fn publish(deck, i) {
     let dash = unwrap_or(get(slide.dirs, "dashboard"), "")
     let proj = unwrap_or(get(slide.dirs, "project"), "")
     let app = unwrap_or(get(slide.dirs, "application"), "")
-    let full_bleed = trim(slide.body) == ""
     emit_retained("deck.slide", {
         index: i,
         total: len(deck.slides),
@@ -368,17 +585,21 @@ fn publish(deck, i) {
     // the heading still above it. `inset` is a fraction of THIS pane, so
     // the host can anchor the region without the script knowing where it
     // sits on screen. Empty name clears it.
+    //
+    // `application:` is NOT a region. It asks the host to step the deck
+    // aside so you look at the real running app, and only means anything
+    // while presenting — in a floating pane it does nothing at all.
+    // `sidebar:` rides along for that case.
     emit_retained("pane.project", {
         name: proj,
-        whole_app: app == "true" or app == "yes" or app == "1",
-        inset: if full_bleed { [0.0, 0.0, 1.0, 1.0] }
-               else { [0.06, 0.30, 0.88, 0.62] },
+        whole_app: is_on(app),
+        sidebar: unwrap_or(get(slide.dirs, "sidebar"), "true") != "false",
     })
 }
 
 fn goto(idx) {
     let s = cur_state()
-    let deck = parse_deck(source())
+    let deck = deck_now()
     let i = clamp_index(idx, len(deck.slides))
     if i == s.i { return }
     reset!(state, { ..s, i: i })
@@ -391,13 +612,28 @@ fn on_init() { request_render() }
 fn on_start() {
     // Load the theme every start (fresh, restart, hot reload) so saving
     // either the .ft or the .glz re-applies it.
-    glaze_load_file(param("style", host_env("HOME") + "/.jim/widgets/deck.glz"))
+    glaze_load_file(style_path())
     // Announce where we already are. Without this a deck resting on slide
     // 0 never publishes, so anything driven by `deck.slide` (a dashboard
     // named on the FIRST slide, a notes pane) would sit blank until the
     // presenter happened to navigate.
-    let deck = parse_deck(source())
+    let deck = deck_now()
     publish(deck, clamp_index(cur_state().i, len(deck.slides)))
+    request_render()
+}
+
+// The host answers `pane.project` with a per-widget status topic. Keep it
+// in state so the next render can explain an empty view.
+//
+// This is the widget↔widget bus (`on_message`), the same channel the deck
+// publishes on — NOT `on_bus`, which is the Claude Code event bus and takes
+// (kind, payload).
+fn on_message(topic, payload, sender) {
+    if not starts_with(topic, "pane.project.status") { return }
+    if typeof(payload) != "Record" { return }
+    if unwrap_or(get(payload, "host"), "") != my_id() { return }
+    let s = cur_state()
+    reset!(state, { ..s, live: payload })
     request_render()
 }
 
@@ -406,10 +642,11 @@ fn on_key(key) {
     if key == "ArrowRight" or key == "ArrowDown" { goto(s.i + 1) }
     if key == "ArrowLeft"  or key == "ArrowUp"   { goto(s.i - 1) }
     if key == "Home" { goto(0) }
-    if key == "End"  { goto(len(parse_deck(source()).slides) - 1) }
+    if key == "End"  { goto(len(deck_now().slides) - 1) }
 }
 
-fn on_click(x, y, shift, cmd, id) {
-    let s = cur_state()
-    if shift { goto(s.i - 1) } else { goto(s.i + 1) }
-}
+// NO `on_click`, deliberately. Click-to-advance is fine for a deck of
+// static slides and actively harmful for this one: a slide can embed a
+// live project, so a click meant for an embedded terminal that lands on
+// the slide instead would jump the deck out from under the thing you were
+// pointing at. Advancing is keys only — see NAVIGATION.

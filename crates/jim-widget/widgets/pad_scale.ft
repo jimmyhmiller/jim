@@ -1,0 +1,293 @@
+// pad_scale.ft — chart geometry: domains, scales, bins, arcs, path building.
+//
+// Everything a chart needs to work out WHERE its marks go, with none of the
+// drawing. Kept separate from pad_chart.ft precisely so this half is a pure
+// module the standalone `funct` CLI can test (see pad_scale_test.ft) — chart
+// math that silently mislocates a point is the kind of bug you cannot see by
+// looking at the picture.
+import { parse_date, nice_ticks, fixed } from "pad_fmt"
+
+// ---- x kinds ----------------------------------------------------------------
+
+// A point's x is a number, an ISO-ish date string, or a plain category. Mixing
+// them in one series is a data error, not something to paper over: a chart
+// that silently reinterprets half its x values is worse than one that refuses.
+export fn x_kind_of(v) {
+    let t = typeof(v)
+    if t == "Int" or t == "Float" { return "number" }
+    if t != "Str" { return "unknown" }
+    // `parse_date` answers with Some/None, so match it — `typeof(None)` is
+    // "Variant(None)", not "Unit", and comparing against "Unit" would call
+    // every label a date.
+    match parse_date(v) { Some(_) => "date", None => "category" }
+}
+
+// The kind for a whole set of series -> { ok, kind, error }.
+export fn x_kind(series) {
+    let mut kind = ""
+    for s in series {
+        for p in points_of(s) {
+            let k = x_kind_of(x_of(p))
+            if k == "unknown" {
+                return { ok: false, kind: "", error: "a point's x value is neither a number, a date, nor a label" }
+            }
+            if kind == "" { kind = k }
+            if k != kind {
+                return { ok: false, kind: "",
+                         error: "this chart mixes ${kind} and ${k} x values; every series has to use one kind" }
+            }
+        }
+    }
+    if kind == "" { return { ok: false, kind: "", error: "the chart has no points" } }
+    { ok: true, kind: kind, error: "" }
+}
+
+export fn points_of(s) {
+    let p = unwrap_or(get(s, "points"), [])
+    if typeof(p) == "List" { p } else { [] }
+}
+
+export fn x_of(point) = unwrap_or(get(point, 0), "")
+
+// A null y is a GAP in the line, not a zero — a dropped metric should break
+// the line, never dive it to the floor.
+export fn y_of(point) {
+    let v = unwrap_or(get(point, 1), "")
+    let t = typeof(v)
+    if t == "Int" or t == "Float" { Some(to_float(v)) } else { None }
+}
+
+// True for a gap (a null y). Kept as a function because `typeof(None)` is
+// "Variant(None)" — comparing against "Unit" silently treats every gap as a
+// value.
+export fn is_gap(y) = match y { Some(_) => false, None => true }
+
+// x as a number, given the axis kind: dates become epoch days, categories
+// become their index in the shared category list.
+export fn x_value(v, kind, categories) {
+    if kind == "number" { return to_float(v) }
+    if kind == "date" { return unwrap_or(parse_date(v), 0.0) }
+    to_float(unwrap_or(index_of(categories, v), 0))
+}
+
+// Every distinct category across the series, in first-seen order — the x axis
+// of a categorical chart, and the reason two series with different gaps still
+// line up.
+export fn categories_of(series) {
+    let mut cats = []
+    for s in series {
+        for p in points_of(s) {
+            let v = x_of(p)
+            match index_of(cats, v) { Some(_) => 0, None => { cats = push(cats, v)  0 } }
+        }
+    }
+    cats
+}
+
+// ---- domains ----------------------------------------------------------------
+
+// { lo, hi, any } over every non-null y in every series.
+export fn y_domain(series) {
+    let mut lo = 0.0
+    let mut hi = 0.0
+    let mut any = false
+    for s in series {
+        for p in points_of(s) {
+            let y = y_of(p)
+            if is_gap(y) { continue }
+            let v = unwrap_or(y, 0.0)
+            if not any { lo = v  hi = v  any = true }
+            if v < lo { lo = v }
+            if v > hi { hi = v }
+        }
+    }
+    { lo: lo, hi: hi, any: any }
+}
+
+// A chart's y axis includes zero unless the data sits far away from it: a bar
+// that doesn't start at zero lies about its own length, and a line that always
+// includes zero flattens every interesting series.
+export fn y_axis(series, include_zero, y_min, y_max, target) {
+    let d = y_domain(series)
+    // `y_min`/`y_max` come straight out of a JSON spec that may not have them,
+    // so anything non-numeric (Unit, "", a stray string) means "not set".
+    let has_min = is_number(y_min)
+    let has_max = is_number(y_max)
+    let mut lo = if has_min { to_float(y_min) } else { d.lo }
+    let mut hi = if has_max { to_float(y_max) } else { d.hi }
+    if include_zero and not has_min and lo > 0.0 { lo = 0.0 }
+    if include_zero and not has_max and hi < 0.0 { hi = 0.0 }
+    nice_ticks(lo, hi, target)
+}
+
+export fn is_number(v) = typeof(v) == "Int" or typeof(v) == "Float"
+
+// ---- scales -----------------------------------------------------------------
+
+// A linear map from data [d0,d1] onto pixels [r0,r1]. A zero-width domain maps
+// everything to the middle of the range rather than dividing by zero.
+export fn scale(d0, d1, r0, r1) = { d0: to_float(d0), d1: to_float(d1),
+                                    r0: to_float(r0), r1: to_float(r1) }
+
+export fn apply_scale(sc, v) {
+    let span = sc.d1 - sc.d0
+    if abs(span) < 0.000000000001 { return (sc.r0 + sc.r1) / 2.0 }
+    sc.r0 + (to_float(v) - sc.d0) / span * (sc.r1 - sc.r0)
+}
+
+// Band scale for categories: n slots across [r0,r1], each mark at its center.
+export fn band(n, r0, r1, pad_ratio) {
+    let count = if n < 1 { 1 } else { n }
+    let width = (to_float(r1) - to_float(r0)) / to_float(count)
+    { r0: to_float(r0), step: width, n: count,
+      inner: width * (1.0 - pad_ratio) }
+}
+
+export fn band_center(b, i) = b.r0 + (to_float(i) + 0.5) * b.step
+
+export fn band_start(b, i) = band_center(b, i) - b.inner / 2.0
+
+// Thin every k-th label so axis text can't overlap: how many to skip, given
+// the widest label and the slot each one has.
+export fn label_step(label_widths, slot) {
+    let mut widest = 0.0
+    for w in label_widths { if w > widest { widest = w } }
+    if slot <= 0.0 { return 1 }
+    let need = to_int(ceil((widest + 6.0) / slot))
+    if need < 1 { 1 } else { need }
+}
+
+// ---- histogram --------------------------------------------------------------
+
+// Sturges' rule, clamped: enough bins to show shape, few enough to stay honest
+// about how little data there may be.
+export fn bin_count(n, requested) {
+    if is_number(requested) and to_int(requested) > 0 { return to_int(requested) }
+    if n <= 1 { return 1 }
+    let k = to_int(ceil(log10(to_float(n)) / log10(2.0))) + 1
+    if k < 4 { return 4 }
+    if k > 30 { return 30 }
+    k
+}
+
+// -> { lo, hi, width, counts } over `values`.
+export fn histogram(values, requested_bins) {
+    let n = len(values)
+    if n == 0 { return { lo: 0.0, hi: 0.0, width: 0.0, counts: [] } }
+    let mut lo = to_float(values[0])
+    let mut hi = lo
+    for v in values {
+        let f = to_float(v)
+        if f < lo { lo = f }
+        if f > hi { hi = f }
+    }
+    let k = bin_count(n, requested_bins)
+    // A single repeated value has no spread; give it one unit of width so the
+    // bar has somewhere to stand.
+    if hi - lo < 0.000000001 { hi = lo + 1.0 }
+    let width = (hi - lo) / to_float(k)
+    let mut counts = []
+    let mut i = 0
+    while i < k { counts = push(counts, 0)  i = i + 1 }
+    for v in values {
+        let f = to_float(v)
+        let mut idx = to_int(floor((f - lo) / width))
+        // The maximum lands exactly on the top edge; it belongs to the last
+        // bin, not to a k+1st one.
+        if idx >= k { idx = k - 1 }
+        if idx < 0 { idx = 0 }
+        counts = assoc(counts, idx, counts[idx] + 1)
+    }
+    { lo: lo, hi: hi, width: width, counts: counts }
+}
+
+// ---- path building ----------------------------------------------------------
+
+fn n2(v) = fixed(v, 2)
+
+export fn move_to(x, y) = "M " + n2(x) + " " + n2(y)
+export fn line_to(x, y) = " L " + n2(x) + " " + n2(y)
+
+// A polyline through [{x,y}], as SVG path data. Empty for fewer than two
+// points — a one-point line is not a line.
+export fn polyline(pts) {
+    if len(pts) < 2 { return "" }
+    let mut d = ""
+    let mut i = 0
+    while i < len(pts) {
+        d = d + (if i == 0 { move_to(pts[i].x, pts[i].y) } else { line_to(pts[i].x, pts[i].y) })
+        i = i + 1
+    }
+    d
+}
+
+// The same polyline closed down to `baseline` — the area under a line.
+export fn area_path(pts, baseline) {
+    if len(pts) < 2 { return "" }
+    let last = pts[len(pts) - 1]
+    polyline(pts) + line_to(last.x, baseline) + line_to(pts[0].x, baseline) + " Z"
+}
+
+// A rectangle with the two ends AWAY from the baseline rounded, which is how a
+// bar shows which end carries the data. `r` is clamped so a short bar can't
+// curl into a lozenge.
+export fn bar_path(x, y, w, h, r0) {
+    if h <= 0.0 or w <= 0.0 { return "" }
+    let r = min(min(to_float(r0), w / 2.0), h)
+    if r <= 0.1 {
+        return move_to(x, y) + line_to(x + w, y) + line_to(x + w, y + h) + line_to(x, y + h) + " Z"
+    }
+    // Top edge rounded (a bar growing UP from a baseline below it).
+    move_to(x, y + h) +
+        line_to(x, y + r) +
+        " Q " + n2(x) + " " + n2(y) + " " + n2(x + r) + " " + n2(y) +
+        line_to(x + w - r, y) +
+        " Q " + n2(x + w) + " " + n2(y) + " " + n2(x + w) + " " + n2(y + r) +
+        line_to(x + w, y + h) +
+        " Z"
+}
+
+// A donut segment between two angles (radians, 0 = 3 o'clock, growing
+// clockwise in canvas space) as a closed path with both arcs.
+export fn arc_path(cx, cy, r_in, r_out, a0, a1) {
+    let sweep = a1 - a0
+    if abs(sweep) < 0.0001 { return "" }
+    // A single arc command can't describe more than half a circle
+    // unambiguously without the large-arc flag; set it when we're past π.
+    let large = if abs(sweep) > 3.14159265358979 { "1" } else { "0" }
+    let x0 = cx + r_out * cos(a0)
+    let y0 = cy + r_out * sin(a0)
+    let x1 = cx + r_out * cos(a1)
+    let y1 = cy + r_out * sin(a1)
+    let x2 = cx + r_in * cos(a1)
+    let y2 = cy + r_in * sin(a1)
+    let x3 = cx + r_in * cos(a0)
+    let y3 = cy + r_in * sin(a0)
+    move_to(x0, y0) +
+        " A " + n2(r_out) + " " + n2(r_out) + " 0 " + large + " 1 " + n2(x1) + " " + n2(y1) +
+        line_to(x2, y2) +
+        " A " + n2(r_in) + " " + n2(r_in) + " 0 " + large + " 0 " + n2(x3) + " " + n2(y3) +
+        " Z"
+}
+
+// Slice angles for a donut: start at 12 o'clock and go clockwise, which is
+// where a reader's eye starts. Zero and negative values are dropped — a pie of
+// negatives is not a pie.
+export fn donut_angles(values) {
+    let mut total = 0.0
+    for v in values { let f = to_float(v)  if f > 0.0 { total = total + f } }
+    if total <= 0.0 { return { total: 0.0, spans: [] } }
+    let start = -1.5707963267948966
+    let mut spans = []
+    let mut a = start
+    let mut i = 0
+    while i < len(values) {
+        let f = to_float(values[i])
+        let frac = if f > 0.0 { f / total } else { 0.0 }
+        let sweep = frac * 6.283185307179586
+        spans = push(spans, { i: i, a0: a, a1: a + sweep, frac: frac })
+        a = a + sweep
+        i = i + 1
+    }
+    { total: total, spans: spans }
+}

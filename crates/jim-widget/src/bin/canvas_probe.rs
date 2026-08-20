@@ -92,6 +92,15 @@ fn main() -> ExitCode {
         .add_plugins(jim_style::chrome_theme::ChromeThemePlugin)
         .add_systems(Startup, jim_editor::setup_editor_font);
     app.add_message::<claude_bus_bevy::ClaudeBusEvent>();
+    // The widget host reads the embedded-editor messages (Element::Editor), so
+    // those message types have to exist even when no editor is on screen —
+    // without them a widget system fails param validation and the app dies
+    // before the capture frame.
+    app.add_message::<jim_editor::EmbeddedEditorPress>()
+        .add_message::<jim_editor::EmbeddedEditorDrag>()
+        .add_message::<jim_editor::EmbeddedEditorRelease>()
+        .add_message::<jim_editor::EmbeddedEditorScroll>()
+        .add_message::<jim_editor::EmbeddedEditorSubmit>();
     app.add_plugins(PanePlugin {
         reserved_layers: vec![32],
     })

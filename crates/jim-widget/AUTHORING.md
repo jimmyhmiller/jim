@@ -405,6 +405,41 @@ anchors top-left and stretches — fine for a texture, wrong for a photo.
 An image with no size from the flex tree claims a default minimum height
 so it can't silently collapse to nothing.
 
+### Drawing: canvas paths
+
+`Canvas` children are absolutely positioned (`x`/`y` in pixels from the
+canvas box's top-left, y DOWN) and every one of them **requires an `id`**
+— omit it and the whole frame fails to deserialize, leaving the pane
+blank. Alongside `rect` / `text` / `sprite` there is `path`, which draws
+real vector geometry:
+
+```funct
+{ kind: "canvas", style: { width: "100%", height: "220" }, children: [
+    // A filled area with a 25%-alpha wash, plus the line on top.
+    { kind: "path", id: "area", d: "M 20 200 L 20 120 C 60 90 100 170 140 110 L 140 200 Z",
+      fill: "#3c7ae040" },
+    { kind: "path", id: "line", d: "M 20 120 C 60 90 100 170 140 110",
+      stroke: "#4c8fd8", stroke_width: 2.0, cap: "round", join: "round" },
+] }
+```
+
+`d` is SVG path data: `M L H V C S Q T A Z` and their relative lowercase
+forms, so arcs (donuts) and beziers (curved edges) are available, not
+just polylines. Malformed data logs a clear error naming the offending
+byte and skips that one item — it never draws something else instead.
+
+Give a path `fill`, `stroke`, or both (fill paints first). A translucent
+color is composited on the CPU against `bg` — which defaults to the
+theme's `pane_bg` — because Bevy 0.19 will not render a blend-mode mesh
+through a per-pane camera. Set `bg` explicitly when a path sits on top of
+some other fill rather than on the bare pane.
+
+Before `path` existed, chart widgets drew lines as rows of rotated
+`rect`s (`df_view_line.ft`); that trick is no longer necessary.
+`cargo run --release -p jim_widget --bin path_probe` renders fills,
+strokes, arcs and an alpha wash in a real pane and checks the resulting
+pixels, which is how we know this path survives the pane camera.
+
 ### Revealing panes by name (pane groups)
 
 A widget can show and hide *other* panes — a dashboard of live terminals,

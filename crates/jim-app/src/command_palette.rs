@@ -60,6 +60,8 @@ const TOP_MARGIN: f32 = 96.0;
 const MAX_ROWS: usize = 10;
 /// Synthetic result-row id for the "Ask DeepSeek" entry.
 const ASK_ID: &str = "__ask_deepseek__";
+/// Synthetic row for "type a URL, get a web pane".
+const OPEN_URL_ID: &str = "__open_url__";
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteMode {
@@ -70,6 +72,31 @@ pub enum PaletteMode {
     Busy,
     /// The agent finished; final answer + transcript shown until dismissed.
     Plan,
+}
+
+/// Does what was typed look like somewhere to browse?
+///
+/// Deliberately conservative — this row sits at the top of the results, so it
+/// must not appear for ordinary action searches like "terminal" or "editor".
+/// Accepts an explicit scheme, `localhost[:port]`, or something with a dot and
+/// no spaces (`example.com`, `docs.rs/serde`).
+fn as_url(q: &str) -> Option<String> {
+    let q = q.trim();
+    if q.is_empty() || q.contains(char::is_whitespace) {
+        return None;
+    }
+    if q.starts_with("http://") || q.starts_with("https://") || q.starts_with("file://") {
+        return Some(q.to_string());
+    }
+    let host = q.split('/').next().unwrap_or(q);
+    if host == "localhost" || host.starts_with("localhost:") {
+        return Some(format!("http://{q}"));
+    }
+    // A dot with something either side, e.g. example.com — but not "0.5" or
+    // a bare filename like "lib.rs" typed while searching.
+    let (before, after) = host.split_once('.')?;
+    let tld_like = after.len() >= 2 && after.chars().all(|c| c.is_ascii_alphabetic() || c == '.');
+    (!before.is_empty() && tld_like).then(|| format!("https://{q}"))
 }
 
 /// One line of the agent transcript shown in the palette.
@@ -301,6 +328,19 @@ fn refresh_results(
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
     let mut rows: Vec<PaletteRow> = scored.into_iter().map(|(_, r)| r).collect();
+    if let Some(url) = as_url(q) {
+        // Above the DeepSeek row: if it parses as a URL, opening it is almost
+        // always what was meant.
+        rows.insert(
+            0,
+            PaletteRow {
+                id: OPEN_URL_ID,
+                title: format!("Open URL: {url}"),
+                category: "Panes",
+                keybind: None,
+            },
+        );
+    }
     if !q.is_empty() {
         rows.push(PaletteRow {
             id: ASK_ID,
@@ -328,6 +368,8 @@ fn palette_input(
     mut invocations: ResMut<ActionInvocations>,
     mut agent_ch: ResMut<AgentChannel>,
     mut usage: ResMut<PaletteUsage>,
+    // Carries the typed URL to the `pane.open_url` action.
+    mut runtime: ResMut<crate::actions::RuntimeActions>,
     mut open_req: ResMut<PaletteOpenRequest>,
     keymap: Res<Keymap>,
 ) {
@@ -376,6 +418,18 @@ fn palette_input(
                     if let Some(row) = palette.results.get(palette.selected).cloned() {
                         if row.id == ASK_ID {
                             start_agent(&mut palette, &projects, &pane_registry, &mut agent_ch);
+                        } else if row.id == OPEN_URL_ID {
+                            // The pane kind is fixed; the URL is whatever was
+                            // typed, so hand it over as the action's config.
+                            if let Some(url) = as_url(&palette.query) {
+                                runtime.set_config(
+                                    crate::actions::WEBVIEW_URL_ACTION,
+                                    serde_json::json!({ "url": url }),
+                                );
+                                usage.bump(crate::actions::WEBVIEW_URL_ACTION);
+                                invocations.request(crate::actions::WEBVIEW_URL_ACTION, None);
+                            }
+                            close(&mut palette);
                         } else {
                             usage.bump(row.id);
                             invocations.request(row.id, None);

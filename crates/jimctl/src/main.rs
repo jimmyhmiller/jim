@@ -27,6 +27,8 @@ mod cmd_mcp;
 mod cmd_memory;
 mod cmd_msg;
 mod cmd_open;
+mod cmd_web;
+mod cmd_pad;
 mod cmd_pi;
 mod cmd_project;
 mod cmd_review;
@@ -45,6 +47,8 @@ pub fn sub_args() -> impl Iterator<Item = String> {
 fn main() -> ExitCode {
     match std::env::args().nth(1).as_deref() {
         Some("open") => cmd_open::run(),
+        Some("web") => cmd_web::run(),
+        Some("pad") => cmd_pad::run(),
         Some("widget") => cmd_widget::run(),
         Some("channel") => cmd_channel::run(),
         Some("codex") => cmd_codex::run(),
@@ -94,7 +98,8 @@ fn usage() {
         "usage: jimctl <command> [args...]\n\
          \n\
          commands:\n\
-         \topen <file> [--project NAME]   open a file in an editor pane\n\
+         \topen <file|url> [--project N]  open a file in an editor pane, or a URL in a web pane\n\
+         \tweb <url> [--project NAME]     open a URL in a web pane (browser)\n\
          \twidget ...                     spawn/control a widget pane\n\
          \tchannel                        MCP channel bridging a Claude session to the agent bus\n\
          \tcodex                          bridge a Codex (codex-cli) session onto the agent bus\n\
@@ -114,6 +119,7 @@ fn usage() {
          \tlsp ...                        structural code queries via rust-analyzer (ensure/symbols/source/rpc)\n\
          \tmemory ...                     manage the DeepSeek planner's memory\n\
          \tinject ...                     send keystrokes into a session\n\
-         \ttrace [--arm|--disarm] [--ms N]  control the frame-trace recorder at runtime"
+         \ttrace [--arm|--disarm] [--ms N]  control the frame-trace recorder at runtime\n\
+         \tpad ...                        write cells into a live notebook pane"
     );
 }

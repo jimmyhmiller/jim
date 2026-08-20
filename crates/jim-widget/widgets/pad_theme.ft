@@ -1,0 +1,89 @@
+// pad_theme.ft — the notebook's palette and type scale.
+//
+// A pad reads like a typeset report rather than a dashboard: one text color
+// with a muted second rank, hairline rules, no boxes around anything, and
+// generous space between cells doing the work that borders would otherwise do.
+//
+// Every color comes from the active jim theme through `theme_get`, so a
+// notebook re-themes with the rest of the editor instead of carrying its own
+// hardcoded paper color. The fallbacks only apply when a theme omits a token.
+extern fn theme_get(token)
+
+fn tc(token, fb) {
+    let c = theme_get(token)
+    if typeof(c) == "Str" { c } else { fb }
+}
+
+// ---- ink --------------------------------------------------------------------
+
+export fn ink()        = tc("fg", "#e6e9f0")
+export fn ink_muted()  = tc("fg_muted", "#9098a4")
+export fn rule()       = tc("chrome_divider", "#3a414e")
+export fn accent()     = tc("accent", "#8fe3b0")
+export fn surface()    = tc("surface_2", "#12151b")
+export fn surface_alt() = tc("surface_1", "#0e1116")
+export fn paper()      = tc("pane_bg", "#0b0e13")
+
+export fn col_info()    = tc("accent", "#8fe3b0")
+export fn col_success() = tc("status_success", "#8fe3b0")
+export fn col_warn()    = tc("warn", "#e0b066")
+export fn col_error()   = tc("err", "#e08a8a")
+
+// ---- type -------------------------------------------------------------------
+
+export fn font_body()    = "font_family_body"
+export fn font_heading() = "font_family_heading"
+export fn font_mono()    = "mono"
+
+// Heading sizes, h1..h6. A pad's h1 is a report title, so it leads by a lot.
+fn heading_sizes() = [25.0, 20.5, 17.5, 15.5, 14.5, 13.5]
+export fn size_heading(level) {
+    let l = if level < 1 { 1 } else { if level > 6 { 6 } else { level } }
+    unwrap_or(get(heading_sizes(), l - 1), 14.5)
+}
+export fn size_body()  = 14.5
+export fn size_small() = 12.5
+export fn size_tiny()  = 11.0
+export fn size_mono()  = 12.5
+
+// ---- spacing ----------------------------------------------------------------
+
+// The gap BETWEEN cells. Large on purpose: space is what separates cells in a
+// typeset document, so nothing needs a border.
+export fn gap_cell()  = 26.0
+export fn gap_block() = 10.0
+export fn pad_page()  = 22.0
+
+// ---- alpha ------------------------------------------------------------------
+
+fn hexd(d) = slice("0123456789abcdef", d, 1)
+
+// A color at `a` (0..255) alpha, as #rrggbbaa. Element colors accept the alpha
+// byte; canvas paths composite it against the pane background themselves.
+export fn alpha(color, a) {
+    let m = if a < 0 { 0 } else { if a > 255 { 255 } else { to_int(a) } }
+    // A color that already carries alpha would end up 10 chars long.
+    let base = if len(color) >= 9 { slice(color, 0, 7) } else { color }
+    base + hexd(m / 16) + hexd(m - (m / 16) * 16)
+}
+
+// The categorical series palette, reusing the syntax scale every theme
+// defines. Eight entries, which is also the cap the CLI enforces on a chart —
+// past that the colors stop being separable.
+fn series_tokens() = ["syntax_keyword", "syntax_function", "syntax_type",
+                      "syntax_string", "syntax_constant", "syntax_attribute",
+                      "syntax_property", "syntax_operator"]
+
+export fn series_count() = 8
+
+export fn series_color(i) {
+    let toks = series_tokens()
+    let n = len(toks)
+    let idx = ((i % n) + n) % n
+    tc(unwrap_or(get(toks, idx), "accent"), "#8fe3b0")
+}
+
+// A single-series chart is not a categorical problem, so it doesn't get a
+// categorical color — it gets one muted ink tone, the way a printed figure
+// would.
+export fn series_solo() = tc("syntax_function", "#7aa2d8")

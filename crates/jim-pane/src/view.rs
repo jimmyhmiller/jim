@@ -32,7 +32,7 @@
 //! instead of the global viewport.
 
 use bevy::math::{Rect, Vec2};
-use bevy::prelude::Resource;
+use bevy::prelude::{Entity, Resource};
 
 use crate::PaneViewport;
 
@@ -63,6 +63,16 @@ pub struct View {
     /// Which project's panes this view shows. `None` = whatever the host
     /// considers active (the root's meaning).
     pub project: Option<u64>,
+    /// The pane this view is embedded in. `None` for [`ROOT_VIEW`] (the
+    /// window is nobody's child).
+    ///
+    /// Input needs this: the host pane covers its own view's rect, and it
+    /// is usually the TOPMOST thing there (a presenting deck sits at
+    /// `z = 500` and fills the window). Without knowing the host, every
+    /// click aimed at a pane *inside* the view is swallowed by the pane the
+    /// view is drawn in — which is how a live project view ends up looking
+    /// interactive and being inert.
+    pub host: Option<Entity>,
     /// 0 for the root; `parent.depth + 1` otherwise.
     pub depth: u8,
 }
@@ -91,6 +101,7 @@ impl Default for Views {
             views: vec![View {
                 id: ROOT_VIEW,
                 parent: None,
+                host: None,
                 // Filled in each frame by the host from the real window.
                 rect: Rect::from_corners(Vec2::ZERO, Vec2::new(f32::MAX, f32::MAX)),
                 transform: PaneViewport::default(),
@@ -142,6 +153,7 @@ impl Views {
         rect: Rect,
         transform: PaneViewport,
         project: Option<u64>,
+        host: Option<Entity>,
     ) -> Option<ViewId> {
         let depth = self.get(parent)?.depth.checked_add(1)?;
         if depth > MAX_VIEW_DEPTH {
@@ -155,6 +167,7 @@ impl Views {
             rect,
             transform,
             project,
+            host,
             depth,
         });
         Some(id)
@@ -221,6 +234,25 @@ impl Views {
         }
     }
 
+    /// Is `pane` the host of `view` or of any view it nests inside?
+    ///
+    /// Hit-testing asks this to skip the panes a point is looking
+    /// *through*. A click inside a slide's live project view is aimed at
+    /// the project, not at the slide — and not at whatever hosts the slide
+    /// either, so the whole ancestor chain is excluded, not just the
+    /// nearest host. The root view has no host, so this is always false in
+    /// a one-view world and the ordinary hit-test is unchanged.
+    pub fn is_host_of(&self, view: ViewId, pane: Entity) -> bool {
+        let mut cur = self.get(view);
+        while let Some(v) = cur {
+            if v.host == Some(pane) {
+                return true;
+            }
+            cur = v.parent.and_then(|p| self.get(p));
+        }
+        false
+    }
+
     /// Project framed by the deepest view under a window point.
     pub fn project_at(&self, window_pt: Vec2) -> Option<u64> {
         let (id, _) = self.resolve(window_pt);
@@ -253,6 +285,7 @@ mod tests {
                 Rect::from_corners(Vec2::new(200.0, 200.0), Vec2::new(600.0, 600.0)),
                 vp(0.5, Vec2::ZERO),
                 Some(2),
+                None,
             )
             .expect("child fits under the depth cap");
         (v, child)
@@ -306,15 +339,46 @@ mod tests {
         let mut parent = ROOT_VIEW;
         for depth in 1..=MAX_VIEW_DEPTH {
             parent = v
-                .insert(parent, rect, PaneViewport::default(), None)
+                .insert(parent, rect, PaneViewport::default(), None, None)
                 .unwrap_or_else(|| panic!("depth {depth} must be allowed"));
             assert_eq!(v.get(parent).unwrap().depth, depth);
         }
         assert!(
-            v.insert(parent, rect, PaneViewport::default(), None)
+            v.insert(parent, rect, PaneViewport::default(), None, None)
                 .is_none(),
             "one past the cap must be refused"
         );
+    }
+
+    /// The pane a view is drawn INSIDE is looked through, not at. Without
+    /// this, a click aimed at a project embedded in a slide is taken by the
+    /// slide — which, while presenting, covers the whole window — and the
+    /// embedded project is a picture instead of the real thing.
+    #[test]
+    fn a_view_looks_through_its_host_chain() {
+        let deck = Entity::from_raw_u32(11).expect("valid entity");
+        let outer_host = Entity::from_raw_u32(12).expect("valid entity");
+        let bystander = Entity::from_raw_u32(13).expect("valid entity");
+        let rect = Rect::from_corners(Vec2::ZERO, Vec2::new(100.0, 100.0));
+        let mut v = Views::default();
+        let outer = v
+            .insert(
+                ROOT_VIEW,
+                rect,
+                PaneViewport::default(),
+                None,
+                Some(outer_host),
+            )
+            .unwrap();
+        let inner = v
+            .insert(outer, rect, PaneViewport::default(), None, Some(deck))
+            .unwrap();
+
+        assert!(v.is_host_of(inner, deck), "the view's own host");
+        assert!(v.is_host_of(inner, outer_host), "and every host above it");
+        assert!(!v.is_host_of(inner, bystander));
+        // The root has no host, so a one-view world hit-tests as it always did.
+        assert!(!v.is_host_of(ROOT_VIEW, deck));
     }
 
     /// Removing a view takes its whole subtree — a leaked grandchild would
@@ -324,10 +388,10 @@ mod tests {
         let mut v = Views::default();
         let rect = Rect::from_corners(Vec2::ZERO, Vec2::new(100.0, 100.0));
         let child = v
-            .insert(ROOT_VIEW, rect, PaneViewport::default(), None)
+            .insert(ROOT_VIEW, rect, PaneViewport::default(), None, None)
             .unwrap();
         let grandchild = v
-            .insert(child, rect, PaneViewport::default(), None)
+            .insert(child, rect, PaneViewport::default(), None, None)
             .unwrap();
         assert_eq!(v.len(), 3);
         v.remove(child);

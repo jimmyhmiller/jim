@@ -252,6 +252,14 @@ extern fn rand_int(lo, hi)
 extern fn hash_str(s)
 extern fn time()
 
+// --- text metrics ---
+// Exact widths from the host's font metrics (the same ones the renderer lays
+// text out with). Canvas labels must be positioned with these, not with a
+// guessed `len * size * ratio` — that over- and under-shoots by enough to
+// overlap axis ticks.
+extern fn measure_text(s, size)
+extern fn char_width(size)
+
 // --- markdown ---
 // md_parse(text) -> [ { kind, level, ordered, indent, lang, lines: [[run]] } ]
 //   kind: "paragraph" | "blank" | "heading" | "code-block" | "block-quote"
@@ -2131,13 +2139,15 @@ mod tests {
             }
             find(&el).expect("a heading run")
         };
-        // deck.glz: size_h1 = 64 at the 1280x720 reference.
+        // deck.glz: size_h1 at the 1280x720 reference. Read it from the
+        // sheet rather than hard-coding: the point of this test is that the
+        // SCALE still applies, and pinning the absolute size made a routine
+        // type-scale tweak look like a scaling regression.
         let full = heading_size(&mut d.vm, 1280.0, 720.0);
-        assert!((full - 64.0).abs() < 0.01, "reference size, got {full}");
         let half = heading_size(&mut d.vm, 640.0, 360.0);
         assert!(
-            (half - 32.0).abs() < 0.01,
-            "half-size pane halves type, got {half}"
+            (half - full / 2.0).abs() < 0.01,
+            "a half-size pane halves type: {full} -> {half}"
         );
     }
 

@@ -87,6 +87,23 @@ Wait for the script to confirm that Jim launched before reporting completion.
   model. `crates/jim-inference` — classifier prompts + `style-muse`.
   `crates/claude-bus*` + `claude-*` — Claude Code event bus & hook
   tools (kept plain; reusable outside Jim).
+- `crates/jim-webview` — web pane (kind `"webview"`), backed by Chromium.
+  jim does **not** link CEF. `crates/jim-webview-host` is a separate binary
+  that owns CEF and one browser; jim talks to it over a unix socket and gets
+  frames as **IOSurface ids** (a u32 — pixels never cross the socket, they
+  stay in GPU-shareable memory). `crates/jim-webview-helper` (`jim-helper`)
+  is the tiny executable Chromium launches its renderer/GPU processes from;
+  `make-bundle.sh` copies it into five `Jim Helper*.app` bundles.
+  Out-of-process is NOT optional: in-process CEF crashes jim, because Bevy
+  runs AppKit's `-[NSApplication run]` loop and Chromium's macOS message pump
+  installs CFRunLoop observers that trap inside it (EXC_BREAKPOINT under
+  `__CFRunLoopDoObservers`). Adding `CrAppProtocol` to `NSApplication` at
+  runtime does not help.
+  Servo was tried first and abandoned: it could not resize acceptably —
+  270-666ms (occasionally ~10s) from a pane resize to a correctly sized
+  frame, with a 100% blank white frame in between. CEF does the same resize
+  in ~83ms and never emits a blank frame.
+
 - `crates/jimctl` — the `jim`-control CLI multi-tool. One binary with
   subcommands (`jimctl open|widget|inbox|project|suggest|msg|close|
   issue|inject`), replacing the old `tb*` binaries. Deliberately
@@ -97,6 +114,30 @@ The GUI's LaunchServices identity (`CFBundleIdentifier =
 com.jimmyhmiller.terminal-bevy`) is FROZEN despite the rename — changing
 it would lose the Dock pin. Same for the `TERMINAL_BEVY_*` runtime env
 vars and the `/tmp/.terminal-bevy` socket dir.
+
+## Chromium (CEF) webview gotchas
+
+Learned the hard way; all of these fail silently or crash rather than
+explaining themselves:
+
+- **Helper bundle ids must all be `<main id>.helper`.** Chromium derives the
+  Mach rendezvous service name by stripping ONE `.helper` suffix from the
+  running bundle id. Per-type ids (`.helper.gpu`) break the lookup with
+  `bootstrap_look_up …MachPortRendezvousServer.N: Unknown service name` and
+  every renderer dies at startup.
+- **Each host needs its own `root_cache_path`.** Chromium enforces a process
+  singleton on the cache dir, so the second host's `cef::initialize` just
+  fails and that pane never renders.
+- **`screen_info` must report the device scale factor.** Without it CEF
+  assumes 1.0, paints logical-sized frames, and the pane draws at half size.
+- **The host's socket must stay blocking.** Non-blocking makes
+  `BufReader::lines()` return `WouldBlock` immediately, the command reader
+  exits on its first poll, and every resize/scroll jim sends is dropped.
+- **Never put non-finite floats on the wire.** jim signals pointer-leave with
+  `x = inf`; `serde_json` writes that as `null` and the host rejects the
+  message.
+- **The host must exit on socket EOF**, or it is orphaned to PID 1 on every
+  `dev-restart` and its Chromium helpers accumulate.
 
 ## libghostty-vt patch (fork) + zig 0.16
 

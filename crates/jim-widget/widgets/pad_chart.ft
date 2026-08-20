@@ -1,0 +1,583 @@
+// pad_chart.ft — chart cells, drawn with canvas paths.
+//
+// Six chart types: line, area, scatter, bar, donut, histogram. The geometry
+// lives in pad_scale.ft (pure, tested); this module turns it into canvas items
+// and decides what a chart should LOOK like.
+//
+// The house style, which is why several things here are deliberate rather than
+// configurable:
+//   - one muted color for a single series; the categorical palette only
+//     appears when there are series to tell apart
+//   - a legend only when there are two or more series, and line charts label
+//     their ends directly instead, so color is never the only channel
+//   - bars start at zero and round only the end that carries the data
+//   - a null y breaks the line rather than diving it to the floor
+import "host"
+import { x_kind, points_of, x_of, y_of, is_gap, x_value, categories_of,
+         y_axis, scale, apply_scale, band, band_center, band_start,
+         label_step, histogram, polyline, area_path, bar_path, arc_path,
+         donut_angles, is_number } from "pad_scale"
+import { number, tick, date_tick, fixed } from "pad_fmt"
+import { ink, ink_muted, rule, accent, surface_alt, paper,
+         font_body, font_heading, font_mono, size_body, size_small, size_tiny,
+         series_color, series_solo, alpha } from "pad_theme"
+import { cell_rec, cell_str } from "pad_log"
+import { cell_error, caption } from "pad_cells"
+
+// ---- geometry constants -----------------------------------------------------
+
+fn plot_h() = 230.0
+fn pad_top() = 10.0
+fn pad_bottom() = 30.0
+fn pad_right() = 14.0
+fn tick_size() = 10.0
+fn label_size() = 11.0
+
+// ---- spec accessors ---------------------------------------------------------
+
+fn spec_str(spec, k) {
+    let v = unwrap_or(get(spec, k), "")
+    if typeof(v) == "Str" { v } else { "" }
+}
+
+fn spec_num(spec, k) = unwrap_or(get(spec, k), "")
+
+fn spec_arr(spec, k) {
+    let v = unwrap_or(get(spec, k), [])
+    if typeof(v) == "List" { v } else { [] }
+}
+
+fn spec_bool(spec, k) {
+    let v = unwrap_or(get(spec, k), false)
+    if typeof(v) == "Bool" { v } else { false }
+}
+
+fn series_name(s, i) {
+    let n = unwrap_or(get(s, "name"), "")
+    if typeof(n) == "Str" and n != "" { n } else { "series " + str(i + 1) }
+}
+
+// A single series isn't a categorical problem, so it doesn't get a categorical
+// color.
+fn color_for(i, count) = if count <= 1 { series_solo() } else { series_color(i) }
+
+// ---- canvas item helpers ----------------------------------------------------
+
+fn path_item(id, d, fill, stroke, w) {
+    let mut it = { kind: "path", id: id, d: d }
+    if fill != "" { it = assoc(it, "fill", fill) }
+    if stroke != "" {
+        it = assoc(it, "stroke", stroke)
+        it = assoc(it, "stroke_width", w)
+        it = assoc(it, "cap", "round")
+        it = assoc(it, "join", "round")
+    }
+    // Paths flatten their own alpha against this, so tell them what they sit
+    // on rather than letting them guess.
+    assoc(it, "bg", paper())
+}
+
+fn rect_item(id, x, y, w, h, color) =
+    { kind: "rect", id: id, x: x, y: y, w: w, h: h, color: color, anchor: "top-left" }
+
+fn text_item(id, x, y, value, size, color, anchor, family) =
+    { kind: "text", id: id, x: x, y: y, value: value, size: size, color: color,
+      anchor: anchor, family: family }
+
+fn cat(a, b) {
+    let mut out = a
+    for x in b { out = push(out, x) }
+    out
+}
+
+// ---- axes -------------------------------------------------------------------
+
+// Ticks + grid lines + the baseline. Grid is a hairline the marks sit on, not
+// a cage around them: no box, no vertical rules.
+fn y_axis_items(axis, sy, left, plot_w, id_prefix) {
+    let mut items = []
+    let mut i = 0
+    for t in axis.ticks {
+        let y = apply_scale(sy, t)
+        items = push(items, rect_item(id_prefix + "g" + str(i), left, y, plot_w, 1.0,
+                                      alpha(rule(), 110)))
+        items = push(items, text_item(id_prefix + "t" + str(i), left - 6.0, y,
+                                      tick(t), tick_size(), ink_muted(), "center",
+                                      font_mono()))
+        i = i + 1
+    }
+    items
+}
+
+// Width the y tick labels need, so the plot starts where they end.
+fn y_axis_width(axis) {
+    let mut widest = 0.0
+    for t in axis.ticks {
+        let w = measure_text(tick(t), tick_size())
+        if w > widest { widest = w }
+    }
+    widest + 12.0
+}
+
+// ---- xy charts (line / area / scatter) --------------------------------------
+
+fn xy_points(s, kind, cats, sx, sy) {
+    let mut runs = []
+    let mut cur = []
+    let mut i = 0
+    for p in points_of(s) {
+        let y = y_of(p)
+        if is_gap(y) {
+            // A gap closes the current run; the next value starts a new one, so
+            // the line is broken rather than bridged.
+            if len(cur) > 0 { runs = push(runs, cur)  cur = [] }
+            i = i + 1
+            continue
+        }
+        let px = apply_scale(sx, x_value(x_of(p), kind, cats))
+        let py = apply_scale(sy, unwrap_or(y, 0.0))
+        cur = push(cur, { x: px, y: py })
+        i = i + 1
+    }
+    if len(cur) > 0 { runs = push(runs, cur) }
+    runs
+}
+
+fn x_tick_items(kind, cats, sx, sy, axis, left, plot_w, baseline, series) {
+    let mut items = []
+    if kind == "category" {
+        let mut widths = []
+        for c in cats { widths = push(widths, measure_text(str(c), label_size())) }
+        let slot = if len(cats) > 0 { plot_w / to_float(len(cats)) } else { plot_w }
+        let step = label_step(widths, slot)
+        let mut i = 0
+        while i < len(cats) {
+            if i % step == 0 {
+                items = push(items, text_item("xc" + str(i), apply_scale(sx, to_float(i)),
+                                              baseline + 8.0, str(cats[i]), label_size(),
+                                              ink_muted(), "top-center", font_body()))
+            }
+            i = i + 1
+        }
+        return items
+    }
+    // Numeric and date axes get their own nice ticks along x.
+    let mut lo = sx.d0
+    let mut hi = sx.d1
+    let span = hi - lo
+    let steps = 5
+    let mut i = 0
+    let mut last = ""
+    while i <= steps {
+        let v = lo + span * (to_float(i) / to_float(steps))
+        let label = if kind == "date" { date_tick(v, span) } else { tick(v) }
+        // A date axis at day grain repeats its label when the span is short;
+        // showing it once is enough.
+        if label != last {
+            items = push(items, text_item("xn" + str(i), apply_scale(sx, v),
+                                          baseline + 8.0, label, tick_size(),
+                                          ink_muted(), "top-center", font_mono()))
+            last = label
+        }
+        i = i + 1
+    }
+    items
+}
+
+fn render_xy(spec, kind_name, width) {
+    let series = spec_arr(spec, "series")
+    if len(series) == 0 { return cell_error("chart", "this ${kind_name} chart has no series") }
+    let xk = x_kind(series)
+    if not xk.ok { return cell_error("chart", xk.error) }
+    let kind = xk.kind
+    let cats = if kind == "category" { categories_of(series) } else { [] }
+
+    // Lines and scatters don't force zero (it flattens a series that lives far
+    // from it); an area chart is a filled quantity, so it does.
+    let include_zero = kind_name == "area"
+    let axis = y_axis(series, include_zero, spec_num(spec, "y_min"), spec_num(spec, "y_max"), 5)
+    let left = y_axis_width(axis)
+    let plot_w = width - left - pad_right()
+    if plot_w < 60.0 { return cell_error("chart", "the pane is too narrow to draw this chart") }
+    let top = pad_top()
+    let baseline = top + plot_h()
+    let sy = scale(axis.min, axis.max, baseline, top)
+
+    // A band-ish inset keeps the first and last marks off the axis ends.
+    let sx = if kind == "category" {
+        let b = band(len(cats), left, left + plot_w, 0.0)
+        scale(0.0, to_float(len(cats) - 1),
+              band_center(b, 0), band_center(b, len(cats) - 1))
+    } else {
+        let mut lo = 0.0
+        let mut hi = 0.0
+        let mut any = false
+        for s in series {
+            for p in points_of(s) {
+                let v = x_value(x_of(p), kind, cats)
+                if not any { lo = v  hi = v  any = true }
+                if v < lo { lo = v }
+                if v > hi { hi = v }
+            }
+        }
+        scale(lo, hi, left + 4.0, left + plot_w - 4.0)
+    }
+
+    let mut items = y_axis_items(axis, sy, left, plot_w, "y")
+    items = push(items, rect_item("axis", left, baseline, plot_w, 1.0, alpha(rule(), 200)))
+    items = cat(items, x_tick_items(kind, cats, sx, sy, axis, left, plot_w, baseline, series))
+
+    let n = len(series)
+    let mut si = 0
+    while si < n {
+        let s = series[si]
+        let color = color_for(si, n)
+        let runs = xy_points(s, kind, cats, sx, sy)
+        let mut ri = 0
+        for run in runs {
+            let id = "s" + str(si) + "r" + str(ri)
+            if kind_name == "area" and len(run) >= 2 {
+                items = push(items, path_item(id + "a", area_path(run, apply_scale(sy, axis.min)),
+                                              alpha(color, 46), "", 0.0))
+            }
+            if kind_name != "scatter" and len(run) >= 2 {
+                items = push(items, path_item(id, polyline(run), "", color, 2.0))
+            }
+            if kind_name == "scatter" or len(run) == 1 {
+                let mut pi = 0
+                for pt in run {
+                    items = push(items, path_item(id + "d" + str(pi), dot_path(pt.x, pt.y, 2.5),
+                                                  color, "", 0.0))
+                    pi = pi + 1
+                }
+            }
+            ri = ri + 1
+        }
+        // Label the line at its end, so a reader never has to match a color to
+        // a legend entry to know which series they're looking at.
+        if n > 1 and len(runs) > 0 {
+            let last_run = runs[len(runs) - 1]
+            if len(last_run) > 0 {
+                let tip = last_run[len(last_run) - 1]
+                items = push(items, text_item("e" + str(si), tip.x + 6.0, tip.y,
+                                              series_name(s, si), label_size(), color,
+                                              "center", font_body()))
+            }
+        }
+        si = si + 1
+    }
+
+    chart_frame(spec, items, width, baseline + pad_bottom())
+}
+
+// A filled circle, as four quarter arcs — the marker for a scatter point or a
+// lone value with no neighbours to connect to.
+fn dot_path(cx, cy, r) {
+    let n = fixed(r, 2)
+    "M " + fixed(cx - r, 2) + " " + fixed(cy, 2) +
+        " A " + n + " " + n + " 0 1 1 " + fixed(cx + r, 2) + " " + fixed(cy, 2) +
+        " A " + n + " " + n + " 0 1 1 " + fixed(cx - r, 2) + " " + fixed(cy, 2) + " Z"
+}
+
+// ---- bar --------------------------------------------------------------------
+
+fn bar_series_values(s) {
+    let v = unwrap_or(get(s, "values"), [])
+    if typeof(v) == "List" { v } else { [] }
+}
+
+// Bar charts carry their values as `{categories, series:[{name, values}]}`
+// rather than points, so they need their own domain walk.
+fn bar_domain(series, stacked) {
+    let mut lo = 0.0
+    let mut hi = 0.0
+    if stacked {
+        let mut ci = 0
+        let width = bar_width(series)
+        while ci < width {
+            let mut pos = 0.0
+            let mut neg = 0.0
+            for s in series {
+                let v = to_float(unwrap_or(get(bar_series_values(s), ci), 0))
+                if v >= 0.0 { pos = pos + v } else { neg = neg + v }
+            }
+            if pos > hi { hi = pos }
+            if neg < lo { lo = neg }
+            ci = ci + 1
+        }
+        return { lo: lo, hi: hi }
+    }
+    for s in series {
+        for v0 in bar_series_values(s) {
+            let v = to_float(v0)
+            if v > hi { hi = v }
+            if v < lo { lo = v }
+        }
+    }
+    { lo: lo, hi: hi }
+}
+
+fn bar_width(series) {
+    let mut w = 0
+    for s in series {
+        let n = len(bar_series_values(s))
+        if n > w { w = n }
+    }
+    w
+}
+
+fn render_bar(spec, width) {
+    let series = spec_arr(spec, "series")
+    if len(series) == 0 { return cell_error("chart", "this bar chart has no series") }
+    if spec_bool(spec, "horizontal") {
+        return cell_error("chart",
+            "horizontal bars aren't drawn yet — remove `horizontal` to get a vertical chart")
+    }
+    let stacked = spec_bool(spec, "stacked")
+    let cats = spec_arr(spec, "categories")
+    let n_cats = if len(cats) > 0 { len(cats) } else { bar_width(series) }
+    if n_cats == 0 { return cell_error("chart", "this bar chart has no values") }
+
+    let dom = bar_domain(series, stacked)
+    if stacked and dom.lo < 0.0 {
+        // Stacking mixed signs makes segment lengths unreadable — they'd cross
+        // the baseline mid-stack.
+        return cell_error("chart",
+            "a stacked bar chart can't mix positive and negative values; split them into two charts")
+    }
+    // A bar's length is only meaningful from zero.
+    let axis = y_axis([{ points: [[0, dom.lo], [1, dom.hi]] }], true,
+                      spec_num(spec, "y_min"), spec_num(spec, "y_max"), 5)
+    let left = y_axis_width(axis)
+    let plot_w = width - left - pad_right()
+    if plot_w < 60.0 { return cell_error("chart", "the pane is too narrow to draw this chart") }
+    let top = pad_top()
+    let baseline = top + plot_h()
+    let sy = scale(axis.min, axis.max, baseline, top)
+    let zero_y = apply_scale(sy, 0.0)
+    let b = band(n_cats, left, left + plot_w, 0.28)
+
+    let mut items = y_axis_items(axis, sy, left, plot_w, "y")
+    items = push(items, rect_item("axis", left, zero_y, plot_w, 1.0, alpha(rule(), 200)))
+
+    let n = len(series)
+    let mut ci = 0
+    while ci < n_cats {
+        let slot_x = band_start(b, ci)
+        let group_w = b.inner
+        let each_w = if stacked { group_w } else { group_w / to_float(n) }
+        let mut stack_top = zero_y
+        let mut si = 0
+        while si < n {
+            let v = to_float(unwrap_or(get(bar_series_values(series[si]), ci), 0))
+            let color = color_for(si, n)
+            let x = if stacked { slot_x } else { slot_x + to_float(si) * each_w }
+            let y_val = apply_scale(sy, v)
+            let id = "b" + str(ci) + "-" + str(si)
+            if stacked {
+                let h = zero_y - y_val
+                if h > 0.0 {
+                    // A hairline gap between segments so a stack reads as
+                    // parts, not as one long bar.
+                    items = push(items, path_item(id,
+                        bar_path(x, stack_top - h, each_w, h - 1.0, 3.0), color, "", 0.0))
+                    stack_top = stack_top - h
+                }
+            } else {
+                let h = abs(zero_y - y_val)
+                if h > 0.0 {
+                    let y = if v >= 0.0 { y_val } else { zero_y }
+                    items = push(items, path_item(id, bar_path(x, y, each_w - 1.0, h, 3.0),
+                                                  color, "", 0.0))
+                }
+            }
+            si = si + 1
+        }
+        if ci < len(cats) {
+            items = push(items, text_item("xc" + str(ci), band_center(b, ci), baseline + 8.0,
+                                          str(cats[ci]), label_size(), ink_muted(),
+                                          "top-center", font_body()))
+        }
+        ci = ci + 1
+    }
+    let mut extra = []
+    if n > 1 {
+        let mut names = []
+        let mut si2 = 0
+        while si2 < n { names = push(names, series_name(series[si2], si2))  si2 = si2 + 1 }
+        extra = push(extra, legend(names, n))
+    }
+    chart_frame_with(spec, items, width, baseline + pad_bottom(), extra)
+}
+
+// ---- donut ------------------------------------------------------------------
+
+fn render_donut(spec, width) {
+    let slices = spec_arr(spec, "slices")
+    if len(slices) == 0 { return cell_error("chart", "this donut chart has no slices") }
+    let mut values = []
+    let mut labels = []
+    for s in slices {
+        values = push(values, to_float(unwrap_or(get(s, "value"), 0)))
+        labels = push(labels, str(unwrap_or(get(s, "label"), "")))
+    }
+    let d = donut_angles(values)
+    if d.total <= 0.0 {
+        return cell_error("chart", "every slice of this donut is zero or negative")
+    }
+
+    let size = min(plot_h(), width * 0.6)
+    let r_out = size / 2.0
+    let r_in = r_out * 0.58
+    let cx = r_out + 10.0
+    let cy = pad_top() + r_out
+
+    let mut items = []
+    for span in d.spans {
+        if span.frac <= 0.0 { continue }
+        let color = color_for(span.i, len(values))
+        items = push(items, path_item("s" + str(span.i),
+                                      arc_path(cx, cy, r_in, r_out, span.a0, span.a1),
+                                      color, "", 0.0))
+    }
+    // The total sits in the hole — the number a donut is usually hiding.
+    items = push(items, text_item("total", cx, cy - 8.0, number(d.total), 19.0, ink(),
+                                  "center", font_heading()))
+    items = push(items, text_item("totall", cx, cy + 12.0, "total", size_tiny(), ink_muted(),
+                                  "center", font_body()))
+
+    // Labels down the right side, each with its own share, so no one has to
+    // match colors to read the chart.
+    let legend_x = cx + r_out + 22.0
+    let mut i = 0
+    let mut y = pad_top() + 6.0
+    while i < len(values) {
+        if values[i] > 0.0 {
+            items = push(items, rect_item("k" + str(i), legend_x, y + 3.0, 9.0, 9.0,
+                                          color_for(i, len(values))))
+            let share = fixed(values[i] / d.total * 100.0, 1) + "%"
+            items = push(items, text_item("kl" + str(i), legend_x + 15.0, y,
+                                          labels[i] + "  " + share, label_size(), ink(),
+                                          "top-left", font_body()))
+            y = y + 19.0
+        }
+        i = i + 1
+    }
+    chart_frame(spec, items, width, max(cy + r_out + 16.0, y + 10.0))
+}
+
+// ---- histogram --------------------------------------------------------------
+
+fn render_histogram(spec, width) {
+    let raw = spec_arr(spec, "values")
+    if len(raw) == 0 { return cell_error("chart", "this histogram has no values") }
+    let mut values = []
+    for v in raw { if is_number(v) { values = push(values, to_float(v)) } }
+    if len(values) == 0 {
+        return cell_error("chart", "this histogram's values are not numbers")
+    }
+    let h = histogram(values, spec_num(spec, "bins"))
+    let k = len(h.counts)
+
+    let mut max_count = 0
+    for c in h.counts { if c > max_count { max_count = c } }
+    let axis = y_axis([{ points: [[0, 0], [1, to_float(max_count)]] }], true, "", "", 4)
+    let left = y_axis_width(axis)
+    let plot_w = width - left - pad_right()
+    if plot_w < 60.0 { return cell_error("chart", "the pane is too narrow to draw this chart") }
+    let top = pad_top()
+    let baseline = top + plot_h()
+    let sy = scale(axis.min, axis.max, baseline, top)
+    let b = band(k, left, left + plot_w, 0.08)
+
+    let mut items = y_axis_items(axis, sy, left, plot_w, "y")
+    items = push(items, rect_item("axis", left, baseline, plot_w, 1.0, alpha(rule(), 200)))
+    let color = series_solo()
+    let mut i = 0
+    while i < k {
+        let y = apply_scale(sy, to_float(h.counts[i]))
+        let height = baseline - y
+        if height > 0.0 {
+            items = push(items, path_item("h" + str(i),
+                                          bar_path(band_start(b, i), y, b.inner, height, 2.0),
+                                          color, "", 0.0))
+        }
+        i = i + 1
+    }
+    // A histogram's x axis is a range, so it's labelled at its ends and middle
+    // rather than per bar.
+    items = push(items, text_item("hx0", left, baseline + 8.0, number(h.lo), tick_size(),
+                                  ink_muted(), "top-left", font_mono()))
+    // CanvasAnchor has no right-hand variants, so right-align by measuring.
+    let hi_label = number(h.hi)
+    items = push(items, text_item("hx1", left + plot_w - measure_text(hi_label, tick_size()),
+                                  baseline + 8.0, hi_label, tick_size(), ink_muted(),
+                                  "top-left", font_mono()))
+    items = push(items, text_item("hn", left + plot_w / 2.0, baseline + 8.0,
+                                  str(len(values)) + " values in " + str(k) + " bins",
+                                  size_tiny(), ink_muted(), "top-center", font_body()))
+    chart_frame(spec, items, width, baseline + pad_bottom())
+}
+
+// ---- frame ------------------------------------------------------------------
+
+// Title, the plot, and a legend when there's something to disambiguate.
+fn chart_frame(spec, items, width, height) = chart_frame_with(spec, items, width, height, [])
+
+// `extra` holds anything that belongs under the plot — a legend, for the
+// charts whose marks can't carry their own labels.
+fn chart_frame_with(spec, items, width, height, extra) {
+    let title = spec_str(spec, "title")
+    let subtitle = spec_str(spec, "subtitle")
+    let mut kids = []
+    if title != "" {
+        kids = push(kids, { kind: "text", value: title, size: 15.5, color: ink(),
+                            family: font_heading() })
+    }
+    if subtitle != "" {
+        kids = push(kids, { kind: "text", value: subtitle, size: size_small(),
+                            color: ink_muted(), family: font_body() })
+    }
+    kids = push(kids, { kind: "canvas", children: items,
+                        style: { width: "100%", height: str(to_int(height)) } })
+    for x in extra { kids = push(kids, x) }
+    let y_label = spec_str(spec, "y_label")
+    let x_label = spec_str(spec, "x_label")
+    if y_label != "" or x_label != "" {
+        let both = if y_label != "" and x_label != "" { y_label + " · " + x_label }
+                   else { y_label + x_label }
+        kids = push(kids, caption(both))
+    }
+    { kind: "vstack", gap: 6.0, children: kids }
+}
+
+// A legend, for the charts that can't label their marks directly.
+fn legend(names, count) {
+    let mut kids = []
+    let mut i = 0
+    while i < len(names) {
+        kids = push(kids, { kind: "hstack", gap: 6.0, align: "center", children: [
+            { kind: "swatch", color: color_for(i, count), size: 9.0 },
+            { kind: "text", value: names[i], size: size_tiny(), color: ink_muted(),
+              family: font_body() },
+        ] })
+        i = i + 1
+    }
+    { kind: "hstack", gap: 16.0, align: "center", children: kids }
+}
+
+// ---- entry point ------------------------------------------------------------
+
+export fn render_chart(cell, width) {
+    let spec = cell_rec(cell, "spec")
+    let kind = spec_str(spec, "type")
+    if kind == "" {
+        return cell_error("chart", "the spec has no `type` (line, area, scatter, bar, donut or histogram)")
+    }
+    let w = if width < 200.0 { 200.0 } else { width }
+    if kind == "line" or kind == "area" or kind == "scatter" { return render_xy(spec, kind, w) }
+    if kind == "bar" { return render_bar(spec, w) }
+    if kind == "donut" { return render_donut(spec, w) }
+    if kind == "histogram" { return render_histogram(spec, w) }
+    cell_error("chart", "unknown chart type “" + kind + "”")
+}

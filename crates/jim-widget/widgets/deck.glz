@@ -1,65 +1,80 @@
 // deck.glz — the default deck theme.
 //
-// A deck's whole look lives here. `deck.ft` reads BOX styling through
-// `glaze(...)` and TYPOGRAPHY through `glaze_token(...)`, so retuning a
-// talk means editing this file — and saving it hot-reloads the live deck.
+// A deck's whole look lives here. `deck.ft` reads COLOUR and TYPE through
+// `glaze_token(...)` and surface treatments through `glaze(...)`, so
+// retuning a talk means editing this file — and saving it hot-reloads the
+// live deck.
 //
-// Sizes are authored against a 1280x720 reference slide. `deck.ft` scales
-// every one of them by the pane's size, so a slide looks identical in a
-// small pane and on a projector.
+// Division of labour with deck.ft: this file owns colour, type sizes and
+// surface treatment (fill / border / radius). It does NOT own layout
+// metrics — margins, gaps and padding are fractions of the pane computed in
+// deck.ft, so a slide keeps its proportions at any pane size. Fixed pixel
+// padding here would eat a small pane alive.
+//
+// Type sizes are authored against a 1280x720 reference slide; deck.ft
+// multiplies every one of them by the pane's scale.
 
 // ---- palette ----
-token bg         = oklch(0.17 0.014 260)
-token bg_alt     = oklch(0.22 0.014 260)
-token fg         = oklch(0.95 0.006 260)
-token fg_muted   = oklch(0.70 0.012 260)
+token bg         = oklch(0.16 0.014 260)
+token bg_alt     = oklch(0.21 0.014 260)
+token fg         = oklch(0.96 0.006 260)
+token fg_muted   = oklch(0.74 0.012 260)
+// One step past muted, for furniture that should be present but never read
+// first — the deck title in the footer.
+token fg_faint   = oklch(0.55 0.012 260)
 token accent     = oklch(0.80 0.13 85)
 token line       = oklch(0.42 0.014 260 / 0.6)
-token code_fg    = oklch(0.84 0.09 75)
-token code_bg    = oklch(0.13 0.012 260)
+token code_fg    = oklch(0.86 0.08 75)
+token code_bg    = oklch(0.12 0.012 260)
 token link       = oklch(0.76 0.10 240)
 
 // ---- type scale (reference px, scaled at render) ----
-token size_body  = 26
-token size_h1    = 64
-token size_h2    = 44
-token size_h3    = 32
+token size_body  = 27
+token size_h1    = 72
+token size_h2    = 46
+token size_h3    = 33
 token size_code  = 21
-token size_note  = 18
+token size_note  = 17
 
 // ---- the slide surface ----
 // `layout` is a static variant param, so the branch folds at resolve time.
+// A title slide gets a slightly deeper ground so it reads as a chapter
+// break when you flip past it.
 style slide(layout) {
-    fill bg
-    pad  layout == title ? 96px : 72px
+    fill layout == title ? bg_alt : bg
 }
 
 style code_block {
     fill   code_bg
-    radius 10px
     border line 1px
-    pad    20px
 }
 
 style quote_rule {
-    fill   accent
-    radius 2px
-    width  4px
+    fill accent
 }
 
-// Progress affordance in the corner.
+// The accent rule above a title slide's heading.
+style title_rule {
+    fill accent
+}
+
+// The mat a live project view is painted into. Slightly recessed against
+// the slide with a hairline edge, so an embedded workspace reads as a
+// screen sitting on the slide rather than a hole cut through it.
+style screen {
+    fill   code_bg
+    border line 1px
+}
+
+// ---- progress affordance along the bottom ----
 style footer {
     pad 0px
 }
 
 style footer_bar {
-    fill   line
-    radius 2px
-    height 3px
+    fill line
 }
 
 style footer_fill {
-    fill   accent
-    radius 2px
-    height 3px
+    fill accent
 }

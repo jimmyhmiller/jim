@@ -82,7 +82,7 @@ cp "$SRC_DYLIB" "$FRAMEWORKS/libghostty-vt.dylib"
 # in MacOS/, those features die on a machine that doesn't have them on PATH
 # or a dev target/ tree — i.e. a fresh Mac.
 # `cargo build --release` produces all of them (workspace default-members).
-for sib in jimctl glaze_ui jim-lsp style-muse jim-daemon claude-bus; do
+for sib in jimctl glaze_ui jim-lsp style-muse jim-daemon claude-bus jim-webview-host; do
     SRC_SIB="target/$PROFILE/$sib"
     if [ -x "$SRC_SIB" ]; then
         cp "$SRC_SIB" "$MACOS/$sib"
@@ -136,13 +136,95 @@ else
     echo "[make-bundle]          will reset on each rebuild. Run ./scripts/setup-signing.sh by hand." >&2
 fi
 
+# ---------------------------------------------------------------------------
+# Chromium Embedded Framework (webview panes)
+#
+# CEF is multi-process: the framework provides the engine, and the renderer /
+# GPU / utility processes are launched from separate helper .app bundles. The
+# layout below is mandated by Chromium and is not negotiable.
+#
+# Helper bundle ids are derived from (never equal to) the main id, so the
+# app's frozen LaunchServices identity and its TCC grants are untouched.
+# ---------------------------------------------------------------------------
+CEF_FRAMEWORK=$(find "target/$PROFILE/build" -maxdepth 4 -type d \
+    -name "Chromium Embedded Framework.framework" 2>/dev/null | head -1)
+HELPER_BIN="target/$PROFILE/jim-helper"
+
+if [ -n "$CEF_FRAMEWORK" ] && [ -x "$HELPER_BIN" ]; then
+    echo "[make-bundle] adding Chromium Embedded Framework"
+    rm -rf "$FRAMEWORKS/Chromium Embedded Framework.framework"
+    ditto "$CEF_FRAMEWORK" "$FRAMEWORKS/Chromium Embedded Framework.framework"
+
+    # One bundle per Chromium process type. The suffix in the name is what
+    # Chromium looks for; the ids only have to be unique and stable.
+    # NOTE: every helper shares the id "$BUNDLE_ID.helper" on purpose.
+    # Chromium derives the Mach rendezvous service name that helpers use to
+    # find the browser process by stripping ONE ".helper" suffix from the
+    # running bundle id. Per-type ids like ".helper.gpu" break that lookup:
+    #   bootstrap_look_up <id>.MachPortRendezvousServer.N: Unknown service name
+    #   No rendezvous client, terminating process
+    # which kills every renderer at startup. This matches Chrome's own layout.
+    make_helper() {
+        suffix="$1"   # "" | " (GPU)" | " (Renderer)" | " (Plugin)" | " (Alerts)"
+        name="Jim Helper$suffix"
+        app="$FRAMEWORKS/$name.app"
+
+        rm -rf "$app"
+        mkdir -p "$app/Contents/MacOS"
+        cp "$HELPER_BIN" "$app/Contents/MacOS/$name"
+        chmod +x "$app/Contents/MacOS/$name"
+
+        # LSUIElement keeps helpers out of the Dock. MallocNanoZone=0 is
+        # Chromium's own requirement for its allocator.
+        cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>     <string>en</string>
+    <key>CFBundleExecutable</key>            <string>$name</string>
+    <key>CFBundleIdentifier</key>            <string>$BUNDLE_ID.helper</string>
+    <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
+    <key>CFBundleName</key>                  <string>$name</string>
+    <key>CFBundleDisplayName</key>           <string>$name</string>
+    <key>CFBundlePackageType</key>           <string>APPL</string>
+    <key>CFBundleShortVersionString</key>    <string>0.1.0</string>
+    <key>CFBundleVersion</key>               <string>1</string>
+    <key>LSMinimumSystemVersion</key>        <string>11.0</string>
+    <key>LSUIElement</key>                   <string>1</string>
+    <key>LSFileQuarantineEnabled</key>       <true/>
+    <key>LSEnvironment</key>
+    <dict><key>MallocNanoZone</key>          <string>0</string></dict>
+</dict>
+</plist>
+PLIST
+        codesign --force --sign "$SIGN_ARG" "$app" >/dev/null 2>&1 \
+            || echo "[make-bundle] WARNING: could not sign $name" >&2
+    }
+
+    make_helper ""            "helper"
+    make_helper " (GPU)"      "helper.gpu"
+    make_helper " (Renderer)" "helper.renderer"
+    make_helper " (Plugin)"   "helper.plugin"
+    make_helper " (Alerts)"   "helper.alerts"
+
+    # Sign the framework before the outer seal (inside-out signing).
+    codesign --force --sign "$SIGN_ARG" \
+        "$FRAMEWORKS/Chromium Embedded Framework.framework" >/dev/null 2>&1 \
+        || echo "[make-bundle] WARNING: could not sign CEF framework" >&2
+elif [ -n "$CEF_FRAMEWORK" ] || [ -x "$HELPER_BIN" ]; then
+    # Loudly: a half-present CEF is a webview pane that fails at runtime.
+    echo "[make-bundle] WARNING: CEF incomplete — framework='$CEF_FRAMEWORK' helper='$HELPER_BIN'" >&2
+    echo "[make-bundle]          webview panes will not work in this bundle" >&2
+fi
+
 # install_name_tool invalidated the existing signature. Re-sign nested
 # code (the dylib + sibling executables) first; the whole bundle is signed
 # at the end, after Info.plist is in place, so the seal covers the
 # usage-description strings. Every Mach-O under the bundle must carry a
 # valid signature or the outer seal is invalid and the app fails Gatekeeper.
 codesign --force --sign "$SIGN_ARG" "$FRAMEWORKS/libghostty-vt.dylib" >/dev/null 2>&1 || true
-for sib in jimctl glaze_ui jim-lsp style-muse jim-daemon claude-bus; do
+for sib in jimctl glaze_ui jim-lsp style-muse jim-daemon claude-bus jim-webview-host; do
     [ -f "$MACOS/$sib" ] && codesign --force --sign "$SIGN_ARG" "$MACOS/$sib" >/dev/null 2>&1 || true
 done
 

@@ -1,0 +1,117 @@
+// pad_log_test.ft — funct crates/jim-widget/widgets/pad_log_test.ft
+import { reduce, parse_line, apply, cell_type, cell_str, cell_num, cell_arr,
+         is_known, record_line } from "pad_log"
+
+fn check(what, got, want) {
+    if got != want { fail("${what}: got ${got}, want ${want}") }
+}
+
+fn md(id, src) = "{\"op\":\"update\",\"id\":\"${id}\",\"ts\":1,\"cell\":{\"type\":\"markdown\",\"source\":\"${src}\"}}"
+
+fn test_append() {
+    let r = reduce(md("a", "one") + "\n" + md("b", "two"))
+    check("two cells", len(r.cells), 2)
+    check("no errors", len(r.errors), 0)
+    check("first id", r.cells[0].id, "a")
+    check("second id", r.cells[1].id, "b")
+    check("source", cell_str(r.cells[0].cell, "source", ""), "one")
+    check("type", cell_type(r.cells[0].cell), "markdown")
+}
+
+fn test_update_in_place() {
+    // The live-counter case: same id twice replaces, keeping its position.
+    let log = md("a", "one") + "\n" + md("b", "two") + "\n" + md("a", "one-revised")
+    let r = reduce(log)
+    check("still two cells", len(r.cells), 2)
+    check("position kept", r.cells[0].id, "a")
+    check("content replaced", cell_str(r.cells[0].cell, "source", ""), "one-revised")
+    check("sibling untouched", cell_str(r.cells[1].cell, "source", ""), "two")
+}
+
+fn test_remove_and_clear() {
+    let log = md("a", "one") + "\n" + md("b", "two") + "\n{\"op\":\"remove\",\"id\":\"a\"}"
+    let r = reduce(log)
+    check("one left", len(r.cells), 1)
+    check("the right one left", r.cells[0].id, "b")
+
+    let r2 = reduce(log + "\n{\"op\":\"clear\"}")
+    check("clear empties", len(r2.cells), 0)
+
+    // Removing something that was never there is a no-op, not an error.
+    let r3 = reduce(md("a", "one") + "\n{\"op\":\"remove\",\"id\":\"ghost\"}")
+    check("unknown remove keeps cells", len(r3.cells), 1)
+    check("unknown remove is not an error", len(r3.errors), 0)
+}
+
+fn test_blank_lines() {
+    let r = reduce("\n" + md("a", "one") + "\n\n")
+    check("blank lines skipped", len(r.cells), 1)
+    check("blank lines are not errors", len(r.errors), 0)
+}
+
+fn test_malformed_is_reported_not_fatal() {
+    let log = md("a", "one") + "\nnot json at all\n" + md("b", "two")
+    let r = reduce(log)
+    check("good cells survive", len(r.cells), 2)
+    check("bad line reported", len(r.errors), 1)
+    if not contains(r.errors[0], "line 2") { fail("error should name the line: ${r.errors[0]}") }
+
+    let missing_op = reduce("{\"id\":\"x\"}")
+    check("missing op reported", len(missing_op.errors), 1)
+
+    let bad_op = reduce("{\"op\":\"frobnicate\",\"id\":\"x\"}")
+    check("unknown op reported", len(bad_op.errors), 1)
+    if not contains(bad_op.errors[0], "frobnicate") { fail("error should name the op") }
+
+    let no_cell = reduce("{\"op\":\"update\",\"id\":\"x\"}")
+    check("missing cell reported", len(no_cell.errors), 1)
+
+    let no_type = reduce("{\"op\":\"update\",\"id\":\"x\",\"cell\":{\"source\":\"hi\"}}")
+    check("missing cell type reported", len(no_type.errors), 1)
+
+    let no_id = reduce("{\"op\":\"update\",\"cell\":{\"type\":\"markdown\"}}")
+    check("missing id reported", len(no_id.errors), 1)
+}
+
+fn test_accessors() {
+    let r = reduce("{\"op\":\"update\",\"id\":\"t\",\"cell\":{\"type\":\"table\",\"columns\":[\"a\",\"b\"],\"rows\":[[1,2]]}}")
+    let c = r.cells[0].cell
+    check("type", cell_type(c), "table")
+    check("array", len(cell_arr(c, "columns")), 2)
+    check("missing array is empty", len(cell_arr(c, "nope")), 0)
+    check("string default", cell_str(c, "title", "untitled"), "untitled")
+    check("number default", cell_num(c, "width", 42.0), 42.0)
+    check("known", is_known(c), true)
+
+    let unknown = reduce("{\"op\":\"update\",\"id\":\"u\",\"cell\":{\"type\":\"hologram\"}}")
+    check("unknown type still parses", len(unknown.cells), 1)
+    check("but is not known", is_known(unknown.cells[0].cell), false)
+}
+
+fn test_record_line_round_trips() {
+    let line = record_line("update", "c1", { source: "hello" }, 7)
+    let p = parse_line(line)
+    // The cell has no `type`, so this must be rejected — the writer is
+    // expected to include it.
+    check("cell without type rejected", p.ok, false)
+
+    let ok_line = "{\"op\":\"remove\",\"id\":\"c1\"}"
+    let p2 = parse_line(ok_line)
+    check("remove parses", p2.ok, true)
+
+    let cleared = apply([{ id: "x", cell: {}, ts: 0 }], { op: "clear" })
+    check("apply clear", len(cleared), 0)
+}
+
+fn run() {
+    test_append()
+    test_update_in_place()
+    test_remove_and_clear()
+    test_blank_lines()
+    test_malformed_is_reported_not_fatal()
+    test_accessors()
+    test_record_line_round_trips()
+    println("pad_log: ok")
+}
+
+run()

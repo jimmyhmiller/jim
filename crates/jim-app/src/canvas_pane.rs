@@ -1055,13 +1055,28 @@ const BREADCRUMB_TOP: f32 = 6.0;
 const BREADCRUMB_H: f32 = 20.0;
 
 #[derive(Resource, Default)]
-struct BreadcrumbState {
+pub struct BreadcrumbState {
     root: Option<Entity>,
     last_sig: u64,
     /// Per-crumb clickable rects in window-space + the descent depth to
     /// truncate to when clicked (crumb 0 = project root, crumb k keeps the
     /// first k canvases). Rebuilt with the visuals.
     hits: Vec<(Rect, usize)>,
+}
+
+impl BreadcrumbState {
+    /// Is `pt` (window px) on a clickable crumb? The breadcrumb is host
+    /// chrome drawn over the canvas, so anything that competes for canvas
+    /// clicks (the whiteboard drawing surface) has to leave these rects
+    /// alone — otherwise the `↑` starts a stroke/marquee instead of
+    /// ascending, and a nested canvas becomes a trap while Draw Tools are
+    /// open.
+    pub fn hit(&self, pt: Vec2) -> bool {
+        self.root.is_some()
+            && self.hits.iter().any(|(r, _)| {
+                pt.x >= r.min.x && pt.x <= r.max.x && pt.y >= r.min.y && pt.y <= r.max.y
+            })
+    }
 }
 
 #[derive(Component)]
@@ -1167,10 +1182,14 @@ fn render_breadcrumb(world: &mut World) {
         to_world(wx, BREADCRUMB_TOP),
     );
     let up_w = char_w; // single glyph
+    // Pad the hit box well past the glyph: a one-character target is a hard
+    // click, and this is the pointer's only way out of a nested canvas. The
+    // gap to the first crumb is `char_w * 2`, so the padding can't swallow it.
+    const UP_PAD: f32 = 6.0;
     hits.push((
         Rect::from_corners(
-            Vec2::new(wx - 3.0, BREADCRUMB_TOP),
-            Vec2::new(wx + up_w + 3.0, BREADCRUMB_TOP + BREADCRUMB_H),
+            Vec2::new(wx - UP_PAD, BREADCRUMB_TOP),
+            Vec2::new(wx + up_w.max(12.0) + UP_PAD, BREADCRUMB_TOP + BREADCRUMB_H),
         ),
         up_depth,
     ));

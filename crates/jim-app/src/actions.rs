@@ -501,6 +501,11 @@ pub fn rebuild_keymap(world: &mut World) {
             },
         }
     }
+    for (id, seq) in &bindings {
+        if id.starts_with("present.") {
+            warn!("[navdbg] bound {id} -> {}", seq_label(seq));
+        }
+    }
     world.resource_mut::<Keymap>().bindings = bindings;
 }
 
@@ -620,6 +625,17 @@ pub struct RuntimeActions {
     configs: HashMap<&'static str, serde_json::Value>,
     rx: Option<Mutex<Receiver<()>>>,
     _watcher: Option<RecommendedWatcher>,
+}
+
+impl RuntimeActions {
+    /// Point a `SpawnConfigured` action at a config decided at runtime.
+    ///
+    /// Used by the palette's "Open URL: …" row: the pane kind is fixed but
+    /// the URL is whatever was typed, so the config can't be baked into the
+    /// `Copy` action enum.
+    pub fn set_config(&mut self, id: &'static str, config: serde_json::Value) {
+        self.configs.insert(id, config);
+    }
 }
 
 fn actions_manifest_path() -> Option<PathBuf> {
@@ -1007,7 +1023,25 @@ fn generate_pane_spawn_actions(registry: Res<PaneRegistry>, mut actions: ResMut<
             run: ActionRun::SpawnPane { kind, size: None },
         });
     }
+
+    // A web pane is only useful with a URL, so it also gets an action whose
+    // config is filled in at dispatch by the palette's "Open URL: …" row.
+    // Invoked with no config it just opens the default page.
+    if actions.get(WEBVIEW_URL_ACTION).is_none() {
+        actions.register(Action {
+            id: WEBVIEW_URL_ACTION,
+            title: "Open URL…",
+            category: "Panes",
+            keywords: &["web", "browser", "url", "site", "webview", "http"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::SpawnConfigured { kind: "webview" },
+        });
+    }
 }
+
+/// Action id the palette uses to open a typed URL in a web pane.
+pub const WEBVIEW_URL_ACTION: &str = "pane.open_url";
 
 /// Default spawn shortcut for a few well-known pane kinds. Anything not
 /// listed gets no default and is still bindable from `keybinds.json` by
@@ -1068,6 +1102,13 @@ fn dispatch_action_keybinds(
         let mut candidate = pending.chords.clone();
         candidate.push(chord);
 
+        if chord.cmd && chord.shift {
+            warn!(
+                "[navdbg] chord {} -> match {:?}",
+                chord.label(),
+                keymap.match_exact(&candidate)
+            );
+        }
         if let Some(id) = keymap.match_exact(&candidate) {
             // Complete binding — fire and reset.
             invocations.request(id, None);

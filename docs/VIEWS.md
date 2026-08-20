@@ -22,6 +22,39 @@ side by side, or in a grid, each looking at a different part of it at
 native size, each independently pannable, all interactive, all the same
 underlying panes.
 
+Two rules follow from that framing, and both were violated in practice
+until a deck made it obvious:
+
+- **Cover the region, don't fit inside it.** A view scales by
+  `max(region.w / source.w, region.h / source.h)` — the largest scale that
+  leaves no dead space — and centres the crop. Fitting instead
+  (`min(…)`, letterbox) is how a project ends up as a small box floating
+  in a wide slide strip: technically "the whole project", visually
+  nothing. The one exception is the whole-application mirror, which
+  letterboxes on purpose: cropping the window would misrepresent the app.
+- **A view is looked THROUGH, not at.** The pane a view is embedded in
+  covers its rect and is usually the topmost thing there, so hit-testing
+  has to skip the view's host and every host above it
+  (`Views::is_host_of`). Without that, "interactive" views are inert —
+  every click lands on the host.
+- **A gesture inside a view stays inside it.** Every canvas-navigation
+  gesture landing in a view is claimed by `region_pan_zoom` — cmd+scroll,
+  cmd+opt+scroll, pinch, and a middle/space drag-pan *start* — including
+  the ones it chooses not to act on. Claim only the ones you handle and
+  the rest fall through to `canvas::handle_pan_zoom_input`, which moves
+  the outer canvas as well: the slide slides while the project inside it
+  slides the other way.
+- **A view of the surface it's drawn on can't be panned.** An
+  `application: true` mirror (or a view of the project the host pane lives
+  in) frames the outer canvas's own pan/zoom state, so "pan the guest" and
+  "pan the host" are the same write. Those gestures are claimed and
+  dropped rather than moving both.
+- **The inset is a fraction of the host's CONTENT box**, not its outer
+  rect. A widget computes the inset from its own `render(w, h)` box; measure
+  it against the pane rect instead and the view sits a title bar and two
+  margins off from the frame the widget drew, spilling over the content
+  above it.
+
 ## The goal
 
 Show the **real, working thing** in more than one place at a time. Drag a
@@ -213,14 +246,25 @@ the view moves the pane in both. Nothing about decks yet.
 directive publishes it. The region is anchored to the publishing pane's
 rect (decode the bus `sender` id → entity, already working).
 
-**4. Nesting + depth cap. — BUILT**
-Views inside views; `MAX_VIEW_DEPTH`. Verify the slideshow-inside-itself
-case renders two levels and then stops.
+**4. Nesting + depth cap. — NOT BUILT (the type exists, nothing reaches it).**
+`Views::insert` enforces `MAX_VIEW_DEPTH`, and `remove` takes a whole
+subtree, so the *tree* handles nesting. But nothing creates a depth-2
+view: `live_views` only accepts a `pane.project` publisher whose host
+pane is in the ACTIVE project, which makes every live view a direct child
+of the root. Several sibling views at depth 1 do work (regions are keyed
+by host pane, not a single slot).
+
+The slideshow-inside-itself case therefore renders ONE level, not two:
+the whole-app view keeps the deck pane among its guests, so you see the
+deck's widget content mirrored inside itself — but the mirror has no
+cameras of its own, so it does not recurse. Making it truly recurse means
+resolving a host pane's parent view and letting a region hang off it.
 
 **5. Whole-app views. — BUILT** A view whose world rect is the whole window and
 whose layer set includes layer 0 — sidebar, tabs, canvas background, the
 lot. Per the finding above this is a *configuration* of stage 2, not new
-machinery. Recursion (stage 4) is what makes it survive containing itself.
+machinery — the same fit, with the window as the source rect instead of
+just the canvas area.
 
 **6. Delete `project_region.rs`. — BUILT** The texture path goes away; nothing
 should be left that fakes this.

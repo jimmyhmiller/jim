@@ -1,0 +1,278 @@
+// pad_fmt.ft — number, date and axis-tick formatting for the pad notebook.
+//
+// funct's `str` prints a Float at full precision ("0.30000000000000004") and
+// keeps a trailing ".0" on whole floats, neither of which belongs on a chart
+// axis or in a stat tile. Everything here builds its own decimal text instead.
+//
+// Pure module: no host natives, no side effects — importable and testable with
+// the standalone `funct` CLI (see pad_fmt_test.ft).
+
+// ---- helpers ----------------------------------------------------------------
+
+fn pow10(n) {
+    let mut p = 1.0
+    let mut i = 0
+    while i < n { p = p * 10.0  i = i + 1 }
+    p
+}
+
+// 10^k for a possibly-negative integer k, by repeated multiply/divide.
+// `exp(k * ln(10))` drifts (10^2 comes back as 100.00000000000004), and that
+// drift lands straight on an axis label as "100.00000000000001".
+fn pow10i(k) {
+    if k >= 0 { return pow10(k) }
+    let mut p = 1.0
+    let mut i = 0
+    while i < -k { p = p / 10.0  i = i + 1 }
+    p
+}
+
+// funct has no NaN literal; a value only fails self-comparison when it's NaN.
+export fn is_nan(v) = v != v
+
+// i64 can't hold this, and `to_int` would wrap. Past it, fall back to `str`.
+fn int_safe_limit() = 1000000000000000.0
+
+fn pad_left_zeros(s, width) {
+    let mut out = s
+    while len(out) < width { out = "0" + out }
+    out
+}
+
+fn trim_trailing(s, ch) {
+    let mut out = s
+    while len(out) > 0 and slice(out, len(out) - 1, 1) == ch {
+        out = slice(out, 0, len(out) - 1)
+    }
+    out
+}
+
+// "1.500" -> "1.5", "2.000" -> "2". Only touches strings with a decimal point.
+export fn trim_zeros(s) {
+    if not contains(s, ".") { return s }
+    let t = trim_trailing(s, "0")
+    if slice(t, len(t) - 1, 1) == "." { slice(t, 0, len(t) - 1) } else { t }
+}
+
+// ---- fixed-point ------------------------------------------------------------
+
+// `v` with exactly `n` decimal places, half-away-from-zero like Rust's `{:.n}`.
+export fn fixed(v, n) {
+    if is_nan(v) { return "–" }
+    let neg = v < 0.0
+    let a = abs(to_float(v))
+    if a >= int_safe_limit() { return str(v) }
+    let p = pow10(n)
+    let scaled = round(a * p)
+    let ip = floor(scaled / p)
+    let fp = scaled - ip * p
+    let mut s = str(to_int(ip))
+    if n > 0 {
+        s = s + "." + pad_left_zeros(str(to_int(fp)), n)
+    }
+    // -0.4 at 0 decimals is "0", not "-0".
+    if neg and scaled > 0.0 { "-" + s } else { s }
+}
+
+// "1234567" -> "1,234,567". Digits only; sign and decimals are handled by the
+// callers that know where those live.
+fn group_digits(digits) {
+    let cs = chars(digits)
+    let n = len(cs)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        if i > 0 and (n - i) % 3 == 0 { out = out + "," }
+        out = out + cs[i]
+        i = i + 1
+    }
+    out
+}
+
+// 1234567 -> "1,234,567"
+export fn commas(v) {
+    if is_nan(v) { return "–" }
+    let a = abs(to_float(v))
+    if a >= int_safe_limit() { return str(v) }
+    let out = group_digits(str(to_int(floor(a + 0.5))))
+    if v < 0.0 { "-" + out } else { out }
+}
+
+fn is_whole(v) = abs(v - round(v)) < 0.000000001
+
+// A number as a reader sees it: thousands separators on the integer part,
+// just enough decimals, and no trailing zeros.
+export fn number(v) {
+    if is_nan(v) { return "–" }
+    let f = to_float(v)
+    if is_whole(f) and abs(f) < int_safe_limit() { return commas(f) }
+    let a = abs(f)
+    let s = if a >= 100.0 { fixed(f, 1) } else { if a >= 1.0 { fixed(f, 2) } else { fixed(f, 4) } }
+    let t = trim_zeros(s)
+    if t == "" or t == "-" { return "0" }
+    // Group the integer part: "1234.6" -> "1,234.6".
+    let neg = starts_with(t, "-")
+    let body = if neg { slice(t, 1, len(t) - 1) } else { t }
+    let dot = unwrap_or(index_of(body, "."), -1)
+    let grouped = if dot < 0 {
+        group_digits(body)
+    } else {
+        group_digits(slice(body, 0, dot)) + slice(body, dot, len(body) - dot)
+    }
+    if neg { "-" + grouped } else { grouped }
+}
+
+// Stat-tile scale: 1,284 · 12.9K · 4.2M · 1.1B.
+export fn compact(v) {
+    if is_nan(v) { return "–" }
+    let f = to_float(v)
+    let a = abs(f)
+    if a < 10000.0 { return number(f) }
+    let div = if a >= 1000000000.0 { 1000000000.0 } else { if a >= 1000000.0 { 1000000.0 } else { 1000.0 } }
+    let suffix = if a >= 1000000000.0 { "B" } else { if a >= 1000000.0 { "M" } else { "K" } }
+    let scaled = f / div
+    let s = if abs(scaled) >= 100.0 { fixed(scaled, 0) } else { trim_zeros(fixed(scaled, 1)) }
+    s + suffix
+}
+
+// Axis tick label: compact past a million, plain below it.
+export fn tick(v) {
+    if v == 0.0 { return "0" }
+    if abs(to_float(v)) >= 1000000.0 { compact(v) } else { number(v) }
+}
+
+// ---- nice ticks -------------------------------------------------------------
+
+// Ticks over [lo, hi] at steps of 1/2/5 × 10^k, with the domain widened to
+// land on them. Returns { min, max, step, ticks }.
+// Round `v` to the nearest multiple of `step`, killing accumulated float dust.
+fn snap(v, step) {
+    let r = round(v / step) * step
+    if abs(r) < step * 0.000000001 { 0.0 } else { r }
+}
+
+export fn nice_ticks(lo, hi, target) {
+    let mut a = to_float(min(lo, hi))
+    let mut b = to_float(max(lo, hi))
+    if abs(b - a) < 0.000000000001 {
+        // Degenerate domain: open a window around the single value so the
+        // axis still has extent.
+        let pad = if a == 0.0 { 1.0 } else { abs(a) * 0.1 }
+        a = a - pad
+        b = b + pad
+    }
+    let want = if target < 2 { 2 } else { target }
+    let raw = (b - a) / to_float(want)
+    let mag = pow10i(to_int(floor(log10(raw))))
+    let norm = raw / mag
+    let unit = if norm <= 1.0 { 1.0 } else { if norm <= 2.0 { 2.0 } else { if norm <= 5.0 { 5.0 } else { 10.0 } } }
+    let step = unit * mag
+    // Snap the domain ends onto the step grid; `floor(a/step)*step` can land a
+    // hair off (100.00000000000001) and that hair shows up as a tick label.
+    let nice_min = snap(floor(a / step) * step, step)
+    let nice_max = snap(ceil(b / step) * step, step)
+    let mut ticks = []
+    let mut t = nice_min
+    let mut i = 0
+    while t <= nice_max + step * 0.000000001 and i < 100 {
+        // Snap to the grid: accumulating `step` drifts (0.30000000000000004).
+        ticks = push(ticks, snap(t, step))
+        t = t + step
+        i = i + 1
+    }
+    { min: nice_min, max: nice_max, step: step, ticks: ticks }
+}
+
+// ---- dates ------------------------------------------------------------------
+//
+// Dates are carried as days since 1970-01-01 (fractional for times), so an
+// axis can scale them like any other number.
+
+fn month_names() = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// Howard Hinnant's civil-date algorithms, which are exact in integer math and
+// handle the proleptic Gregorian leap rules without a table.
+export fn days_from_civil(y0, m, d) {
+    let y = if m <= 2 { y0 - 1 } else { y0 }
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 }
+    let yoe = y - era * 400
+    let mp = (m + 9) % 12
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+export fn civil_from_days(z0) {
+    let z = z0 + 719468
+    let era = if z >= 0 { z / 146097 } else { (z - 146096) / 146097 }
+    let doe = z - era * 146097
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }
+    { year: if m <= 2 { y + 1 } else { y }, month: m, day: d }
+}
+
+fn digits_only(s) {
+    if len(s) == 0 { return false }
+    for c in chars(s) { if not contains("0123456789", c) { return false } }
+    true
+}
+
+// "YYYY-MM-DD" (optionally "…THH:MM…" or "… HH:MM…") -> Some(epoch days),
+// None if the string isn't a date. The time contributes a fraction of a day so
+// same-day points still order correctly.
+export fn parse_date(s) {
+    if len(s) < 10 { return None }
+    if slice(s, 4, 1) != "-" or slice(s, 7, 1) != "-" { return None }
+    let ys = slice(s, 0, 4)
+    let ms = slice(s, 5, 2)
+    let ds = slice(s, 8, 2)
+    if not (digits_only(ys) and digits_only(ms) and digits_only(ds)) { return None }
+    // `parse_int` returns Ok/Err, and `digits_only` above already guarantees
+    // these parse — the fallback is only here so a fault can't escape.
+    let y = unwrap_or(parse_int(ys), -1)
+    let m = unwrap_or(parse_int(ms), -1)
+    let d = unwrap_or(parse_int(ds), -1)
+    if m < 1 or m > 12 or d < 1 or d > 31 { return None }
+    let mut frac = 0.0
+    if len(s) >= 16 {
+        let sep = slice(s, 10, 1)
+        if sep == "T" or sep == " " {
+            let hs = slice(s, 11, 2)
+            let mins = slice(s, 14, 2)
+            if digits_only(hs) and digits_only(mins) {
+                let hh = to_float(unwrap_or(parse_int(hs), 0))
+                let mm = to_float(unwrap_or(parse_int(mins), 0))
+                frac = (hh * 60.0 + mm) / 1440.0
+            }
+        }
+    }
+    Some(to_float(days_from_civil(y, m, d)) + frac)
+}
+
+// Axis label for an epoch-day value; `span_days` picks the grain so a
+// multi-year axis reads "2026" and a two-week axis reads "Aug 16".
+export fn date_tick(day, span_days) {
+    let c = civil_from_days(to_int(round(day)))
+    if span_days > 730.0 { return str(c.year) }
+    let name = month_names()[c.month - 1]
+    if span_days > 90.0 { name + " " + pad_left_zeros(str(c.year % 100), 2) } else { name + " " + str(c.day) }
+}
+
+// "Aug 16, 2026" — for tooltips, where there's room for the whole thing.
+export fn date_full(day) {
+    let c = civil_from_days(to_int(round(day)))
+    month_names()[c.month - 1] + " " + str(c.day) + ", " + str(c.year)
+}
+
+// "2026-08-16" from a unix-millisecond timestamp (UTC).
+export fn iso_from_ms(ms) {
+    let c = civil_from_days(to_int(floor(to_float(ms) / 86400000.0)))
+    let y = pad_left_zeros(str(c.year), 4)
+    let m = pad_left_zeros(str(c.month), 2)
+    y + "-" + m + "-" + pad_left_zeros(str(c.day), 2)
+}

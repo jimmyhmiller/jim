@@ -1,0 +1,27 @@
+[package]
+name = "jim_webview_host"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# Owns CEF in its own process.
+#
+# In-process CEF crashes jim: Bevy runs AppKit's `-[NSApplication run]` loop
+# and Chromium's macOS message pump installs CFRunLoop observers that trap
+# inside it (EXC_BREAKPOINT under `__CFRunLoopDoObservers`). Here CEF gets a
+# main thread it can own, and jim only ever receives finished frames.
+#
+# Frames cross as an IOSurface id (a u32), never as pixels.
+[dependencies]
+cef = "151"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.3"
+objc2-io-surface = "0.3.2"
+objc2-core-foundation = "0.3.2"
+
+[[bin]]
+name = "jim-webview-host"
+path = "src/main.rs"

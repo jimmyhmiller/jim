@@ -1340,6 +1340,7 @@ fn despawn_cube(prism: &mut Prism, commands: &mut Commands, images: &mut Assets<
 fn suppress_window_pane_cams(
     prism: Res<Prism>,
     projects: Res<Projects>,
+    presentation: Res<crate::present::Presentation>,
     panes: Query<(&PaneProject, &PaneRect, Has<jim_pane::PaneScreenAnchored>)>,
     windows: Query<&Window>,
     region: Option<Res<jim_pane::PaneCanvasRegion>>,
@@ -1349,6 +1350,15 @@ fn suppress_window_pane_cams(
     let _t_prof = jim_pane::prof::sys_span("cube_suppress_cams");
     let cube_up = prism.root.is_some();
     let active = projects.active;
+    // While a deck COVERS the window, every canvas pane behind it is
+    // invisible, and drawing them is a full duplicate render of the
+    // workspace every frame. Cull them; the deck itself and any other
+    // screen-anchored pane stay, since those are what you can see.
+    //
+    // Not while the deck has stepped aside, though: that is the slide whose
+    // entire point is that you ARE looking at the real panes.
+    let presenting_deck = presentation.active();
+    let deck_covers_window = presenting_deck.is_some() && !presentation.stepped_aside();
     let win = windows.single().ok();
     let region = region.as_deref().copied();
     let viewport = viewport.as_deref().copied().unwrap_or_default();
@@ -1366,8 +1376,23 @@ fn suppress_window_pane_cams(
             && panes
                 .get(owner.0)
                 .map(|(proj, rect, anchored)| {
-                    if Some(proj.0) != active {
-                        return false;
+                    // The presenting deck ALWAYS draws — it is the
+                    // presentation. Its own project need not be active: a
+                    // `project:` slide switches the app out from under it,
+                    // and gating the deck on project membership then turned
+                    // the whole screen black. The deck was still `Visible`
+                    // (`sync_visibility` exempts it), but a visible pane
+                    // with no camera renders nothing, and the cull below
+                    // had already taken every other pane. Both halves of
+                    // the exemption have to agree.
+                    let is_deck = presenting_deck == Some(owner.0);
+                    if !is_deck {
+                        if Some(proj.0) != active {
+                            return false;
+                        }
+                        if deck_covers_window && !anchored {
+                            return false;
+                        }
                     }
                     match win {
                         Some(w) => {

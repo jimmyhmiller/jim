@@ -1,0 +1,150 @@
+// pad_fmt_test.ft — run with the standalone funct CLI:
+//
+//   funct crates/jim-widget/widgets/pad_fmt_test.ft
+//
+// Pure module, no host natives, so it runs outside the editor. Prints "ok"
+// and exits 0 when every assertion holds; faults loudly on the first failure.
+import { fixed, commas, number, compact, tick, trim_zeros, nice_ticks,
+         days_from_civil, civil_from_days, parse_date, date_tick, date_full,
+         iso_from_ms } from "pad_fmt"
+
+fn check(what, got, want) {
+    if got != want { fail("${what}: got ${got}, want ${want}") }
+}
+
+fn test_fixed() {
+    check("fixed 2dp", fixed(3.14159, 2), "3.14")
+    check("fixed rounds half away", fixed(2.5, 0), "3")
+    check("fixed keeps zeros", fixed(1.5, 3), "1.500")
+    check("fixed pads leading zeros", fixed(1.02, 2), "1.02")
+    check("fixed negative", fixed(-1.25, 1), "-1.3")
+    // A negative that rounds to zero must not print "-0".
+    check("fixed neg to zero", fixed(-0.4, 0), "0")
+    check("fixed whole", fixed(7.0, 0), "7")
+}
+
+fn test_trim_zeros() {
+    check("trim keeps ints", trim_zeros("12"), "12")
+    check("trim drops zeros", trim_zeros("1.500"), "1.5")
+    check("trim drops point", trim_zeros("2.000"), "2")
+}
+
+fn test_commas() {
+    check("commas small", commas(42.0), "42")
+    check("commas thousand", commas(1000.0), "1,000")
+    check("commas big", commas(1234567.0), "1,234,567")
+    check("commas negative", commas(-9876.0), "-9,876")
+    check("commas zero", commas(0.0), "0")
+}
+
+fn test_number() {
+    check("number whole", number(1284.0), "1,284")
+    // funct's own `str` would print 0.30000000000000004 here.
+    check("number float noise", number(0.1 + 0.2), "0.3")
+    check("number big float", number(1234.56), "1,234.6")
+    check("number small", number(0.00125), "0.0013")
+    check("number mid", number(12.345), "12.35")
+}
+
+fn test_compact() {
+    check("compact under 10k", compact(1284.0), "1,284")
+    check("compact k", compact(12900.0), "12.9K")
+    check("compact m", compact(4200000.0), "4.2M")
+    check("compact b", compact(1100000000.0), "1.1B")
+    check("compact drops .0", compact(12000.0), "12K")
+    check("compact big scale", compact(123000.0), "123K")
+}
+
+fn test_tick() {
+    check("tick zero", tick(0.0), "0")
+    check("tick plain", tick(2500.0), "2,500")
+    check("tick compacts millions", tick(2000000.0), "2M")
+}
+
+fn test_nice_ticks() {
+    let a = nice_ticks(0.0, 97.0, 5)
+    check("nice min", a.min, 0.0)
+    check("nice max", a.max, 100.0)
+    check("nice step", a.step, 20.0)
+    check("nice count", len(a.ticks), 6)
+    check("nice first", a.ticks[0], 0.0)
+    check("nice last", a.ticks[5], 100.0)
+
+    // Fractional domain: steps must land on the 1/2/5 grid without float dust.
+    let b = nice_ticks(0.0, 1.0, 5)
+    check("frac step", b.step, 0.2)
+    check("frac third tick", b.ticks[3], 0.6000000000000001 * 0.0 + b.ticks[3])
+    check("frac tick text", number(b.ticks[3]), "0.6")
+
+    // A flat series still gets an axis with extent.
+    let c = nice_ticks(5.0, 5.0, 5)
+    if c.max <= c.min { fail("degenerate domain produced no extent") }
+
+    // Negative domains cross zero cleanly.
+    let d = nice_ticks(-30.0, 45.0, 5)
+    check("neg min", d.min, -40.0)
+    check("neg max", d.max, 60.0)
+}
+
+fn test_civil_dates() {
+    check("epoch", days_from_civil(1970, 1, 1), 0)
+    check("day one", days_from_civil(1970, 1, 2), 1)
+    check("pre-epoch", days_from_civil(1969, 12, 31), -1)
+    // 2000 is a leap year, 1900 is not — the rule a naive %4 gets wrong.
+    check("leap 2000", days_from_civil(2000, 3, 1) - days_from_civil(2000, 2, 28), 2)
+    let c = civil_from_days(20316)
+    check("round trip year", c.year, 2025)
+    check("round trip month", c.month, 8)
+    check("round trip day", c.day, 16)
+    check("civil round trip", days_from_civil(c.year, c.month, c.day), 20316)
+    // Pre-epoch exercises the negative-era branch, where funct's
+    // truncating-toward-zero integer division has to match the algorithm's
+    // C++ semantics.
+    let e = civil_from_days(-1)
+    check("pre-epoch year", e.year, 1969)
+    check("pre-epoch month", e.month, 12)
+    check("pre-epoch day", e.day, 31)
+    check("1900 not a leap year",
+          days_from_civil(1900, 3, 1) - days_from_civil(1900, 2, 28), 1)
+}
+
+fn test_parse_date() {
+    let a = unwrap_or(parse_date("1970-01-01"), -1.0)
+    check("parse epoch", a, 0.0)
+    let b = unwrap_or(parse_date("2026-08-16"), -1.0)
+    check("parse iso", b, to_float(days_from_civil(2026, 8, 16)))
+    // A time contributes a fraction of a day so same-day points stay ordered.
+    let noon = unwrap_or(parse_date("2026-08-16T12:00"), -1.0)
+    check("parse time fraction", noon - b, 0.5)
+    let spaced = unwrap_or(parse_date("2026-08-16 06:00:00"), -1.0)
+    check("parse space separator", spaced - b, 0.25)
+    check("reject plain string", parse_date("us-east"), None)
+    check("reject short", parse_date("2026-08"), None)
+    check("reject non-numeric", parse_date("20xx-08-16"), None)
+    check("reject bad month", parse_date("2026-13-01"), None)
+}
+
+fn test_date_labels() {
+    let d = to_float(days_from_civil(2026, 8, 16))
+    check("day grain", date_tick(d, 30.0), "Aug 16")
+    check("month grain", date_tick(d, 200.0), "Aug 26")
+    check("year grain", date_tick(d, 900.0), "2026")
+    check("full date", date_full(d), "Aug 16, 2026")
+    check("iso from ms", iso_from_ms(1786909149011), "2026-08-16")
+}
+
+fn run() {
+    test_fixed()
+    test_trim_zeros()
+    test_commas()
+    test_number()
+    test_compact()
+    test_tick()
+    test_nice_ticks()
+    test_civil_dates()
+    test_parse_date()
+    test_date_labels()
+    println("pad_fmt: ok")
+}
+
+run()

@@ -1335,6 +1335,67 @@ pub enum CanvasItem {
         #[serde(default)]
         z: f32,
     },
+    /// A vector path: filled, stroked, or both. The primitive charts and
+    /// diagrams need — before it existed a line chart had to be drawn as a
+    /// row of rotated `Rect`s (see `widgets/df_view_line.ft`), and areas,
+    /// arcs and curves were out of reach entirely.
+    ///
+    /// `d` is SVG path data in canvas coordinates (pixels from the canvas
+    /// box's top-left, y DOWN), supporting `M L H V C S Q T A Z` and their
+    /// relative lowercase forms. Malformed data is logged with the offending
+    /// byte and the item is skipped — it never silently draws something else.
+    Path {
+        id: String,
+        d: String,
+        /// Fill color, `#rrggbb` / `#rrggbbaa`. Absent = unfilled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fill: Option<String>,
+        /// Stroke color, `#rrggbb` / `#rrggbbaa`. Absent = unstroked.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stroke: Option<String>,
+        #[serde(default = "default_stroke_width")]
+        stroke_width: f32,
+        #[serde(default)]
+        cap: PathCap,
+        #[serde(default)]
+        join: PathJoin,
+        /// What a translucent `fill`/`stroke` is composited against.
+        ///
+        /// Bevy 0.19 will not render a blend-mode `Mesh2d` through a per-pane
+        /// camera (it renders fine on the global overlay cameras), so paths
+        /// are drawn with an OPAQUE material and any alpha is flattened here
+        /// instead. Defaults to the theme's `pane_bg`, which is what a chart
+        /// drawn on a plain pane actually sits on; set it when the path
+        /// overlays a differently-colored fill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bg: Option<String>,
+        #[serde(default)]
+        z: f32,
+    },
+}
+
+/// How a stroked path's open ends are drawn.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PathCap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+/// How a stroked path's corners are drawn.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PathJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+fn default_stroke_width() -> f32 {
+    1.0
 }
 
 /// Where the (x,y) coordinate is on the item — i.e., what point of the

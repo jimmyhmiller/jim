@@ -45,7 +45,6 @@ pub mod issues_pane;
 /// callers can continue to write `jim_app::daemon_proto::*`.
 pub use jim_daemon::proto as daemon_proto;
 pub mod ipc;
-pub mod live_views;
 mod notify_setup;
 pub mod pane_annotation;
 pub mod pane_groups;
@@ -55,6 +54,7 @@ pub mod radial;
 pub mod render_trace;
 pub mod run_button;
 pub mod screenshot_consent;
+pub mod slide_targets;
 pub mod tools;
 pub mod whiteboard_bg;
 pub mod window_geometry;
@@ -165,6 +165,11 @@ impl Plugin for AppShellPlugin {
         // generic flame-bevy offscreen-render + CPU readback systems. The
         // rendered trace is shown as a Sprite filling the pane content.
         app.add_plugins(jim_flame::FlamePlugin);
+        // Servo-backed web panes: registers the "webview" pane kind. Servo
+        // renders offscreen and the frame is painted into a Sprite filling the
+        // pane content, so a web page is a real pane (clipped, z-ordered,
+        // nestable) rather than a native view floating over the canvas.
+        app.add_plugins(jim_webview::WebviewPlugin);
         // Render-thread phase timing into jim's trace (extract/prepare/queue/
         // passes), so render cost stops being an anonymous "untracked gap".
         app.add_plugins(render_trace::RenderTracePlugin);
@@ -244,7 +249,7 @@ impl Plugin for AppShellPlugin {
             // already renders over panes via the overlay camera.
             // .add_plugins(pane_annotation::PaneAnnotationPlugin)
             .add_plugins(pane_groups::PaneGroupsPlugin)
-            .add_plugins(live_views::ProjectRegionPlugin)
+            .add_plugins(slide_targets::SlideTargetPlugin)
             .add_plugins(present::PresentPlugin)
             .add_plugins(workflow_graph::WorkflowGraphPlugin)
             .add_plugins(fps::FpsOverlayPlugin)
@@ -317,6 +322,24 @@ impl Plugin for AppShellPlugin {
             radial_icon: None,
             default_keys: &[],
             run: ActionRun::Custom(action_open_chess),
+        })
+        .add_action(Action {
+            id: "whiteboard.toggle_canvas_draw",
+            title: "Draw on Canvas",
+            category: "View",
+            keywords: &[
+                "whiteboard",
+                "draw",
+                "sketch",
+                "annotate",
+                "toolbar",
+                "draw tools",
+                "pen",
+                "excalidraw",
+            ],
+            radial_icon: Some("✎"),
+            default_keys: &[],
+            run: ActionRun::Custom(action_toggle_canvas_draw),
         })
         .add_action(Action {
             id: "view.toggle_cube",
@@ -2480,6 +2503,57 @@ fn action_open_glaze_ui(ctx: &mut actions::ActionCtx) {
 /// `pane.close_focused` — route the focused pane through the normal close
 /// path (runs the kind's `on_close`, then despawns). No-op when nothing is
 /// focused.
+/// `whiteboard.toggle_canvas_draw` — turn canvas drawing on/off for the
+/// canvas the user is currently looking at. Canvas-draw mode is defined as
+/// "a *visible* Draw Tools toolbar exists" (see
+/// `jim_whiteboard::toolbar::track_canvas_active`), so the toggle is
+/// literally spawn-or-close that toolbar. There is no whiteboard *window*
+/// involved: the drawing lands straight on the canvas (`whiteboard_bg`) and
+/// over panes (`pane_annotation`).
+///
+/// Nested canvases are a `(project, canvas)` visibility namespace
+/// (`canvas_pane`), and `projects::sync_visibility` hides every pane that
+/// isn't on the level being viewed — including the toolbar. So the toggle
+/// has to be level-scoped at both ends: it only counts toolbars on THIS
+/// level, and it stamps a newly spawned one with the current
+/// `PaneCanvas`. Without the stamp, toggling inside a nested canvas spawns
+/// a toolbar on the project root that is hidden the same frame — canvas-draw
+/// mode never turns on and nothing appears to happen.
+fn action_toggle_canvas_draw(ctx: &mut actions::ActionCtx) {
+    let world = &mut *ctx.world;
+    let Some(active) = world.resource::<projects::Projects>().active else {
+        return;
+    };
+    let level = world.resource::<canvas_pane::CanvasNav>().level(active);
+    let open: Vec<Entity> = world
+        .query_filtered::<(
+            Entity,
+            &jim_pane::PaneProject,
+            Option<&jim_pane::PaneCanvas>,
+        ), With<jim_whiteboard::toolbar::ToolbarPane>>()
+        .iter(world)
+        .filter(|(_, proj, canvas)| proj.0 == active && canvas.map_or(0, |c| c.0) == level)
+        .map(|(e, _, _)| e)
+        .collect();
+    if !open.is_empty() {
+        world
+            .resource_mut::<jim_pane::PendingPaneActions>()
+            .close
+            .extend(open);
+        return;
+    }
+    // `spawn_from_config` repositions the toolbar to its fixed top-right
+    // screen slot, so this seed position only matters if there's no window.
+    let Some(entity) =
+        jim_whiteboard::toolbar::spawn_toolbar(world, Vec2::new(16.0, 64.0), Some(active))
+    else {
+        return;
+    };
+    if level != 0 {
+        world.entity_mut(entity).insert(jim_pane::PaneCanvas(level));
+    }
+}
+
 fn action_close_focused(ctx: &mut actions::ActionCtx) {
     if let Some(e) = ctx.world.resource::<jim_pane::FocusedPane>().0 {
         ctx.world

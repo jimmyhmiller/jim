@@ -1,0 +1,150 @@
+// pad_graph_test.ft — funct crates/jim-widget/widgets/pad_graph_test.ft
+//
+// Only the pure half (tokenize / parse_dot / assign_ranks / layout) — the
+// drawing half needs the host's font metrics, so `layout` takes its measurer
+// as a callback and this file passes a fake one.
+import { tokenize, parse_dot, assign_ranks, layout } from "pad_graph"
+
+fn check(what, got, want) {
+    if got != want { fail("${what}: got ${got}, want ${want}") }
+}
+
+// A fake measurer: 7px per character, so box sizes are predictable.
+fn fake_measure() = (s) => to_float(len(s)) * 7.0
+
+fn node_named(laid, name) {
+    for n in laid.nodes { if n.id == name { return n } }
+    fail("no node named ${name}")
+}
+
+fn test_tokenize() {
+    let t = tokenize("digraph { a -> b [label=\"x y\"]; }")
+    check("tokenizes", t.ok, true)
+    check("first token", t.tokens[0].v, "digraph")
+    // `->` is one token, and a quoted label keeps its spaces.
+    let mut saw_arrow = false
+    let mut saw_label = false
+    for tk in t.tokens {
+        if tk.t == "sym" and tk.v == "->" { saw_arrow = true }
+        if tk.t == "str" and tk.v == "x y" { saw_label = true }
+    }
+    check("arrow is one token", saw_arrow, true)
+    check("quoted label kept whole", saw_label, true)
+
+    check("comments skipped", len(tokenize("digraph { // hi\n a }").tokens), 4)
+    check("unterminated string caught", tokenize("digraph { a [label=\"oops }").ok, false)
+}
+
+fn test_parse_basic() {
+    let g = parse_dot("digraph { web -> api; api -> db [label=\"write\"]; }")
+    check("parses", g.ok, true)
+    check("directed", g.directed, true)
+    check("three nodes", len(g.nodes), 3)
+    check("two edges", len(g.edges), 2)
+    check("edge from", g.edges[0].from, "web")
+    check("edge to", g.edges[0].to, "api")
+    check("edge label", g.edges[1].label, "write")
+    // A node mentioned only in an edge still exists, labelled by its name.
+    check("implicit node label", g.nodes[0].label, "web")
+}
+
+fn test_parse_chains_and_attrs() {
+    let g = parse_dot("digraph { a -> b -> c; b [label=\"Middle\", shape=diamond]; }")
+    check("chain makes two edges", len(g.edges), 2)
+    check("chain first", g.edges[0].to, "b")
+    check("chain second", g.edges[1].from, "b")
+    let mut b = { label: "", shape: "" }
+    for n in g.nodes { if n.id == "b" { b = n } }
+    check("node label attr", b.label, "Middle")
+    check("node shape attr", b.shape, "diamond")
+
+    // rankdir is picked up; `node [...]` defaults are accepted and ignored.
+    let lr = parse_dot("digraph { rankdir=LR; node [shape=box]; a -> b; }")
+    check("rankdir", lr.rankdir, "LR")
+    check("defaults ignored, edges kept", len(lr.edges), 1)
+
+    // An undirected graph parses too.
+    let ug = parse_dot("graph { a -- b; }")
+    check("undirected parses", ug.ok, true)
+    check("undirected flag", ug.directed, false)
+}
+
+fn test_parse_errors() {
+    let bad = parse_dot("flowchart { a -> b }")
+    check("wrong header rejected", bad.ok, false)
+    if not contains(bad.error, "digraph") { fail("error should say what's expected: ${bad.error}") }
+
+    let no_brace = parse_dot("digraph")
+    check("missing brace rejected", no_brace.ok, false)
+
+    let dangling = parse_dot("digraph { a -> }")
+    check("dangling edge rejected", dangling.ok, false)
+
+    // Subgraphs are refused rather than half-drawn.
+    let sub = parse_dot("digraph { subgraph cluster_0 { a } }")
+    check("subgraph refused", sub.ok, false)
+    if not contains(sub.error, "subgraph") { fail("error should name subgraphs: ${sub.error}") }
+}
+
+fn test_ranks() {
+    // A chain ranks 0,1,2.
+    let r = assign_ranks(3, [{ f: 0, t: 1 }, { f: 1, t: 2 }])
+    check("rank source", r[0], 0)
+    check("rank middle", r[1], 1)
+    check("rank sink", r[2], 2)
+
+    // A diamond puts the join below BOTH branches (longest path, not first).
+    let d = assign_ranks(4, [{ f: 0, t: 1 }, { f: 0, t: 2 }, { f: 1, t: 3 }, { f: 2, t: 3 }])
+    check("diamond join rank", d[3], 2)
+
+    // A cycle still terminates, with the back edge dropped.
+    let c = assign_ranks(3, [{ f: 0, t: 1 }, { f: 1, t: 2 }, { f: 2, t: 0 }])
+    check("cycle head stays at zero", c[0], 0)
+    check("cycle ranks progress", c[2], 2)
+}
+
+fn test_layout_positions() {
+    let g = parse_dot("digraph { a -> b; a -> c; }")
+    let laid = layout(g, fake_measure())
+    check("laid out", laid.ok, true)
+    check("all nodes placed", len(laid.nodes), 3)
+
+    let a = node_named(laid, "a")
+    let b = node_named(laid, "b")
+    let c = node_named(laid, "c")
+    // Top-to-bottom by default: children sit strictly below their parent.
+    if b.y <= a.y { fail("child should be below its parent (a.y=${a.y}, b.y=${b.y})") }
+    check("siblings share a rank", b.y, c.y)
+    // Siblings must not overlap horizontally.
+    if b.x + b.w > c.x and c.x + c.w > b.x { fail("siblings overlap: b.x=${b.x} c.x=${c.x}") }
+    // The canvas is big enough to hold every box.
+    for n in laid.nodes {
+        if n.x + n.w > laid.w + 0.01 { fail("node ${n.id} overflows the width") }
+        if n.y + n.h > laid.h + 0.01 { fail("node ${n.id} overflows the height") }
+    }
+
+    // rankdir=LR turns the same graph on its side.
+    let lr = layout(parse_dot("digraph { rankdir=LR; a -> b; }"), fake_measure())
+    let la = node_named(lr, "a")
+    let lb = node_named(lr, "b")
+    if lb.x <= la.x { fail("LR should place the child to the right") }
+    check("LR keeps ranks level", lb.y, la.y)
+
+    // A longer label makes a wider box.
+    let wide = layout(parse_dot("digraph { a [label=\"a much longer label\"]; }"), fake_measure())
+    if node_named(wide, "a").w <= 60.0 { fail("a long label should widen its box") }
+
+    check("empty graph reports itself", layout({ nodes: [], edges: [], index: {} }, fake_measure()).ok, false)
+}
+
+fn run() {
+    test_tokenize()
+    test_parse_basic()
+    test_parse_chains_and_attrs()
+    test_parse_errors()
+    test_ranks()
+    test_layout_positions()
+    println("pad_graph: ok")
+}
+
+run()

@@ -1,0 +1,37 @@
+[package]
+name = "jim_webview"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+jim_pane = { path = "../jim-pane" }
+# For `request_main_loop_wakeup()`: frames arrive on a socket thread and jim's
+# main loop is reactive, so it has to be poked or the frame just sits there.
+jim_widget = { path = "../jim-widget" }
+
+# NOTE: jim does NOT link CEF. Chromium runs in `jim-webview-host`, because
+# in-process CEF crashes jim: Bevy runs AppKit's `-[NSApplication run]` loop
+# and Chromium's macOS message pump installs CFRunLoop observers that trap
+# inside it. This crate only talks to that process over a socket and imports
+# the IOSurfaces it publishes.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
+bevy = { version = "0.19", default-features = false, features = [
+    "2d",
+    "system_font_discovery",
+    "3d",
+    "x11",
+    "wayland",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.3"
+objc2-io-surface = "0.3.2"
+objc2-core-foundation = "0.3.2"
+
+[lib]
+name = "jim_webview"
+path = "src/lib.rs"

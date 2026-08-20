@@ -44,6 +44,10 @@ funct = "0.1"
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-json = "0.24"
+# Path tessellation for `CanvasItem::Path` (src/vector.rs) — fills, strokes,
+# caps/joins and bezier flattening, the same tessellator jim-whiteboard draws
+# its scenes with.
+lyon = "1.0"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 bevy = { version = "0.19", default-features = false, features = [
     "2d",

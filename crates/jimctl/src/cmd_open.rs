@@ -55,6 +55,12 @@ pub fn run() -> ExitCode {
         }
     };
 
+    // `open <url>` is what both agents and humans reach for first, so make it
+    // do the obvious thing rather than failing to canonicalize a URL as a path.
+    if let Some(url) = crate::cmd_web::normalize(&args.path.to_string_lossy()) {
+        return crate::cmd_web::open_url(&url, args.project.as_deref());
+    }
+
     let abs = match args.path.canonicalize() {
         Ok(p) => p,
         Err(e) => {

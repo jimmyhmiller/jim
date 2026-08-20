@@ -1,0 +1,16 @@
+[package]
+name = "jim_webview_helper"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+# CEF spawns its renderer/GPU/utility processes from a separate executable.
+# This is that executable, and it is deliberately tiny: it must NOT pull in
+# jim-app, bevy or libghostty, because make-bundle copies it into five helper
+# .app bundles inside Jim.app.
+[dependencies]
+cef = "151"
+
+[[bin]]
+name = "jim-helper"
+path = "src/main.rs"

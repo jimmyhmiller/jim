@@ -1003,8 +1003,11 @@ fn emit_pane_hover(
     // (entity, rect, anchored, title_h, resizable)
     let unpinned_rects: Vec<(Entity, PaneRect, bool, f32, bool)> = panes
         .iter()
-        .filter(|(_, _, project, vis, pinned, _, _, _)| {
+        .filter(|(e, _, project, vis, pinned, _, _, _)| {
             target_project.is_none_or(|id| project.0 == id)
+                // The pane the view is drawn INSIDE is being looked
+                // through, not at (see `Views::is_host_of`).
+                && !views.is_host_of(view_id, *e)
                 && !matches!(vis, Some(Visibility::Hidden))
                 && !pinned
         })
@@ -1045,7 +1048,7 @@ fn emit_pane_hover(
     if target.is_none() {
         let mut best: Option<(Entity, f32, Vec2)> = None;
         for (e, r, project, vis, pinned, anchored, ov, member) in panes.iter() {
-            if target_project.is_some_and(|id| project.0 != id) {
+            if target_project.is_some_and(|id| project.0 != id) || views.is_host_of(view_id, e) {
                 continue;
             }
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
@@ -2002,8 +2005,18 @@ fn handle_pane_mouse(
         // window cursor; canvas panes against the canvas cursor.
         let unpinned_rects: Vec<(Entity, PaneRect, bool)> = panes
             .iter()
-            .filter(|(_, _, vis, pinned, anchored)| {
-                !matches!(vis, Some(Visibility::Hidden))
+            .filter(|(e, _, vis, pinned, anchored)| {
+                // Inside a child view only that view's project is
+                // clickable, and never the pane the view is drawn in.
+                // The hover path has always filtered this way; the press
+                // path did not, so a click inside a live project view was
+                // taken by the HOST pane (a presenting deck covers the
+                // whole window at z = 500 and won every time) and the
+                // embedded project was decorative.
+                target_project.is_none_or(|id| {
+                    aux.projects.get(*e).is_ok_and(|p| p.0 == id)
+                }) && !views.is_host_of(view_id, *e)
+                    && !matches!(vis, Some(Visibility::Hidden))
                     && !pinned
                     // While the host is drawing over panes, ignore presses on
                     // normal panes (they get routed to an annotation surface);
@@ -2109,7 +2122,9 @@ fn handle_pane_mouse(
         // works even while the tile is pinned to the background.
         let mut best_dclick: Option<(Entity, f32)> = None;
         for (e, r, vis, pinned, anchored) in panes.iter() {
-            if target_project.is_some_and(|id| aux.projects.get(e).is_ok_and(|p| p.0 != id)) {
+            if target_project.is_some_and(|id| aux.projects.get(e).is_ok_and(|p| p.0 != id))
+                || views.is_host_of(view_id, e)
+            {
                 continue;
             }
             if matches!(vis, Some(Visibility::Hidden)) || !pinned {
@@ -2244,6 +2259,20 @@ fn handle_pane_mouse(
 /// frustum (z = [-1000, 1000]). When that happens the pane silently
 /// vanishes — looked just like "clicking made the pane disappear,"
 /// which is exactly the bug this guards against.
+/// Does this pane take part in canvas z-stacking?
+///
+/// Pinned panes are background decoration, held at z=0. Screen-anchored
+/// panes own their own z: a presenting deck is re-pinned to exactly
+/// `MAX_PANE_Z` every frame by `present.rs`. Folding that into `max_z`
+/// made EVERY click compute `max_z + 1 > MAX_PANE_Z` and renumber the
+/// whole stack — which rewrites every pane camera's order, re-sorts every
+/// live-view camera, and races `apply_presentation` to put the deck's z
+/// back. Clicking a pane embedded in a slide flashed the real app over the
+/// slide for a frame because of it.
+fn stacks_in_z(pinned: bool, anchored: bool) -> bool {
+    !pinned && !anchored
+}
+
 const MAX_PANE_Z: f32 = 500.0;
 
 fn bring_to_front(
@@ -2263,12 +2292,12 @@ fn bring_to_front(
     if let Ok((_, _, _, true, _)) = panes.get(target) {
         return;
     }
-    // Compute max-z over UNPINNED panes only so pinned panes (kept at
-    // z=0 by `pin_pane`) don't pull the floor up and don't get touched
-    // by renormalization.
+    // Compute max-z over STACKING panes only — see `stacks_in_z`. Pinned
+    // panes (kept at z=0 by `pin_pane`) mustn't pull the floor up, and a
+    // screen-anchored pane mustn't either.
     let max_z = panes
         .iter()
-        .filter(|(_, _, _, pinned, _)| !pinned)
+        .filter(|(_, _, _, pinned, anchored)| stacks_in_z(*pinned, *anchored))
         .map(|(_, r, _, _, _)| r.z)
         .fold(0.0_f32, f32::max);
     if let Ok((_, mut rect, _, _, _)) = panes.get_mut(target) {
@@ -2277,11 +2306,11 @@ fn bring_to_front(
         }
     }
     // Renormalize if the stack is approaching the camera frustum.
-    // Only renumber unpinned panes; pinned panes stay at z=0.
+    // Only renumber stacking panes; pinned stay at z=0, anchored own theirs.
     if max_z + 1.0 > MAX_PANE_Z {
         let mut entries: Vec<(Entity, f32)> = panes
             .iter()
-            .filter(|(_, _, _, pinned, _)| !pinned)
+            .filter(|(_, _, _, pinned, anchored)| stacks_in_z(*pinned, *anchored))
             .map(|(e, r, _, _, _)| (e, r.z))
             .collect();
         entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));

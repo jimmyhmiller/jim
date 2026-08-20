@@ -69,12 +69,41 @@ fi
 #   - `jim bus-daemon` (the widget/agent message-bus daemon; survives
 #     GUI restarts so retained messages + agent roster persist)
 ABS_BIN="$(pwd)/$BIN"
-KILL=$(ps -ax -o pid,command \
-    | awk '($0 ~ /Jim\.app\/Contents\/MacOS\/jim($|[[:space:]])/ \
-            || $0 ~ /target\/(debug|release)\/jim($|[[:space:]])/) \
-           && $0 !~ /--daemon/ \
-           && $0 !~ /jim-daemon/ \
-           && $0 !~ /bus-daemon/ { print $1 }')
+
+# Finding the running GUI.
+#
+# This used to match only the full command line:
+#     /Jim\.app\/Contents\/MacOS\/jim($|[[:space:]])/
+# A GUI that has CRASHED but not yet been reaped shows in `ps` as "(jim)" —
+# parenthesised, with no path — so it did not match, was never killed, and the
+# script happily launched another one on top of it. Five crashed instances
+# accumulated that way in one session before anyone noticed.
+#
+# Match on the executable name as well, which is stable in both states, and
+# exclude the daemons (which survive restarts by design) and the CEF webview
+# hosts (handled separately below).
+jim_gui_pids() {
+    ps -Ao pid=,comm=,command= | awk '
+        {
+            pid = $1
+            comm = $2
+            cmd = ""
+            for (i = 3; i <= NF; i++) cmd = cmd $i " "
+            # macOS `ps -o comm=` prints the full path, so compare basenames.
+            n = split(comm, parts, "/")
+            base = parts[n]
+        }
+        base ~ /daemon/            { next }   # jim-daemon
+        cmd  ~ /--daemon/          { next }   # jim --daemon …
+        cmd  ~ /bus-daemon/        { next }   # jim bus-daemon
+        base == "jim-webview-host" { next }   # CEF host, reaped below
+        (base == "jim" || base == "(jim)" \
+         || cmd ~ /Jim\.app\/Contents\/MacOS\/jim( |$)/ \
+         || cmd ~ /target\/(debug|release)\/jim( |$)/) { print pid }
+    '
+}
+
+KILL=$(jim_gui_pids)
 if [ -n "$KILL" ]; then
     # whisper-server is a normal child process, not one of Jim's persistent
     # daemons. macOS reparents it to PID 1 if the GUI is killed first, so old
@@ -90,10 +119,45 @@ if [ -n "$KILL" ]; then
         echo "[dev-restart] killing GUI-owned whisper server(s):$WHISPER_KILL"
         kill $WHISPER_KILL 2>/dev/null || true
     fi
+
     echo "[dev-restart] killing existing GUI(s): $KILL"
     kill $KILL 2>/dev/null || true
-    # Give them a beat to release the socket before the new instance binds.
-    sleep 0.4
+
+    # Verify they are actually gone. Never assume: launching on top of a
+    # survivor is exactly how instances pile up.
+    REMAIN=""
+    i=0
+    while [ $i -lt 20 ]; do
+        sleep 0.1
+        REMAIN=$(jim_gui_pids)
+        [ -z "$REMAIN" ] && break
+        i=$((i + 1))
+    done
+
+    if [ -n "$REMAIN" ]; then
+        echo "[dev-restart] still alive after SIGTERM, sending SIGKILL: $REMAIN" >&2
+        kill -9 $REMAIN 2>/dev/null || true
+        sleep 0.5
+        REMAIN=$(jim_gui_pids)
+    fi
+
+    if [ -n "$REMAIN" ]; then
+        echo "[dev-restart] ERROR: GUI process(es) still running: $REMAIN" >&2
+        echo "[dev-restart] refusing to launch — that would leave two Jims running." >&2
+        exit 1
+    fi
+fi
+
+# CEF webview hosts are children of the GUI, each owning a Chromium. They are
+# NOT daemons and must not outlive the GUI; orphaned ones keep rendering and
+# stack up across restarts.
+HOSTS=$(ps -Ao pid=,comm= | awk '$2 == "jim-webview-host" { print $1 }')
+if [ -n "$HOSTS" ]; then
+    echo "[dev-restart] reaping webview host(s): $HOSTS"
+    kill $HOSTS 2>/dev/null || true
+    sleep 0.2
+    HOSTS=$(ps -Ao pid=,comm= | awk '$2 == "jim-webview-host" { print $1 }')
+    [ -n "$HOSTS" ] && kill -9 $HOSTS 2>/dev/null || true
 fi
 
 LOG=${TMPDIR:-/tmp}/jim-${PROFILE}.log
@@ -120,3 +184,15 @@ env -i \
     TERM="${TERM:-xterm-256color}" SHELL="$SHELL" TMPDIR="$TMPDIR" LANG="$LANG" \
     /bin/zsh -lc "exec open -n '$APP' --stdout '$LOG' --stderr '$LOG' ${GUI_ARGS:+--args $GUI_ARGS}"
 echo "[dev-restart] launched Jim.app via LaunchServices → $LOG"
+
+# Belt and braces: prove we ended up with exactly one GUI. Silent duplicates
+# are what made this script untrustworthy in the first place, so say so loudly
+# rather than leaving it to be discovered by eye.
+sleep 1
+RUNNING=$(jim_gui_pids | tr '\n' ' ' | sed 's/ *$//')
+COUNT=$(printf '%s' "$RUNNING" | wc -w | tr -d ' ')
+if [ "$COUNT" = "1" ]; then
+    echo "[dev-restart] verified: 1 GUI running (pid $RUNNING)"
+else
+    echo "[dev-restart] WARNING: expected 1 GUI, found $COUNT: $RUNNING" >&2
+fi
