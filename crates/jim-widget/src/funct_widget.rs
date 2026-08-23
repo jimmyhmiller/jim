@@ -1224,6 +1224,14 @@ fn register_host_surface(
     let dirty = slots.render_dirty.clone();
     vm.register0("request_render", move || {
         dirty.store(true, Ordering::Release);
+        // Same reasoning as `set_animating` above, and it applies to the
+        // MOST common of these calls: handlers run on the worker thread, so
+        // marking the render dirty from there is inert until something else
+        // happens to wake the reactive loop. A widget that re-rendered in
+        // response to a key or a bus message would sit unchanged on screen
+        // until the user jiggled the mouse — the new frame is ready, nobody
+        // is awake to pick it up.
+        crate::request_main_loop_wakeup();
     });
     // Scroll jump: applied by the host together with the next published
     // frame (so it clamps against the new content's max). Marks the

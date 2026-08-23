@@ -75,6 +75,16 @@ pub struct SlideTarget {
 #[derive(Resource, Default, Debug, Clone)]
 pub struct SlideTargets {
     pub by_host: HashMap<Entity, SlideTarget>,
+    /// Bumped every time a host publishes what its slide wants — even when
+    /// the answer is identical to last time.
+    ///
+    /// A deck publishes on every slide change, but moving between two
+    /// `application:` slides resolves to the SAME target, so nothing about
+    /// `by_host` changes. Anything watching only for a change of contents
+    /// therefore cannot see the slide move at all: that is why a slide
+    /// change left the picture stale until an unrelated event woke the
+    /// loop. This counter is the "a slide happened" signal.
+    pub bump: u64,
 }
 
 impl SlideTargets {
@@ -194,6 +204,7 @@ fn apply_bus_messages(
         };
         let name = ask.name.clone();
 
+        targets.bump = targets.bump.wrapping_add(1);
         match target_from(&ask, |n| {
             projects.list.iter().find(|p| p.name == n).map(|p| p.id)
         }) {

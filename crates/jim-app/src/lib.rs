@@ -503,7 +503,11 @@ impl Plugin for AppShellPlugin {
                 mirror_active_project_to_style,
                 maintain_project_themes,
                 mirror_focus_to_style,
-                maintain_winit_mode_for_animation,
+                // AFTER the slide picture: it decides whether the loop
+                // keeps drawing, and a burst requested later in the same
+                // frame would not be seen until the next one — which, in
+                // reactive mode, is a frame that never comes on its own.
+                maintain_winit_mode_for_animation.after(slide_view::SlideViewSet),
                 sync_canvas_clear_color,
                 window_geometry::fit_window_to_monitor,
                 window_geometry::save_on_change,
@@ -779,6 +783,16 @@ fn setup_ipc_listener(world: &mut World) {
     // depend on winit, so we hand it a closure over the proxy.
     if let Some(proxy) = wakeup.clone() {
         jim_widget::set_wakeup_hook(move || {
+            let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
+        });
+    }
+    // The RETURN trip from the bus daemon needs the same treatment. A
+    // widget's `emit` already wakes the loop on its way out, but the
+    // message comes back over a socket into a channel drained per frame —
+    // with nothing to wake us, it sat there until the user next touched the
+    // keyboard. Every bus-driven widget update was waiting on input.
+    if let Some(proxy) = wakeup.clone() {
+        jim_bus::client::set_wakeup_hook(move || {
             let _ = proxy.send_event(bevy::winit::WinitUserEvent::WakeUp);
         });
     }

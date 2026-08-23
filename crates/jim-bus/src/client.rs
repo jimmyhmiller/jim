@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -203,6 +203,34 @@ impl Drop for BusHandle {
     }
 }
 
+/// Called whenever the subscriber queues an inbound message, so a host
+/// with a reactive main loop can wake up and drain it.
+///
+/// Without this, a message coming BACK from the bus daemon lands in the
+/// channel and sits there until something else happens to run a frame. The
+/// publish side is already covered — a widget's `emit` wakes the loop on
+/// its way out — but the return trip had nothing, so anything driven by the
+/// bus only appeared when the user next touched the keyboard or mouse. A
+/// deck changing slides looked like it hadn't re-rendered until you moved
+/// the mouse; the frame was ready and no one was awake to deliver it.
+///
+/// `jim-bus` is deliberately dependency-free, so the host installs a
+/// closure rather than this crate knowing about winit.
+static WAKEUP_HOOK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Install the wakeup hook. First caller wins; a no-op if never set (CLI
+/// clients and tests have no loop to wake).
+pub fn set_wakeup_hook(f: impl Fn() + Send + Sync + 'static) {
+    let _ = WAKEUP_HOOK.set(Box::new(f));
+}
+
+/// Cheap and thread-safe; called from the subscriber thread.
+fn wake_host() {
+    if let Some(f) = WAKEUP_HOOK.get() {
+        f();
+    }
+}
+
 /// Forever-reconnecting subscriber. Tracks the highest seq delivered and
 /// resumes from it after a drop.
 fn subscriber_loop(tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
@@ -247,13 +275,16 @@ fn subscriber_session(
                     match f {
                         BusFrame::Message { seq, msg } => {
                             *last_seq = Some(seq);
-                            if tx.send(Inbound::Message(msg)).is_err() {
+                            let queued = tx.send(Inbound::Message(msg));
+                            wake_host();
+                            if queued.is_err() {
                                 stop.store(true, Ordering::SeqCst);
                                 return Ok(());
                             }
                         }
                         BusFrame::ReplayEnd => {
                             let _ = tx.send(Inbound::ReplayEnd);
+                            wake_host();
                         }
                         BusFrame::ReplayStart | BusFrame::Lagged { .. } => {}
                     }

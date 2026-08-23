@@ -100,6 +100,21 @@ fn picture_scale(window: &Window) -> f32 {
 /// How long one level of the dive takes.
 const DIVE_SECONDS: f32 = 0.75;
 
+/// Frames to keep rendering after the picture is rebuilt.
+///
+/// The recursion fills in ONE LEVEL PER RENDERED FRAME: the cameras draw
+/// the app into `scene`, and the in-slide sprite samples `shown`, which is
+/// last frame's copy. So the first frame after a slide change is blank, the
+/// second is one level deep, and so on.
+///
+/// Jim is reactive and only draws on events, so without this a slide change
+/// gets roughly the single frame the deck's own re-render asks for — the
+/// picture sits empty or flat until you happen to move the mouse. A burst
+/// is enough because the depth does not decay: once frames stop, `shown`
+/// keeps whatever nesting it reached. Holding the loop Continuous for as
+/// long as the slide is up would cost ~1.5 cores for no further depth.
+const REBUILD_FRAMES: u32 = 45;
+
 /// Camera order band, above every window pane camera (which top out at
 /// 75_150) and below the whiteboard overlay (80_000). These cameras never
 /// draw to the window, but orders are global and must not collide — Bevy
@@ -134,6 +149,10 @@ struct SlidePicture {
     built_for: Vec<(Entity, usize)>,
     /// Hosts the current sprites were built for.
     hosts: Vec<Entity>,
+    /// Last `SlideTargets::bump` acted on. Any change means a slide moved,
+    /// which needs a burst of frames even when nothing about the camera set
+    /// does.
+    last_bump: u64,
 }
 
 /// Is a dive in flight? Read by the shell's update-mode decision.
@@ -144,11 +163,15 @@ struct SlidePicture {
 #[derive(Resource, Default)]
 pub struct SlideDive {
     active: bool,
+    /// Frames left of the post-rebuild burst. See [`REBUILD_FRAMES`].
+    cooldown: u32,
 }
 
 impl SlideDive {
+    /// Does the loop need to keep drawing? True during a dive, and for a
+    /// short burst after the picture is rebuilt so the recursion can fill.
     pub fn animating(&self) -> bool {
-        self.active
+        self.active || self.cooldown > 0
     }
 }
 
@@ -196,6 +219,18 @@ struct PictureSpriteOf(Entity);
 #[derive(Component)]
 struct PictureSprite;
 
+/// Everything this module does in `Update`.
+///
+/// Exists so the shell's update-mode decision can run AFTER it. Both live
+/// in `Update` and were unordered, so Bevy was free to decide the frame
+/// cadence BEFORE the burst that asks for frames was set — the request
+/// would then sit unread until the next frame, which in reactive mode only
+/// arrives when the user causes an event. That is precisely the "the slide
+/// changed but the picture didn't fill in until I moved the mouse" bug: the
+/// burst was correct and simply never observed in time.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SlideViewSet;
+
 pub struct SlideViewPlugin;
 
 impl Plugin for SlideViewPlugin {
@@ -206,6 +241,7 @@ impl Plugin for SlideViewPlugin {
                 Update,
                 (drive_picture, start_dive, apply_dive)
                     .chain()
+                    .in_set(SlideViewSet)
                     .after(crate::present::PresentSet)
                     .after(crate::projects::sync_visibility),
             );
@@ -240,6 +276,7 @@ fn create_images(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         cap: 1.0,
         built_for: Vec::new(),
         hosts: Vec::new(),
+        last_bump: 0,
     });
 }
 
@@ -307,6 +344,7 @@ type PaneQuery<'w, 's> = Query<
 fn drive_picture(
     mut commands: Commands,
     mut picture: ResMut<SlidePicture>,
+    mut dive: ResMut<SlideDive>,
     mut images: ResMut<Assets<Image>>,
     targets: Res<crate::slide_targets::SlideTargets>,
     windows: Query<&Window>,
@@ -339,6 +377,14 @@ fn drive_picture(
         .filter(|host| panes.get(*host).is_ok_and(|p| p.3.get()))
         .collect();
     hosts.sort();
+
+    // A slide moved. Burst BEFORE the no-hosts bail: leaving an
+    // `application:` slide needs frames just as much as arriving on one —
+    // the deck still has to draw whatever it moved to.
+    if picture.last_bump != targets.bump {
+        picture.last_bump = targets.bump;
+        dive.cooldown = REBUILD_FRAMES;
+    }
 
     if hosts.is_empty() {
         if !picture.built_for.is_empty() || !picture.hosts.is_empty() {
@@ -593,6 +639,12 @@ fn apply_dive(
     if dive.active != running {
         dive.active = running;
     }
+    // Ticked here rather than in `drive_picture`: this runs every frame,
+    // and while the counter is positive the loop is Continuous, so the
+    // frames it is counting are the frames that actually happen.
+    if dive.cooldown > 0 {
+        dive.cooldown -= 1;
+    }
 }
 
 /// Where a host pane's picture goes, in world space, and how big.
@@ -823,6 +875,34 @@ mod tests {
     #[test]
     fn a_collapsed_pane_cannot_be_dived_into() {
         assert!(dive_rect(0.5, Vec2::ZERO, Vec2::ZERO, Vec2::new(800.0, 600.0), 1.0).is_none());
+    }
+
+    /// The burst has to outlast the pipeline it is feeding: the picture
+    /// gains one level per rendered frame, and a slide change starts from
+    /// nothing.
+    #[test]
+    fn the_rebuild_burst_outlasts_the_first_few_levels() {
+        let mut dive = SlideDive::default();
+        assert!(!dive.animating(), "idle by default");
+        dive.cooldown = REBUILD_FRAMES;
+        assert!(dive.animating(), "a rebuild keeps the loop drawing");
+        for _ in 0..REBUILD_FRAMES {
+            assert!(dive.animating());
+            dive.cooldown -= 1;
+        }
+        assert!(!dive.animating(), "and releases it again");
+        assert!(
+            REBUILD_FRAMES >= 10,
+            "fewer than ~10 frames and the recursion is still visibly shallow"
+        );
+    }
+
+    /// A dive keeps the loop awake on its own, independently of the burst.
+    #[test]
+    fn a_dive_keeps_drawing_without_a_burst() {
+        let mut dive = SlideDive::default();
+        dive.active = true;
+        assert!(dive.animating());
     }
 
     /// A host's picture is placed against the pane's CONTENT area — what
