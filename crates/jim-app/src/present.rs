@@ -38,6 +38,10 @@ pub struct Presentation {
     /// The current slide is an `application:` slide: the deck hides itself
     /// and you look at the real application.
     stepped_aside: bool,
+    /// The deck's presentation geometry (window-filling, chrome hidden) is
+    /// currently applied. False while a slide has handed the window to the
+    /// real app and the deck is back to being an ordinary pane.
+    presented_geometry: bool,
     /// Show the sidebar while stepped aside.
     show_sidebar: bool,
     /// Project that was active before the current `project:` slide
@@ -50,6 +54,24 @@ pub struct Presentation {
     /// depending on which order you viewed them in. A deck has to be
     /// idempotent: a slide looks the same however you got there.
     saved_project: Option<u64>,
+    /// Start/stop a show from outside the keyboard.
+    ///
+    /// The same seam `ToggleExpose` uses: a presentation takes over the
+    /// whole window, so there is otherwise no way to exercise it from a
+    /// script — and the path it turns on is the one that can take the app
+    /// down with a render-validation error. Verifiable beats plausible.
+    pub pending_toggle: bool,
+    /// Which deck [`Self::pending_toggle`] means, by title. `None` uses the
+    /// focused pane, exactly like F5.
+    pub pending_title: Option<String>,
+    /// A scripted slide move: `"ArrowRight"` / `"ArrowLeft"`, delivered to
+    /// the presenting deck's worker exactly as [`NEXT`]/[`PREV`] do.
+    ///
+    /// Navigation is the half of a talk that a script could not reach, and
+    /// it is where the interesting transitions live: engaging a mirror
+    /// mid-show is a different code path from starting on one, and only the
+    /// first of those crashed.
+    pub pending_nav: Option<String>,
 }
 
 impl Presentation {
@@ -121,6 +143,8 @@ impl Plugin for PresentPlugin {
                 (
                     // `sync_visibility` reads `stepped_aside` to decide
                     // whether the deck is on screen, so resolve it first.
+                    apply_pending_toggle.before(apply_app_slide),
+                    apply_pending_nav.before(apply_app_slide),
                     apply_app_slide.before(crate::projects::sync_visibility),
                     (presentation_keys, apply_presentation).chain(),
                 )
@@ -164,6 +188,62 @@ fn is_deck(world: &World, entity: Entity) -> bool {
     world
         .get::<jim_widget::script_widget::ScriptWidget>(entity)
         .is_some_and(|w| w.script_path.ends_with("deck.ft"))
+}
+
+/// Consume [`Presentation::pending_toggle`], the scripted form of F5.
+///
+/// Same rule as the action: starting needs a focused deck, stopping needs
+/// nothing, because a running show has exactly one deck to stop.
+fn apply_pending_toggle(
+    mut presentation: ResMut<Presentation>,
+    focused: Res<jim_pane::FocusedPane>,
+    widgets: Query<&jim_widget::script_widget::ScriptWidget>,
+    titled: Query<(Entity, &jim_pane::PaneTitle)>,
+) {
+    if !std::mem::take(&mut presentation.pending_toggle) {
+        return;
+    }
+    let named = presentation.pending_title.take();
+    if presentation.deck.is_some() {
+        presentation.deck = None;
+        return;
+    }
+    let wanted = match &named {
+        Some(title) => titled
+            .iter()
+            .find(|(_, t)| &t.0 == title)
+            .map(|(entity, _)| entity),
+        None => focused.0,
+    };
+    match wanted.filter(|e| widgets.get(*e).is_ok_and(is_deck_widget)) {
+        Some(deck) => presentation.deck = Some(deck),
+        None => match named {
+            Some(title) => info!("[present] no deck pane titled `{title}`"),
+            None => info!("[present] no deck focused — click a deck pane first"),
+        },
+    }
+}
+
+/// Consume [`Presentation::pending_nav`] — the scripted form of ⌘⇧→/←.
+fn apply_pending_nav(
+    mut presentation: ResMut<Presentation>,
+    widgets: Query<&jim_widget::script_widget::ScriptWidget>,
+) {
+    let Some(key) = presentation.pending_nav.take() else {
+        return;
+    };
+    let Some(deck) = presentation.deck else {
+        info!("[present] nav ignored: no talk running");
+        return;
+    };
+    match widgets.get(deck) {
+        Ok(widget) => widget.send_key(&key),
+        Err(_) => info!("[present] nav ignored: the presenting deck is gone"),
+    }
+}
+
+fn is_deck_widget(widget: &jim_widget::script_widget::ScriptWidget) -> bool {
+    widget.script_path.ends_with("deck.ft")
 }
 
 fn toggle_presentation(ctx: &mut ActionCtx) {
@@ -285,6 +365,23 @@ fn presentation_keys(
     }
 }
 
+/// Give the deck the window, or give it back.
+///
+/// Two geometries, switched by `stepped_aside`:
+///
+/// - **Presenting** — window-filling, chrome hidden, screen-anchored. The
+///   slide IS the screen.
+/// - **Stepped aside** — the deck's ORDINARY pane: its saved rect on the
+///   canvas, its title bar and border back, no anchoring. The show is still
+///   running and the deck is still rendering; it has simply stopped
+///   covering the window.
+///
+/// Stepping aside used to HIDE the deck instead, and that removed the one
+/// thing the slide was about. An `application:`/`project:` slide says "look
+/// at the real app" — and this deck's own pane is part of the real app. You
+/// find it on the canvas and it is showing a slide of the app that contains
+/// it. Any pane rendering this deck does the same, which is what makes it
+/// recursive rather than a picture of something else.
 fn apply_presentation(
     mut presentation: ResMut<Presentation>,
     mut projects: ResMut<crate::projects::Projects>,
@@ -298,27 +395,38 @@ fn apply_presentation(
     };
     if let Some(deck) = presentation.deck {
         let window_size = Vec2::new(window.width(), window.height());
+        let aside = presentation.stepped_aside;
         if let Ok((mut rect, chrome)) = panes.get_mut(deck) {
-            let entering = presentation.saved_rect.is_none();
-            if entering {
+            if presentation.saved_rect.is_none() {
+                // The deck's own rect on the canvas, remembered once for
+                // the whole show — every step aside returns to THIS, not to
+                // wherever the previous slide left it.
                 presentation.saved_rect = Some(*rect);
                 presentation.saved_deck = Some(deck);
-                for part in chrome_parts(chrome) {
-                    if let Ok(mut vis) = visibility.get_mut(part) {
-                        *vis = Visibility::Hidden;
-                    }
+                // Keep rendering even when something else hides the pane,
+                // so it is already correct the moment it comes back.
+                commands
+                    .entity(deck)
+                    .insert(jim_widget::script_widget::RenderWhileHidden);
+            }
+            if aside && presentation.presented_geometry {
+                presentation.presented_geometry = false;
+                set_chrome_visible(chrome, &mut visibility, true);
+                commands
+                    .entity(deck)
+                    .remove::<PaneScreenAnchored>()
+                    .remove::<PaneChromeOverride>();
+                if let Some(saved) = presentation.saved_rect {
+                    *rect = saved;
                 }
+            } else if !aside && !presentation.presented_geometry {
+                presentation.presented_geometry = true;
+                set_chrome_visible(chrome, &mut visibility, false);
                 // title_h = 0 and no border/radius: the pane is a bare
                 // surface. The rect then grows by the content inset on
                 // every side (`content_area_th` insets by MARGIN all round
                 // once the title bar is gone) so the slide itself — not the
                 // pane around it — covers the window exactly.
-                // Keep the deck rendering even while an `application:`
-                // slide hides it, so it is already correct the moment the
-                // next ordinary slide brings it back.
-                commands
-                    .entity(deck)
-                    .insert(jim_widget::script_widget::RenderWhileHidden);
                 commands.entity(deck).insert((
                     PaneChromeOverride {
                         title_h: 0.0,
@@ -329,17 +437,20 @@ fn apply_presentation(
                     PaneScreenAnchored,
                 ));
             }
-            let want = PaneRect {
-                pos: Vec2::splat(-MARGIN),
-                size: window_size + Vec2::splat(2.0 * MARGIN),
-                z: 500.0,
-            };
-            if rect.pos != want.pos || rect.size != want.size || rect.z != want.z {
-                *rect = want;
+            if !aside {
+                let want = PaneRect {
+                    pos: Vec2::splat(-MARGIN),
+                    size: window_size + Vec2::splat(2.0 * MARGIN),
+                    z: 500.0,
+                };
+                if rect.pos != want.pos || rect.size != want.size || rect.z != want.z {
+                    *rect = want;
+                }
             }
         }
     } else if presentation.saved_rect.is_some() {
         presentation.stepped_aside = false;
+        presentation.presented_geometry = false;
         if let Some(project) = presentation.saved_project.take() {
             projects.set_active(project);
         }
@@ -350,11 +461,7 @@ fn apply_presentation(
                 }
             }
             if let Ok((_, chrome)) = panes.get(deck) {
-                for part in chrome_parts(chrome) {
-                    if let Ok(mut vis) = visibility.get_mut(part) {
-                        *vis = Visibility::Inherited;
-                    }
-                }
+                set_chrome_visible(chrome, &mut visibility, true);
             }
             commands
                 .entity(deck)
@@ -363,6 +470,19 @@ fn apply_presentation(
                 .remove::<jim_widget::script_widget::RenderWhileHidden>();
         } else {
             presentation.saved_rect = None;
+        }
+    }
+}
+
+fn set_chrome_visible(chrome: &PaneChrome, visibility: &mut Query<&mut Visibility>, show: bool) {
+    let want = if show {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for part in chrome_parts(chrome) {
+        if let Ok(mut vis) = visibility.get_mut(part) {
+            *vis = want;
         }
     }
 }
@@ -382,6 +502,20 @@ mod tests {
             show_sidebar,
             ..Default::default()
         }
+    }
+
+    /// Stepping aside must NOT hide the deck. The slide is about the real
+    /// app, and this deck's own pane is part of the real app — hiding it
+    /// removes the thing you are meant to go and find.
+    #[test]
+    fn stepping_aside_keeps_the_deck_visible_and_ordinary() {
+        let mut p = presentation(Some(deck(1)), true, true);
+        p.presented_geometry = true;
+        assert!(p.stepped_aside());
+        assert!(
+            p.sidebar_visible(),
+            "the app you stepped aside for includes its sidebar"
+        );
     }
 
     /// `project:` and `application:` are full-screen-only directives. In a

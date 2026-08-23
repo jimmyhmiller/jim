@@ -55,6 +55,7 @@ pub mod render_trace;
 pub mod run_button;
 pub mod screenshot_consent;
 pub mod slide_targets;
+pub mod slide_view;
 pub mod tools;
 pub mod whiteboard_bg;
 pub mod window_geometry;
@@ -207,6 +208,8 @@ impl Plugin for AppShellPlugin {
             //   - MENU_OVERLAY_LAYER (32): menus / FPS / status bar.
             //   - WHITEBOARD_OVERLAY_LAYER (31): the canvas drawing overlay.
             //   - cube::CUBE_LAYER (4096): the prism's structural geometry.
+            //   - slide_view::BLIT_LAYER (4097): the blit quad that copies
+            //     a slide's picture of the app.
             //   - jim_style::dynamic::OVERLAY_LAYER (30): the dust/shader
             //     canvas overlay, drawn at order 1_000_001 above everything.
             // This is the single registry of global layers; anyone adding a
@@ -217,6 +220,7 @@ impl Plugin for AppShellPlugin {
                     MENU_OVERLAY_LAYER,
                     WHITEBOARD_OVERLAY_LAYER,
                     cube::CUBE_LAYER,
+                    slide_view::BLIT_LAYER,
                     jim_style::dynamic::OVERLAY_LAYER,
                     jim_pane::dock::DOCK_OVERLAY_LAYER,
                 ],
@@ -251,6 +255,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(pane_groups::PaneGroupsPlugin)
             .add_plugins(slide_targets::SlideTargetPlugin)
             .add_plugins(present::PresentPlugin)
+            .add_plugins(slide_view::SlideViewPlugin)
             .add_plugins(workflow_graph::WorkflowGraphPlugin)
             .add_plugins(fps::FpsOverlayPlugin)
             .add_plugins(debug_bar::DebugBarPlugin)
@@ -792,6 +797,7 @@ fn drain_ipc_open_requests(
     mut drawer: ResMut<drawer::Drawer>,
     mut prism: ResMut<cube::Prism>,
     mut expose: ResMut<expose::Expose>,
+    mut presentation: ResMut<present::Presentation>,
     mut msg_bus: ResMut<jim_widget::WidgetMsgBus>,
     mut palette_open: ResMut<command_palette::PaletteOpenRequest>,
     mut issues: ResMut<issues_pane::IssuesStore>,
@@ -928,6 +934,13 @@ fn drain_ipc_open_requests(
             }
             ipc::IpcRequest::ToggleExpose => {
                 expose.pending_toggle = true;
+            }
+            ipc::IpcRequest::TogglePresent { title } => {
+                presentation.pending_toggle = true;
+                presentation.pending_title = title;
+            }
+            ipc::IpcRequest::PresentNav { key } => {
+                presentation.pending_nav = Some(key.unwrap_or_else(|| "ArrowRight".to_string()));
             }
             ipc::IpcRequest::ActivateProject { project } => {
                 match projects::resolve_project(&OpenProjectTarget::ByName(project), &projects) {

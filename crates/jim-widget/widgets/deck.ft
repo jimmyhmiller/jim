@@ -515,15 +515,12 @@ fn render(w, h) {
     let base = { ..glaze_at("slide", { layout: layout }, [], w, h),
                  width: "100%", height: "100%" }
 
-    // A live slide draws NOTHING. The host is about to hide this pane and
-    // show the real application, so anything drawn here is a frame or two of
-    // flicker on the way out — which is exactly what the "nothing is there"
-    // text turned out to be. It survived from the embedded-mirror model,
-    // where the host painted the project through a hole in the slide and the
-    // deck had to explain an empty hole. There is no hole any more.
-    if live {
-        return { kind: "vstack", gap: 0.0, style: base, children: [] }
-    }
+    // A live slide used to draw NOTHING, because the host HID this pane on
+    // its way to showing the real application. It no longer hides it: the
+    // deck steps aside by going back to being an ordinary pane on the
+    // canvas, where it stays visible and keeps rendering. So a live slide
+    // draws exactly like any other one — a blank pane sitting on the canvas
+    // during the demo was the old model leaking through.
 
     let content = { kind: "vstack", gap: 0.0, children: kids }
     let padded = { ..base, padding: edges(h * pad_y_frac(), w * pad_x_frac(),

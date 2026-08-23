@@ -378,6 +378,46 @@ Each stage stands alone.
      the app's own navigation. A hidden sidebar also takes no clicks — it
      used to stay live in an invisible strip under the slide.
 
+4d. ⚠️ **Recursive slides — the deck stops hiding.**
+
+   Stage 4c had an `application:`/`project:` slide HIDE the deck. That
+   removes the one thing such a slide is about: you are looking at the real
+   app, and this deck's own pane is part of the real app. Go and find it on
+   the canvas and it is showing a slide of the app that contains it — any
+   pane rendering that deck does the same. That is where the recursion
+   comes from, and hiding the deck threw it away.
+
+   So stepping aside now means **going back to being an ordinary pane**:
+   the saved canvas rect, title bar and border back, no screen anchoring.
+   The show is still running; the deck has simply stopped covering the
+   window. A live slide therefore renders like any other slide — the old
+   "a live slide draws NOTHING" rule existed only because the pane was
+   about to be hidden.
+
+   **A whole-window copy is the wrong mechanism, and this is the scar.**
+   The first attempt at the picture re-pointed EVERY camera in the app at
+   an offscreen texture and blitted that to the screen. It put the entire
+   editor downstream of one feature, and every failure took the whole app:
+
+   - Image render targets are single-sampled and Jim sets `Msaa` nowhere,
+     so all ~60 cameras run at Bevy's default `Sample4`. Bevy treats the
+     mismatch as a FATAL validation error — the app quits. Crashed twice.
+   - Fixing that by pairing the retarget with `Msaa::Off` in one command
+     flush moved the collision to the WINDOW, where the blit briefly shares
+     the target with ~60 not-yet-retargeted cameras. Crashed again.
+   - With it finally stable, the window showed a copy of the app that was
+     missing most of the app — one pane and a sidebar, no matter which
+     project. The editor was unusable, because you were no longer looking
+     at the editor.
+
+   The rule that came out of it: **Jim's own rendering stays untouched.**
+   The app draws straight to the window as it always has — nothing
+   retargeted, no global MSAA change. A picture for a slide must be
+   produced ADDITIVELY, the way `cube.rs` does it (its own cameras into its
+   own images), so a mistake can make the slide wrong and nothing else.
+
+   Still to build: the picture itself, on that additive basis.
+
 5. ✅ **`present.rs` — presentation mode.** F5 hands the whole window to
    one deck. "Whole window" is literal, and three separate things had to be
    true for it:
@@ -457,7 +497,6 @@ existing precedent to copy.
 | `jim_pane::PaneGroup` + `PaneSnapshot.group` | named, revealable pane groups (persisted) |
 | `jim-app/src/pane_groups.rs` | `VisibleGroups` + the `pane.groups` bus consumer |
 | `jimctl group assign\|clear\|show\|hide\|list` | wire and rehearse a deck's dashboards |
-| `jim-app/src/live_views.rs` | interactive project/whole-app views via direct cameras |
 | `docs/example-deck.md` | every format feature, including a `project:` slide |
 
 76 tests in `jim_widget`, 39 in `jim_app`, 31 in `glaze`. The deck, both

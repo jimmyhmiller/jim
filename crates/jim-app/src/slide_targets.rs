@@ -126,29 +126,36 @@ fn payload_bool_or(value: Option<&serde_json::Value>, default: bool) -> bool {
 /// that doesn't resolve is refused rather than silently treated as the
 /// active project — pointing a slide at a typo must not look like success.
 fn target_from(
-    name: &str,
-    whole_app: bool,
-    show_sidebar: bool,
+    ask: &Ask,
     resolve: impl Fn(&str) -> Option<u64>,
 ) -> Result<Option<SlideTarget>, ()> {
-    if name.is_empty() {
+    let whole_app = ask.whole_app;
+    if ask.name.is_empty() {
         if !whole_app {
             return Ok(None);
         }
         return Ok(Some(SlideTarget {
             project: None,
             name: String::new(),
-            show_sidebar,
+            show_sidebar: ask.show_sidebar,
         }));
     }
-    match resolve(name) {
+    match resolve(&ask.name) {
         Some(project) => Ok(Some(SlideTarget {
             project: Some(project),
-            name: name.to_string(),
-            show_sidebar,
+            name: ask.name.clone(),
+            show_sidebar: ask.show_sidebar,
         })),
         None => Err(()),
     }
+}
+
+/// What one `pane.project` payload asked for, before it is resolved.
+#[derive(Debug, Clone)]
+struct Ask {
+    name: String,
+    whole_app: bool,
+    show_sidebar: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,17 +179,22 @@ fn apply_bus_messages(
         if hosts.get(host).is_err() {
             continue;
         }
-        let name = msg
-            .payload
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let whole_app = payload_bool(msg.payload.get("whole_app"));
-        // Defaults ON. "Show me the whole application" without its sidebar
-        // is not the whole application — that was the wrong default.
-        let show_sidebar = payload_bool_or(msg.payload.get("sidebar"), true);
+        let ask = Ask {
+            name: msg
+                .payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            whole_app: payload_bool(msg.payload.get("whole_app")),
+            // Defaults ON. "Show me the whole application" without its
+            // sidebar is not the whole application — that was the wrong
+            // default.
+            show_sidebar: payload_bool_or(msg.payload.get("sidebar"), true),
+        };
+        let name = ask.name.clone();
 
-        match target_from(name, whole_app, show_sidebar, |n| {
+        match target_from(&ask, |n| {
             projects.list.iter().find(|p| p.name == n).map(|p| p.id)
         }) {
             Ok(None) => {
@@ -207,7 +219,7 @@ fn apply_bus_messages(
             }
             Err(()) => {
                 warn!("[slide] no project named `{name}`");
-                publish_status(&mut bus, &mut published, host, name, false, 0, false);
+                publish_status(&mut bus, &mut published, host, &name, false, 0, false);
                 targets.by_host.remove(&host);
             }
         }
@@ -265,6 +277,15 @@ fn publish_status(
 mod tests {
     use super::*;
 
+    /// An ordinary ask: a plain slide, before any directive changes it.
+    fn ask(name: &str, whole_app: bool, show_sidebar: bool) -> Ask {
+        Ask {
+            name: name.to_string(),
+            whole_app,
+            show_sidebar,
+        }
+    }
+
     fn resolve(name: &str) -> Option<u64> {
         match name {
             "Recursion" => Some(1),
@@ -285,13 +306,13 @@ mod tests {
     /// A plain slide clears the request, so the deck comes back.
     #[test]
     fn an_ordinary_slide_clears_the_request() {
-        assert_eq!(target_from("", false, false, resolve), Ok(None));
+        assert_eq!(target_from(&ask("", false, false), resolve), Ok(None));
     }
 
     /// `application: true` hands over the window without switching project.
     #[test]
     fn an_application_slide_does_not_switch_project() {
-        let t = target_from("", true, false, resolve)
+        let t = target_from(&ask("", true, false), resolve)
             .expect("valid")
             .expect("a target");
         assert_eq!(t.project, None);
@@ -300,7 +321,7 @@ mod tests {
     /// `project: Name` switches first, then hands over.
     #[test]
     fn a_project_slide_resolves_the_name() {
-        let t = target_from("Metaphysics", false, false, resolve)
+        let t = target_from(&ask("Metaphysics", false, false), resolve)
             .expect("valid")
             .expect("a target");
         assert_eq!(t.project, Some(10));
@@ -309,7 +330,10 @@ mod tests {
     /// A typo must be refused, not silently shown as the active project.
     #[test]
     fn an_unknown_project_is_an_error_not_a_fallback() {
-        assert_eq!(target_from("Recursoin", false, false, resolve), Err(()));
+        assert_eq!(
+            target_from(&ask("Recursoin", false, false), resolve),
+            Err(())
+        );
     }
 
     /// "The whole application" includes its sidebar. Defaulting it off made
@@ -317,15 +341,17 @@ mod tests {
     /// application.
     #[test]
     fn the_sidebar_is_on_unless_a_slide_turns_it_off() {
-        let on = target_from("", true, true, resolve).unwrap().unwrap();
+        let on = target_from(&ask("", true, true), resolve).unwrap().unwrap();
         assert!(on.show_sidebar);
-        let off = target_from("", true, false, resolve).unwrap().unwrap();
+        let off = target_from(&ask("", true, false), resolve)
+            .unwrap()
+            .unwrap();
         assert!(!off.show_sidebar);
     }
 
     #[test]
     fn the_sidebar_preference_rides_along() {
-        let t = target_from("Recursion", false, true, resolve)
+        let t = target_from(&ask("Recursion", false, true), resolve)
             .expect("valid")
             .expect("a target");
         assert!(t.show_sidebar);

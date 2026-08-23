@@ -2080,13 +2080,17 @@ pub fn sync_visibility(
         // Without this, clicking the mirrored sidebar hid the very deck
         // doing the presenting.
         if presenting == Some(entity) {
-            // ...unless this slide hands the window to the real application,
-            // in which case the deck gets out of the way entirely.
-            let want = if presentation.stepped_aside() {
-                Visibility::Hidden
-            } else {
-                Visibility::Inherited
-            };
+            // A slide that hands the window to the real application does
+            // NOT hide the deck. The deck gets out of the way by going back
+            // to being an ordinary pane on the canvas (see
+            // `present::apply_presentation`) — it keeps rendering, in its
+            // own place, like any other pane.
+            //
+            // That is the whole point of such a slide: you are looking at
+            // the real app, you find the pane this deck lives in, and it is
+            // showing a slide of the app that contains it. Hiding the deck
+            // removed the one thing the slide was about.
+            let want = Visibility::Inherited;
             if *vis != want {
                 *vis = want;
             }

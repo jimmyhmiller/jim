@@ -118,6 +118,28 @@ pub enum IpcRequest {
     /// `"ToggleExpose"`. Mirrors the Cmd+Shift+E keybind / `view.toggle_expose`
     /// action; handy for scripting and headless verification.
     ToggleExpose,
+    /// Start or stop a presentation. Unit variant → wire form is the bare
+    /// JSON string `"TogglePresent"`. Mirrors F5 / `present.toggle`:
+    /// starting needs the focused pane to be a deck, stopping does not.
+    /// Same purpose as [`Self::ToggleExpose`] — a mode that owns the whole
+    /// window is otherwise unreachable from a script.
+    TogglePresent {
+        /// Present the deck pane with exactly this title, instead of the
+        /// focused one. Naming the deck is not the "whichever deck
+        /// published last" guess `present.toggle` refuses — it is the
+        /// caller being explicit, the same way `Close` takes a title so it
+        /// can never nuke the wrong pane. Ignored when stopping.
+        #[serde(default)]
+        title: Option<String>,
+    },
+    /// Move the running show one slide. Mirrors `present.next` /
+    /// `present.prev`, which go straight to the deck's worker and do not
+    /// need the deck focused.
+    PresentNav {
+        /// `"ArrowRight"` (default) or `"ArrowLeft"`.
+        #[serde(default)]
+        key: Option<String>,
+    },
     /// `tbinbox --project NAME --sender X --body "..."` — append a
     /// message to a project's inbox. The receiver writes the message
     /// to `~/.jim/inbox/<id>.jsonl`; the running app's
