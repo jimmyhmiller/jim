@@ -1063,15 +1063,24 @@ pub fn markdown_readback(
                 let g = &gs[i];
                 let prev_same = i > 0 && gs[i - 1].row == g.row;
                 let next_same = i + 1 < n && gs[i + 1].row == g.row;
-                // Cell boundaries = midpoints between glyph centers; fall back
-                // to the glyph's own half-width at the row ends.
+                // Cell boundaries = midpoints between glyph centers. At a row
+                // end, mirror the nearest center-to-center advance when one is
+                // available. Using the atlas rectangle there is wrong for
+                // whitespace: a space has little or no painted bitmap, even
+                // though it has a normal typographic advance. That made the
+                // caret barely move after typing a trailing space, then jump
+                // to the correct position once the next glyph appeared.
                 let left = if prev_same {
                     (gs[i - 1].x + g.x) * 0.5
+                } else if next_same {
+                    g.x - (gs[i + 1].x - g.x) * 0.5
                 } else {
                     g.x - g.half
                 };
                 let right = if next_same {
                     (g.x + gs[i + 1].x) * 0.5
+                } else if prev_same {
+                    g.x + (g.x - gs[i - 1].x) * 0.5
                 } else {
                     g.x + g.half
                 };

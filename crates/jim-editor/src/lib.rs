@@ -26,9 +26,10 @@ use bevy::text::{LineHeight, TextSpan};
 use editor_core::commands::{
     cursor_char_left, cursor_char_right, cursor_doc_end, cursor_doc_start, cursor_line_down,
     cursor_line_end, cursor_line_start, cursor_line_up, cursor_word_left, cursor_word_right,
-    delete_char_backward, delete_char_forward, indent_more, insert_newline_and_indent, select_all,
-    select_char_left, select_char_right, select_doc_end, select_doc_start, select_line_down,
-    select_line_end, select_line_start, select_line_up, select_word_left, select_word_right,
+    delete_char_backward, delete_char_forward, delete_group_backward, indent_more,
+    insert_newline_and_indent, select_all, select_char_left, select_char_right, select_doc_end,
+    select_doc_start, select_line_down, select_line_end, select_line_start, select_line_up,
+    select_word_left, select_word_right,
 };
 use editor_core::history::{redo, undo};
 use editor_core::selection::{Range, Selection};
@@ -1316,6 +1317,7 @@ fn handle_input(
             } else {
                 run(state, cursor_line_end)
             }),
+            KeyCode::Backspace if mod_word => Some(run_history(state, delete_group_backward)),
             KeyCode::Backspace => Some(run_history(state, delete_char_backward)),
             KeyCode::Delete => Some(run_history(state, delete_char_forward)),
             KeyCode::Enter | KeyCode::NumpadEnter => {
@@ -2035,6 +2037,7 @@ fn handle_embedded_keys(
             } else {
                 run(state, cursor_line_end)
             }),
+            KeyCode::Backspace if mod_word => Some(run_history(state, delete_group_backward)),
             KeyCode::Backspace => Some(run_history(state, delete_char_backward)),
             KeyCode::Delete => Some(run_history(state, delete_char_forward)),
             KeyCode::Enter | KeyCode::NumpadEnter => {

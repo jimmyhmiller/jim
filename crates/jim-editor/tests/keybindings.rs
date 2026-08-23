@@ -120,6 +120,20 @@ fn backspace_at_caret_deletes_prior_char() {
 }
 
 #[test]
+fn alt_backspace_deletes_prior_word() {
+    let mut app = make_app("one two");
+    press(&mut app, KeyCode::End, Key::End);
+    app.update();
+    press(&mut app, KeyCode::AltLeft, Key::Alt);
+    app.update();
+    press(&mut app, KeyCode::Backspace, Key::Backspace);
+    app.update();
+    let s = read_state(&mut app);
+    assert_eq!(s.doc.to_string(), "one ");
+    assert_eq!(s.selection.primary_range().head, 4);
+}
+
+#[test]
 fn enter_inserts_newline_and_indents() {
     let mut app = make_app("    fn foo {");
     press(&mut app, KeyCode::End, Key::End);
