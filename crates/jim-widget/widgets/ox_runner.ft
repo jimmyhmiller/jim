@@ -1,0 +1,240 @@
+// ox_runner.ft — live status of the Ox Alpha task runner on the remote box.
+//
+// The runner lives on computer.jimmyhmiller.com: you drop a markdown task in
+// ~/ox-runner/inbox/ and Ox Alpha does the work in an isolated git worktree,
+// then pushes a branch. This widget watches it.
+//
+// Fully event-driven: one long-lived `ssh ... ox stream` child. The remote
+// side emits a JSON snapshot line ONLY when something changes (plus a ~20s
+// heartbeat), so an idle runner costs nothing here — no set_animating, no
+// per-frame polling. on_proc_output wakes us; we re-render once.
+import "host"
+import { col_text, col_muted, col_accent } from "df"
+import { rget } from "git"
+
+let ox_host = "computer.jimmyhmiller.com"
+let ox_bin = "/home/jimmyhmiller/ox-runner/bin/ox"
+
+fn init_state() = {
+    proc: -1,
+    connected: false,
+    err: "",
+    snap: { daemon: "?", model: "", concurrency: 0,
+            counts: { waiting: 0, running: 0, done: 0, failed: 0 },
+            queued: [], in_flight: [], recent: [] },
+    tab: "runs",
+}
+let state = atom(init_state())
+
+// ---- the stream child -------------------------------------------------------
+
+fn start_stream() {
+    let s = @state
+    if s.proc != -1 { return }
+    // BatchMode: never hang on a password prompt. ServerAlive*: notice a dead
+    // link instead of sitting on a silent socket forever.
+    let h = proc_spawn("ssh", [
+        "-o", "BatchMode=yes",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "ConnectTimeout=10",
+        ox_host, ox_bin, "stream",
+    ])
+    if h == -1 {
+        reset!(state, { ..s, err: "could not spawn ssh" })
+    } else {
+        reset!(state, { ..s, proc: h, err: "" })
+    }
+    request_render()
+}
+
+fn on_start() { start_stream() }
+
+fn on_proc_output(handle, line) {
+    let s = @state
+    if handle != s.proc { return }
+    let t = trim(line)
+    if t == "" { return }
+    // The remote emits one complete JSON object per line. json_parse returns
+    // an Option, so unwrap before type-checking.
+    let parsed = unwrap_or(json_parse(t), 0)
+    if typeof(parsed) == "Record" {
+        reset!(state, { ..s, snap: parsed, connected: true, err: "" })
+        request_render()
+    } else {
+        // Never swallow unexpected output - stderr noise or a broken remote
+        // should be visible, not silently dropped.
+        reset!(state, { ..s, err: slice(t, 0, 160) })
+        request_render()
+    }
+}
+
+fn on_proc_exit(handle, code) {
+    let s = @state
+    if handle != s.proc { return }
+    reset!(state, { ..s, proc: -1, connected: false,
+                    err: "stream ended (exit " + str(code) + ") - press ↻" })
+    request_render()
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "reconnect" {
+        let s = @state
+        if s.proc != -1 { proc_kill(s.proc) }
+        reset!(state, { ..s, proc: -1, connected: false, err: "reconnecting…" })
+        request_render()
+        start_stream()
+        return
+    }
+    if id == "tab_runs" { let s = @state; reset!(state, { ..s, tab: "runs" }); request_render(); return }
+    if id == "tab_queue" { let s = @state; reset!(state, { ..s, tab: "queue" }); request_render(); return }
+}
+
+// ---- pure helpers -----------------------------------------------------------
+
+fn status_color(st) {
+    if st == "success" { "#7fb87f" }
+    else if st == "partial" { "#e0b066" }
+    else if st == "no-changes" { "#e0b066" }
+    else if st == "interrupted" { "#8fa0c0" }
+    else { "#e08a8a" }
+}
+
+fn dur(secs) {
+    if secs < 60 { str(secs) + "s" }
+    else if secs < 3600 { str(secs / 60) + "m " + str(secs % 60) + "s" }
+    else { str(secs / 3600) + "h " + str((secs % 3600) / 60) + "m" }
+}
+
+fn short_run(id) {
+    // ids are <date>-<time>-<slug>; the slug is the readable part.
+    if len(id) > 16 { slice(id, 16, len(id)) } else { id }
+}
+
+fn count_chip(label, n, color) = {
+    kind: "hstack", gap: 4.0, align: "center", children: [
+        { kind: "text", value: str(n), size: 14.0, weight: "bold", color: color },
+        { kind: "text", value: label, size: 11.0, color: col_muted() },
+    ]
+}
+
+fn inflight_card(r) = {
+    kind: "vstack", gap: 2.0, pad: 8.0, children: [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "text", value: "▶", size: 12.0, color: "#7fb0e0" },
+            { kind: "text", value: rget(r, "repo", "?"), size: 12.0,
+              weight: "bold", color: col_text() },
+            { kind: "text", value: dur(rget(r, "elapsed", 0)), size: 11.0,
+              color: col_muted() },
+        ]},
+        { kind: "text", value: rget(r, "title", ""), size: 11.0, color: col_text() },
+        { kind: "text", value: rget(r, "last", ""), size: 10.0, color: col_muted() },
+    ]
+}
+
+fn recent_row(r) {
+    let st = rget(r, "status", "")
+    let pushed = rget(r, "pushed", false)
+    let tail = if pushed { rget(r, "branch", "") } else { rget(r, "reason", "") }
+    let files = rget(r, "files", 0)
+    let churn = if files > 0 {
+        str(files) + "f +" + str(rget(r, "insertions", 0)) +
+        " -" + str(rget(r, "deletions", 0))
+    } else { "" }
+    {
+        kind: "vstack", gap: 1.0, children: [
+            { kind: "hstack", gap: 6.0, align: "center", children: [
+                { kind: "text", value: "●", size: 10.0, color: status_color(st) },
+                { kind: "text", value: st, size: 11.0, weight: "bold",
+                  color: status_color(st) },
+                { kind: "text", value: rget(r, "repo", ""), size: 11.0,
+                  color: col_text() },
+                { kind: "text", value: dur(rget(r, "duration", 0)), size: 10.0,
+                  color: col_muted() },
+                { kind: "text", value: churn, size: 10.0, color: col_muted() },
+            ]},
+            { kind: "text", value: slice(tail, 0, 78), size: 10.0,
+              color: if pushed { col_accent() } else { col_muted() } },
+        ]
+    }
+}
+
+// ---- render -----------------------------------------------------------------
+
+fn render(w, h) {
+    let s = @state
+    let snap = s.snap
+    let counts = rget(snap, "counts", {})
+    let daemon = rget(snap, "daemon", "?")
+    let dcolor = if daemon == "active" { "#7fb87f" } else { "#e08a8a" }
+    let live = s.connected and s.proc != -1
+
+    let inflight = rget(snap, "in_flight", [])
+    let recent = rget(snap, "recent", [])
+    let queued = rget(snap, "queued", [])
+
+    let mut body = []
+
+    if len(inflight) > 0 {
+        body = push(body, { kind: "text", value: "IN FLIGHT", size: 10.0,
+                            weight: "bold", color: col_muted() })
+        for r in inflight { body = push(body, inflight_card(r)) }
+    }
+
+    if s.tab == "queue" {
+        body = push(body, { kind: "text", value: "WAITING", size: 10.0,
+                            weight: "bold", color: col_muted() })
+        if len(queued) == 0 {
+            body = push(body, { kind: "text", value: "queue is empty",
+                                size: 11.0, color: col_muted() })
+        } else {
+            for q in queued {
+                body = push(body, { kind: "hstack", gap: 8.0, children: [
+                    { kind: "text", value: rget(q, "repo", ""), size: 11.0,
+                      weight: "bold", color: col_accent() },
+                    { kind: "text", value: rget(q, "task", ""), size: 11.0,
+                      color: col_text() },
+                ]})
+            }
+        }
+    } else {
+        if len(recent) == 0 {
+            body = push(body, { kind: "text", value: "no runs recorded yet",
+                                size: 11.0, color: col_muted() })
+        } else {
+            body = push(body, { kind: "text", value: "RECENT", size: 10.0,
+                                weight: "bold", color: col_muted() })
+            for r in recent { body = push(body, recent_row(r)) }
+        }
+    }
+
+    let status_line = if s.err != "" { s.err }
+        else if live { "live" }
+        else { "connecting…" }
+
+    {
+        kind: "vstack", gap: 8.0, pad: 12.0, children: [
+            { kind: "hstack", gap: 10.0, align: "center", children: [
+                { kind: "text", value: "ox runner", size: 14.0,
+                  weight: "bold", color: col_text() },
+                { kind: "text", value: daemon, size: 11.0, color: dcolor },
+                { kind: "text", value: rget(snap, "model", ""), size: 10.0,
+                  color: col_muted() },
+                { kind: "button", id: "reconnect", label: "↻" },
+            ]},
+            { kind: "hstack", gap: 14.0, align: "center", children: [
+                count_chip("waiting", rget(counts, "waiting", 0), col_accent()),
+                count_chip("running", rget(counts, "running", 0), "#7fb0e0"),
+                count_chip("done", rget(counts, "done", 0), "#7fb87f"),
+                count_chip("failed", rget(counts, "failed", 0), "#e08a8a"),
+            ]},
+            { kind: "hstack", gap: 6.0, children: [
+                { kind: "button", id: "tab_runs", label: "runs" },
+                { kind: "button", id: "tab_queue", label: "queue" },
+            ]},
+            { kind: "vstack", gap: 6.0, children: body },
+            { kind: "text", value: status_line, size: 10.0,
+              color: if s.err != "" { "#e08a8a" } else { col_muted() } },
+        ]
+    }
+}
