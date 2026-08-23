@@ -210,6 +210,8 @@ impl Plugin for AppShellPlugin {
             //   - cube::CUBE_LAYER (4096): the prism's structural geometry.
             //   - slide_view::BLIT_LAYER (4097): the blit quad that copies
             //     a slide's picture of the app.
+            //   - slide_view::DIVE_LAYER (4098): the full-window overlay
+            //     that zooms into a recursive slide.
             //   - jim_style::dynamic::OVERLAY_LAYER (30): the dust/shader
             //     canvas overlay, drawn at order 1_000_001 above everything.
             // This is the single registry of global layers; anyone adding a
@@ -221,6 +223,7 @@ impl Plugin for AppShellPlugin {
                     WHITEBOARD_OVERLAY_LAYER,
                     cube::CUBE_LAYER,
                     slide_view::BLIT_LAYER,
+                    slide_view::DIVE_LAYER,
                     jim_style::dynamic::OVERLAY_LAYER,
                     jim_pane::dock::DOCK_OVERLAY_LAYER,
                 ],
@@ -2691,6 +2694,7 @@ fn maintain_winit_mode_for_animation(
     mut pin_watch: ResMut<diagnostics::ContinuousWatch>,
     animated_panes: Query<(), With<AnimatedChromePane>>,
     mut chrome_animates: ResMut<ChromeAnimates>,
+    slide_dive: Res<slide_view::SlideDive>,
 ) {
     let preset_animates = preset.0.as_deref().map_or(false, |name| {
         registry
@@ -2747,7 +2751,11 @@ fn maintain_winit_mode_for_animation(
         // Push-to-talk dictation: the capture's idle watchdog kills a
         // stream nobody polls within ~2s, so the reactive baseline would
         // cut the user off mid-sentence. See `Dictation::needs_frames`.
-        || dictation.needs_frames();
+        || dictation.needs_frames()
+        // Diving into a recursive slide: a ~0.75s transform, and the app is
+        // reactive otherwise, so without this the zoom would advance one
+        // frame per mouse twitch instead of playing.
+        || slide_dive.animating();
     // NOTE: an open command palette is deliberately NOT a Continuous source.
     // It only needs its DeepSeek worker result polled promptly; pinning full
     // 60fps for that is wasteful. Below it instead tightens the *reactive*

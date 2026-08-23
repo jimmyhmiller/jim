@@ -82,12 +82,23 @@ use jim_pane::{
 /// constant safely below the far plane is enough.
 const PICTURE_Z: f32 = 900.0;
 
-/// Longest side of the picture, in pixels.
+/// The picture is rendered at the window's FULL device resolution.
 ///
-/// It is shown inside a pane a few hundred pixels across, and every level of
-/// the recursion shrinks it further, so native resolution would be spent on
-/// detail no one can see. Capping it also caps the cost of the second draw.
-const MAX_PICTURE: f32 = 1100.0;
+/// It was capped (~1100px, then logical size) while it only ever appeared
+/// inside a pane a few hundred pixels across. The dive makes that
+/// indefensible: the overlay briefly IS your display, so anything below
+/// device resolution means double-clicking visibly drops the whole screen
+/// to a softer copy of itself on the very first frame.
+///
+/// Pixel-exact costs a device-resolution second render while an
+/// `application:` slide is up. That is the price of the effect being
+/// invisible at the moment it starts.
+fn picture_scale(window: &Window) -> f32 {
+    window.scale_factor()
+}
+
+/// How long one level of the dive takes.
+const DIVE_SECONDS: f32 = 0.75;
 
 /// Camera order band, above every window pane camera (which top out at
 /// 75_150) and below the whiteboard overlay (80_000). These cameras never
@@ -95,6 +106,12 @@ const MAX_PICTURE: f32 = 1100.0;
 /// logs "unpredictable render results" every frame when they do.
 const BAND_START: isize = 76_000;
 const BAND_BLIT: isize = 79_999;
+
+/// The dive overlay draws to the WINDOW, over everything — sidebar,
+/// whiteboard overlay, panes — because the whole app is what appears to
+/// zoom. Below the menu overlay (100_000) so a menu can never end up
+/// underneath it.
+const DIVE_CAMERA_ORDER: isize = 95_000;
 
 /// The two images behind a slide's picture.
 #[derive(Resource)]
@@ -119,9 +136,52 @@ struct SlidePicture {
     hosts: Vec<Entity>,
 }
 
+/// Is a dive in flight? Read by the shell's update-mode decision.
+///
+/// Jim is reactive by default and only redraws on events, so without this
+/// the animation would advance one frame per mouse twitch. It is a
+/// transient pin, held for [`DIVE_SECONDS`] and released.
+#[derive(Resource, Default)]
+pub struct SlideDive {
+    active: bool,
+}
+
+impl SlideDive {
+    pub fn animating(&self) -> bool {
+        self.active
+    }
+}
+
+/// A dive in progress, `t` running 0 → 1 over exactly one LEVEL.
+///
+/// The whole screen appears to zoom, so this is not a transform on the
+/// in-slide picture — it is a full-window overlay OF that picture whose
+/// sampled window shrinks from "the entire app" to "the nested copy". At
+/// `t = 0` the overlay is pixel-identical to what is already on screen
+/// (one frame stale), so it appears without a seam; at `t = 1` the nested
+/// copy fills the display, and that copy IS the app. Dropping the overlay
+/// there leaves you one level down with nothing to give it away, which is
+/// what lets you keep diving forever.
+#[derive(Component)]
+struct Diving {
+    t: f32,
+    /// The host being dived into — its content area is the zoom target.
+    host: Entity,
+}
+
 /// One of this module's private cameras.
 #[derive(Component)]
 struct PictureCamera;
+
+/// The full-window camera that draws a dive overlay.
+///
+/// Deliberately NOT a `PictureCamera`: that marker means "part of the set
+/// that composes the picture", and those are despawned wholesale whenever
+/// the pane set changes. Sharing it would have let a rebuild mid-dive kill
+/// the overlay, and — worse — let the end of a dive despawn the chrome and
+/// blit cameras the picture itself depends on.
+#[derive(Component)]
+struct DiveCamera;
 
 /// A per-pane picture camera, and the pane it photographs. Kept across
 /// frames and updated in place; only a change in the pane SET rebuilds.
@@ -140,12 +200,15 @@ pub struct SlideViewPlugin;
 
 impl Plugin for SlideViewPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, create_images).add_systems(
-            Update,
-            drive_picture
-                .after(crate::present::PresentSet)
-                .after(crate::projects::sync_visibility),
-        );
+        app.init_resource::<SlideDive>()
+            .add_systems(Startup, create_images)
+            .add_systems(
+                Update,
+                (drive_picture, start_dive, apply_dive)
+                    .chain()
+                    .after(crate::present::PresentSet)
+                    .after(crate::projects::sync_visibility),
+            );
     }
 }
 
@@ -307,7 +370,7 @@ fn drive_picture(
     visible.sort_by(|a, b| a.3.total_cmp(&b.3).then(a.0.cmp(&b.0)));
     let signature: Vec<(Entity, usize)> = visible.iter().map(|(e, _, l, _)| (*e, *l)).collect();
 
-    let cap = (MAX_PICTURE / logical.x.max(logical.y)).min(1.0);
+    let cap = picture_scale(window);
     let size = (logical * cap).ceil().as_uvec2().max(UVec2::ONE);
     let resized = picture.size != size;
     if resized {
@@ -376,6 +439,159 @@ fn drive_picture(
         if transform.translation != want {
             transform.translation = want;
         }
+    }
+}
+
+/// How much smaller each level of the recursion is than the one around it.
+///
+/// The picture shows the whole window letterboxed into the host's content
+/// area, so the host's own copy inside it is scaled by exactly this — and
+/// so is every level below. It is the zoom of one dive.
+fn level_ratio(area: Vec2, logical: Vec2) -> f32 {
+    if area.x <= 0.0 || area.y <= 0.0 || logical.x <= 0.0 || logical.y <= 0.0 {
+        return 0.0;
+    }
+    (area.x / logical.x).min(area.y / logical.y)
+}
+
+/// The sub-rectangle of the picture to show at dive progress `t`.
+///
+/// Diving samples a shrinking WINDOW of the texture rather than scaling the
+/// sprite. Scaling the sprite would grow it 5x past the pane it lives in
+/// and spill over the chrome; the sprite's on-screen bounds never move, so
+/// there is nothing to clip and no geometry to get wrong.
+///
+/// `t = 0` is the whole image. `t = 1` is exactly the nested copy of this
+/// host — centred on the host's content area, scaled by [`level_ratio`].
+/// The size shrinks exponentially so the zoom reads at a constant rate;
+/// the centre moves linearly so `t = 1` lands on the nested copy exactly,
+/// which is what makes the snap back invisible.
+fn dive_rect(t: f32, content_pos: Vec2, area: Vec2, logical: Vec2, cap: f32) -> Option<Rect> {
+    let ratio = level_ratio(area, logical);
+    if ratio <= 0.0 {
+        return None;
+    }
+    let image = logical * cap;
+    let centre = image * 0.5;
+    let target = (content_pos + area * 0.5) * cap;
+    let size = image * ratio.powf(t);
+    Some(Rect::from_center_size(centre.lerp(target, t), size))
+}
+
+/// Begin a dive on the picture the user double-clicked.
+///
+/// Spawns the full-window overlay. It is created showing the whole picture
+/// unshrunk, which is what the screen already looks like — so the frame it
+/// appears on is indistinguishable from the one before it.
+fn start_dive(
+    mut commands: Commands,
+    picture: Res<SlidePicture>,
+    windows: Query<&Window>,
+    mut clicks: MessageReader<jim_pane::PaneDoubleClicked>,
+    hosts: Query<&PictureSpriteOf>,
+    existing: Query<Entity, With<Diving>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let logical = Vec2::new(window.width(), window.height());
+    for click in clicks.read() {
+        if !hosts.iter().any(|owner| owner.0 == click.pane) {
+            continue;
+        }
+        // One dive at a time. A second double-click mid-flight restarts
+        // rather than stacking two overlays on top of each other.
+        for entity in &existing {
+            commands.entity(entity).despawn();
+        }
+        let layers = RenderLayers::from_layers(&[DIVE_LAYER]);
+        commands.spawn((
+            Camera2d,
+            Camera {
+                order: DIVE_CAMERA_ORDER,
+                // Don't clear: until the zoom bites, the overlay is the
+                // app's own image and there is nothing to wipe.
+                clear_color: ClearColorConfig::None,
+                ..default()
+            },
+            // NOT Msaa::Off. This camera draws to the WINDOW, where every
+            // other camera is at Bevy's default Sample4, and one straggler
+            // at a different sample count is a fatal validation error.
+            layers.clone(),
+            DiveCamera,
+            Name::new("slide-dive:camera"),
+        ));
+        commands.spawn((
+            Sprite {
+                image: picture.shown.clone(),
+                custom_size: Some(logical),
+                ..default()
+            },
+            Transform::default(),
+            layers,
+            Diving {
+                t: 0.0,
+                host: click.pane,
+            },
+            Name::new("slide-dive:overlay"),
+        ));
+    }
+}
+
+/// Advance the dive: shrink the sampled window, then dissolve into reality.
+#[allow(clippy::too_many_arguments)]
+fn apply_dive(
+    mut commands: Commands,
+    time: Res<Time>,
+    picture: Res<SlidePicture>,
+    mut dive: ResMut<SlideDive>,
+    windows: Query<&Window>,
+    viewport: Option<Res<PaneViewport>>,
+    panes: PaneQuery,
+    mut diving: Query<(Entity, &mut Diving, &mut Sprite)>,
+    cameras: Query<Entity, With<DiveCamera>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let logical = Vec2::new(window.width(), window.height());
+    let viewport = viewport.as_deref().copied().unwrap_or_default();
+    let mut running = false;
+
+    for (entity, mut state, mut sprite) in &mut diving {
+        state.t += time.delta_secs() / DIVE_SECONDS;
+
+        // The host's content area is the zoom target, and it is where the
+        // nested copy sits inside the picture.
+        let target = panes
+            .get(state.host)
+            .ok()
+            .and_then(|(_, rect, _, _, anchored, chrome)| {
+                let screen = screen_rect(rect, anchored.is_some(), &viewport);
+                let (pos, area) = content_rect(&screen, chrome.map_or(TITLE_H, |c| c.title_h));
+                dive_rect(state.t.min(1.0), pos, area, logical, picture.cap).map(|r| (r, area))
+            });
+
+        if state.t >= 1.0 || target.is_none() {
+            // Arrived. The overlay and the app behind it are showing the
+            // same frame, so removing it is invisible — and leaves you one
+            // level in.
+            commands.entity(entity).despawn();
+            for camera in &cameras {
+                commands.entity(camera).despawn();
+            }
+            continue;
+        }
+        running = true;
+        let (rect, _) = target.expect("checked above");
+        sprite.rect = Some(rect);
+        if sprite.custom_size != Some(logical) {
+            sprite.custom_size = Some(logical);
+        }
+    }
+
+    if dive.active != running {
+        dive.active = running;
     }
 }
 
@@ -511,6 +727,11 @@ fn spawn_picture(
     }
 }
 
+/// Render layer for the full-screen dive overlay. Reserved like
+/// [`BLIT_LAYER`], and constructed the same way — `RenderLayers::layer()`
+/// panics above 63.
+pub const DIVE_LAYER: usize = 4098;
+
 /// Render layer for the blit quad. Reserved in `PaneLayerAllocator` so no
 /// pane is ever allocated it.
 ///
@@ -555,6 +776,53 @@ mod tests {
             "below the overlays"
         );
         assert!(BAND_BLIT > BAND_START);
+    }
+
+    /// A dive travels exactly one level: at `t = 1` the sampled window is
+    /// the nested copy of this host, so dropping back to `t = 0` shows the
+    /// same pixels and the animation has no seam. Get this wrong and every
+    /// dive ends in a visible jump.
+    #[test]
+    fn a_dive_lands_exactly_on_the_nested_copy() {
+        let logical = Vec2::new(1600.0, 1000.0);
+        let pos = Vec2::new(200.0, 150.0);
+        let area = Vec2::new(400.0, 300.0);
+        let cap = 0.5;
+
+        let start = dive_rect(0.0, pos, area, logical, cap).expect("a rect");
+        assert_eq!(start.min, Vec2::ZERO, "t=0 is the whole image");
+        assert_eq!(start.max, logical * cap);
+
+        // One level down is `ratio` of the window, centred on the host's
+        // content area — which is where the host's own copy is drawn.
+        let ratio = level_ratio(area, logical);
+        assert!((ratio - 0.25).abs() < 1e-6, "height-limited: 300/1000");
+        let end = dive_rect(1.0, pos, area, logical, cap).expect("a rect");
+        let want = Rect::from_center_size((pos + area * 0.5) * cap, logical * cap * ratio);
+        assert!((end.min - want.min).length() < 1e-3, "{end:?} vs {want:?}");
+        assert!((end.max - want.max).length() < 1e-3, "{end:?} vs {want:?}");
+    }
+
+    /// The sampled window shrinks monotonically, so the zoom never stalls
+    /// or reverses part-way.
+    #[test]
+    fn a_dive_zooms_in_the_whole_way() {
+        let logical = Vec2::new(1600.0, 1000.0);
+        let (pos, area) = (Vec2::new(200.0, 150.0), Vec2::new(400.0, 300.0));
+        let mut previous = f32::INFINITY;
+        for step in 0..=10 {
+            let rect = dive_rect(step as f32 / 10.0, pos, area, logical, 1.0).expect("a rect");
+            let width = rect.max.x - rect.min.x;
+            assert!(width < previous, "step {step}: {width} !< {previous}");
+            previous = width;
+        }
+    }
+
+    /// A pane with no content area has no picture and therefore no dive —
+    /// it must not produce a degenerate rect.
+    #[test]
+    fn a_collapsed_pane_cannot_be_dived_into() {
+        assert!(dive_rect(0.5, Vec2::ZERO, Vec2::ZERO, Vec2::new(800.0, 600.0), 1.0).is_none());
     }
 
     /// A host's picture is placed against the pane's CONTENT area — what
