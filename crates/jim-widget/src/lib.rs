@@ -1241,6 +1241,14 @@ fn handle_overlay_input(
     if open.0.is_none() {
         return;
     }
+    // The press that OPENED this menu must never also dismiss it. The press
+    // handlers live in a different plugin's system chain, so their order
+    // relative to this one is unconstrained — we cannot rely on
+    // `render_select_overlay` having populated `hits.trigger_rect` first.
+    // A change this frame means the toggle just happened; leave it alone.
+    if open.is_changed() {
+        return;
+    }
     if keys.just_pressed(KeyCode::Escape) {
         open.0 = None;
         return;
@@ -1758,6 +1766,12 @@ fn handle_popover_input(
     )>,
 ) {
     if open.0.is_none() {
+        return;
+    }
+    // Same reasoning as handle_overlay_input: the press that opened the
+    // popover must not also close it, and system order across plugins is
+    // unconstrained.
+    if open.is_changed() {
         return;
     }
     if keys.just_pressed(KeyCode::Escape) {

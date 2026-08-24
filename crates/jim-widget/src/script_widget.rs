@@ -1337,6 +1337,8 @@ fn forward_clicks_to_workers(
     mut commands: Commands,
     mut presses: MessageReader<PaneContentPressed>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut open_select: ResMut<crate::WidgetOpenSelect>,
+    mut open_popover: ResMut<crate::WidgetOpenPopover>,
     widgets: Query<(
         &PaneKindMarker,
         &ScriptWidget,
@@ -1359,6 +1361,16 @@ fn forward_clicks_to_workers(
         // visually-rendered position of each rect.
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
         let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_y);
+
+        // While this pane has an open dropdown / popover, the floating overlay
+        // owns the pointer: `handle_overlay_input` picks the option or
+        // dismisses. Routing the same press to elements underneath would fire
+        // whatever happens to sit behind the menu.
+        if open_select.0.as_ref().is_some_and(|o| o.pane == ev.pane)
+            || open_popover.0.as_ref().is_some_and(|o| o.pane == ev.pane)
+        {
+            continue;
+        }
 
         // A press inside a live editor portal is owned by the editor
         // (`route_editor_portal_press` focuses it + places the caret); it
@@ -1400,6 +1412,34 @@ fn forward_clicks_to_workers(
             Some((id, crate::ClickKind::NumberChange { value })) => {
                 commands.entity(ev.pane).remove::<crate::WidgetInputFocus>();
                 w.handle.send(HostToWorker::NumberChange { id, value });
+            }
+            // Select / Popover triggers toggle host-owned open state; no
+            // worker event until an option is actually picked. These arms were
+            // missing entirely, so `Element::Select` never opened in a funct
+            // widget — the press fell through to the button/empty-space case.
+            Some((id, crate::ClickKind::SelectTrigger)) => {
+                let already = open_select
+                    .0
+                    .as_ref()
+                    .is_some_and(|o| o.pane == ev.pane && o.id == id);
+                open_select.0 = if already {
+                    None
+                } else {
+                    Some(crate::OpenSelect { pane: ev.pane, id })
+                };
+                commands.entity(ev.pane).remove::<crate::WidgetInputFocus>();
+            }
+            Some((id, crate::ClickKind::PopoverTrigger)) => {
+                let already = open_popover
+                    .0
+                    .as_ref()
+                    .is_some_and(|o| o.pane == ev.pane && o.id == id);
+                open_popover.0 = if already {
+                    None
+                } else {
+                    Some(crate::OpenSelect { pane: ev.pane, id })
+                };
+                commands.entity(ev.pane).remove::<crate::WidgetInputFocus>();
             }
             Some((id, crate::ClickKind::InputFocus)) => {
                 // Seed the host-owned edit buffer from the input's
