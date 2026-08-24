@@ -250,6 +250,14 @@ impl Plugin for CanvasPlugin {
                     // pan state could be a frame apart from each other in a
                     // schedule-arbitrary way — the smear during a pan.
                     .after(CanvasInputSet)
+                    // ...and after the presentation resolves this frame's
+                    // slide. The gutter follows `sidebar_visible()`, which
+                    // flips when a slide hands the window to the real app —
+                    // so running first means publishing a region for the
+                    // PREVIOUS slide, and every pane camera is clipped
+                    // wrong for a frame. Visibly: panes draw over the
+                    // sidebar, then snap behind it.
+                    .after(crate::present::PresentSet)
                     .before(jim_pane::PaneViewportReaders),
             )
             .add_systems(PostUpdate, sync_origin_indicators);

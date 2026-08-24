@@ -100,6 +100,20 @@ fn picture_scale(window: &Window) -> f32 {
 /// How long one level of the dive takes.
 const DIVE_SECONDS: f32 = 0.75;
 
+/// Rendered frames to refresh the picture before a dive becomes visible.
+///
+/// The overlay drops a copy of the app over the live one, so the copy has
+/// to BE the live one or the difference shows. Idle in reactive mode,
+/// `shown` holds whatever the last frame drew — possibly seconds old — and
+/// anything that moved since (a focus ring, a cursor, a sidebar highlight)
+/// disagrees for a frame. That reads as a flash, or as the sidebar briefly
+/// z-fighting with itself.
+///
+/// One rendered frame is enough to put a current `scene` into `shown`; two
+/// covers the blit's own frame of lag. At the frame rates this runs at that
+/// is under 20ms, so the dive still starts on the click.
+const DIVE_WARMUP_FRAMES: u32 = 2;
+
 /// Frames to keep rendering after the picture is rebuilt.
 ///
 /// The recursion fills in ONE LEVEL PER RENDERED FRAME: the cameras draw
@@ -165,13 +179,16 @@ pub struct SlideDive {
     active: bool,
     /// Frames left of the post-rebuild burst. See [`REBUILD_FRAMES`].
     cooldown: u32,
+    /// A dive waiting for the picture to be current: the host, and how many
+    /// rendered frames still to wait. See [`DIVE_WARMUP_FRAMES`].
+    pending: Option<(Entity, u32)>,
 }
 
 impl SlideDive {
     /// Does the loop need to keep drawing? True during a dive, and for a
     /// short burst after the picture is rebuilt so the recursion can fill.
     pub fn animating(&self) -> bool {
-        self.active || self.cooldown > 0
+        self.active || self.cooldown > 0 || self.pending.is_some()
     }
 }
 
@@ -239,11 +256,17 @@ impl Plugin for SlideViewPlugin {
             .add_systems(Startup, create_images)
             .add_systems(
                 Update,
-                (drive_picture, start_dive, apply_dive)
+                (drive_picture, start_dive, spawn_pending_dive, apply_dive)
                     .chain()
                     .in_set(SlideViewSet)
                     .after(crate::present::PresentSet)
-                    .after(crate::projects::sync_visibility),
+                    .after(crate::projects::sync_visibility)
+                    // The picture's pane cameras are clipped by the SAME
+                    // `PaneCanvasRegion` the window's are, and that region
+                    // is what keeps panes off the sidebar. Aiming them from
+                    // a region published earlier in the frame draws this
+                    // frame's panes with the last frame's gutter.
+                    .after(crate::canvas::publish_canvas_region),
             );
     }
 }
@@ -524,64 +547,80 @@ fn dive_rect(t: f32, content_pos: Vec2, area: Vec2, logical: Vec2, cap: f32) -> 
     Some(Rect::from_center_size(centre.lerp(target, t), size))
 }
 
-/// Begin a dive on the picture the user double-clicked.
+/// Arm a dive on the picture the user double-clicked.
 ///
-/// Spawns the full-window overlay. It is created showing the whole picture
-/// unshrunk, which is what the screen already looks like — so the frame it
-/// appears on is indistinguishable from the one before it.
+/// Nothing is shown yet. The overlay puts a copy of the app over the live
+/// app, so it must not appear until that copy is CURRENT — see
+/// [`DIVE_WARMUP_FRAMES`]. Arming also starts frames flowing, which is what
+/// makes the copy current.
 fn start_dive(
-    mut commands: Commands,
-    picture: Res<SlidePicture>,
-    windows: Query<&Window>,
+    mut dive: ResMut<SlideDive>,
     mut clicks: MessageReader<jim_pane::PaneDoubleClicked>,
     hosts: Query<&PictureSpriteOf>,
-    existing: Query<Entity, With<Diving>>,
 ) {
-    let Ok(window) = windows.single() else {
-        return;
-    };
-    let logical = Vec2::new(window.width(), window.height());
     for click in clicks.read() {
         if !hosts.iter().any(|owner| owner.0 == click.pane) {
             continue;
         }
-        // One dive at a time. A second double-click mid-flight restarts
-        // rather than stacking two overlays on top of each other.
-        for entity in &existing {
-            commands.entity(entity).despawn();
-        }
-        let layers = RenderLayers::from_layers(&[DIVE_LAYER]);
-        commands.spawn((
-            Camera2d,
-            Camera {
-                order: DIVE_CAMERA_ORDER,
-                // Don't clear: until the zoom bites, the overlay is the
-                // app's own image and there is nothing to wipe.
-                clear_color: ClearColorConfig::None,
-                ..default()
-            },
-            // NOT Msaa::Off. This camera draws to the WINDOW, where every
-            // other camera is at Bevy's default Sample4, and one straggler
-            // at a different sample count is a fatal validation error.
-            layers.clone(),
-            DiveCamera,
-            Name::new("slide-dive:camera"),
-        ));
-        commands.spawn((
-            Sprite {
-                image: picture.shown.clone(),
-                custom_size: Some(logical),
-                ..default()
-            },
-            Transform::default(),
-            layers,
-            Diving {
-                t: 0.0,
-                host: click.pane,
-            },
-            Name::new("slide-dive:overlay"),
-        ));
+        dive.pending = Some((click.pane, DIVE_WARMUP_FRAMES));
+        // The warmup needs rendered frames to happen at all.
+        dive.cooldown = dive.cooldown.max(REBUILD_FRAMES);
     }
+}
+
+/// Show a warmed-up dive once the picture has caught up.
+fn spawn_pending_dive(
+    mut commands: Commands,
+    mut dive: ResMut<SlideDive>,
+    picture: Res<SlidePicture>,
+    windows: Query<&Window>,
+    existing: Query<Entity, Or<(With<Diving>, With<DiveCamera>)>>,
+) {
+    let Some((host, remaining)) = dive.pending else {
+        return;
+    };
+    if remaining > 0 {
+        dive.pending = Some((host, remaining - 1));
+        return;
+    }
+    dive.pending = None;
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let logical = Vec2::new(window.width(), window.height());
+    // One dive at a time: a second double-click restarts rather than
+    // stacking two overlays.
+    for entity in &existing {
+        commands.entity(entity).despawn();
+    }
+    let layers = RenderLayers::from_layers(&[DIVE_LAYER]);
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: DIVE_CAMERA_ORDER,
+            // Don't clear: until the zoom bites, the overlay is the app's
+            // own image and there is nothing to wipe.
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        // NOT Msaa::Off. This camera draws to the WINDOW, where every other
+        // camera is at Bevy's default Sample4, and one straggler at a
+        // different sample count is a fatal validation error.
+        layers.clone(),
+        DiveCamera,
+        Name::new("slide-dive:camera"),
+    ));
+    commands.spawn((
+        Sprite {
+            image: picture.shown.clone(),
+            custom_size: Some(logical),
+            ..default()
+        },
+        Transform::default(),
+        layers,
+        Diving { t: 0.0, host },
+        Name::new("slide-dive:overlay"),
+    ));
 }
 
 /// Advance the dive: shrink the sampled window, then dissolve into reality.
@@ -903,6 +942,23 @@ mod tests {
         let mut dive = SlideDive::default();
         dive.active = true;
         assert!(dive.animating());
+    }
+
+    /// A dive must not become visible until the picture it shows is
+    /// current, or the copy disagrees with the live app underneath it for a
+    /// frame — which looks like a flash, not a zoom.
+    #[test]
+    fn a_dive_waits_for_the_picture_to_catch_up() {
+        let mut dive = SlideDive::default();
+        dive.pending = Some((Entity::from_raw_u32(1).expect("valid"), DIVE_WARMUP_FRAMES));
+        assert!(
+            dive.animating(),
+            "an armed dive keeps frames coming, which is what warms it"
+        );
+        assert!(
+            DIVE_WARMUP_FRAMES >= 1,
+            "one frame puts a fresh scene in shown"
+        );
     }
 
     /// A host's picture is placed against the pane's CONTENT area — what
