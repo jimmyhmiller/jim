@@ -976,16 +976,48 @@ fn render_select_overlay(
     let tr_max = local_to_window(target.anchor.max);
     hits.trigger_rect = Rect::from_corners(tr_min, tr_max);
 
-    // Menu anchor: just below the trigger.
-    let menu_top_window =
-        local_to_window(Vec2::new(target.anchor.min.x, target.anchor.max.y + 4.0));
-    let anchor_world = to_world(menu_top_window);
-
     let pad = render::SELECT_MENU_PAD;
     let item_h = render::SELECT_ITEM_H;
     let menu_w = target.width;
     let n = target.options.len();
-    let menu_h = pad * 2.0 + n as f32 * item_h;
+    let full_h = pad * 2.0 + n as f32 * item_h;
+
+    // Fit the menu to the window. Dropping straight down with no clamp meant a
+    // long list (a project picker with 30+ entries is ~840px) ran off the
+    // bottom of the screen, so most of it — often all of the part worth
+    // clicking — was unreachable.
+    //
+    // Prefer below the trigger; flip above when that side has more room. Then
+    // clamp to whatever that side offers, and scroll the list so the selected
+    // option is always visible in the clamped window.
+    let below_top = local_to_window(Vec2::new(target.anchor.min.x, target.anchor.max.y + 4.0));
+    let above_bottom = local_to_window(Vec2::new(target.anchor.min.x, target.anchor.min.y - 4.0));
+    let room_below = (win_h - below_top.y).max(0.0);
+    let room_above = above_bottom.y.max(0.0);
+    let flip_up = full_h > room_below && room_above > room_below;
+    let avail = if flip_up { room_above } else { room_below };
+    // Always leave a little breathing room against the window edge.
+    let menu_h = full_h.min((avail - 8.0).max(item_h + pad * 2.0));
+
+    // How many whole items fit, and where the list must start so `value` shows.
+    let visible = (((menu_h - pad * 2.0) / item_h).floor() as usize).max(1);
+    let sel_idx = target
+        .options
+        .iter()
+        .position(|o| o.id == target.value)
+        .unwrap_or(0);
+    let first = if n <= visible {
+        0
+    } else {
+        sel_idx.min(n - visible)
+    };
+
+    let menu_top_window = if flip_up {
+        Vec2::new(below_top.x, above_bottom.y - menu_h)
+    } else {
+        below_top
+    };
+    let anchor_world = to_world(menu_top_window);
     let layer = bevy::camera::visibility::RenderLayers::layer(overlay_layer.0);
 
     // Overlay root at the anchor; children render in content-local (y-down,
@@ -1045,7 +1077,8 @@ fn render_select_overlay(
     let accent = octx
         .resolve_color("accent")
         .unwrap_or(Color::srgb(0.42, 0.62, 0.92));
-    for (i, opt) in target.options.iter().enumerate() {
+    for (row, opt) in target.options.iter().enumerate().skip(first).take(visible) {
+        let i = row - first;
         let y = pad + i as f32 * item_h;
         let item_origin = Vec2::new(pad, y);
         let item_size = Vec2::new((menu_w - pad * 2.0).max(0.0), item_h);

@@ -1076,15 +1076,25 @@ pub(crate) fn funct_worker_main(
     if let Some(src) = initial_source.as_deref() {
         worker.load(src);
     }
-    match initial_state.get(STATE_KEY) {
-        // RESTART: rehydrate the saved state and STOP. `on_start` (side
-        // effects — fetches, etc.) is deliberately NOT run: we restore the
-        // data we already had instead of redoing the work.
-        Some(data) => worker.seed_state(data),
-        // FRESH spawn (never persisted): run `on_start` once to do the
-        // initial side effects (e.g. the first fetch).
-        None => worker.call_lifecycle("on_start"),
+    // Rehydrate saved data first (so `on_start` observes the restored state),
+    // then ALWAYS run `on_start`.
+    //
+    // This used to skip `on_start` on the RESTART path, to avoid redoing a
+    // fetch whose result we had already persisted. But `state` is data, and
+    // some side effects are NOT data: a `proc_spawn`ed child, a `set_animating`
+    // loop, a bus subscription. None of those survive a worker restart, while
+    // the state describing them does — so a widget owning a long-lived process
+    // came back with a persisted handle to a process that no longer existed,
+    // and nothing ever respawned it. AUTHORING.md has always documented
+    // `on_start` as running on every start (fresh/restart/hot-reload) for
+    // exactly this reason; the code disagreed.
+    //
+    // Widgets that want fetch-once-per-fresh-spawn semantics can see the
+    // difference themselves: on a restart their `state` is already populated.
+    if let Some(data) = initial_state.get(STATE_KEY) {
+        worker.seed_state(data);
     }
+    worker.call_lifecycle("on_start");
     // Legacy whole-VM snapshots (SNAPSHOT_KEY) are intentionally ignored:
     // restoring them would bring back stale baked-in code. Such widgets
     // re-init their state once, then persist in the new state-only format.

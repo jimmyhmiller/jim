@@ -17,10 +17,6 @@ let ox_bin = "/home/jimmyhmiller/ox-runner/bin/ox"
 // Snapshot schema this widget needs; see SCHEMA in ox-snapshot.py.
 let wanted_schema = 2
 
-// Re-created on every script load and NEVER persisted, unlike `state`. Process
-// handles do not survive a worker restart, so the first render of a session
-// must discard any rehydrated handle instead of trusting it.
-let session = atom({ booted: false })
 
 fn init_state() = {
     proc: -1,
@@ -326,15 +322,6 @@ fn render(w, h) {
     // stops). So the stream cannot be owned by on_start alone or it dies at the
     // first hot reload and never returns. Ensure it here: start_stream() is a
     // no-op while a stream is live, and `backoff` keeps retries paced.
-    if not (@session).booted {
-        reset!(session, { booted: true })
-        let boot = cur()
-        // Any handle we rehydrated belongs to a dead worker; drop it so
-        // start_stream() does not early-return forever on a phantom stream.
-        reset!(state, { ..boot, proc: -1, submit_proc: -1, connected: false,
-                        retries: 0, backoff: 0.0, respawned: 0 })
-        start_stream()
-    }
     let s = cur()
     let snap = s.snap
     let counts = rget(snap, "counts", {})
