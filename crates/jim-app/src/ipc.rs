@@ -250,6 +250,33 @@ pub enum IpcRequest {
         #[serde(default)]
         titles: Option<Vec<String>>,
     },
+    /// `jimctl move --project P (--kind K | --title T ... | --all) --to DEST`
+    /// — move panes from one project to another. Membership (`PaneProject`)
+    /// is what confines a pane to a project, so this is the scriptable
+    /// equivalent of "this pane belongs over there instead".
+    ///
+    /// Moved panes are placed on the destination's ROOT canvas and dropped
+    /// from any named group, because both of those gate visibility
+    /// per-project: a pane carrying a nested-canvas id or a group the
+    /// destination never reveals would arrive invisible, which reads as
+    /// "the move ate my pane".
+    ///
+    /// Docked panes are refused rather than moved — a dock owns its
+    /// members' rects, so tearing one out silently corrupts the dock it
+    /// left behind. Undock it first.
+    MovePanes {
+        /// Source project name (or `active`). `None` = active.
+        #[serde(default)]
+        project: Option<String>,
+        /// Destination project name (or `active`). Required.
+        to: String,
+        /// Only move panes of this kind (e.g. `script_widget`).
+        #[serde(default)]
+        kind: Option<String>,
+        /// Only move panes whose title exactly matches one of these.
+        #[serde(default)]
+        titles: Option<Vec<String>>,
+    },
     /// `jimctl group assign|clear` — put panes into a named group (or take
     /// them out of one). A grouped pane is hidden until its group is
     /// revealed, so this is how a deck's dashboards get wired up ONCE;

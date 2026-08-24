@@ -15,6 +15,7 @@ mod agent_bus;
 mod cmd_agent;
 mod cmd_channel;
 mod cmd_close;
+mod cmd_move;
 mod cmd_codex;
 mod cmd_dock;
 mod cmd_git;
@@ -62,6 +63,7 @@ fn main() -> ExitCode {
         Some("review") => cmd_review::run(),
         Some("msg") => cmd_msg::run(),
         Some("close") => cmd_close::run(),
+        Some("move") => cmd_move::run(),
         Some("dock") => cmd_dock::run(),
         Some("group") => cmd_group::run(),
         Some("issue") => cmd_issue::run(),
@@ -113,6 +115,7 @@ fn usage() {
          \treview ...                     local code-review threads (list/add/reply/resolve)\n\
          \tmsg <topic> <body>             publish on the widget message bus\n\
          \tclose ...                      close a pane\n\
+         \tmove ...                       move panes to another project\n\
          \tdock --project P [--title T ...]  snap panes into a dock (sidebar+main)\n\
          \tgroup ...                      named pane groups (assign/clear/show/hide/list)\n\
          \tissue ...                      issue-tracker operations\n\

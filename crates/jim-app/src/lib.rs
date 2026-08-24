@@ -1150,6 +1150,30 @@ fn drain_ipc_open_requests(
                 };
                 pending.close_panes.push((project_id, kind, titles));
             }
+            ipc::IpcRequest::MovePanes {
+                project,
+                to,
+                kind,
+                titles,
+            } => {
+                let src_target = match project.as_deref() {
+                    Some("active") | None => OpenProjectTarget::Active,
+                    Some(name) => OpenProjectTarget::ByName(name.to_string()),
+                };
+                let dest_target = match to.as_str() {
+                    "active" => OpenProjectTarget::Active,
+                    name => OpenProjectTarget::ByName(name.to_string()),
+                };
+                let Some(src_id) = projects::resolve_project(&src_target, &projects) else {
+                    eprintln!("[ipc] move_panes: no matching source project");
+                    continue;
+                };
+                let Some(dest_id) = projects::resolve_project(&dest_target, &projects) else {
+                    eprintln!("[ipc] move_panes: no project named {to:?} to move into");
+                    continue;
+                };
+                pending.move_panes.push((src_id, dest_id, kind, titles));
+            }
             ipc::IpcRequest::SetPaneGroup {
                 project,
                 titles,

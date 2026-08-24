@@ -568,6 +568,10 @@ pub struct PendingActions {
     /// `jimctl group assign|clear`: `(project_id, titles, group)`. `None`
     /// as the group clears membership. Applied by `apply_pane_group_sets`.
     pub set_pane_groups: Vec<(u64, Vec<String>, Option<String>)>,
+    /// `jimctl move`: `(src_project_id, dest_project_id, kind, titles)`.
+    /// Resolved to entities in `apply_pending_actions` (needs a world
+    /// query), same as `close_panes`.
+    pub move_panes: Vec<(u64, u64, Option<String>, Option<Vec<String>>)>,
     /// Dock requests from `jimctl dock`:
     /// `(project_id, titles, template, empty, slots)`. With `empty`, spawn
     /// a template skeleton of `slots` empty cells; otherwise dock the
@@ -1625,6 +1629,83 @@ fn apply_pending_actions(world: &mut World) {
                 close_q.close.push(e);
             }
         }
+    }
+
+    // `jimctl move` requests: re-home panes into another project.
+    // `PaneProject` is the whole of project membership — `sync_visibility`
+    // reads it every frame and `mark_terminals_dirty_on_change` watches it
+    // for persistence — so the move itself is one component write.
+    //
+    // Two components have to be reset along with it, because both gate
+    // visibility RELATIVE to a project:
+    //   * `PaneCanvas` — a nested-canvas level inside the source project.
+    //     `sync_visibility` shows a pane only when its level equals the
+    //     level its project is parked on, so a pane carrying level 3 into
+    //     a project sitting at root is hidden in both. Land on root.
+    //   * `PaneGroup` — a named group is only revealed per-project, so a
+    //     moved pane in an unrevealed group would arrive invisible.
+    // Getting either wrong looks exactly like "the move deleted my pane",
+    // so they are cleared rather than carried.
+    for (src_id, dest_id, kind_filter, title_filter) in actions.move_panes {
+        if src_id == dest_id {
+            eprintln!("[ipc] move_panes: source and destination are the same project");
+            continue;
+        }
+        let (targets, docked): (Vec<Entity>, Vec<String>) = {
+            let mut q = world.query::<(
+                Entity,
+                &PaneProject,
+                &PaneKindMarker,
+                &jim_pane::PaneTitle,
+                Has<jim_pane::dock::DockMember>,
+                Has<jim_pane::dock::Dock>,
+                &PaneTag,
+            )>();
+            let matched: Vec<(Entity, String, bool)> = q
+                .iter(world)
+                .filter(|(_, m, _, _, _, _, _)| m.0 == src_id)
+                .filter(|(_, _, k, _, _, _, _)| {
+                    kind_filter.as_deref().is_none_or(|want| k.0 == want)
+                })
+                .filter(|(_, _, _, t, _, _, _)| {
+                    title_filter
+                        .as_ref()
+                        .is_none_or(|ts| ts.iter().any(|w| w == &t.0))
+                })
+                .map(|(e, _, _, t, is_member, is_dock, _)| (e, t.0.clone(), is_member || is_dock))
+                .collect();
+            let mut ok = Vec::new();
+            let mut bad = Vec::new();
+            for (e, title, is_docked) in matched {
+                // A dock drives its members' rects. Moving one out from
+                // under its dock leaves both sides inconsistent, so refuse
+                // loudly instead of half-doing it.
+                if is_docked {
+                    bad.push(title);
+                } else {
+                    ok.push(e);
+                }
+            }
+            (ok, bad)
+        };
+        if !docked.is_empty() {
+            eprintln!(
+                "[ipc] move_panes: refusing to move docked pane(s) {docked:?} \
+                 — undock them first (a dock owns its members' layout)"
+            );
+        }
+        if targets.is_empty() {
+            eprintln!("[ipc] move_panes: no panes matched");
+            continue;
+        }
+        let moved = targets.len();
+        for e in targets {
+            let mut ent = world.entity_mut(e);
+            ent.insert(PaneProject(dest_id));
+            ent.insert(jim_pane::PaneCanvas(0));
+            ent.remove::<jim_pane::PaneGroup>();
+        }
+        eprintln!("[ipc] move_panes: moved {moved} pane(s) {src_id} -> {dest_id}");
     }
 
     // `jimctl group assign|clear`: put panes into a named group (or take
