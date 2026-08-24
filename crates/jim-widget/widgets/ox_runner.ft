@@ -388,17 +388,6 @@ fn render(w, h) {
                 count_chip("done", rget(counts, "done", 0), "#7fb87f"),
                 count_chip("failed", rget(counts, "failed", 0), "#e08a8a"),
             ]},
-            { kind: "textarea", id: "task", value: s.task, rows: 4,
-              placeholder: "Describe the task. Cmd+Enter to send." },
-            { kind: "hstack", gap: 8.0, align: "center", children: [
-                { kind: "select", id: "repo", value: s.repo, width: 200.0,
-                  placeholder: "project…", options: repo_options(snap) },
-                { kind: "button", id: "queue_task",
-                  label: if s.submit_proc != -1 { "sending…" } else { "Queue" } },
-                { kind: "text", value: s.submit_msg, size: 10.0,
-                  color: if s.submit_ok { col_muted() } else { "#e08a8a" } },
-            ]},
-            { kind: "divider" },
             { kind: "hstack", gap: 6.0, children: [
                 { kind: "button", id: "tab_runs", label: "runs" },
                 { kind: "button", id: "tab_queue", label: "queue" },
@@ -406,6 +395,24 @@ fn render(w, h) {
             { kind: "vstack", gap: 6.0, children: body },
             { kind: "text", value: status_line, size: 10.0,
               color: if s.err != "" { "#e08a8a" } else { col_muted() } },
+            { kind: "divider" },
+            // Compose sits at the bottom: the run list is what you read, this
+            // is what you act with. Full width so long task text stays legible.
+            // `style.width` sizes the box, but the wrap calculation in
+            // layout.rs still uses the element's own `width`, so set both or
+            // the text wraps early inside a full-width box.
+            { kind: "textarea", id: "task", value: s.task, rows: 12,
+              width: 900.0,
+              placeholder: "Describe the task. Cmd+Enter to send.",
+              style: { width: "100%" } },
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "select", id: "repo", value: s.repo, width: 260.0,
+                  placeholder: "project…", options: repo_options(snap) },
+                { kind: "button", id: "queue_task",
+                  label: if s.submit_proc != -1 { "sending…" } else { "Queue" } },
+                { kind: "text", value: s.submit_msg, size: 10.0,
+                  color: if s.submit_ok { col_muted() } else { "#e08a8a" } },
+            ]},
         ]
     }
 }
