@@ -17,6 +17,11 @@ let ox_bin = "/home/jimmyhmiller/ox-runner/bin/ox"
 // Snapshot schema this widget needs; see SCHEMA in ox-snapshot.py.
 let wanted_schema = 2
 
+// Re-created on every script load and NEVER persisted, unlike `state`. Process
+// handles do not survive a worker restart, so the first render of a session
+// must discard any rehydrated handle instead of trusting it.
+let session = atom({ booted: false })
+
 fn init_state() = {
     proc: -1,
     connected: false,
@@ -32,6 +37,8 @@ fn init_state() = {
     submit_msg: "",
     submit_ok: true,
     respawned: 0,
+    retries: 0,
+    backoff: 0.0,
 }
 let state = atom(init_state())
 
@@ -58,14 +65,26 @@ fn start_stream() {
         ox_host, ox_bin, "stream",
     ])
     if h == -1 {
-        reset!(state, { ..s, err: "could not spawn ssh" })
+        // Nothing retries a failed spawn on its own, so arm the backoff timer
+        // rather than sitting dead with an error message.
+        reset!(state, { ..s, err: "could not spawn ssh; retrying", backoff: 5.0 })
+        set_animating(true)
     } else {
         reset!(state, { ..s, proc: h, err: "" })
     }
     request_render()
 }
 
-fn on_start() { start_stream() }
+fn on_start() {
+    // Process handles do NOT survive a restart or hot reload, but `state` does.
+    // A stale `proc` from a previous session made start_stream() early-return
+    // forever, so the pane sat with a dead stream and no data. Any handle we
+    // rehydrate is invalid by definition — clear it before spawning.
+    let s = cur()
+    reset!(state, { ..s, proc: -1, submit_proc: -1, connected: false,
+                    retries: 0, backoff: 0.0, respawned: 0 })
+    start_stream()
+}
 
 fn on_proc_output(handle, line) {
     let s = cur()
@@ -101,7 +120,7 @@ fn on_proc_output(handle, line) {
             start_stream()
             return
         }
-        reset!(state, { ..s, snap: parsed, connected: true, err: "" })
+        reset!(state, { ..s, snap: parsed, connected: true, err: "", retries: 0, backoff: 0.0 })
         request_render()
     } else {
         // Never swallow unexpected output - stderr noise or a broken remote
@@ -125,9 +144,30 @@ fn on_proc_exit(handle, code) {
         return
     }
     if handle != s.proc { return }
-    reset!(state, { ..s, proc: -1, connected: false,
-                    err: "stream ended (exit " + str(code) + ") - press ↻" })
+    // Back off 2s, 4s, 8s … capped, so a box that is down does not get
+    // hammered, and animate only while we are actually waiting to retry.
+    let n = s.retries + 1
+    let wait = if n <= 1 { 2.0 } else if n == 2 { 4.0 } else if n == 3 { 8.0 } else if n == 4 { 16.0 } else { 30.0 }
+    reset!(state, { ..s, proc: -1, connected: false, retries: n, backoff: wait,
+                    err: "stream ended (exit " + str(code) + "), retrying in " + str(wait) + "s" })
+    set_animating(true)
     request_render()
+}
+
+
+// Only runs while disconnected; start_stream() stops the animation again.
+fn on_frame(dt) {
+    let s = cur()
+    if s.proc != -1 { set_animating(false); return }
+    let left = s.backoff - dt
+    if left > 0.0 {
+        reset!(state, { ..s, backoff: left })
+        return
+    }
+    reset!(state, { ..s, backoff: 0.0, err: "reconnecting…" })
+    set_animating(false)
+    request_render()
+    start_stream()
 }
 
 fn on_click(x, y, shift, cmd, id) {
@@ -281,6 +321,20 @@ fn recent_row(r) {
 // ---- render -----------------------------------------------------------------
 
 fn render(w, h) {
+    // `on_start` only fires on a FRESH spawn — once this pane has persisted
+    // state, jim never calls it again (funct_widget.rs: RESTART seeds state and
+    // stops). So the stream cannot be owned by on_start alone or it dies at the
+    // first hot reload and never returns. Ensure it here: start_stream() is a
+    // no-op while a stream is live, and `backoff` keeps retries paced.
+    if not (@session).booted {
+        reset!(session, { booted: true })
+        let boot = cur()
+        // Any handle we rehydrated belongs to a dead worker; drop it so
+        // start_stream() does not early-return forever on a phantom stream.
+        reset!(state, { ..boot, proc: -1, submit_proc: -1, connected: false,
+                        retries: 0, backoff: 0.0, respawned: 0 })
+        start_stream()
+    }
     let s = cur()
     let snap = s.snap
     let counts = rget(snap, "counts", {})
