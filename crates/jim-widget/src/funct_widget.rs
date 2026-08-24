@@ -201,6 +201,9 @@ extern fn set_scroll(y)
 // --- subprocess bridge (UCI engines, language servers, …) ---
 extern fn proc_spawn(cmd)
 extern fn proc_write(handle, line)
+// Drop the child's stdin so it sees EOF. Needed by anything that reads its
+// input to completion (`sort`, `wc`, `ssh host some-command`) before acting.
+extern fn proc_close_stdin(handle)
 extern fn proc_read(handle)
 extern fn proc_alive(handle)
 extern fn proc_kill(handle)
@@ -1460,6 +1463,12 @@ fn register_host_surface(
                 .lock()
                 .map(|mut r| r.write_line(id, &line))
                 .unwrap_or(false)
+        });
+    }
+    {
+        let procs = procs.clone();
+        vm.register1("proc_close_stdin", move |id: i64| -> bool {
+            procs.lock().map(|mut r| r.close_stdin(id)).unwrap_or(false)
         });
     }
     {

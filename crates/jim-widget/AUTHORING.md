@@ -348,6 +348,22 @@ and only repaints when a handler calls `request_render()`. No
 `set_animating` for I/O. `proc_read` / `proc_alive` still exist for
 explicit polling / back-compat.
 
+To feed a child on **stdin**, `proc_write(handle, line)` writes one line
+(a trailing newline is added). A child that reads its input to completion
+— `sort`, `wc`, `ssh host some-command` — needs EOF before it will act,
+so close the pipe when you are done writing:
+
+```funct
+fn submit(text) {
+    let h = proc_spawn("ssh", ["host", "wc", "-l"])
+    for line in split(text, "\n") { proc_write(h, line) }
+    proc_close_stdin(h)          // without this, the child waits forever
+}
+```
+
+`proc_close_stdin(handle)` returns false if the handle is unknown or
+stdin was already closed, so a double close is harmless.
+
 ### Rich text and Markdown
 
 `Element::Text` is a **single uniform run**. To style part of a wrapped

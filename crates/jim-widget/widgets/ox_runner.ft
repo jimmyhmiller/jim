@@ -23,13 +23,27 @@ fn init_state() = {
             counts: { waiting: 0, running: 0, done: 0, failed: 0 },
             queued: [], in_flight: [], recent: [] },
     tab: "runs",
+    // compose box
+    task: "",
+    repo: "",
+    submit_proc: -1,
+    submit_msg: "",
+    submit_ok: true,
 }
 let state = atom(init_state())
+
+// `state` persists across restarts and hot reloads, so a rehydrated record can
+// be missing fields this version added. Merging the defaults underneath means
+// adding a field is never a breaking change for an already-open pane.
+fn cur() {
+    let raw = @state
+    if typeof(raw) == "Record" { merge(init_state(), raw) } else { init_state() }
+}
 
 // ---- the stream child -------------------------------------------------------
 
 fn start_stream() {
-    let s = @state
+    let s = cur()
     if s.proc != -1 { return }
     // BatchMode: never hang on a password prompt. ServerAlive*: notice a dead
     // link instead of sitting on a silent socket forever.
@@ -51,7 +65,21 @@ fn start_stream() {
 fn on_start() { start_stream() }
 
 fn on_proc_output(handle, line) {
-    let s = @state
+    let s = cur()
+    if handle == s.submit_proc {
+        // `ox enqueue` replies with one JSON line saying what it filed.
+        let r = unwrap_or(json_parse(trim(line)), 0)
+        if typeof(r) == "Record" {
+            let good = rget(r, "ok", false)
+            let msg = if good {
+                "queued " + rget(r, "task", "") + " -> " + rget(r, "repo", "")
+            } else { rget(r, "error", "failed") }
+            reset!(state, { ..s, submit_msg: msg, submit_ok: good,
+                            task: if good { "" } else { s.task } })
+            request_render()
+        }
+        return
+    }
     if handle != s.proc { return }
     let t = trim(line)
     if t == "" { return }
@@ -70,7 +98,18 @@ fn on_proc_output(handle, line) {
 }
 
 fn on_proc_exit(handle, code) {
-    let s = @state
+    let s = cur()
+    if handle == s.submit_proc {
+        // A nonzero exit with no JSON line means ssh itself failed.
+        let quiet = s.submit_msg == "sending…"
+        reset!(state, { ..s, submit_proc: -1,
+                        submit_msg: if quiet {
+                            "ssh failed (exit " + str(code) + ")"
+                        } else { s.submit_msg },
+                        submit_ok: if quiet { false } else { s.submit_ok } })
+        request_render()
+        return
+    }
     if handle != s.proc { return }
     reset!(state, { ..s, proc: -1, connected: false,
                     err: "stream ended (exit " + str(code) + ") - press ↻" })
@@ -79,18 +118,84 @@ fn on_proc_exit(handle, code) {
 
 fn on_click(x, y, shift, cmd, id) {
     if id == "reconnect" {
-        let s = @state
+        let s = cur()
         if s.proc != -1 { proc_kill(s.proc) }
         reset!(state, { ..s, proc: -1, connected: false, err: "reconnecting…" })
         request_render()
         start_stream()
         return
     }
-    if id == "tab_runs" { let s = @state; reset!(state, { ..s, tab: "runs" }); request_render(); return }
-    if id == "tab_queue" { let s = @state; reset!(state, { ..s, tab: "queue" }); request_render(); return }
+    if id == "queue_task" { submit_task(); return }
+    if id == "tab_runs" { let s = cur(); reset!(state, { ..s, tab: "runs" }); request_render(); return }
+    if id == "tab_queue" { let s = cur(); reset!(state, { ..s, tab: "queue" }); request_render(); return }
+}
+
+// ---- submitting a task ----------------------------------------------------
+//
+// The body goes down ssh's stdin a line at a time, terminated by a sentinel
+// line rather than EOF: the remote `ox enqueue` reads until `__OX_END__`, so
+// closing the pipe here would leave it waiting for a line that never comes.
+
+fn submit_task() {
+    let s = cur()
+    if s.submit_proc != -1 { return }
+    if trim(s.task) == "" {
+        reset!(state, { ..s, submit_msg: "nothing to send", submit_ok: false })
+        request_render()
+        return
+    }
+    if s.repo == "" {
+        reset!(state, { ..s, submit_msg: "pick a project first", submit_ok: false })
+        request_render()
+        return
+    }
+    let h = proc_spawn("ssh", [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        ox_host, ox_bin, "enqueue", "--repo", s.repo,
+    ])
+    if h == -1 {
+        reset!(state, { ..s, submit_msg: "could not spawn ssh", submit_ok: false })
+        request_render()
+        return
+    }
+    for line in split(s.task, "\n") { proc_write(h, line) }
+    proc_write(h, "__OX_END__")
+    reset!(state, { ..s, submit_proc: h, submit_msg: "sending…", submit_ok: true })
+    request_render()
+}
+
+fn on_input_change(id, value) {
+    if id == "task" { let s = cur(); reset!(state, { ..s, task: value }) }
+}
+
+// Cmd/Ctrl+Enter in the textarea.
+fn on_input_submit(id, value) {
+    if id == "task" {
+        let s = cur()
+        reset!(state, { ..s, task: value })
+        submit_task()
+    }
+}
+
+fn on_select_change(id, value) {
+    if id == "repo" {
+        let s = cur()
+        reset!(state, { ..s, repo: value, submit_msg: "" })
+        request_render()
+    }
 }
 
 // ---- pure helpers -----------------------------------------------------------
+
+fn repo_options(snap) {
+    let mut opts = []
+    for r in rget(snap, "repos", []) {
+        let n = rget(r, "name", "")
+        if n != "" { opts = push(opts, { id: n, label: n }) }
+    }
+    opts
+}
 
 fn status_color(st) {
     if st == "success" { "#7fb87f" }
@@ -162,7 +267,7 @@ fn recent_row(r) {
 // ---- render -----------------------------------------------------------------
 
 fn render(w, h) {
-    let s = @state
+    let s = cur()
     let snap = s.snap
     let counts = rget(snap, "counts", {})
     let daemon = rget(snap, "daemon", "?")
@@ -228,6 +333,17 @@ fn render(w, h) {
                 count_chip("done", rget(counts, "done", 0), "#7fb87f"),
                 count_chip("failed", rget(counts, "failed", 0), "#e08a8a"),
             ]},
+            { kind: "textarea", id: "task", value: s.task, rows: 4,
+              placeholder: "Describe the task. Cmd+Enter to send." },
+            { kind: "hstack", gap: 8.0, align: "center", children: [
+                { kind: "select", id: "repo", value: s.repo, width: 200.0,
+                  placeholder: "project…", options: repo_options(snap) },
+                { kind: "button", id: "queue_task",
+                  label: if s.submit_proc != -1 { "sending…" } else { "Queue" } },
+                { kind: "text", value: s.submit_msg, size: 10.0,
+                  color: if s.submit_ok { col_muted() } else { "#e08a8a" } },
+            ]},
+            { kind: "divider" },
             { kind: "hstack", gap: 6.0, children: [
                 { kind: "button", id: "tab_runs", label: "runs" },
                 { kind: "button", id: "tab_queue", label: "queue" },

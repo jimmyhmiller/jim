@@ -14,6 +14,7 @@
 //!                                          handle is a positive id, or
 //!                                          -1 if the spawn failed
 //!   proc_write(handle, line)   -> bool     write `line` + "\n" to stdin
+//!   proc_close_stdin(handle)   -> bool     drop stdin so the child sees EOF
 //!   proc_read(handle)          -> String   next buffered stdout line, or
 //!                                          "" if none is ready (non-
 //!                                          blocking — call from on_frame)
@@ -261,6 +262,19 @@ impl ProcRegistry {
             }
         }
         false
+    }
+
+    /// Drop the child's stdin so it sees EOF.
+    ///
+    /// A child that reads its input to completion — `sort`, `wc`, an `ssh`
+    /// running such a command — will sit forever otherwise: the pipe stays
+    /// open for as long as we hold the handle, so "done writing" has to be
+    /// said explicitly. Returns false for an unknown handle or one already
+    /// closed, so a double close is harmless.
+    pub fn close_stdin(&mut self, id: i64) -> bool {
+        self.procs
+            .get_mut(&id)
+            .is_some_and(|p| p.stdin.take().is_some())
     }
 
     /// Next buffered stdout line, or "" if none is available right now.
