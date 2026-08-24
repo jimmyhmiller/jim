@@ -14,6 +14,8 @@ import { rget } from "git"
 
 let ox_host = "computer.jimmyhmiller.com"
 let ox_bin = "/home/jimmyhmiller/ox-runner/bin/ox"
+// Snapshot schema this widget needs; see SCHEMA in ox-snapshot.py.
+let wanted_schema = 2
 
 fn init_state() = {
     proc: -1,
@@ -29,6 +31,7 @@ fn init_state() = {
     submit_proc: -1,
     submit_msg: "",
     submit_ok: true,
+    respawned: 0,
 }
 let state = atom(init_state())
 
@@ -87,6 +90,17 @@ fn on_proc_output(handle, line) {
     // an Option, so unwrap before type-checking.
     let parsed = unwrap_or(json_parse(t), 0)
     if typeof(parsed) == "Record" {
+        if rget(parsed, "v", 0) < wanted_schema and s.respawned == 0 {
+            // Stale `ox stream` on the other end: kill it and start a new one,
+            // which picks up the installed script. Once only, so an older
+            // runner that genuinely cannot serve this schema does not loop.
+            proc_kill(s.proc)
+            reset!(state, { ..s, proc: -1, respawned: 1,
+                            err: "stream was stale; reconnecting…" })
+            request_render()
+            start_stream()
+            return
+        }
         reset!(state, { ..s, snap: parsed, connected: true, err: "" })
         request_render()
     } else {
@@ -120,7 +134,7 @@ fn on_click(x, y, shift, cmd, id) {
     if id == "reconnect" {
         let s = cur()
         if s.proc != -1 { proc_kill(s.proc) }
-        reset!(state, { ..s, proc: -1, connected: false, err: "reconnecting…" })
+        reset!(state, { ..s, proc: -1, connected: false, respawned: 0, err: "reconnecting…" })
         request_render()
         start_stream()
         return
