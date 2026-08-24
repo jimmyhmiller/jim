@@ -31,7 +31,9 @@ use serde_json::{Value, json};
 /// locate their state — no env override, so the CLI and the pane can never
 /// disagree about where a notebook lives.
 fn pads_dir() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     home.join(".jim").join("pads")
 }
 
@@ -54,7 +56,10 @@ fn valid_name(name: &str) -> Result<(), String> {
         return Err("a notebook name cannot be empty".into());
     }
     if name.len() > 64 {
-        return Err(format!("notebook name is too long ({} chars, max 64)", name.len()));
+        return Err(format!(
+            "notebook name is too long ({} chars, max 64)",
+            name.len()
+        ));
     }
     if let Some(bad) = name
         .chars()
@@ -81,7 +86,8 @@ fn write_state(v: &Value) -> Result<(), String> {
     let dir = pads_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let path = state_path();
-    std::fs::write(&path, format!("{v:#}\n")).map_err(|e| format!("writing {}: {e}", path.display()))
+    std::fs::write(&path, format!("{v:#}\n"))
+        .map_err(|e| format!("writing {}: {e}", path.display()))
 }
 
 fn current_notebook() -> String {
@@ -126,9 +132,13 @@ fn now_ms() -> u64 {
 /// because it's meant to be typed back in (`pad rm c3f9`).
 fn fresh_id(log: &str) -> String {
     let taken = existing_ids(log);
-    let mut seed = now_ms().wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut seed = now_ms()
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     for _ in 0..1000 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let id = format!("{:04x}", (seed >> 33) as u16);
         if !taken.iter().any(|t| *t == id) {
             return id;
@@ -281,7 +291,10 @@ impl Args {
             .read_to_string(&mut buf)
             .map_err(|e| format!("reading stdin: {e}"))?;
         if buf.trim().is_empty() {
-            return Err("nothing to write: pass the content as an argument, a file path, or on stdin".into());
+            return Err(
+                "nothing to write: pass the content as an argument, a file path, or on stdin"
+                    .into(),
+            );
         }
         Ok((buf, None))
     }
@@ -326,7 +339,9 @@ pub fn run() -> ExitCode {
             print_usage();
             return ExitCode::SUCCESS;
         }
-        other => Err(format!("unknown subcommand `{other}` (try `jimctl pad help`)")),
+        other => Err(format!(
+            "unknown subcommand `{other}` (try `jimctl pad help`)"
+        )),
     };
 
     match result {
@@ -388,7 +403,8 @@ fn cmd_new(args: &Args) -> Result<(), String> {
             path.display()
         ));
     }
-    std::fs::create_dir_all(pads_dir()).map_err(|e| format!("creating {}: {e}", pads_dir().display()))?;
+    std::fs::create_dir_all(pads_dir())
+        .map_err(|e| format!("creating {}: {e}", pads_dir().display()))?;
     std::fs::write(&path, "").map_err(|e| format!("writing {}: {e}", path.display()))?;
     set_current(name)?;
     notify(name, "clear", "");
@@ -437,7 +453,10 @@ fn cmd_list() -> Result<(), String> {
     }
     for n in names {
         let marker = if n == current { "*" } else { " " };
-        let cells = read_log(&n).lines().filter(|l| !l.trim().is_empty()).count();
+        let cells = read_log(&n)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
         println!("{marker} {n}  ({cells} records)");
     }
     Ok(())
@@ -479,7 +498,9 @@ fn cmd_callout(args: &Args) -> Result<(), String> {
                 .read_to_string(&mut buf)
                 .map_err(|e| format!("reading stdin: {e}"))?;
             if buf.trim().is_empty() {
-                return Err("nothing to write: pass the callout body as an argument or on stdin".into());
+                return Err(
+                    "nothing to write: pass the callout body as an argument or on stdin".into(),
+                );
             }
             buf
         }
@@ -665,7 +686,9 @@ fn table_from_csv(raw: &str) -> Result<(Vec<String>, Vec<Vec<Value>>), String> {
     if in_quotes {
         return Err("CSV ends inside a quoted field (unbalanced `\"`)".into());
     }
-    let mut it = records.into_iter().filter(|r| !r.iter().all(|f| f.is_empty()));
+    let mut it = records
+        .into_iter()
+        .filter(|r| !r.iter().all(|f| f.is_empty()));
     let columns = it.next().ok_or("CSV has no header row")?;
     let width = columns.len();
     let rows: Vec<Vec<Value>> = it
@@ -788,8 +811,7 @@ fn cmd_stats(args: &Args) -> Result<(), String> {
 
 fn cmd_json(args: &Args) -> Result<(), String> {
     let (raw, path) = args.body_file_or_stdin()?;
-    let value: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("not valid JSON: {e}"))?;
+    let value: Value = serde_json::from_str(&raw).map_err(|e| format!("not valid JSON: {e}"))?;
     let mut cell = json!({ "type": "json", "value": value });
     let title = args.get("title").map(str::to_string).or_else(|| {
         path.as_deref()
@@ -840,7 +862,9 @@ fn cmd_image(args: &Args) -> Result<(), String> {
 fn cmd_graph(args: &Args) -> Result<(), String> {
     let (dot, path) = args.body_file_or_stdin()?;
     if !dot.contains('{') {
-        return Err("that doesn't look like DOT — expected something like `digraph { a -> b }`".into());
+        return Err(
+            "that doesn't look like DOT — expected something like `digraph { a -> b }`".into(),
+        );
     }
     let mut cell = json!({ "type": "graph", "dot": dot });
     let title = args.get("title").map(str::to_string).or_else(|| {
@@ -918,8 +942,7 @@ mod tests {
     #[test]
     fn json_array_of_objects_unions_keys_in_order() {
         // Document order, not alphabetical: `region` was written first.
-        let (cols, rows) =
-            table_from_json(r#"[{"region":1,"a":2},{"a":3,"c":4}]"#).unwrap();
+        let (cols, rows) = table_from_json(r#"[{"region":1,"a":2},{"a":3,"c":4}]"#).unwrap();
         assert_eq!(cols, vec!["region", "a", "c"]);
         assert_eq!(rows[1][0], Value::Null);
         assert_eq!(rows[1][2], json!(4));
@@ -928,8 +951,7 @@ mod tests {
 
     #[test]
     fn json_columns_rows_shape() {
-        let (cols, rows) =
-            table_from_json(r#"{"columns":["x"],"rows":[[1],[2]]}"#).unwrap();
+        let (cols, rows) = table_from_json(r#"{"columns":["x"],"rows":[[1],[2]]}"#).unwrap();
         assert_eq!(cols, vec!["x"]);
         assert_eq!(rows.len(), 2);
     }

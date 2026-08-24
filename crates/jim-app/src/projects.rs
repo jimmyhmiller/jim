@@ -29,6 +29,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use bevy::camera::ClearColorConfig;
+use bevy::camera::visibility::RenderLayers;
 use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
@@ -320,6 +322,11 @@ pub struct Projects {
     /// [`Projects::switch_workspace`].
     pub active_workspace: u64,
     pub next_workspace_id: u64,
+    /// A workspace change waiting to be animated: `(left behind, travel
+    /// direction)`. Written by [`Projects::switch_workspace_toward`] and
+    /// taken by `sidebar_slide`. Session-only — a switch that happens
+    /// while nothing is drawing simply isn't animated.
+    pub pending_switch: Option<(u64, f32)>,
     /// Counter for `TerminalSession` ids. Bumped on every spawn (new or
     /// restored) so we never collide with an existing scrollback file.
     pub next_terminal_id: u64,
@@ -446,6 +453,7 @@ impl Projects {
             terminals_dirty: false,
             unread_bells: std::collections::HashMap::new(),
             show_hidden: false,
+            pending_switch: None,
         }
     }
     /// Hand out a fresh nested-canvas id and mark state dirty so the
@@ -776,6 +784,28 @@ impl Projects {
     /// restores its own — re-validated, because that project may have
     /// been deleted, or parked in this workspace, since you last left.
     pub fn switch_workspace(&mut self, id: u64) {
+        // Which way the list should travel. Comparing positions is right
+        // for a click on the strip or a name from the CLI; a wrapping
+        // swipe knows better and says so via `switch_workspace_toward`.
+        let dir = self
+            .workspaces
+            .iter()
+            .position(|w| w.id == id)
+            .map(|to| {
+                if to as i64 > self.workspace_index() as i64 {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .unwrap_or(1);
+        self.switch_workspace_toward(id, dir);
+    }
+
+    /// `switch_workspace`, with the travel direction stated rather than
+    /// inferred. Cycling off one end of the strip and onto the other is
+    /// still forward motion even though the index goes backwards.
+    pub fn switch_workspace_toward(&mut self, id: u64, dir: i32) {
         if self.active_workspace == id || !self.workspaces.iter().any(|w| w.id == id) {
             return;
         }
@@ -783,8 +813,13 @@ impl Projects {
         if let Some(ws) = self.workspace_mut() {
             ws.active = leaving;
         }
+        let from = self.active_workspace;
         self.active_workspace = id;
         self.adopt_workspace_active();
+        // Every entry point — swipe, strip click, `jimctl`, palette —
+        // funnels through here, so recording the move is enough to make
+        // all of them animate. `sidebar_slide` picks it up.
+        self.pending_switch = Some((from, if dir >= 0 { 1.0 } else { -1.0 }));
         self.dirty = true;
         self.layout_dirty = true;
     }
@@ -811,7 +846,9 @@ impl Projects {
         let cur = self.workspace_index() as i32;
         let next = (cur + delta).rem_euclid(n as i32) as usize;
         let id = self.workspaces[next].id;
-        self.switch_workspace(id);
+        // Say the direction rather than let it be inferred: wrapping from
+        // the last workspace to the first is still forward motion.
+        self.switch_workspace_toward(id, delta);
         Some(id)
     }
     pub fn name_of(&self, id: u64) -> Option<&str> {
@@ -1042,6 +1079,261 @@ struct ProjectDrag {
     dirty_pending: bool,
 }
 
+// ----- The workspace slide -----
+//
+// Switching workspace pushes the whole list sideways: the one you left
+// travels off one edge while the one you arrived at comes in from the
+// other, the way a page turns. Anything less and a swipe just teleports
+// the sidebar's contents, which reads as a glitch rather than a move.
+//
+// This only works because the sidebar owns a camera whose viewport is
+// the sidebar rect (see [`SIDEBAR_LAYER`]); without that, content
+// halfway through the slide would be painting across the canvas.
+
+/// How long one workspace slide takes. Short — this is navigation
+/// feedback, not a transition you are meant to watch.
+const SLIDE_SECONDS: f32 = 0.22;
+
+/// Dedicated RenderLayer for the sidebar.
+///
+/// The sidebar used to draw on layer 0, which meant nothing clipped it:
+/// a long project name already spilled onto the canvas, and a sliding
+/// list would have smeared right across it. Its own camera, viewport'd
+/// to the sidebar rect, makes clipping the renderer's problem — the same
+/// trick the panes use.
+///
+/// MUST be listed in `PanePlugin.reserved_layers` (see `lib.rs`), or the
+/// pane allocator can hand the same id to a pane and that pane's content
+/// would render inside the sidebar.
+pub const SIDEBAR_LAYER: usize = 28;
+
+/// Height of the footer band the list can never scroll into. Matches
+/// [`EYE_ZONE`], because the footer exists to give that hot-zone a
+/// surface of its own.
+const FOOTER_H: f32 = EYE_ZONE;
+
+// Depth ladder above `SIDEBAR_Z`, in draw order. The rows occupy
+// 0.05–0.25 and scroll; everything below is chrome pinned over them.
+/// Opaque band that hides rows scrolled down past the footer.
+const Z_FOOTER_MASK: f32 = 0.26;
+/// The hairline above the footer.
+const Z_FOOTER_RULE: f32 = 0.27;
+/// The show-hidden eyeball.
+const Z_FOOTER_ITEM: f32 = 0.28;
+/// Opaque band that hides rows scrolled up past the header.
+const Z_HEADER_MASK: f32 = 0.30;
+/// The hairline under the header.
+const Z_HEADER_RULE: f32 = 0.32;
+/// Workspace name (and its rename caret, just above).
+const Z_HEADER_TEXT: f32 = 0.34;
+/// Second mask, so the name sliding out of a workspace disappears behind
+/// the strip rather than travelling across it.
+const Z_STRIP_MASK: f32 = 0.36;
+/// The workspace bars and the `+`.
+const Z_STRIP: f32 = 0.38;
+/// Scroll indicator, over everything — it reports on the list but is not
+/// part of it.
+const Z_SCROLLBAR: f32 = 0.40;
+
+/// Width of the scroll indicator, hugging the sidebar's inner edge.
+const SCROLLBAR_W: f32 = 3.0;
+/// Shortest the thumb gets. Proportional sizing alone would shrink it to
+/// a couple of pixels once the list is long enough to need it most.
+const SCROLLBAR_MIN_H: f32 = 24.0;
+
+/// Camera order for the sidebar. Above every pane camera (< 75_150) and
+/// above the whiteboard overlay (80_000) — ink on the canvas must not
+/// paint over the chrome — but below the recursive-slide dive (95_000)
+/// and the menu overlay (100_000), both of which are meant to cover the
+/// whole window, sidebar included.
+pub const SIDEBAR_CAMERA_ORDER: isize = 90_000;
+
+#[derive(Component)]
+struct SidebarCamera;
+
+/// Live state of the slide. `t` runs 0→1 over [`SLIDE_SECONDS`].
+#[derive(Resource, Default)]
+pub struct SidebarSlide {
+    /// The workspace being left, and how far along we are.
+    from: Option<u64>,
+    /// +1 = moving forward through the strip (the new list enters from
+    /// the right), -1 = backward.
+    dir: f32,
+    t: f32,
+}
+
+impl SidebarSlide {
+    /// Is a slide in flight? The app is reactive, so this has to feed
+    /// `want_continuous` or the slide would advance one frame per mouse
+    /// twitch instead of playing.
+    pub fn animating(&self) -> bool {
+        self.from.is_some()
+    }
+
+    /// Eased progress. Ease-out cubic: the list arrives decelerating,
+    /// which is what makes a short slide read as movement rather than a
+    /// jump-cut.
+    fn eased(&self) -> f32 {
+        let t = self.t.clamp(0.0, 1.0);
+        1.0 - (1.0 - t).powi(3)
+    }
+}
+
+/// Start a slide when a workspace change is queued, and advance one in
+/// flight.
+fn sidebar_slide(mut slide: ResMut<SidebarSlide>, mut projects: ResMut<Projects>, time: Res<Time>) {
+    if let Some((from, dir)) = projects.pending_switch.take() {
+        // Re-switching mid-slide restarts from where the eye is, not
+        // from a fresh full-width offset, so a fast double swipe reads
+        // as continuous motion.
+        slide.from = Some(from);
+        slide.dir = dir;
+        slide.t = 0.0;
+    }
+    if slide.from.is_none() {
+        return;
+    }
+    slide.t += time.delta_secs() / SLIDE_SECONDS;
+    if slide.t >= 1.0 {
+        slide.from = None;
+        slide.t = 0.0;
+    }
+    // Every frame of the slide is a fresh layout: the two lists are
+    // spawned at new offsets rather than tweened in place, because the
+    // sidebar has always rebuilt wholesale and one moving mechanism is
+    // cheaper to reason about than two.
+    projects.layout_dirty = true;
+}
+
+/// Keep the sidebar camera's viewport glued to the sidebar rect.
+///
+/// Spawns it on the first run. The viewport maths is the pane cameras'
+/// (`pane_camera_setup_for`), which means the world coordinates the
+/// layout already computes land in exactly the same place they did on
+/// layer 0 — the camera only decides where drawing stops.
+fn sync_sidebar_camera(
+    mut commands: Commands,
+    windows: Query<&Window>,
+    sidebar: Res<Sidebar>,
+    presentation: Res<crate::present::Presentation>,
+    mut cam: Query<(&mut Camera, &mut Transform), With<SidebarCamera>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let rect = PaneRect {
+        pos: Vec2::ZERO,
+        size: Vec2::new(sidebar.width, window.height()),
+        z: 0.0,
+    };
+    let setup = jim_pane::camera::pane_camera_setup_for(
+        &rect,
+        Vec2::new(window.width(), window.height()),
+        window.scale_factor(),
+        None,
+    );
+    // While presenting there is no sidebar; the entities are hidden, so
+    // the camera has nothing to draw either way, but leaving a stale
+    // viewport around is one less thing to wonder about.
+    let visible = setup.visible && presentation.sidebar_visible();
+    if let Ok((mut camera, mut transform)) = cam.single_mut() {
+        let same_viewport = camera.viewport.as_ref().is_some_and(|v| {
+            v.physical_position == setup.viewport.physical_position
+                && v.physical_size == setup.viewport.physical_size
+        });
+        if !same_viewport {
+            camera.viewport = Some(setup.viewport);
+        }
+        if camera.is_active != visible {
+            camera.is_active = visible;
+        }
+        let want = Vec3::new(setup.cam_center.x, setup.cam_center.y, 0.0);
+        if transform.translation != want {
+            transform.translation = want;
+        }
+        return;
+    }
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: SIDEBAR_CAMERA_ORDER,
+            viewport: Some(setup.viewport),
+            // The sidebar overlays the canvas render; clearing would
+            // wipe everything drawn under it.
+            clear_color: ClearColorConfig::None,
+            is_active: visible,
+            ..default()
+        },
+        // NOT `Msaa::Off`: this camera draws to the window, where every
+        // other camera is at Bevy's default Sample4, and one straggler
+        // at a different sample count is a fatal validation error.
+        Transform::from_xyz(setup.cam_center.x, setup.cam_center.y, 0.0),
+        RenderLayers::from_layers(&[SIDEBAR_LAYER]),
+        SidebarCamera,
+        Name::new("sidebar:camera"),
+    ));
+}
+
+// ----- Scrolling the list -----
+
+/// How far the list can travel: its height, less the room below the
+/// header. Zero when everything already fits, which is the common case
+/// and why nothing about the sidebar changes until it doesn't.
+///
+/// The "+ New Project" row and its divider scroll WITH the list rather
+/// than pinning to the bottom. Pinning would move that row halfway down
+/// an otherwise short sidebar, changing the layout for everyone to solve
+/// a problem only long lists have.
+fn max_scroll(rows: usize, win_h: f32) -> f32 {
+    let content = rows as f32 * ROW_H + DIVIDER_H + ROW_H;
+    (content - rows_room(win_h)).max(0.0)
+}
+
+/// Vertical room the list has: below the sticky header, above the
+/// footer. Both bands are opaque and pinned, so this is the only part of
+/// the sidebar a row can actually be seen or clicked in.
+fn rows_room(win_h: f32) -> f32 {
+    (win_h - HEADER_H - FOOTER_H).max(0.0)
+}
+
+/// Is this cursor y inside the band where rows are visible? Outside it
+/// the row is behind the header or footer mask, and a click there must
+/// not pick something the user cannot see.
+fn in_rows_band(pt_y: f32, win_h: f32) -> bool {
+    pt_y >= HEADER_H && pt_y < (win_h - FOOTER_H).max(HEADER_H)
+}
+
+/// Which visible row a cursor y is over.
+///
+/// Hover, press and reorder all map a cursor onto a row, and they have
+/// to agree: if one of them forgets the scroll you highlight one project
+/// and grab another.
+fn row_slot_at(pt_y: f32, scroll: f32) -> i64 {
+    ((pt_y - HEADER_H + scroll) / ROW_H).floor() as i64
+}
+
+/// How far each workspace's list is scrolled, in px from the top.
+///
+/// Per workspace, because they hold different numbers of projects and
+/// coming back to one should find it where you left it. View state:
+/// session-only, like `show_hidden`.
+#[derive(Resource, Default)]
+pub struct SidebarScroll {
+    per_workspace: std::collections::HashMap<u64, f32>,
+}
+
+impl SidebarScroll {
+    fn get(&self, workspace: u64) -> f32 {
+        self.per_workspace.get(&workspace).copied().unwrap_or(0.0)
+    }
+    /// Read the offset clamped to what the list can actually travel.
+    /// Clamping on read as well as on write means a window resize or a
+    /// project deletion can't leave the list parked past its end.
+    fn clamped(&self, workspace: u64, rows: usize, win_h: f32) -> f32 {
+        self.get(workspace).clamp(0.0, max_scroll(rows, win_h))
+    }
+}
+
 // ----- Two-finger workspace swipe -----
 
 /// Horizontal pixels one gesture must travel before it switches
@@ -1053,18 +1345,46 @@ const SWIPE_THRESHOLD_PX: f32 = 55.0;
 /// and a vertical scroll that silently swapped the whole sidebar would
 /// be the worst possible failure here.
 const SWIPE_AXIS_RATIO: f32 = 1.6;
+/// Travel before a gesture commits to an axis. Below this the direction
+/// is mostly noise; above it, the choice sticks for the rest of the
+/// gesture so a long scroll can drift sideways without switching
+/// workspace, and a swipe can drift vertically without scrolling.
+const AXIS_LOCK_PX: f32 = 6.0;
 /// Quiet time that ends a gesture. A trackpad reports no "fingers
 /// lifted", so the gap between event bursts is the only signal that one
 /// swipe finished and the next began.
-const SWIPE_IDLE_SECS: f32 = 0.2;
+///
+/// Measured in WALL CLOCK, not accumulated per frame. The app is
+/// reactive: with nothing happening it renders every 5s, so a per-frame
+/// accumulator counts "frames the app happened to run" rather than time,
+/// and the gesture stays latched until something else wakes the loop.
+/// That was the bug where you had to jiggle the mouse between swipes —
+/// the jiggle was what let the app notice the gap.
+const SWIPE_IDLE_SECS: f64 = 0.2;
 /// Pixels attributed to one notch of a line-unit wheel. Only a mouse
 /// with a horizontal tilt produces these; a couple of notches should
 /// switch, same as a flick.
 const SWIPE_LINE_PX: f32 = 30.0;
 
-/// Live state for the workspace swipe. See [`sidebar_swipe`].
+/// What a gesture turned out to be. Decided once, near its start, and
+/// held until the gesture ends — see [`AXIS_LOCK_PX`].
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum GestureAxis {
+    #[default]
+    Undecided,
+    /// Sideways: change workspace.
+    Swipe,
+    /// Up and down: scroll the list.
+    Scroll,
+}
+
+/// Live state for a wheel gesture over the sidebar. See
+/// [`sidebar_wheel`].
 #[derive(Resource, Default)]
 struct SidebarSwipe {
+    /// What this gesture is for, once it has travelled far enough to
+    /// say.
+    axis: GestureAxis,
     /// Horizontal pixels accumulated within the current gesture.
     accum: f32,
     /// Vertical pixels in the same gesture, for the axis test.
@@ -1073,21 +1393,75 @@ struct SidebarSwipe {
     /// exactly ONE workspace however far it runs, so a long drag can't
     /// blow through five of them.
     fired: bool,
-    /// Seconds since the last wheel event.
-    idle: f32,
+    /// `Time::elapsed_secs_f64` of the last wheel event, or `None`
+    /// before the first one. A wall-clock stamp rather than a per-frame
+    /// accumulator — see [`SWIPE_IDLE_SECS`].
+    last_event: Option<f64>,
 }
 
-/// Two-finger horizontal swipe over the sidebar switches workspace.
+impl SidebarSwipe {
+    fn begin(&mut self) {
+        self.accum = 0.0;
+        self.accum_y = 0.0;
+        self.fired = false;
+        self.axis = GestureAxis::Undecided;
+    }
+
+    /// Commit to an axis once the gesture has moved far enough to mean
+    /// something. Returns what it settled on, or `Undecided` while it is
+    /// still too small to call.
+    fn decide_axis(&mut self) -> GestureAxis {
+        if self.axis != GestureAxis::Undecided {
+            return self.axis;
+        }
+        let (dx, dy) = (self.accum.abs(), self.accum_y.abs());
+        self.axis = if dx >= AXIS_LOCK_PX && dx >= dy * SWIPE_AXIS_RATIO {
+            GestureAxis::Swipe
+        } else if dy >= AXIS_LOCK_PX {
+            // Anything clearly vertical scrolls. The ratio guard is
+            // deliberately one-sided: mistaking a scroll for a swipe
+            // swaps the whole sidebar under the user, while mistaking a
+            // swipe for a scroll just moves the list a little.
+            GestureAxis::Scroll
+        } else {
+            GestureAxis::Undecided
+        };
+        self.axis
+    }
+
+    /// Does `dx` belong to a NEW gesture rather than the one in
+    /// progress?
+    ///
+    /// This is what makes swiping back and forth work. macOS keeps
+    /// delivering momentum events for up to a second after your fingers
+    /// leave the trackpad, so the quiet gap that would otherwise end a
+    /// gesture never arrives between two swipes made in quick
+    /// succession. Momentum only ever decays in the direction of the
+    /// flick that caused it, so a sign flip is always a real new gesture
+    /// and never the tail of the old one.
+    fn is_reversal(&self, dx: f32) -> bool {
+        dx != 0.0 && self.accum != 0.0 && dx.signum() != self.accum.signum()
+    }
+}
+
+/// Route a two-finger gesture over the sidebar: sideways changes
+/// workspace, up and down scrolls the list.
 ///
-/// Only over the sidebar: the canvas already owns horizontal wheel input
-/// for `cmd`-pan, and a gesture that switched context from anywhere on
-/// screen would fire by accident constantly.
+/// One system rather than two, because the axis is a single decision per
+/// gesture and both readings must not fire off the same flick. Trackpads
+/// leak each axis into the other, so the gesture commits to one early
+/// (see [`SidebarSwipe::decide_axis`]) and stays there.
 ///
-/// Direction matches the canvas pan and macOS paging — fingers moving
-/// LEFT drag the next workspace in from the right.
-fn sidebar_swipe(
+/// Only over the sidebar: the canvas already owns wheel input elsewhere,
+/// and a gesture that switched context from anywhere on screen would
+/// fire by accident constantly.
+///
+/// Swipe direction matches the canvas pan and macOS paging — fingers
+/// moving LEFT drag the next workspace in from the right.
+fn sidebar_wheel(
     mut wheel: MessageReader<MouseWheel>,
     mut swipe: ResMut<SidebarSwipe>,
+    mut scroll: ResMut<SidebarScroll>,
     time: Res<Time>,
     windows: Query<&Window>,
     sidebar: Res<Sidebar>,
@@ -1095,15 +1469,6 @@ fn sidebar_swipe(
     keys: Res<ButtonInput<KeyCode>>,
     mut projects: ResMut<Projects>,
 ) {
-    // End the gesture after a quiet spell, so the next burst starts from
-    // zero and gets its own switch.
-    swipe.idle += time.delta_secs();
-    if swipe.idle > SWIPE_IDLE_SECS {
-        swipe.accum = 0.0;
-        swipe.accum_y = 0.0;
-        swipe.fired = false;
-    }
-
     // No sidebar, no gesture — during a talk the strip down the left is
     // the slide, and swiping it must not switch context behind the
     // presenter's back.
@@ -1116,10 +1481,11 @@ fn sidebar_swipe(
         wheel.clear();
         return;
     }
-    let over_sidebar = windows
-        .single()
-        .ok()
-        .and_then(|w| w.cursor_position())
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let over_sidebar = window
+        .cursor_position()
         .is_some_and(|pt| pt.x < sidebar.width);
 
     let mut dx = 0.0;
@@ -1137,30 +1503,53 @@ fn sidebar_swipe(
     if !had_event {
         return;
     }
-    swipe.idle = 0.0;
-    // A gesture that started off the sidebar keeps accumulating time but
-    // no distance, so dragging out of the sidebar mid-swipe stops it
-    // rather than completing it somewhere the user isn't looking.
+    let now = time.elapsed_secs_f64();
+    let quiet = swipe.last_event.is_none_or(|t| now - t > SWIPE_IDLE_SECS);
+    swipe.last_event = Some(now);
+
+    // Two things end a gesture and start the next one: a quiet gap, or a
+    // reversal (see `is_reversal` — the reversal is what survives
+    // momentum).
+    if quiet || swipe.is_reversal(dx) {
+        swipe.begin();
+    }
+
+    // A gesture that started off the sidebar accumulates nothing, so
+    // dragging out of the sidebar mid-gesture abandons it rather than
+    // completing it somewhere the user isn't looking.
     if !over_sidebar {
         return;
     }
     swipe.accum += dx;
     swipe.accum_y += dy;
-    if swipe.fired {
-        return;
-    }
-    if swipe.accum.abs() < SWIPE_THRESHOLD_PX {
-        return;
-    }
-    if swipe.accum.abs() < swipe.accum_y.abs() * SWIPE_AXIS_RATIO {
-        return;
-    }
-    // Positive x is fingers moving right — the same sign the canvas pan
-    // reads as "show me what's to the left" — so that goes back a
-    // workspace.
-    let delta = if swipe.accum > 0.0 { -1 } else { 1 };
-    if projects.cycle_workspace(delta).is_some() {
-        swipe.fired = true;
+
+    match swipe.decide_axis() {
+        GestureAxis::Undecided => {}
+        GestureAxis::Scroll => {
+            let workspace = projects.active_workspace;
+            let rows = sidebar_rows_for(&projects, workspace).len();
+            // Positive y is fingers moving down, which under natural
+            // scrolling drags the content down — towards the top of the
+            // list, so the offset shrinks.
+            let want = (scroll.get(workspace) - dy).clamp(0.0, max_scroll(rows, window.height()));
+            if scroll.get(workspace) != want {
+                scroll.per_workspace.insert(workspace, want);
+                projects.layout_dirty = true;
+            }
+        }
+        GestureAxis::Swipe => {
+            // One switch per gesture, however far it runs.
+            if swipe.fired || swipe.accum.abs() < SWIPE_THRESHOLD_PX {
+                return;
+            }
+            // Positive x is fingers moving right — the same sign the
+            // canvas pan reads as "show me what's to the left" — so that
+            // goes back a workspace.
+            let delta = if swipe.accum > 0.0 { -1 } else { 1 };
+            if projects.cycle_workspace(delta).is_some() {
+                swipe.fired = true;
+            }
+        }
     }
 }
 
@@ -1238,6 +1627,28 @@ fn workspace_strip(projects: &Projects, sidebar_width: f32) -> WorkspaceStrip {
     WorkspaceStrip { bars, add, left }
 }
 
+impl SidebarBounds {
+    /// Where this hit rect actually sits for `pass`.
+    ///
+    /// The departing list's rects are pushed out of reach rather than
+    /// spawned in place: two live `SidebarHit::Project` entities naming
+    /// different workspaces would make the picker's first-match-wins
+    /// arbitrary, and the one that won might be the list on its way out.
+    fn placed(self, pass: &SidebarPass) -> Self {
+        if !pass.interactive {
+            return Self {
+                min: Vec2::splat(f32::INFINITY),
+                max: Vec2::splat(f32::INFINITY),
+            };
+        }
+        let d = Vec2::new(pass.dx, 0.0);
+        Self {
+            min: self.min + d,
+            max: self.max + d,
+        }
+    }
+}
+
 fn in_bounds(pt: Vec2, b: &SidebarBounds) -> bool {
     pt.x >= b.min.x && pt.x <= b.max.x && pt.y >= b.min.y && pt.y <= b.max.y
 }
@@ -1253,6 +1664,8 @@ impl Plugin for ProjectsPlugin {
             .insert_resource(SidebarResize::default())
             .insert_resource(SidebarHover::default())
             .insert_resource(SidebarSwipe::default())
+            .insert_resource(SidebarSlide::default())
+            .insert_resource(SidebarScroll::default())
             .insert_resource(ProjectDrag::default())
             .insert_resource(Renaming::default())
             .insert_resource(PendingActions::default())
@@ -1266,9 +1679,11 @@ impl Plugin for ProjectsPlugin {
                     sidebar_resize_drag,
                     project_drag,
                     sidebar_hover,
-                    // Before the layout rebuild, so a workspace switch
-                    // repaints the list in the same frame as the flick.
-                    sidebar_swipe,
+                    // Before the layout rebuild, so a workspace switch or
+                    // a scroll repaints in the same frame as the gesture.
+                    sidebar_wheel,
+                    sidebar_slide,
+                    sync_sidebar_camera,
                     sidebar_layout,
                     // After the layout rebuild (which respawns the entities)
                     // and before input, so a hidden sidebar is both unseen
@@ -1379,6 +1794,93 @@ fn load_or_seed_projects(mut commands: Commands, mut pending: ResMut<PendingActi
 
 // ---------- Sidebar layout ----------
 
+/// One list of projects to draw this frame.
+///
+/// At rest there is exactly one, sitting at `dx == 0`. During a slide
+/// there are two, and everything that differs between them — which
+/// projects, which is active, where it sits, whether it takes clicks —
+/// is in here, so the drawing code below stays a single pass over rows.
+struct SidebarPass {
+    /// Indices into `Projects::list`, each with its parked flag *in this
+    /// pass's workspace* (parked rows appear only under `show_hidden`).
+    rows: Vec<(usize, bool)>,
+    /// Workspace being shown, for the header name.
+    workspace: u64,
+    /// The active project in THIS workspace. The list being left keeps
+    /// showing its own selection as it goes.
+    active: Option<u64>,
+    /// Horizontal offset in logical px.
+    dx: f32,
+    /// How far this list is scrolled, in px from the top.
+    scroll: f32,
+    /// Only the arriving list takes clicks. Clicking the departing one
+    /// would act on a workspace you have already left.
+    interactive: bool,
+}
+
+/// Rows to list for `workspace`, in `Projects::list` order.
+fn sidebar_rows_for(projects: &Projects, workspace: u64) -> Vec<(usize, bool)> {
+    let parked = projects
+        .workspaces
+        .iter()
+        .find(|w| w.id == workspace)
+        .map(|w| w.hidden.as_slice())
+        .unwrap_or(&[]);
+    (0..projects.list.len())
+        .filter_map(|i| {
+            let hidden = parked.contains(&projects.list[i].id);
+            (projects.show_hidden || !hidden).then_some((i, hidden))
+        })
+        .collect()
+}
+
+fn sidebar_passes(
+    projects: &Projects,
+    slide: &SidebarSlide,
+    scroll: &SidebarScroll,
+    width: f32,
+    win_h: f32,
+) -> Vec<SidebarPass> {
+    let rows = sidebar_rows_for(projects, projects.active_workspace);
+    let arriving = SidebarPass {
+        scroll: scroll.clamped(projects.active_workspace, rows.len(), win_h),
+        rows,
+        workspace: projects.active_workspace,
+        active: projects.active,
+        dx: 0.0,
+        interactive: true,
+    };
+    let Some(from) = slide.from else {
+        return vec![arriving];
+    };
+    // A full sidebar width of travel: the arriving list starts entirely
+    // off the edge it is coming from, the departing one leaves by the
+    // opposite edge. Anything less reads as a nudge rather than a page
+    // turn, and the camera viewport means the overshoot costs nothing.
+    let p = slide.eased();
+    let leaving = sidebar_rows_for(projects, from);
+    vec![
+        SidebarPass {
+            scroll: scroll.clamped(from, leaving.len(), win_h),
+            rows: leaving,
+            workspace: from,
+            // `switch_workspace_toward` stamped the project we were in
+            // onto the workspace we left, so it is still recorded there.
+            active: projects
+                .workspaces
+                .iter()
+                .find(|w| w.id == from)
+                .and_then(|w| w.active),
+            dx: -slide.dir * width * p,
+            interactive: false,
+        },
+        SidebarPass {
+            dx: slide.dir * width * (1.0 - p),
+            ..arriving
+        },
+    ]
+}
+
 /// Clip `s` to what fits in `room` pixels at `advance` px per character,
 /// marking the cut with an ellipsis. The sidebar font is monospace, so
 /// character count is an exact width — no shaping needed.
@@ -1413,12 +1915,17 @@ fn sidebar_layout(
     sidebar: Res<Sidebar>,
     theme: Res<jim_style::Theme>,
     mut projects: ResMut<Projects>,
+    slide: Res<SidebarSlide>,
+    scroll: Res<SidebarScroll>,
     renaming: Res<Renaming>,
     hover: Res<SidebarHover>,
     drag: Res<ProjectDrag>,
     font: Res<MonoFont>,
     metrics: Res<MonoMetrics>,
-    existing: Query<Entity, With<SidebarEntity>>,
+    // Roots only. Each list is a parent with its rows as children, and
+    // `despawn` takes the subtree — so despawning children too would
+    // spam "entity is invalid" for every row on every rebuild.
+    existing: Query<Entity, (With<SidebarEntity>, Without<ChildOf>)>,
     mut last_dims: Local<LastWindowDims>,
 ) {
     let Ok(window) = windows.single() else {
@@ -1451,9 +1958,29 @@ fn sidebar_layout(
     let world_left_edge = -win_w * 0.5;
     let world_top_edge = win_h * 0.5;
 
+    // Chrome that does NOT slide — the masks, the header, the footer —
+    // hangs off one root so `spawn_eye` and friends have a parent and
+    // the despawn sweep has a single entity to take.
+    // Everything the sidebar draws is on its own render layer, seen only
+    // by a camera viewport'd to the sidebar rect. That is what lets the
+    // lists below slide a full sidebar width without smearing across the
+    // canvas — and it clips over-long project names too, which used to
+    // spill.
+    let layers = RenderLayers::from_layers(&[SIDEBAR_LAYER]);
+    let root = commands
+        .spawn((
+            SidebarEntity,
+            layers.clone(),
+            Transform::default(),
+            Visibility::default(),
+            Name::new("sidebar:chrome"),
+        ))
+        .id();
+
     // Container bg — full height.
     commands.spawn((
         SidebarEntity,
+        layers.clone(),
         Sprite {
             color: palette.bg,
             custom_size: Some(Vec2::new(width, win_h)),
@@ -1467,6 +1994,7 @@ fn sidebar_layout(
     // against the canvas without needing a contrasting bg.
     commands.spawn((
         SidebarEntity,
+        layers.clone(),
         Sprite {
             color: palette.divider,
             custom_size: Some(Vec2::new(DIVIDER_H, win_h)),
@@ -1480,80 +2008,597 @@ fn sidebar_layout(
         ),
     ));
 
-    // Header — the current workspace's name on the left, the workspace
-    // switcher strip on the right. The name replaces the old static
-    // "PROJECTS" caption: with a swipe gesture that silently swaps the
-    // whole list, a header that never changes is worse than no header.
     let strip = workspace_strip(&projects, width);
     let renaming_workspace = renaming.target == RenameTarget::Workspace
         && renaming.id == Some(projects.active_workspace);
-    {
-        let line_h = HEADER_FONT_SIZE * 1.4;
-        let pad_y = ((HEADER_H - line_h) * 0.5).max(0.0);
-        let advance = metrics.cell_width * (HEADER_FONT_SIZE / FONT_SIZE);
-        let name_room = (strip.left - ROW_PAD_X - WS_BAR_GAP).max(0.0);
-        let label = if renaming_workspace {
-            renaming.buffer.clone()
-        } else {
-            let full = projects.workspace_name().to_uppercase();
-            truncate_to_width(&full, name_room, advance)
-        };
-        commands.spawn((
-            SidebarEntity,
-            Text2d::new(label.clone()),
-            TextFont {
-                font: (font.0.clone()).into(),
-                font_size: FontSize::Px(HEADER_FONT_SIZE),
-                ..default()
-            },
-            LineHeight::Px(line_h),
-            TextColor(if renaming_workspace {
-                palette.text
+
+    // The lists on screen this frame. At rest that is one, at its
+    // resting offset, and the loop below is the same code it always was.
+    // Mid-slide it is two: the workspace being left travelling out and
+    // the one arriving travelling in.
+    let passes = sidebar_passes(&projects, &slide, &scroll, width, win_h);
+    for pass in &passes {
+        // One parent per list, so the slide is a single transform rather
+        // than an offset threaded through every row's coordinates.
+        let content = commands
+            .spawn((
+                SidebarEntity,
+                layers.clone(),
+                Transform::from_xyz(pass.dx, 0.0, 0.0),
+                Visibility::default(),
+                Name::new("sidebar:list"),
+            ))
+            .id();
+        // Header — the current workspace's name on the left, the workspace
+        // switcher strip on the right. The name replaces the old static
+        // "PROJECTS" caption: with a swipe gesture that silently swaps the
+        // whole list, a header that never changes is worse than no header.
+        {
+            let line_h = HEADER_FONT_SIZE * 1.4;
+            let pad_y = ((HEADER_H - line_h) * 0.5).max(0.0);
+            let advance = metrics.cell_width * (HEADER_FONT_SIZE / FONT_SIZE);
+            let name_room = (strip.left - ROW_PAD_X - WS_BAR_GAP).max(0.0);
+            // Only the arriving list can be mid-rename; the one on its
+            // way out shows its committed name.
+            let renaming_this_name = renaming_workspace && pass.interactive;
+            let label = if renaming_this_name {
+                renaming.buffer.clone()
             } else {
-                palette.text_faint
-            }),
-            Anchor::TOP_LEFT,
-            Transform::from_xyz(
-                world_left_edge + ROW_PAD_X,
-                world_top_edge - pad_y,
-                SIDEBAR_Z + 0.2,
-            ),
-        ));
-        // Double-click target for renaming the workspace.
-        commands.spawn((
-            SidebarEntity,
-            Transform::from_xyz(world_left_edge, world_top_edge, SIDEBAR_Z + 0.05),
-            SidebarHit::WorkspaceName,
-            SidebarBounds {
-                min: Vec2::new(0.0, 0.0),
-                max: Vec2::new(strip.left.max(0.0), HEADER_H),
-            },
-        ));
-        if renaming_workspace {
-            let caret_h = 14.0;
+                let full = projects
+                    .workspaces
+                    .iter()
+                    .find(|w| w.id == pass.workspace)
+                    .map_or("", |w| w.name.as_str())
+                    .to_uppercase();
+                truncate_to_width(&full, name_room, advance)
+            };
             commands.spawn((
                 SidebarEntity,
-                Sprite {
-                    color: palette.edit_underline,
-                    custom_size: Some(Vec2::new(2.0, caret_h)),
+                ChildOf(content),
+                layers.clone(),
+                Text2d::new(label.clone()),
+                TextFont {
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(HEADER_FONT_SIZE),
                     ..default()
                 },
+                LineHeight::Px(line_h),
+                TextColor(if renaming_this_name {
+                    palette.text
+                } else {
+                    palette.text_faint
+                }),
                 Anchor::TOP_LEFT,
                 Transform::from_xyz(
-                    world_left_edge + ROW_PAD_X + label.chars().count() as f32 * advance,
-                    world_top_edge - (HEADER_H - caret_h) * 0.5,
-                    SIDEBAR_Z + 0.25,
+                    world_left_edge + ROW_PAD_X,
+                    world_top_edge - pad_y,
+                    SIDEBAR_Z + Z_HEADER_TEXT,
+                ),
+            ));
+            // Double-click target for renaming the workspace.
+            commands.spawn((
+                SidebarEntity,
+                ChildOf(content),
+                layers.clone(),
+                Transform::from_xyz(world_left_edge, world_top_edge, SIDEBAR_Z + 0.05),
+                SidebarHit::WorkspaceName,
+                SidebarBounds {
+                    min: Vec2::new(0.0, 0.0),
+                    max: Vec2::new(strip.left.max(0.0), HEADER_H),
+                }
+                .placed(pass),
+            ));
+            if renaming_this_name {
+                let caret_h = 14.0;
+                commands.spawn((
+                    SidebarEntity,
+                    ChildOf(content),
+                    layers.clone(),
+                    Sprite {
+                        color: palette.edit_underline,
+                        custom_size: Some(Vec2::new(2.0, caret_h)),
+                        ..default()
+                    },
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(
+                        world_left_edge + ROW_PAD_X + label.chars().count() as f32 * advance,
+                        world_top_edge - (HEADER_H - caret_h) * 0.5,
+                        SIDEBAR_Z + Z_HEADER_TEXT + 0.01,
+                    ),
+                ));
+            }
+        }
+
+        // Project rows. Hidden projects are skipped unless `show_hidden` is
+        // on (then they show dimmed). We index into the *visible* sequence so
+        // rows stay gap-free no matter how many projects are hidden.
+        let rows_top_window = HEADER_H - pass.scroll;
+        for (idx, &(li, hidden_this)) in pass.rows.iter().enumerate() {
+            let proj = &projects.list[li];
+            let row_top_window = rows_top_window + idx as f32 * ROW_H;
+            let row_top_world = world_top_edge - row_top_window;
+            let active = pass.active == Some(proj.id);
+            let renaming_this =
+                renaming.target == RenameTarget::Project && renaming.id == Some(proj.id);
+            let dragging_this = drag.dragging && drag.candidate == Some(proj.id);
+
+            // Row bg — painted when active, renaming, or being dragged. Other
+            // rows sit on the sidebar bg with no separator: the spacing from
+            // ROW_H + the indent is enough visual structure.
+            if active || renaming_this || dragging_this {
+                let bg_color = if renaming_this {
+                    palette.row_renaming_bg
+                } else {
+                    palette.row_active_bg
+                };
+                commands.spawn((
+                    SidebarEntity,
+                    ChildOf(content),
+                    layers.clone(),
+                    Sprite {
+                        color: bg_color,
+                        custom_size: Some(Vec2::new(width - DIVIDER_H, ROW_H)),
+                        ..default()
+                    },
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(world_left_edge, row_top_world, SIDEBAR_Z + 0.1),
+                ));
+            }
+
+            // Active accent stripe (thin coloured bar on the left edge).
+            if active {
+                commands.spawn((
+                    SidebarEntity,
+                    ChildOf(content),
+                    layers.clone(),
+                    Sprite {
+                        color: palette.active_stripe,
+                        custom_size: Some(Vec2::new(STRIPE_W, ROW_H)),
+                        ..default()
+                    },
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(world_left_edge, row_top_world, SIDEBAR_Z + 0.15),
+                ));
+            }
+
+            // Renaming underline — a 2px accent strip along the bottom of
+            // the row that reads as the cursor of a text input field.
+            if renaming_this {
+                commands.spawn((
+                    SidebarEntity,
+                    ChildOf(content),
+                    layers.clone(),
+                    Sprite {
+                        color: palette.edit_underline,
+                        custom_size: Some(Vec2::new(width - DIVIDER_H, 2.0)),
+                        ..default()
+                    },
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(
+                        world_left_edge,
+                        row_top_world - (ROW_H - 2.0),
+                        SIDEBAR_Z + 0.15,
+                    ),
+                ));
+            }
+
+            // Project pick hit-region — covers the row minus the delete glyph.
+            commands.spawn((
+                SidebarEntity,
+                ChildOf(content),
+                layers.clone(),
+                Transform::from_xyz(world_left_edge, row_top_world, SIDEBAR_Z + 0.05),
+                SidebarHit::Project(proj.id),
+                SidebarBounds {
+                    min: Vec2::new(sidebar_origin_x_window, row_top_window),
+                    max: Vec2::new(
+                        sidebar_origin_x_window + width - DELETE_W - EYE_W - DIVIDER_H,
+                        row_top_window + ROW_H,
+                    ),
+                }
+                .placed(pass),
+            ));
+
+            // Label.
+            let label = if renaming_this {
+                renaming.buffer.clone()
+            } else {
+                proj.name.clone()
+            };
+            let label_color = if active || renaming_this {
+                palette.text
+            } else if hidden_this {
+                palette.text_faint
+            } else {
+                palette.text_dim
+            };
+            {
+                let line_h = TEXT_FONT_SIZE * 1.4;
+                let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
+                commands.spawn((
+                    SidebarEntity,
+                    ChildOf(content),
+                    layers.clone(),
+                    Text2d::new(label),
+                    TextFont {
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(TEXT_FONT_SIZE),
+                        ..default()
+                    },
+                    LineHeight::Px(line_h),
+                    TextColor(label_color),
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(
+                        world_left_edge + ROW_PAD_X,
+                        row_top_world - pad_y,
+                        SIDEBAR_Z + 0.2,
+                    ),
+                ));
+            }
+
+            // Caret — real sprite (not a U+2502 glyph, which renders too
+            // low because box-drawing chars don't share the letter baseline).
+            // Positioned via monospace cell-width scaled from FONT_SIZE→TEXT_FONT_SIZE,
+            // and vertically centred in the row so it doesn't sit at the descender.
+            if renaming_this {
+                let char_advance = metrics.cell_width * (TEXT_FONT_SIZE / FONT_SIZE);
+                let caret_w = 2.0;
+                let caret_h = 16.0;
+                let caret_x = world_left_edge
+                    + ROW_PAD_X
+                    + renaming.buffer.chars().count() as f32 * char_advance;
+                let caret_top_y = row_top_world - (ROW_H - caret_h) * 0.5;
+                commands.spawn((
+                    SidebarEntity,
+                    ChildOf(content),
+                    layers.clone(),
+                    Sprite {
+                        color: palette.edit_underline,
+                        custom_size: Some(Vec2::new(caret_w, caret_h)),
+                        ..default()
+                    },
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(caret_x, caret_top_y, SIDEBAR_Z + 0.25),
+                ));
+            }
+
+            // Unread bell badge — right-aligned just before the delete X
+            // when the project has any unseen bells. Uses the active-stripe
+            // colour so it reads as a "this needs attention" cue regardless
+            // of which project is currently selected.
+            if let Some(&n) = projects.unread_bells.get(&proj.id)
+                && n > 0
+            {
+                let badge_text = if n > 99 {
+                    "99+".to_string()
+                } else {
+                    n.to_string()
+                };
+                let badge_anchor_x_world = world_left_edge + width - DELETE_W - EYE_W - 4.0;
+                {
+                    let line_h = TEXT_FONT_SIZE * 1.4;
+                    let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
+                    commands.spawn((
+                        SidebarEntity,
+                        ChildOf(content),
+                        layers.clone(),
+                        Text2d::new(badge_text),
+                        TextFont {
+                            font: (font.0.clone()).into(),
+                            font_size: FontSize::Px(TEXT_FONT_SIZE),
+                            ..default()
+                        },
+                        LineHeight::Px(line_h),
+                        TextColor(palette.active_stripe),
+                        Anchor::TOP_RIGHT,
+                        Transform::from_xyz(
+                            badge_anchor_x_world,
+                            row_top_world - pad_y,
+                            SIDEBAR_Z + 0.2,
+                        ),
+                    ));
+                }
+            }
+
+            // Delete glyph — just a dim × at the right edge of the row.
+            // No filled background; the bounds are still a tappable rect.
+            let delete_x_window = sidebar_origin_x_window + width - DELETE_W;
+            let delete_x_world = world_left_edge + width - DELETE_W;
+            commands.spawn((
+                SidebarEntity,
+                ChildOf(content),
+                layers.clone(),
+                Transform::from_xyz(delete_x_world, row_top_world, SIDEBAR_Z + 0.05),
+                SidebarHit::DeleteProject(proj.id),
+                SidebarBounds {
+                    min: Vec2::new(delete_x_window, row_top_window),
+                    max: Vec2::new(delete_x_window + DELETE_W, row_top_window + ROW_H),
+                }
+                .placed(pass),
+            ));
+            {
+                let glyph_size = TEXT_FONT_SIZE + 1.0;
+                let line_h = glyph_size * 1.4;
+                let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
+                commands.spawn((
+                    SidebarEntity,
+                    ChildOf(content),
+                    layers.clone(),
+                    Text2d::new("\u{00D7}"), // multiplication sign — looks better than ASCII 'x'
+                    TextFont {
+                        font: (font.0.clone()).into(),
+                        font_size: FontSize::Px(glyph_size),
+                        ..default()
+                    },
+                    LineHeight::Px(line_h),
+                    TextColor(palette.text_faint),
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(
+                        delete_x_world + 6.0,
+                        row_top_world - pad_y,
+                        SIDEBAR_Z + 0.2,
+                    ),
+                ));
+            }
+
+            // Hide/show eye column — just left of the delete glyph. The
+            // hit-rect is always live, but the eyeball only paints while this
+            // row is hovered, or while the project is already hidden (so a
+            // hidden project still advertises a way to un-hide it). A pupil
+            // (filled inner dot) means "visible / eye open"; a bare ring means
+            // "hidden / eye closed".
+            let eye_x_window = sidebar_origin_x_window + width - DELETE_W - EYE_W;
+            commands.spawn((
+                SidebarEntity,
+                ChildOf(content),
+                layers.clone(),
+                Transform::from_xyz(
+                    world_left_edge + width - DELETE_W - EYE_W,
+                    row_top_world,
+                    SIDEBAR_Z + 0.05,
+                ),
+                SidebarHit::ToggleHidden(proj.id),
+                SidebarBounds {
+                    min: Vec2::new(eye_x_window, row_top_window),
+                    max: Vec2::new(eye_x_window + EYE_W, row_top_window + ROW_H),
+                }
+                .placed(pass),
+            ));
+            if hover.row == Some(proj.id) || hidden_this {
+                let eye_color = if hidden_this {
+                    palette.text_faint
+                } else {
+                    palette.text_dim
+                };
+                spawn_eye(
+                    &mut commands,
+                    content,
+                    &layers,
+                    &font.0,
+                    Vec3::new(
+                        world_left_edge + width - DELETE_W - EYE_W * 0.5,
+                        row_top_world - ROW_H * 0.5,
+                        SIDEBAR_Z + 0.2,
+                    ),
+                    !hidden_this,
+                    eye_color,
+                    TEXT_FONT_SIZE,
+                );
+            }
+        }
+
+        // Divider before the "+ New Project" row.
+        let after_rows_window = rows_top_window + pass.rows.len() as f32 * ROW_H;
+        commands.spawn((
+            SidebarEntity,
+            ChildOf(content),
+            layers.clone(),
+            Sprite {
+                color: palette.divider,
+                custom_size: Some(Vec2::new(width - DIVIDER_H, DIVIDER_H)),
+                ..default()
+            },
+            Anchor::TOP_LEFT,
+            Transform::from_xyz(
+                world_left_edge,
+                world_top_edge - after_rows_window,
+                SIDEBAR_Z + 0.05,
+            ),
+        ));
+
+        let new_proj_top_window = after_rows_window + DIVIDER_H;
+        let new_proj_top_world = world_top_edge - new_proj_top_window;
+        // "+ New Project" — same row style as project rows. Hit area only,
+        // no painted bg until you hover (we skip hover for now).
+        commands.spawn((
+            SidebarEntity,
+            ChildOf(content),
+            layers.clone(),
+            Transform::from_xyz(world_left_edge, new_proj_top_world, SIDEBAR_Z + 0.05),
+            SidebarHit::NewProject,
+            SidebarBounds {
+                min: Vec2::new(sidebar_origin_x_window, new_proj_top_window),
+                max: Vec2::new(
+                    sidebar_origin_x_window + width - DIVIDER_H,
+                    new_proj_top_window + ROW_H,
+                ),
+            }
+            .placed(pass),
+        ));
+        {
+            let line_h = TEXT_FONT_SIZE * 1.4;
+            let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
+            commands.spawn((
+                SidebarEntity,
+                ChildOf(content),
+                layers.clone(),
+                Text2d::new("+  New Project"),
+                TextFont {
+                    font: (font.0.clone()).into(),
+                    font_size: FontSize::Px(TEXT_FONT_SIZE),
+                    ..default()
+                },
+                LineHeight::Px(line_h),
+                TextColor(palette.text_dim),
+                Anchor::TOP_LEFT,
+                Transform::from_xyz(
+                    world_left_edge + ROW_PAD_X,
+                    new_proj_top_world - pad_y,
+                    SIDEBAR_Z + 0.2,
                 ),
             ));
         }
     }
 
+    // Footer. A band the list can never reach, holding the global
+    // "show hidden projects" eyeball.
+    //
+    // The eyeball used to be a bare hot-zone over whatever row happened
+    // to be in the bottom-left corner. Once the list scrolls that stops
+    // working: there is always a row under it, so the corner eats a
+    // click meant for a project and the eyeball itself is invisible
+    // against the rows. Reserving the band is what makes both of them
+    // reliably clickable.
+    let footer_top = (win_h - FOOTER_H).max(HEADER_H);
+    commands.spawn((
+        SidebarEntity,
+        layers.clone(),
+        Sprite {
+            color: palette.bg,
+            custom_size: Some(Vec2::new(width - DIVIDER_H, win_h - footer_top)),
+            ..default()
+        },
+        Anchor::TOP_LEFT,
+        Transform::from_xyz(
+            world_left_edge,
+            world_top_edge - footer_top,
+            SIDEBAR_Z + Z_FOOTER_MASK,
+        ),
+    ));
+    commands.spawn((
+        SidebarEntity,
+        layers.clone(),
+        Sprite {
+            color: palette.divider,
+            custom_size: Some(Vec2::new(width - DIVIDER_H, DIVIDER_H)),
+            ..default()
+        },
+        Anchor::TOP_LEFT,
+        Transform::from_xyz(
+            world_left_edge,
+            world_top_edge - footer_top,
+            SIDEBAR_Z + Z_FOOTER_RULE,
+        ),
+    ));
+    {
+        // Always painted now that it has somewhere to live: an open
+        // pupil in the accent colour means hidden projects are showing,
+        // a bare dim ring means they are tucked away. It brightens on
+        // hover rather than appearing from nothing.
+        let zone = eyeball_zone(win_h, width);
+        let color = if projects.show_hidden {
+            palette.active_stripe
+        } else if hover.eyeball {
+            palette.text
+        } else {
+            palette.text_faint
+        };
+        spawn_eye(
+            &mut commands,
+            root,
+            &layers,
+            &font.0,
+            Vec3::new(
+                world_left_edge + (zone.min.x + zone.max.x) * 0.5,
+                world_top_edge - (zone.min.y + zone.max.y) * 0.5,
+                SIDEBAR_Z + Z_FOOTER_ITEM,
+            ),
+            projects.show_hidden,
+            color,
+            15.0,
+        );
+    }
+
+    // Scroll indicator. Only drawn when the list actually overflows —
+    // which is also the only time anyone needs telling that it scrolls,
+    // and the reason this feature exists. Tracks the arriving list, so
+    // mid-slide it already reports on where you are going.
+    if let Some(pass) = passes.last() {
+        let track_top = HEADER_H;
+        let track_h = rows_room(win_h);
+        let content_h = pass.rows.len() as f32 * ROW_H + DIVIDER_H + ROW_H;
+        let travel = max_scroll(pass.rows.len(), win_h);
+        if travel > 0.0 && content_h > 0.0 {
+            let thumb_h = (track_h * (track_h / content_h)).clamp(SCROLLBAR_MIN_H, track_h);
+            let progress = (pass.scroll / travel).clamp(0.0, 1.0);
+            let thumb_top = track_top + (track_h - thumb_h) * progress;
+            commands.spawn((
+                SidebarEntity,
+                layers.clone(),
+                Sprite {
+                    color: palette.text_faint,
+                    custom_size: Some(Vec2::new(SCROLLBAR_W, thumb_h)),
+                    ..default()
+                },
+                Anchor::TOP_LEFT,
+                Transform::from_xyz(
+                    world_left_edge + width - DIVIDER_H - SCROLLBAR_W - 1.0,
+                    world_top_edge - thumb_top,
+                    SIDEBAR_Z + Z_SCROLLBAR,
+                ),
+            ));
+        }
+    }
+
+    // Sticky header. The rows scroll UNDER it rather than over it, so
+    // an opaque band in the sidebar's own colour sits between the list
+    // and the header's own contents. Invisible at rest — it is the same
+    // flat colour as the background it covers.
+    commands.spawn((
+        SidebarEntity,
+        layers.clone(),
+        Sprite {
+            color: palette.bg,
+            custom_size: Some(Vec2::new(width - DIVIDER_H, HEADER_H)),
+            ..default()
+        },
+        Anchor::TOP_LEFT,
+        Transform::from_xyz(world_left_edge, world_top_edge, SIDEBAR_Z + Z_HEADER_MASK),
+    ));
+
+    // Mask behind the strip, in the sidebar's own colour. The workspace
+    // name slides the full width of the sidebar and would otherwise
+    // travel straight over the bars; this hides it a few pixels early
+    // instead. Invisible at rest — the background it covers is the same
+    // flat colour.
+    if !strip.bars.is_empty() || strip.add.is_some() {
+        let mask_left = strip.left - WS_BAR_GAP;
+        commands.spawn((
+            SidebarEntity,
+            layers.clone(),
+            Sprite {
+                color: palette.bg,
+                custom_size: Some(Vec2::new(
+                    (width - DIVIDER_H - mask_left).max(0.0),
+                    HEADER_H,
+                )),
+                ..default()
+            },
+            Anchor::TOP_LEFT,
+            Transform::from_xyz(
+                world_left_edge + mask_left,
+                world_top_edge,
+                SIDEBAR_Z + 0.26,
+            ),
+        ));
+    }
     // Workspace strip. One bar per workspace, the current one lit —
     // clickable as a direct jump, and the readout for the swipe gesture.
     for (id, b) in &strip.bars {
         let current = *id == projects.active_workspace;
         commands.spawn((
             SidebarEntity,
+            layers.clone(),
             Sprite {
                 color: if current {
                     palette.active_stripe
@@ -1567,11 +2612,12 @@ fn sidebar_layout(
             Transform::from_xyz(
                 world_left_edge + b.min.x,
                 world_top_edge - (HEADER_H - WS_BAR_H) * 0.5,
-                SIDEBAR_Z + 0.2,
+                SIDEBAR_Z + Z_STRIP,
             ),
         ));
         commands.spawn((
             SidebarEntity,
+            layers.clone(),
             Transform::from_xyz(world_left_edge + b.min.x, world_top_edge, SIDEBAR_Z + 0.05),
             SidebarHit::Workspace(*id),
             *b,
@@ -1580,6 +2626,7 @@ fn sidebar_layout(
     if let Some(b) = strip.add {
         commands.spawn((
             SidebarEntity,
+            layers.clone(),
             Transform::from_xyz(world_left_edge + b.min.x, world_top_edge, SIDEBAR_Z + 0.05),
             SidebarHit::NewWorkspace,
             b,
@@ -1588,6 +2635,7 @@ fn sidebar_layout(
         let line_h = glyph * 1.4;
         commands.spawn((
             SidebarEntity,
+            layers.clone(),
             Text2d::new("+"),
             TextFont {
                 font: (font.0.clone()).into(),
@@ -1600,278 +2648,14 @@ fn sidebar_layout(
             Transform::from_xyz(
                 world_left_edge + b.min.x + 4.0,
                 world_top_edge - ((HEADER_H - line_h) * 0.5).max(0.0),
-                SIDEBAR_Z + 0.2,
+                SIDEBAR_Z + Z_STRIP,
             ),
         ));
     }
     // Header divider.
     commands.spawn((
         SidebarEntity,
-        Sprite {
-            color: palette.divider,
-            custom_size: Some(Vec2::new(width - DIVIDER_H, DIVIDER_H)),
-            ..default()
-        },
-        Anchor::TOP_LEFT,
-        Transform::from_xyz(world_left_edge, world_top_edge - HEADER_H, SIDEBAR_Z + 0.05),
-    ));
-
-    // Project rows. Hidden projects are skipped unless `show_hidden` is
-    // on (then they show dimmed). We index into the *visible* sequence so
-    // rows stay gap-free no matter how many projects are hidden.
-    let rows_top_window = HEADER_H;
-    let visible: Vec<usize> = (0..projects.list.len())
-        .filter(|&i| projects.show_hidden || !projects.is_hidden(projects.list[i].id))
-        .collect();
-    for (idx, &li) in visible.iter().enumerate() {
-        let hidden_this = projects.is_hidden(projects.list[li].id);
-        let proj = &projects.list[li];
-        let row_top_window = rows_top_window + idx as f32 * ROW_H;
-        let row_top_world = world_top_edge - row_top_window;
-        let active = projects.active == Some(proj.id);
-        let renaming_this =
-            renaming.target == RenameTarget::Project && renaming.id == Some(proj.id);
-        let dragging_this = drag.dragging && drag.candidate == Some(proj.id);
-
-        // Row bg — painted when active, renaming, or being dragged. Other
-        // rows sit on the sidebar bg with no separator: the spacing from
-        // ROW_H + the indent is enough visual structure.
-        if active || renaming_this || dragging_this {
-            let bg_color = if renaming_this {
-                palette.row_renaming_bg
-            } else {
-                palette.row_active_bg
-            };
-            commands.spawn((
-                SidebarEntity,
-                Sprite {
-                    color: bg_color,
-                    custom_size: Some(Vec2::new(width - DIVIDER_H, ROW_H)),
-                    ..default()
-                },
-                Anchor::TOP_LEFT,
-                Transform::from_xyz(world_left_edge, row_top_world, SIDEBAR_Z + 0.1),
-            ));
-        }
-
-        // Active accent stripe (thin coloured bar on the left edge).
-        if active {
-            commands.spawn((
-                SidebarEntity,
-                Sprite {
-                    color: palette.active_stripe,
-                    custom_size: Some(Vec2::new(STRIPE_W, ROW_H)),
-                    ..default()
-                },
-                Anchor::TOP_LEFT,
-                Transform::from_xyz(world_left_edge, row_top_world, SIDEBAR_Z + 0.15),
-            ));
-        }
-
-        // Renaming underline — a 2px accent strip along the bottom of
-        // the row that reads as the cursor of a text input field.
-        if renaming_this {
-            commands.spawn((
-                SidebarEntity,
-                Sprite {
-                    color: palette.edit_underline,
-                    custom_size: Some(Vec2::new(width - DIVIDER_H, 2.0)),
-                    ..default()
-                },
-                Anchor::TOP_LEFT,
-                Transform::from_xyz(
-                    world_left_edge,
-                    row_top_world - (ROW_H - 2.0),
-                    SIDEBAR_Z + 0.15,
-                ),
-            ));
-        }
-
-        // Project pick hit-region — covers the row minus the delete glyph.
-        commands.spawn((
-            SidebarEntity,
-            Transform::from_xyz(world_left_edge, row_top_world, SIDEBAR_Z + 0.05),
-            SidebarHit::Project(proj.id),
-            SidebarBounds {
-                min: Vec2::new(sidebar_origin_x_window, row_top_window),
-                max: Vec2::new(
-                    sidebar_origin_x_window + width - DELETE_W - EYE_W - DIVIDER_H,
-                    row_top_window + ROW_H,
-                ),
-            },
-        ));
-
-        // Label.
-        let label = if renaming_this {
-            renaming.buffer.clone()
-        } else {
-            proj.name.clone()
-        };
-        let label_color = if active || renaming_this {
-            palette.text
-        } else if hidden_this {
-            palette.text_faint
-        } else {
-            palette.text_dim
-        };
-        {
-            let line_h = TEXT_FONT_SIZE * 1.4;
-            let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
-            commands.spawn((
-                SidebarEntity,
-                Text2d::new(label),
-                TextFont {
-                    font: (font.0.clone()).into(),
-                    font_size: FontSize::Px(TEXT_FONT_SIZE),
-                    ..default()
-                },
-                LineHeight::Px(line_h),
-                TextColor(label_color),
-                Anchor::TOP_LEFT,
-                Transform::from_xyz(
-                    world_left_edge + ROW_PAD_X,
-                    row_top_world - pad_y,
-                    SIDEBAR_Z + 0.2,
-                ),
-            ));
-        }
-
-        // Caret — real sprite (not a U+2502 glyph, which renders too
-        // low because box-drawing chars don't share the letter baseline).
-        // Positioned via monospace cell-width scaled from FONT_SIZE→TEXT_FONT_SIZE,
-        // and vertically centred in the row so it doesn't sit at the descender.
-        if renaming_this {
-            let char_advance = metrics.cell_width * (TEXT_FONT_SIZE / FONT_SIZE);
-            let caret_w = 2.0;
-            let caret_h = 16.0;
-            let caret_x =
-                world_left_edge + ROW_PAD_X + renaming.buffer.chars().count() as f32 * char_advance;
-            let caret_top_y = row_top_world - (ROW_H - caret_h) * 0.5;
-            commands.spawn((
-                SidebarEntity,
-                Sprite {
-                    color: palette.edit_underline,
-                    custom_size: Some(Vec2::new(caret_w, caret_h)),
-                    ..default()
-                },
-                Anchor::TOP_LEFT,
-                Transform::from_xyz(caret_x, caret_top_y, SIDEBAR_Z + 0.25),
-            ));
-        }
-
-        // Unread bell badge — right-aligned just before the delete X
-        // when the project has any unseen bells. Uses the active-stripe
-        // colour so it reads as a "this needs attention" cue regardless
-        // of which project is currently selected.
-        if let Some(&n) = projects.unread_bells.get(&proj.id)
-            && n > 0
-        {
-            let badge_text = if n > 99 {
-                "99+".to_string()
-            } else {
-                n.to_string()
-            };
-            let badge_anchor_x_world = world_left_edge + width - DELETE_W - EYE_W - 4.0;
-            {
-                let line_h = TEXT_FONT_SIZE * 1.4;
-                let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
-                commands.spawn((
-                    SidebarEntity,
-                    Text2d::new(badge_text),
-                    TextFont {
-                        font: (font.0.clone()).into(),
-                        font_size: FontSize::Px(TEXT_FONT_SIZE),
-                        ..default()
-                    },
-                    LineHeight::Px(line_h),
-                    TextColor(palette.active_stripe),
-                    Anchor::TOP_RIGHT,
-                    Transform::from_xyz(
-                        badge_anchor_x_world,
-                        row_top_world - pad_y,
-                        SIDEBAR_Z + 0.2,
-                    ),
-                ));
-            }
-        }
-
-        // Delete glyph — just a dim × at the right edge of the row.
-        // No filled background; the bounds are still a tappable rect.
-        let delete_x_window = sidebar_origin_x_window + width - DELETE_W;
-        let delete_x_world = world_left_edge + width - DELETE_W;
-        commands.spawn((
-            SidebarEntity,
-            Transform::from_xyz(delete_x_world, row_top_world, SIDEBAR_Z + 0.05),
-            SidebarHit::DeleteProject(proj.id),
-            SidebarBounds {
-                min: Vec2::new(delete_x_window, row_top_window),
-                max: Vec2::new(delete_x_window + DELETE_W, row_top_window + ROW_H),
-            },
-        ));
-        {
-            let glyph_size = TEXT_FONT_SIZE + 1.0;
-            let line_h = glyph_size * 1.4;
-            let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
-            commands.spawn((
-                SidebarEntity,
-                Text2d::new("\u{00D7}"), // multiplication sign — looks better than ASCII 'x'
-                TextFont {
-                    font: (font.0.clone()).into(),
-                    font_size: FontSize::Px(glyph_size),
-                    ..default()
-                },
-                LineHeight::Px(line_h),
-                TextColor(palette.text_faint),
-                Anchor::TOP_LEFT,
-                Transform::from_xyz(delete_x_world + 6.0, row_top_world - pad_y, SIDEBAR_Z + 0.2),
-            ));
-        }
-
-        // Hide/show eye column — just left of the delete glyph. The
-        // hit-rect is always live, but the eyeball only paints while this
-        // row is hovered, or while the project is already hidden (so a
-        // hidden project still advertises a way to un-hide it). A pupil
-        // (filled inner dot) means "visible / eye open"; a bare ring means
-        // "hidden / eye closed".
-        let eye_x_window = sidebar_origin_x_window + width - DELETE_W - EYE_W;
-        commands.spawn((
-            SidebarEntity,
-            Transform::from_xyz(
-                world_left_edge + width - DELETE_W - EYE_W,
-                row_top_world,
-                SIDEBAR_Z + 0.05,
-            ),
-            SidebarHit::ToggleHidden(proj.id),
-            SidebarBounds {
-                min: Vec2::new(eye_x_window, row_top_window),
-                max: Vec2::new(eye_x_window + EYE_W, row_top_window + ROW_H),
-            },
-        ));
-        if hover.row == Some(proj.id) || hidden_this {
-            let eye_color = if hidden_this {
-                palette.text_faint
-            } else {
-                palette.text_dim
-            };
-            spawn_eye(
-                &mut commands,
-                &font.0,
-                Vec3::new(
-                    world_left_edge + width - DELETE_W - EYE_W * 0.5,
-                    row_top_world - ROW_H * 0.5,
-                    SIDEBAR_Z + 0.2,
-                ),
-                !hidden_this,
-                eye_color,
-                TEXT_FONT_SIZE,
-            );
-        }
-    }
-
-    // Divider before the "+ New Project" row.
-    let after_rows_window = rows_top_window + visible.len() as f32 * ROW_H;
-    commands.spawn((
-        SidebarEntity,
+        layers.clone(),
         Sprite {
             color: palette.divider,
             custom_size: Some(Vec2::new(width - DIVIDER_H, DIVIDER_H)),
@@ -1880,72 +2664,10 @@ fn sidebar_layout(
         Anchor::TOP_LEFT,
         Transform::from_xyz(
             world_left_edge,
-            world_top_edge - after_rows_window,
-            SIDEBAR_Z + 0.05,
+            world_top_edge - HEADER_H,
+            SIDEBAR_Z + Z_HEADER_RULE,
         ),
     ));
-
-    let new_proj_top_window = after_rows_window + DIVIDER_H;
-    let new_proj_top_world = world_top_edge - new_proj_top_window;
-    // "+ New Project" — same row style as project rows. Hit area only,
-    // no painted bg until you hover (we skip hover for now).
-    commands.spawn((
-        SidebarEntity,
-        Transform::from_xyz(world_left_edge, new_proj_top_world, SIDEBAR_Z + 0.05),
-        SidebarHit::NewProject,
-        SidebarBounds {
-            min: Vec2::new(sidebar_origin_x_window, new_proj_top_window),
-            max: Vec2::new(
-                sidebar_origin_x_window + width - DIVIDER_H,
-                new_proj_top_window + ROW_H,
-            ),
-        },
-    ));
-    {
-        let line_h = TEXT_FONT_SIZE * 1.4;
-        let pad_y = ((ROW_H - line_h) * 0.5).max(0.0);
-        commands.spawn((
-            SidebarEntity,
-            Text2d::new("+  New Project"),
-            TextFont {
-                font: (font.0.clone()).into(),
-                font_size: FontSize::Px(TEXT_FONT_SIZE),
-                ..default()
-            },
-            LineHeight::Px(line_h),
-            TextColor(palette.text_dim),
-            Anchor::TOP_LEFT,
-            Transform::from_xyz(
-                world_left_edge + ROW_PAD_X,
-                new_proj_top_world - pad_y,
-                SIDEBAR_Z + 0.2,
-            ),
-        ));
-    }
-
-    // Global "show hidden projects" eyeball — bottom-left corner. Painted
-    // only while the corner hot-zone is hovered, or while `show_hidden` is
-    // already on (so it stays discoverable as the way to turn it back
-    // off). Open pupil + accent colour = currently revealing hidden
-    // projects; bare dim ring = hidden projects are tucked away.
-    if hover.eyeball || projects.show_hidden {
-        let zone = eyeball_zone(win_h, width);
-        let cx_world = world_left_edge + (zone.min.x + zone.max.x) * 0.5;
-        let cy_world = world_top_edge - (zone.min.y + zone.max.y) * 0.5;
-        let color = if projects.show_hidden {
-            palette.active_stripe
-        } else {
-            palette.text_dim
-        };
-        spawn_eye(
-            &mut commands,
-            &font.0,
-            Vec3::new(cx_world, cy_world, SIDEBAR_Z + 0.3),
-            projects.show_hidden,
-            color,
-            15.0,
-        );
-    }
 
     projects.layout_dirty = false;
 }
@@ -1956,6 +2678,8 @@ fn sidebar_layout(
 /// `.z` is the base layer; the pupil sits just above it).
 fn spawn_eye(
     commands: &mut Commands,
+    parent: Entity,
+    layers: &RenderLayers,
     font: &Handle<Font>,
     center: Vec3,
     open: bool,
@@ -1964,6 +2688,8 @@ fn spawn_eye(
 ) {
     commands.spawn((
         SidebarEntity,
+        ChildOf(parent),
+        layers.clone(),
         Text2d::new("\u{25CB}"), // ○ white circle
         TextFont {
             font: (font.clone()).into(),
@@ -1977,6 +2703,8 @@ fn spawn_eye(
     if open {
         commands.spawn((
             SidebarEntity,
+            ChildOf(parent),
+            layers.clone(),
             Text2d::new("\u{25CF}"), // ● black circle (pupil)
             TextFont {
                 font: (font.clone()).into(),
@@ -2031,6 +2759,7 @@ pub fn sidebar_input(
     consumed: Res<InputConsumed>,
     presentation: Res<crate::present::Presentation>,
     sidebar: Res<Sidebar>,
+    slide: Res<SidebarSlide>,
     time: Res<Time>,
     hits: Query<(&SidebarHit, &SidebarBounds)>,
     mut projects: ResMut<Projects>,
@@ -2045,6 +2774,12 @@ pub fn sidebar_input(
     // invisible strip — and on a slide showing the app, a stray hit would
     // switch project out from under the talk.
     if !presentation.sidebar_visible() {
+        return;
+    }
+    // Nothing is clickable mid-slide. The rows are in motion, so whatever
+    // is under the cursor at press time isn't what the user aimed at —
+    // and it's only ~220ms.
+    if slide.animating() {
         return;
     }
     if !buttons.just_pressed(MouseButton::Left) {
@@ -3344,19 +4079,25 @@ fn sidebar_resize_drag(
 fn sidebar_hover(
     windows: Query<&Window>,
     sidebar: Res<Sidebar>,
+    scroll: Res<SidebarScroll>,
     mut hover: ResMut<SidebarHover>,
     mut projects: ResMut<Projects>,
 ) {
     let Ok(window) = windows.single() else {
         return;
     };
+    let scrolled = scroll.clamped(
+        projects.active_workspace,
+        projects.sidebar_ids().len(),
+        window.height(),
+    );
     let mut new_row = None;
     let mut new_eyeball = false;
     if let Some(pt) = window.cursor_position() {
         if pt.x < sidebar.width {
-            if pt.y >= HEADER_H {
+            if in_rows_band(pt.y, window.height()) {
                 let visible = projects.sidebar_ids();
-                let slot = ((pt.y - HEADER_H) / ROW_H).floor() as i64;
+                let slot = row_slot_at(pt.y, scrolled);
                 if slot >= 0 && (slot as usize) < visible.len() {
                     new_row = Some(visible[slot as usize]);
                 }
@@ -3381,6 +4122,7 @@ fn project_drag(
     windows: Query<&Window>,
     buttons: Res<ButtonInput<MouseButton>>,
     sidebar: Res<Sidebar>,
+    scroll: Res<SidebarScroll>,
     mut drag: ResMut<ProjectDrag>,
     mut projects: ResMut<Projects>,
     mut consumed: ResMut<InputConsumed>,
@@ -3388,6 +4130,11 @@ fn project_drag(
     let Ok(window) = windows.single() else {
         return;
     };
+    let scrolled = scroll.clamped(
+        projects.active_workspace,
+        projects.sidebar_ids().len(),
+        window.height(),
+    );
 
     if buttons.just_released(MouseButton::Left) {
         if drag.dragging && drag.dirty_pending {
@@ -3409,12 +4156,11 @@ fn project_drag(
         drag.dragging = false;
         // Only the row body arms a drag — not the eye/delete columns, the
         // resize handle, or the bottom-left eyeball corner.
-        let in_row_body = pt.x < sidebar.width - DELETE_W - EYE_W
-            && pt.y >= HEADER_H
-            && !in_bounds(pt, &eyeball_zone(window.height(), sidebar.width));
+        let in_row_body =
+            pt.x < sidebar.width - DELETE_W - EYE_W && in_rows_band(pt.y, window.height());
         if in_row_body {
             let visible = projects.sidebar_ids();
-            let slot = ((pt.y - HEADER_H) / ROW_H).floor() as i64;
+            let slot = row_slot_at(pt.y, scrolled);
             if slot >= 0 && (slot as usize) < visible.len() {
                 drag.candidate = Some(visible[slot as usize]);
                 drag.press = pt;
@@ -3437,8 +4183,7 @@ fn project_drag(
         if visible_len == 0 {
             return;
         }
-        let target_slot =
-            (((pt.y - HEADER_H) / ROW_H).floor() as i64).clamp(0, visible_len as i64 - 1) as usize;
+        let target_slot = row_slot_at(pt.y, scrolled).clamp(0, visible_len as i64 - 1) as usize;
         if reorder_visible(&mut projects, id, target_slot) {
             projects.layout_dirty = true;
             drag.dirty_pending = true;
@@ -3695,6 +4440,371 @@ mod tests {
                 assert!(strip.left >= 0.0);
             }
         }
+    }
+
+    /// The complaint that started this: you could not swipe back
+    /// immediately. macOS keeps sending momentum events in the direction
+    /// of the flick for up to a second, so the "gesture ended" gap never
+    /// arrives between two quick swipes. A sign flip has to end it
+    /// instead — momentum never reverses.
+    #[test]
+    fn a_reversal_ends_the_gesture_even_under_momentum() {
+        let mut swipe = SidebarSwipe {
+            // A flick left, past the threshold and already switched.
+            accum: -SWIPE_THRESHOLD_PX - 10.0,
+            fired: true,
+            ..Default::default()
+        };
+        assert!(
+            !swipe.is_reversal(-8.0),
+            "decaying momentum must not read as a new swipe"
+        );
+        assert!(
+            !swipe.is_reversal(0.0),
+            "and an axis-less event ends nothing"
+        );
+        assert!(
+            swipe.is_reversal(12.0),
+            "the opposite direction is always a new gesture"
+        );
+        swipe.begin();
+        assert!(!swipe.fired && swipe.accum == 0.0);
+        assert!(
+            !swipe.is_reversal(12.0),
+            "a fresh gesture has no direction to contradict yet"
+        );
+    }
+
+    /// A slide has to know which way to travel, and cycling off the end
+    /// of the strip onto the other end is still forward motion — the
+    /// index going backwards is an artefact of the wrap, not a direction.
+    #[test]
+    fn a_wrapping_cycle_still_travels_forward() {
+        let mut p = seeded(1);
+        let a = p.active_workspace;
+        p.create_workspace(None);
+        let c = p.create_workspace(None);
+        p.switch_workspace(a);
+        p.pending_switch = None;
+
+        p.cycle_workspace(-1);
+        assert_eq!(p.active_workspace, c);
+        assert_eq!(
+            p.pending_switch.map(|(_, dir)| dir),
+            Some(-1.0),
+            "wrapping backwards off the first workspace travels backwards"
+        );
+
+        p.pending_switch = None;
+        p.cycle_workspace(1);
+        assert_eq!(p.active_workspace, a);
+        assert_eq!(
+            p.pending_switch.map(|(_, dir)| dir),
+            Some(1.0),
+            "and wrapping forwards off the last travels forwards"
+        );
+    }
+
+    /// A click on the strip has no direction of its own, so it is read
+    /// off the positions — jumping rightwards along the strip should
+    /// bring the new list in from the right.
+    #[test]
+    fn a_direct_jump_takes_its_direction_from_the_strip() {
+        let mut p = seeded(1);
+        let a = p.active_workspace;
+        let b = p.create_workspace(None);
+        p.switch_workspace(a);
+
+        p.pending_switch = None;
+        p.switch_workspace(b);
+        assert_eq!(
+            p.pending_switch.map(|(from, dir)| (from, dir)),
+            Some((a, 1.0))
+        );
+
+        p.pending_switch = None;
+        p.switch_workspace(a);
+        assert_eq!(
+            p.pending_switch.map(|(from, dir)| (from, dir)),
+            Some((b, -1.0))
+        );
+    }
+
+    /// Mid-slide there are two lists: the one you left going out and the
+    /// one you arrived at coming in, from opposite edges. Only the
+    /// arriving one may take clicks.
+    #[test]
+    fn a_slide_draws_both_lists_travelling_opposite_ways() {
+        let mut p = seeded(2);
+        let first = p.active_workspace;
+        p.set_hidden(2, true);
+        let second = p.create_workspace(None);
+        p.set_hidden(2, false);
+        p.set_hidden(1, true);
+        p.switch_workspace(first);
+
+        let width = SIDEBAR_DEFAULT_WIDTH;
+        let (from, dir) = p.pending_switch.expect("a switch queues a slide");
+        let slide = SidebarSlide {
+            from: Some(from),
+            dir,
+            t: 0.5,
+        };
+        let passes = sidebar_passes(&p, &slide, &SidebarScroll::default(), width, 900.0);
+        assert_eq!(passes.len(), 2);
+        let (out, incoming) = (&passes[0], &passes[1]);
+        assert_eq!(out.workspace, second, "the list being left");
+        assert_eq!(incoming.workspace, first, "the list arriving");
+        assert!(!out.interactive && incoming.interactive);
+        assert!(
+            out.dx.signum() != incoming.dx.signum(),
+            "they pass each other, {} vs {}",
+            out.dx,
+            incoming.dx
+        );
+        assert!(out.dx.abs() <= width && incoming.dx.abs() <= width);
+        // Each shows its OWN workspace's projects, not the other's.
+        let ids = |pass: &SidebarPass| -> Vec<u64> {
+            pass.rows.iter().map(|&(i, _)| p.list[i].id).collect()
+        };
+        assert_eq!(
+            ids(out),
+            vec![2],
+            "the workspace being left parked project 1"
+        );
+        assert_eq!(
+            ids(incoming),
+            vec![1],
+            "and the one arriving parked project 2"
+        );
+    }
+
+    /// At rest there is one list, at its resting position, taking clicks.
+    #[test]
+    fn at_rest_there_is_one_list_and_it_does_not_move() {
+        let p = seeded(2);
+        let passes = sidebar_passes(
+            &p,
+            &SidebarSlide::default(),
+            &SidebarScroll::default(),
+            SIDEBAR_DEFAULT_WIDTH,
+            900.0,
+        );
+        assert_eq!(passes.len(), 1);
+        assert_eq!(passes[0].dx, 0.0);
+        assert!(passes[0].interactive);
+    }
+
+    /// The eased curve has to actually start at the far edge and land
+    /// exactly at rest, or the list jumps on the first or last frame.
+    #[test]
+    fn the_slide_starts_off_screen_and_lands_at_rest() {
+        let mut p = seeded(1);
+        let a = p.active_workspace;
+        let b = p.create_workspace(None);
+        p.switch_workspace(a);
+        p.switch_workspace(b);
+        let (from, dir) = p.pending_switch.expect("queued");
+        let width = SIDEBAR_DEFAULT_WIDTH;
+
+        let at = |t: f32| {
+            let slide = SidebarSlide {
+                from: Some(from),
+                dir,
+                t,
+            };
+            let passes = sidebar_passes(&p, &slide, &SidebarScroll::default(), width, 900.0);
+            (passes[0].dx, passes[1].dx)
+        };
+        let (out0, in0) = at(0.0);
+        assert_eq!(out0, 0.0, "the departing list starts where it sat");
+        assert_eq!(
+            in0.abs(),
+            width,
+            "the arriving list starts a full width out"
+        );
+        let (out1, in1) = at(1.0);
+        assert_eq!(out1.abs(), width, "and it leaves by a full width");
+        assert_eq!(in1, 0.0, "landing exactly at rest");
+    }
+
+    /// Only the arriving list's hit rects are reachable, and they travel
+    /// with it. Two live rects for the same row in different workspaces
+    /// would make the picker's first-match-wins arbitrary.
+    #[test]
+    fn only_the_arriving_lists_hit_rects_are_reachable() {
+        let base = SidebarBounds {
+            min: Vec2::new(0.0, 10.0),
+            max: Vec2::new(100.0, 40.0),
+        };
+        let arriving = SidebarPass {
+            rows: Vec::new(),
+            workspace: 1,
+            active: None,
+            dx: -30.0,
+            scroll: 0.0,
+            interactive: true,
+        };
+        let moved = base.placed(&arriving);
+        assert_eq!(moved.min.x, -30.0, "the rect follows its row");
+        assert_eq!(moved.min.y, 10.0, "and only sideways");
+
+        let departing = SidebarPass {
+            interactive: false,
+            ..arriving
+        };
+        let gone = base.placed(&departing);
+        assert!(!in_bounds(Vec2::new(50.0, 20.0), &gone));
+        assert!(!in_bounds(Vec2::new(f32::MAX, f32::MAX), &gone));
+    }
+
+    /// A list that fits must not scroll at all — the sidebar looks and
+    /// behaves exactly as it did before scrolling existed.
+    #[test]
+    fn a_list_that_fits_cannot_scroll() {
+        let win_h = 900.0;
+        let fits = ((rows_room(win_h) - DIVIDER_H - ROW_H) / ROW_H).floor() as usize;
+        assert_eq!(max_scroll(fits, win_h), 0.0);
+        assert!(max_scroll(fits + 1, win_h) > 0.0, "one more row overflows");
+    }
+
+    /// The footer is reserved: the list can never scroll into it, so the
+    /// show-hidden eyeball is always visible and always clickable. Before
+    /// this there was permanently a project row under that corner, which
+    /// ate the click and hid the eyeball.
+    #[test]
+    fn the_list_can_never_reach_the_footer() {
+        let win_h = 600.0;
+        assert_eq!(rows_room(win_h), win_h - HEADER_H - FOOTER_H);
+        // Scrolled as far as it goes, the content's last pixel stops at
+        // the top of the footer rather than the bottom of the window.
+        let rows = 60;
+        let content = rows as f32 * ROW_H + DIVIDER_H + ROW_H;
+        assert_eq!(
+            HEADER_H - max_scroll(rows, win_h) + content,
+            win_h - FOOTER_H
+        );
+        // And nothing in the footer band counts as a row hit.
+        assert!(in_rows_band(win_h - FOOTER_H - 1.0, win_h));
+        assert!(!in_rows_band(win_h - FOOTER_H, win_h));
+        assert!(
+            !in_rows_band(win_h - 1.0, win_h),
+            "the eyeball's own corner"
+        );
+        assert!(!in_rows_band(HEADER_H - 1.0, win_h), "and under the header");
+    }
+
+    /// A window too short for header + footer must not produce a
+    /// negative-height row band that would make every hit test nonsense.
+    #[test]
+    fn a_tiny_window_degrades_to_no_row_band() {
+        let win_h = HEADER_H + FOOTER_H * 0.5;
+        assert_eq!(rows_room(win_h), 0.0);
+        assert!(!in_rows_band(HEADER_H + 1.0, win_h));
+        assert!(max_scroll(50, win_h) > 0.0, "still scrollable, just unseen");
+    }
+
+    /// The travel has to cover the "+ New Project" row and its divider,
+    /// not just the projects — otherwise the one row you need to reach
+    /// when the list is long is the one you cannot.
+    #[test]
+    fn the_scroll_range_reaches_the_new_project_row() {
+        let win_h = 300.0;
+        let rows = 40;
+        let travel = max_scroll(rows, win_h);
+        let content = rows as f32 * ROW_H + DIVIDER_H + ROW_H;
+        assert_eq!(travel, content - rows_room(win_h));
+        // Scrolled fully, the bottom of the content sits on the footer,
+        // so the last thing in the list is on screen.
+        assert_eq!(HEADER_H - travel + content, win_h - FOOTER_H);
+    }
+
+    /// Hover, press and reorder all map a cursor onto a row. If they
+    /// disagree you highlight one project and grab another.
+    #[test]
+    fn a_scrolled_row_is_hit_where_it_is_drawn() {
+        // Unscrolled, the first row starts right under the header.
+        assert_eq!(row_slot_at(HEADER_H + 1.0, 0.0), 0);
+        assert_eq!(row_slot_at(HEADER_H + ROW_H + 1.0, 0.0), 1);
+        // Scrolled by exactly two rows, the row drawn just under the
+        // header is the third one.
+        assert_eq!(row_slot_at(HEADER_H + 1.0, ROW_H * 2.0), 2);
+        // And the row drawn where row 0 was is no longer row 0.
+        assert_ne!(row_slot_at(HEADER_H + 1.0, ROW_H * 2.0), 0);
+    }
+
+    /// Each workspace keeps its own scroll position: they hold different
+    /// numbers of projects, and coming back should find the list where
+    /// you left it.
+    #[test]
+    fn scroll_is_remembered_per_workspace() {
+        let win_h = 200.0;
+        let mut scroll = SidebarScroll::default();
+        scroll.per_workspace.insert(1, 120.0);
+        scroll.per_workspace.insert(2, 40.0);
+        assert_eq!(scroll.clamped(1, 40, win_h), 120.0);
+        assert_eq!(scroll.clamped(2, 40, win_h), 40.0);
+        assert_eq!(
+            scroll.clamped(3, 40, win_h),
+            0.0,
+            "unvisited starts at the top"
+        );
+    }
+
+    /// Reading clamped as well as writing clamped: deleting projects or
+    /// shrinking the window must not leave a list parked past its end,
+    /// showing empty space where rows used to be.
+    #[test]
+    fn a_shrinking_list_pulls_its_scroll_back() {
+        let win_h = 400.0;
+        let mut scroll = SidebarScroll::default();
+        // Parked well past the end of even the long list.
+        scroll.per_workspace.insert(1, 5_000.0);
+        assert_eq!(scroll.clamped(1, 40, win_h), max_scroll(40, win_h));
+        assert_eq!(scroll.clamped(1, 2, win_h), 0.0, "now everything fits");
+    }
+
+    /// A gesture commits to one axis and keeps it. Trackpads leak each
+    /// axis into the other, and a scroll that swapped the whole sidebar
+    /// mid-flick would be the worst failure available here.
+    #[test]
+    fn a_gesture_picks_one_axis_and_keeps_it() {
+        let mut g = SidebarSwipe::default();
+        // Too small to call yet.
+        g.accum = 2.0;
+        g.accum_y = 1.0;
+        assert_eq!(g.decide_axis(), GestureAxis::Undecided);
+
+        // Clearly sideways.
+        g.accum = 40.0;
+        g.accum_y = 3.0;
+        assert_eq!(g.decide_axis(), GestureAxis::Swipe);
+        // Drifting vertically later must not change its mind.
+        g.accum_y = 400.0;
+        assert_eq!(g.decide_axis(), GestureAxis::Swipe);
+
+        // A fresh, clearly vertical gesture.
+        g.begin();
+        g.accum = 4.0;
+        g.accum_y = 40.0;
+        assert_eq!(g.decide_axis(), GestureAxis::Scroll);
+        g.accum = 400.0;
+        assert_eq!(g.decide_axis(), GestureAxis::Scroll);
+    }
+
+    /// The one-sided ratio: a mostly-vertical gesture with real sideways
+    /// drift scrolls. Getting this wrong swaps the sidebar under someone
+    /// who was only scrolling.
+    #[test]
+    fn a_wobbly_scroll_does_not_switch_workspace() {
+        let mut g = SidebarSwipe::default();
+        g.accum = 20.0;
+        g.accum_y = 30.0;
+        assert_eq!(
+            g.decide_axis(),
+            GestureAxis::Scroll,
+            "sideways has to clearly dominate, not merely be present"
+        );
     }
 
     #[test]

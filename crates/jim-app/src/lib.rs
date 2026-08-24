@@ -220,6 +220,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(PanePlugin {
                 reserved_layers: vec![
                     MENU_OVERLAY_LAYER,
+                    projects::SIDEBAR_LAYER,
                     WHITEBOARD_OVERLAY_LAYER,
                     cube::CUBE_LAYER,
                     slide_view::BLIT_LAYER,
@@ -2832,6 +2833,18 @@ fn sync_canvas_clear_color(theme: Res<jim_style::Theme>, mut clear: ResMut<Clear
     }
 }
 
+/// The short chrome transforms that need the reactive loop pinned to
+/// Continuous while they play. Bundled into one `SystemParam` because
+/// [`maintain_winit_mode_for_animation`] is at Bevy's 16-argument
+/// ceiling and every one of these is a "keep drawing" vote.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ChromeAnimations<'w> {
+    /// Diving into a recursive presentation slide (~0.75s).
+    pub dive: Res<'w, slide_view::SlideDive>,
+    /// The sidebar's workspace slide (~0.22s).
+    pub sidebar_slide: Res<'w, projects::SidebarSlide>,
+}
+
 /// Switch the winit update mode between Continuous (every frame) and
 /// Reactive (only on input + a 5s heartbeat) depending on whether the
 /// active visual preset needs to animate. Continuous burns ~1.5 cores
@@ -2862,7 +2875,7 @@ fn maintain_winit_mode_for_animation(
     mut pin_watch: ResMut<diagnostics::ContinuousWatch>,
     animated_panes: Query<(), With<AnimatedChromePane>>,
     mut chrome_animates: ResMut<ChromeAnimates>,
-    slide_dive: Res<slide_view::SlideDive>,
+    anim: ChromeAnimations,
 ) {
     let preset_animates = preset.0.as_deref().map_or(false, |name| {
         registry
@@ -2923,7 +2936,10 @@ fn maintain_winit_mode_for_animation(
         // Diving into a recursive slide: a ~0.75s transform, and the app is
         // reactive otherwise, so without this the zoom would advance one
         // frame per mouse twitch instead of playing.
-        || slide_dive.animating();
+        || anim.dive.animating()
+        // The sidebar's workspace slide, for the same reason over a much
+        // shorter ~0.22s.
+        || anim.sidebar_slide.animating();
     // NOTE: an open command palette is deliberately NOT a Continuous source.
     // It only needs its DeepSeek worker result polled promptly; pinning full
     // 60fps for that is wasteful. Below it instead tightens the *reactive*
