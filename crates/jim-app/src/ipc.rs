@@ -277,6 +277,25 @@ pub enum IpcRequest {
         #[serde(default)]
         titles: Option<Vec<String>>,
     },
+    /// `jimctl workspace ...` — the sidebar's saved configurations.
+    ///
+    /// A workspace records which projects are parked and which one you
+    /// were last in; every project exists in every workspace. See
+    /// `projects::WorkspaceData`.
+    Workspace {
+        /// `list` | `new` | `switch` | `next` | `prev` | `rename` |
+        /// `rm` | `show` | `hide`.
+        op: String,
+        /// Workspace to act on, by name. Defaults to the current one.
+        #[serde(default)]
+        name: Option<String>,
+        /// New name, for `new` and `rename`.
+        #[serde(default)]
+        to: Option<String>,
+        /// Project to park / un-park, for `show` and `hide`.
+        #[serde(default)]
+        project: Option<String>,
+    },
     /// `jimctl group assign|clear` — put panes into a named group (or take
     /// them out of one). A grouped pane is hidden until its group is
     /// revealed, so this is how a deck's dashboards get wired up ONCE;

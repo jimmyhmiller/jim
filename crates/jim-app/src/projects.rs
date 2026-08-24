@@ -30,6 +30,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::mouse::{MouseScrollUnit, MouseWheel};
 use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use bevy::text::LineHeight;
@@ -111,6 +112,30 @@ const DIVIDER_H: f32 = 1.0;
 const TEXT_FONT_SIZE: f32 = 13.0;
 const HEADER_FONT_SIZE: f32 = 12.0;
 
+// ----- Workspace switcher strip (sidebar header, right side) -----
+//
+// A page indicator: one short bar per workspace, the current one lit.
+// Bars rather than dots because the sidebar draws with plain `Sprite`s
+// and a rectangle is the only shape that costs nothing.
+
+/// Width of one workspace bar. Uniform across workspaces — the active
+/// one is distinguished by colour, not size, which keeps the strip's
+/// width a plain multiplication and so keeps the overflow window below
+/// honest.
+const WS_BAR_W: f32 = 10.0;
+const WS_BAR_H: f32 = 3.0;
+/// Gap between bars, and between the last bar and the `+`.
+const WS_BAR_GAP: f32 = 5.0;
+/// Hit width of the `+` that adds a workspace.
+const WS_ADD_W: f32 = 16.0;
+/// Inset of the whole strip from the sidebar's inner (right) edge.
+const WS_STRIP_PAD_R: f32 = 8.0;
+/// Horizontal space always left for the workspace name, however many
+/// workspaces there are. Past this the strip drops bars from whichever
+/// end is furthest from the current workspace, rather than shrinking the
+/// name to nothing.
+const WS_NAME_MIN_W: f32 = 70.0;
+
 const NEW_TERMINAL_OFFSET: f32 = 28.0;
 
 // ---------- Persistence ----------
@@ -128,13 +153,50 @@ pub struct ProjectData {
     /// `serde(default)` keeps old projects.json files loadable.
     #[serde(default)]
     pub default_cwd: Option<String>,
-    /// Hidden projects are kept in the list (and on disk) but omitted
-    /// from the sidebar unless `Projects::show_hidden` is on. Hiding
-    /// never deletes the project or its panes — it's purely a sidebar
-    /// declutter. `serde(default)` keeps old projects.json files loadable.
-    #[serde(default)]
-    pub hidden: bool,
+    /// Legacy pre-workspace park flag. Hiding is per-WORKSPACE now — see
+    /// [`WorkspaceData::hidden`] — so this is read once, to seed the
+    /// first workspace out of an old save, and never written back.
+    /// Nothing outside [`Projects::from_persisted`] may read it; ask
+    /// [`Projects::is_hidden`] instead, which knows which workspace you
+    /// are on.
+    ///
+    /// `rename` is load-bearing: the on-disk key is still `hidden`, and
+    /// without it every existing save silently migrates to "nothing
+    /// parked" — a 44-project sidebar where 35 were tucked away.
+    #[serde(default, rename = "hidden", skip_serializing)]
+    legacy_hidden: bool,
 }
+
+/// A workspace: one saved sidebar configuration.
+///
+/// A workspace does NOT own projects. Every project exists in every
+/// workspace; what a workspace remembers is which of them are *parked*
+/// (see the hidden/switchable rules on [`Projects`]) and which one you
+/// were last working in. So switching workspaces never moves a project,
+/// touches a pane, or kills a shell — it parks a different subset and
+/// restores the active project you left behind.
+///
+/// There is always at least one. Deleting the last one is refused, since
+/// every hide decision in the app is stored inside one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceData {
+    pub id: u64,
+    pub name: String,
+    /// Projects parked in THIS workspace. Deleting a project sweeps its
+    /// id out of every workspace, so this never accumulates ghosts that
+    /// would silently re-park a recycled id.
+    #[serde(default)]
+    pub hidden: Vec<u64>,
+    /// Project that was active when this workspace was last left.
+    /// Re-validated on the way back in — it may have been deleted, or
+    /// parked in this workspace, while we were away.
+    #[serde(default)]
+    pub active: Option<u64>,
+}
+
+/// Name given to the workspace an old (pre-workspace) save is migrated
+/// into, and to the first workspace of a fresh install.
+const DEFAULT_WORKSPACE_NAME: &str = "Main";
 
 /// Legacy terminal-only snapshot from before the pane unification.
 /// Kept for `serde(default)` deserialization so old projects.json files
@@ -156,6 +218,15 @@ struct PersistedState {
     active: Option<u64>,
     #[serde(default)]
     next_id: u64,
+    /// Saved sidebar configurations. Empty in any save written before
+    /// workspaces existed; [`Projects::from_persisted`] migrates those
+    /// into a single workspace built from the old per-project flags.
+    #[serde(default)]
+    workspaces: Vec<WorkspaceData>,
+    #[serde(default)]
+    active_workspace: Option<u64>,
+    #[serde(default)]
+    next_workspace_id: u64,
     #[serde(default)]
     sidebar_width: Option<f32>,
     /// Legacy field — populated when reading old saves; never written.
@@ -240,6 +311,15 @@ pub struct Projects {
     pub list: Vec<ProjectData>,
     pub active: Option<u64>,
     pub next_id: u64,
+    /// Saved sidebar configurations, in swipe order. Never empty once
+    /// `load_or_seed_projects` has run; the `Default` impl leaves it
+    /// empty only for the placeholder resource inserted before Startup,
+    /// so every accessor tolerates that.
+    pub workspaces: Vec<WorkspaceData>,
+    /// Which workspace the sidebar is showing. See
+    /// [`Projects::switch_workspace`].
+    pub active_workspace: u64,
+    pub next_workspace_id: u64,
     /// Counter for `TerminalSession` ids. Bumped on every spawn (new or
     /// restored) so we never collide with an existing scrollback file.
     pub next_terminal_id: u64,
@@ -323,10 +403,41 @@ impl Projects {
             .max()
             .unwrap_or(0);
         let next_snap_id = p.next_snap_id.max(panes_max_snap).max(1);
+        // Workspaces. A save written before they existed has none, and
+        // its per-project `hidden` flags ARE a sidebar configuration —
+        // just the only one there was. Migrating them into one workspace
+        // means an upgrade changes nothing the user can see.
+        let mut workspaces = p.workspaces;
+        if workspaces.is_empty() {
+            workspaces.push(WorkspaceData {
+                id: 1,
+                name: DEFAULT_WORKSPACE_NAME.to_string(),
+                hidden: p
+                    .projects
+                    .iter()
+                    .filter(|pr| pr.legacy_hidden)
+                    .map(|pr| pr.id)
+                    .collect(),
+                active: p.active,
+            });
+        }
+        // Same guard as every other counter here: never hand out an id a
+        // hand-edited or older save already uses.
+        let next_workspace_id = p
+            .next_workspace_id
+            .max(workspaces.iter().map(|w| w.id + 1).max().unwrap_or(1))
+            .max(1);
+        let active_workspace = p
+            .active_workspace
+            .filter(|id| workspaces.iter().any(|w| w.id == *id))
+            .unwrap_or(workspaces[0].id);
         Self {
             list: p.projects,
             active: p.active,
             next_id,
+            workspaces,
+            active_workspace,
+            next_workspace_id,
             next_terminal_id,
             next_canvas_id,
             next_snap_id,
@@ -358,6 +469,14 @@ impl Projects {
         self.dirty = true;
         id
     }
+    /// Add a project, listed in the CURRENT workspace and parked in
+    /// every other one.
+    ///
+    /// Projects are global — they exist in every workspace — so a new
+    /// one would otherwise appear in all of them at once, which defeats
+    /// the point of having separated them. Parking it elsewhere means
+    /// "new project shows up where I made it", and un-parking it
+    /// somewhere else is one eye-click away.
     pub fn create(&mut self) -> u64 {
         let id = self.next_id.max(1);
         self.next_id = id + 1;
@@ -365,8 +484,14 @@ impl Projects {
             id,
             name: format!("Project {}", id),
             default_cwd: None,
-            hidden: false,
+            legacy_hidden: false,
         });
+        let current = self.active_workspace;
+        for w in &mut self.workspaces {
+            if w.id != current {
+                w.hidden.push(id);
+            }
+        }
         if self.active.is_none() {
             self.active = Some(id);
         }
@@ -379,6 +504,16 @@ impl Projects {
         self.list.retain(|p| p.id != id);
         if self.list.len() == before {
             return;
+        }
+        // Sweep the id out of every workspace. Left behind, a stale park
+        // entry would silently re-hide whatever project inherits the id,
+        // and a stale `active` would restore a project that no longer
+        // exists on the next swipe back.
+        for w in &mut self.workspaces {
+            w.hidden.retain(|&h| h != id);
+            if w.active == Some(id) {
+                w.active = None;
+            }
         }
         if self.active == Some(id) {
             self.active = self.first_switchable();
@@ -425,17 +560,32 @@ impl Projects {
     // Enforced in two spots: `set_active` refuses hidden targets, and
     // `set_hidden` re-homes `active` if you park the current project.
     // Everything else just reads `switchable*()` and gets it for free.
+    //
+    // Parking is per-WORKSPACE (see [`WorkspaceData`]): the same project
+    // can be listed in one workspace and tucked away in the next. That
+    // is the whole of what a workspace is, which is why these accessors
+    // are the only place the distinction shows up — every caller already
+    // asked "is this hidden?" rather than reading a flag, so they all
+    // became workspace-aware for free.
 
-    /// Is this project parked? (Unknown ids are treated as not hidden.)
+    /// Projects parked in the current workspace. Empty before Startup
+    /// has built any workspace, which is the same as "nothing parked".
+    fn parked(&self) -> &[u64] {
+        self.workspace().map(|w| w.hidden.as_slice()).unwrap_or(&[])
+    }
+
+    /// Is this project parked in the current workspace? (Unknown ids are
+    /// treated as not hidden.)
     pub fn is_hidden(&self, id: u64) -> bool {
-        self.list.iter().any(|p| p.id == id && p.hidden)
+        self.parked().contains(&id)
     }
 
     /// The projects a user can switch between, in list order. THIS is the
     /// set every switcher must enumerate — never `list` directly — so
     /// parked projects stay out of all of them.
     pub fn switchable(&self) -> impl Iterator<Item = &ProjectData> {
-        self.list.iter().filter(|p| !p.hidden)
+        let parked = self.parked();
+        self.list.iter().filter(move |p| !parked.contains(&p.id))
     }
     pub fn switchable_ids(&self) -> Vec<u64> {
         self.switchable().map(|p| p.id).collect()
@@ -451,28 +601,38 @@ impl Projects {
     /// un-park them). Distinct from `switchable_ids` on purpose — revealing
     /// hidden rows in the sidebar must NOT make them switchable elsewhere.
     pub fn sidebar_ids(&self) -> Vec<u64> {
+        let parked = self.parked();
         self.list
             .iter()
-            .filter(|p| self.show_hidden || !p.hidden)
+            .filter(|p| self.show_hidden || !parked.contains(&p.id))
             .map(|p| p.id)
             .collect()
     }
 
-    /// Park / un-park a project. Maintains the active-is-switchable
-    /// invariant: parking the active project re-homes `active` to the
-    /// first remaining switchable one (or `None` if none are left);
-    /// un-parking when nothing is active adopts it as active.
+    /// Park / un-park a project **in the current workspace only**.
+    ///
+    /// Maintains the active-is-switchable invariant: parking the active
+    /// project re-homes `active` to the first remaining switchable one
+    /// (or `None` if none are left); un-parking when nothing is active
+    /// adopts it as active.
     pub fn set_hidden(&mut self, id: u64, hidden: bool) {
-        let mut changed = false;
-        for p in &mut self.list {
-            if p.id == id {
-                if p.hidden != hidden {
-                    p.hidden = hidden;
-                    changed = true;
-                }
-                break;
-            }
+        if !self.list.iter().any(|p| p.id == id) {
+            return;
         }
+        let Some(ws) = self.workspace_mut() else {
+            return;
+        };
+        let changed = if hidden {
+            let missing = !ws.hidden.contains(&id);
+            if missing {
+                ws.hidden.push(id);
+            }
+            missing
+        } else {
+            let before = ws.hidden.len();
+            ws.hidden.retain(|&h| h != id);
+            ws.hidden.len() != before
+        };
         if !changed {
             return;
         }
@@ -489,6 +649,170 @@ impl Projects {
     /// Convenience toggle used by the sidebar eye affordance.
     pub fn toggle_hidden(&mut self, id: u64) {
         self.set_hidden(id, !self.is_hidden(id));
+    }
+
+    // ----- Workspaces -----
+    //
+    // A workspace is a saved sidebar configuration: which projects are
+    // parked, and which one you were working in. Swiping two fingers
+    // horizontally over the sidebar cycles them (see `sidebar_swipe`).
+    //
+    // Every method here keeps two invariants, because breaking either
+    // strands the user with an unusable sidebar:
+    //   * there is always at least one workspace, and
+    //   * `active_workspace` always names one that exists.
+
+    /// The workspace the sidebar is currently showing. `None` only for
+    /// the placeholder resource that exists before Startup builds the
+    /// real one.
+    pub fn workspace(&self) -> Option<&WorkspaceData> {
+        self.workspaces
+            .iter()
+            .find(|w| w.id == self.active_workspace)
+            .or_else(|| self.workspaces.first())
+    }
+
+    fn workspace_mut(&mut self) -> Option<&mut WorkspaceData> {
+        let id = self.active_workspace;
+        if self.workspaces.iter().any(|w| w.id == id) {
+            self.workspaces.iter_mut().find(|w| w.id == id)
+        } else {
+            self.workspaces.first_mut()
+        }
+    }
+
+    /// Display name of the current workspace (the sidebar header).
+    pub fn workspace_name(&self) -> &str {
+        self.workspace().map_or("", |w| w.name.as_str())
+    }
+
+    /// Index of the current workspace in swipe order, for the header
+    /// dot strip.
+    pub fn workspace_index(&self) -> usize {
+        self.workspaces
+            .iter()
+            .position(|w| w.id == self.active_workspace)
+            .unwrap_or(0)
+    }
+
+    pub fn workspace_id_by_name(&self, name: &str) -> Option<u64> {
+        self.workspaces
+            .iter()
+            .find(|w| w.name.eq_ignore_ascii_case(name))
+            .map(|w| w.id)
+    }
+
+    /// Add a workspace, and switch to it.
+    ///
+    /// It starts as a FORK of the one you were on — same parked set,
+    /// same active project. Starting from "everything parked" would open
+    /// onto an empty sidebar that looks broken, and starting from
+    /// "nothing parked" would make the first two workspaces identical
+    /// for anyone who had already tucked projects away. A fork is the
+    /// only option you can adjust with one eye-click in either
+    /// direction.
+    pub fn create_workspace(&mut self, name: Option<String>) -> u64 {
+        let id = self.next_workspace_id.max(1);
+        self.next_workspace_id = id + 1;
+        let (hidden, active) = self
+            .workspace()
+            .map(|w| (w.hidden.clone(), w.active.or(self.active)))
+            .unwrap_or_default();
+        // Remember where we were before leaving, same as a switch.
+        let leaving = self.active;
+        if let Some(ws) = self.workspace_mut() {
+            ws.active = leaving;
+        }
+        self.workspaces.push(WorkspaceData {
+            id,
+            name: name.unwrap_or_else(|| format!("Workspace {id}")),
+            hidden,
+            active,
+        });
+        self.active_workspace = id;
+        self.dirty = true;
+        self.layout_dirty = true;
+        id
+    }
+
+    /// Remove a workspace. Refused (returning false) for the last one:
+    /// every hide decision in the app lives inside a workspace, so there
+    /// has to be somewhere to stand.
+    pub fn delete_workspace(&mut self, id: u64) -> bool {
+        if self.workspaces.len() <= 1 || !self.workspaces.iter().any(|w| w.id == id) {
+            return false;
+        }
+        let idx = self.workspaces.iter().position(|w| w.id == id).unwrap_or(0);
+        self.workspaces.retain(|w| w.id != id);
+        if self.active_workspace == id {
+            // Land on the neighbour that took its place, or the new last
+            // one if we deleted off the end.
+            let next = self.workspaces[idx.min(self.workspaces.len() - 1)].id;
+            self.active_workspace = next;
+            self.adopt_workspace_active();
+        }
+        self.dirty = true;
+        self.layout_dirty = true;
+        true
+    }
+
+    pub fn rename_workspace(&mut self, id: u64, name: String) {
+        for w in &mut self.workspaces {
+            if w.id == id {
+                if w.name != name {
+                    w.name = name;
+                    self.dirty = true;
+                    self.layout_dirty = true;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Show a different workspace.
+    ///
+    /// The workspace being left records the project you were in, so
+    /// swiping back lands exactly where you were. The one being entered
+    /// restores its own — re-validated, because that project may have
+    /// been deleted, or parked in this workspace, since you last left.
+    pub fn switch_workspace(&mut self, id: u64) {
+        if self.active_workspace == id || !self.workspaces.iter().any(|w| w.id == id) {
+            return;
+        }
+        let leaving = self.active;
+        if let Some(ws) = self.workspace_mut() {
+            ws.active = leaving;
+        }
+        self.active_workspace = id;
+        self.adopt_workspace_active();
+        self.dirty = true;
+        self.layout_dirty = true;
+    }
+
+    /// Point `active` at whatever the current workspace remembers,
+    /// falling back to its first switchable project. Upholds the
+    /// active-is-switchable invariant across a workspace change, where
+    /// the *set* of switchable projects moves under `active`.
+    fn adopt_workspace_active(&mut self) {
+        let remembered = self.workspace().and_then(|w| w.active);
+        let usable = remembered
+            .filter(|a| self.list.iter().any(|p| p.id == *a))
+            .filter(|a| !self.is_hidden(*a));
+        self.active = usable.or_else(|| self.first_switchable());
+    }
+
+    /// Step `delta` workspaces along the swipe order, wrapping. Returns
+    /// the workspace landed on, or `None` if there is nowhere to go.
+    pub fn cycle_workspace(&mut self, delta: i32) -> Option<u64> {
+        let n = self.workspaces.len();
+        if n < 2 {
+            return None;
+        }
+        let cur = self.workspace_index() as i32;
+        let next = (cur + delta).rem_euclid(n as i32) as usize;
+        let id = self.workspaces[next].id;
+        self.switch_workspace(id);
+        Some(id)
     }
     pub fn name_of(&self, id: u64) -> Option<&str> {
         self.list
@@ -545,6 +869,17 @@ impl Projects {
 pub struct Renaming {
     pub id: Option<u64>,
     pub buffer: String,
+    /// What `id` names. Project rows and the workspace header both edit
+    /// inline in the sidebar and share one keyboard handler; only the
+    /// commit target differs.
+    pub target: RenameTarget,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenameTarget {
+    #[default]
+    Project,
+    Workspace,
 }
 
 /// Side-channel for spawn / restore / open-file actions that need
@@ -663,9 +998,16 @@ pub struct SidebarEntity;
 pub enum SidebarHit {
     Project(u64),
     DeleteProject(u64),
-    /// Per-row eye column: toggles this project's `hidden` flag.
+    /// Per-row eye column: parks / un-parks this project in the CURRENT
+    /// workspace (see [`Projects::set_hidden`]).
     ToggleHidden(u64),
     NewProject,
+    /// A bar in the header's workspace strip: switch to that workspace.
+    Workspace(u64),
+    /// The `+` at the end of the strip: add a workspace.
+    NewWorkspace,
+    /// The workspace name in the header: double-click renames it.
+    WorkspaceName,
 }
 
 /// Bounds in window coords (top-left origin). Recomputed each frame so
@@ -700,6 +1042,128 @@ struct ProjectDrag {
     dirty_pending: bool,
 }
 
+// ----- Two-finger workspace swipe -----
+
+/// Horizontal pixels one gesture must travel before it switches
+/// workspace. Low enough to feel like a flick, high enough that the
+/// sideways wobble in a vertical scroll never trips it.
+const SWIPE_THRESHOLD_PX: f32 = 55.0;
+/// A gesture only counts as horizontal if it is this much more sideways
+/// than vertical. Trackpads leak a little of each axis into the other,
+/// and a vertical scroll that silently swapped the whole sidebar would
+/// be the worst possible failure here.
+const SWIPE_AXIS_RATIO: f32 = 1.6;
+/// Quiet time that ends a gesture. A trackpad reports no "fingers
+/// lifted", so the gap between event bursts is the only signal that one
+/// swipe finished and the next began.
+const SWIPE_IDLE_SECS: f32 = 0.2;
+/// Pixels attributed to one notch of a line-unit wheel. Only a mouse
+/// with a horizontal tilt produces these; a couple of notches should
+/// switch, same as a flick.
+const SWIPE_LINE_PX: f32 = 30.0;
+
+/// Live state for the workspace swipe. See [`sidebar_swipe`].
+#[derive(Resource, Default)]
+struct SidebarSwipe {
+    /// Horizontal pixels accumulated within the current gesture.
+    accum: f32,
+    /// Vertical pixels in the same gesture, for the axis test.
+    accum_y: f32,
+    /// Set once this gesture has switched. One continuous swipe moves
+    /// exactly ONE workspace however far it runs, so a long drag can't
+    /// blow through five of them.
+    fired: bool,
+    /// Seconds since the last wheel event.
+    idle: f32,
+}
+
+/// Two-finger horizontal swipe over the sidebar switches workspace.
+///
+/// Only over the sidebar: the canvas already owns horizontal wheel input
+/// for `cmd`-pan, and a gesture that switched context from anywhere on
+/// screen would fire by accident constantly.
+///
+/// Direction matches the canvas pan and macOS paging — fingers moving
+/// LEFT drag the next workspace in from the right.
+fn sidebar_swipe(
+    mut wheel: MessageReader<MouseWheel>,
+    mut swipe: ResMut<SidebarSwipe>,
+    time: Res<Time>,
+    windows: Query<&Window>,
+    sidebar: Res<Sidebar>,
+    presentation: Res<crate::present::Presentation>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut projects: ResMut<Projects>,
+) {
+    // End the gesture after a quiet spell, so the next burst starts from
+    // zero and gets its own switch.
+    swipe.idle += time.delta_secs();
+    if swipe.idle > SWIPE_IDLE_SECS {
+        swipe.accum = 0.0;
+        swipe.accum_y = 0.0;
+        swipe.fired = false;
+    }
+
+    // No sidebar, no gesture — during a talk the strip down the left is
+    // the slide, and swiping it must not switch context behind the
+    // presenter's back.
+    if !presentation.sidebar_visible() {
+        wheel.clear();
+        return;
+    }
+    // Cmd+wheel is the canvas pan. Leave it alone.
+    if keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight) {
+        wheel.clear();
+        return;
+    }
+    let over_sidebar = windows
+        .single()
+        .ok()
+        .and_then(|w| w.cursor_position())
+        .is_some_and(|pt| pt.x < sidebar.width);
+
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    let mut had_event = false;
+    for ev in wheel.read() {
+        let scale = match ev.unit {
+            MouseScrollUnit::Line => SWIPE_LINE_PX,
+            MouseScrollUnit::Pixel => 1.0,
+        };
+        dx += ev.x * scale;
+        dy += ev.y * scale;
+        had_event = true;
+    }
+    if !had_event {
+        return;
+    }
+    swipe.idle = 0.0;
+    // A gesture that started off the sidebar keeps accumulating time but
+    // no distance, so dragging out of the sidebar mid-swipe stops it
+    // rather than completing it somewhere the user isn't looking.
+    if !over_sidebar {
+        return;
+    }
+    swipe.accum += dx;
+    swipe.accum_y += dy;
+    if swipe.fired {
+        return;
+    }
+    if swipe.accum.abs() < SWIPE_THRESHOLD_PX {
+        return;
+    }
+    if swipe.accum.abs() < swipe.accum_y.abs() * SWIPE_AXIS_RATIO {
+        return;
+    }
+    // Positive x is fingers moving right — the same sign the canvas pan
+    // reads as "show me what's to the left" — so that goes back a
+    // workspace.
+    let delta = if swipe.accum > 0.0 { -1 } else { 1 };
+    if projects.cycle_workspace(delta).is_some() {
+        swipe.fired = true;
+    }
+}
+
 /// Bottom-left square that reveals + toggles the global "show hidden"
 /// eyeball. Clamped to the sidebar width so it never spills onto the
 /// canvas. Window coords, top-left origin.
@@ -709,6 +1173,69 @@ fn eyeball_zone(win_h: f32, sidebar_width: f32) -> SidebarBounds {
         min: Vec2::new(0.0, (win_h - EYE_ZONE).max(0.0)),
         max: Vec2::new(w, win_h),
     }
+}
+
+/// Geometry of the workspace switcher in the sidebar header.
+///
+/// Computed once and used for BOTH the sprites and the hit entities, so
+/// the two can't drift apart the way they would if each did its own
+/// arithmetic. Window coords, top-left origin.
+struct WorkspaceStrip {
+    /// `(workspace id, bar rect)` in swipe order, for the bars that fit.
+    bars: Vec<(u64, SidebarBounds)>,
+    /// The `+` button, dropped only if even it doesn't fit.
+    add: Option<SidebarBounds>,
+    /// Leftmost x the strip occupies. The name is truncated to end
+    /// before this.
+    left: f32,
+}
+
+fn workspace_strip(projects: &Projects, sidebar_width: f32) -> WorkspaceStrip {
+    let inner_right = sidebar_width - DIVIDER_H - WS_STRIP_PAD_R;
+    let full = |min_x: f32, w: f32| SidebarBounds {
+        // Full header height: a 3px bar is a fine indicator and an
+        // impossible click target.
+        min: Vec2::new(min_x, 0.0),
+        max: Vec2::new(min_x + w, HEADER_H),
+    };
+    let mut add_left = inner_right - WS_ADD_W;
+    let add = if add_left > WS_NAME_MIN_W {
+        Some(full(add_left, WS_ADD_W))
+    } else {
+        add_left = inner_right;
+        None
+    };
+
+    let n = projects.workspaces.len();
+    let avail = (add_left - WS_BAR_GAP - WS_NAME_MIN_W).max(0.0);
+    let step = WS_BAR_W + WS_BAR_GAP;
+    // How many bars fit; the last one needs no trailing gap.
+    let fit = (((avail + WS_BAR_GAP) / step).floor() as usize).min(n);
+    if fit == 0 {
+        return WorkspaceStrip {
+            bars: Vec::new(),
+            add,
+            left: add_left,
+        };
+    }
+    // With more workspaces than bars, show a window centred on the
+    // current one — dropping the bar you are standing on would make the
+    // strip lie about where you are.
+    let start = projects
+        .workspace_index()
+        .saturating_sub(fit / 2)
+        .min(n - fit);
+    let strip_w = fit as f32 * step - WS_BAR_GAP;
+    let left = add_left - WS_BAR_GAP - strip_w;
+    let bars = (0..fit)
+        .map(|i| {
+            (
+                projects.workspaces[start + i].id,
+                full(left + i as f32 * step, WS_BAR_W),
+            )
+        })
+        .collect();
+    WorkspaceStrip { bars, add, left }
 }
 
 fn in_bounds(pt: Vec2, b: &SidebarBounds) -> bool {
@@ -725,6 +1252,7 @@ impl Plugin for ProjectsPlugin {
             .insert_resource(Sidebar::default())
             .insert_resource(SidebarResize::default())
             .insert_resource(SidebarHover::default())
+            .insert_resource(SidebarSwipe::default())
             .insert_resource(ProjectDrag::default())
             .insert_resource(Renaming::default())
             .insert_resource(PendingActions::default())
@@ -738,6 +1266,9 @@ impl Plugin for ProjectsPlugin {
                     sidebar_resize_drag,
                     project_drag,
                     sidebar_hover,
+                    // Before the layout rebuild, so a workspace switch
+                    // repaints the list in the same frame as the flick.
+                    sidebar_swipe,
                     sidebar_layout,
                     // After the layout rebuild (which respawns the entities)
                     // and before input, so a hidden sidebar is both unseen
@@ -848,6 +1379,26 @@ fn load_or_seed_projects(mut commands: Commands, mut pending: ResMut<PendingActi
 
 // ---------- Sidebar layout ----------
 
+/// Clip `s` to what fits in `room` pixels at `advance` px per character,
+/// marking the cut with an ellipsis. The sidebar font is monospace, so
+/// character count is an exact width — no shaping needed.
+fn truncate_to_width(s: &str, room: f32, advance: f32) -> String {
+    if advance <= 0.0 {
+        return s.to_string();
+    }
+    let fits = (room / advance).floor().max(0.0) as usize;
+    if s.chars().count() <= fits {
+        return s.to_string();
+    }
+    if fits <= 1 {
+        return String::new();
+    }
+    s.chars()
+        .take(fits - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
 /// Window dims at the time of the last sidebar rebuild — when the
 /// window resizes we must rebuild so the bg sprite + hit-test bounds
 /// follow it.
@@ -929,26 +1480,126 @@ fn sidebar_layout(
         ),
     ));
 
-    // Header label — uppercase, dim, like a section caption in a modern
-    // sidebar. No header-bar bg; just text on the sidebar bg with a
-    // divider underneath.
+    // Header — the current workspace's name on the left, the workspace
+    // switcher strip on the right. The name replaces the old static
+    // "PROJECTS" caption: with a swipe gesture that silently swaps the
+    // whole list, a header that never changes is worse than no header.
+    let strip = workspace_strip(&projects, width);
+    let renaming_workspace = renaming.target == RenameTarget::Workspace
+        && renaming.id == Some(projects.active_workspace);
     {
         let line_h = HEADER_FONT_SIZE * 1.4;
         let pad_y = ((HEADER_H - line_h) * 0.5).max(0.0);
+        let advance = metrics.cell_width * (HEADER_FONT_SIZE / FONT_SIZE);
+        let name_room = (strip.left - ROW_PAD_X - WS_BAR_GAP).max(0.0);
+        let label = if renaming_workspace {
+            renaming.buffer.clone()
+        } else {
+            let full = projects.workspace_name().to_uppercase();
+            truncate_to_width(&full, name_room, advance)
+        };
         commands.spawn((
             SidebarEntity,
-            Text2d::new("PROJECTS"),
+            Text2d::new(label.clone()),
             TextFont {
                 font: (font.0.clone()).into(),
                 font_size: FontSize::Px(HEADER_FONT_SIZE),
                 ..default()
             },
             LineHeight::Px(line_h),
-            TextColor(palette.text_faint),
+            TextColor(if renaming_workspace {
+                palette.text
+            } else {
+                palette.text_faint
+            }),
             Anchor::TOP_LEFT,
             Transform::from_xyz(
                 world_left_edge + ROW_PAD_X,
                 world_top_edge - pad_y,
+                SIDEBAR_Z + 0.2,
+            ),
+        ));
+        // Double-click target for renaming the workspace.
+        commands.spawn((
+            SidebarEntity,
+            Transform::from_xyz(world_left_edge, world_top_edge, SIDEBAR_Z + 0.05),
+            SidebarHit::WorkspaceName,
+            SidebarBounds {
+                min: Vec2::new(0.0, 0.0),
+                max: Vec2::new(strip.left.max(0.0), HEADER_H),
+            },
+        ));
+        if renaming_workspace {
+            let caret_h = 14.0;
+            commands.spawn((
+                SidebarEntity,
+                Sprite {
+                    color: palette.edit_underline,
+                    custom_size: Some(Vec2::new(2.0, caret_h)),
+                    ..default()
+                },
+                Anchor::TOP_LEFT,
+                Transform::from_xyz(
+                    world_left_edge + ROW_PAD_X + label.chars().count() as f32 * advance,
+                    world_top_edge - (HEADER_H - caret_h) * 0.5,
+                    SIDEBAR_Z + 0.25,
+                ),
+            ));
+        }
+    }
+
+    // Workspace strip. One bar per workspace, the current one lit —
+    // clickable as a direct jump, and the readout for the swipe gesture.
+    for (id, b) in &strip.bars {
+        let current = *id == projects.active_workspace;
+        commands.spawn((
+            SidebarEntity,
+            Sprite {
+                color: if current {
+                    palette.active_stripe
+                } else {
+                    palette.text_faint
+                },
+                custom_size: Some(Vec2::new(WS_BAR_W, WS_BAR_H)),
+                ..default()
+            },
+            Anchor::TOP_LEFT,
+            Transform::from_xyz(
+                world_left_edge + b.min.x,
+                world_top_edge - (HEADER_H - WS_BAR_H) * 0.5,
+                SIDEBAR_Z + 0.2,
+            ),
+        ));
+        commands.spawn((
+            SidebarEntity,
+            Transform::from_xyz(world_left_edge + b.min.x, world_top_edge, SIDEBAR_Z + 0.05),
+            SidebarHit::Workspace(*id),
+            *b,
+        ));
+    }
+    if let Some(b) = strip.add {
+        commands.spawn((
+            SidebarEntity,
+            Transform::from_xyz(world_left_edge + b.min.x, world_top_edge, SIDEBAR_Z + 0.05),
+            SidebarHit::NewWorkspace,
+            b,
+        ));
+        let glyph = HEADER_FONT_SIZE + 1.0;
+        let line_h = glyph * 1.4;
+        commands.spawn((
+            SidebarEntity,
+            Text2d::new("+"),
+            TextFont {
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(glyph),
+                ..default()
+            },
+            LineHeight::Px(line_h),
+            TextColor(palette.text_faint),
+            Anchor::TOP_LEFT,
+            Transform::from_xyz(
+                world_left_edge + b.min.x + 4.0,
+                world_top_edge - ((HEADER_H - line_h) * 0.5).max(0.0),
                 SIDEBAR_Z + 0.2,
             ),
         ));
@@ -970,16 +1621,17 @@ fn sidebar_layout(
     // rows stay gap-free no matter how many projects are hidden.
     let rows_top_window = HEADER_H;
     let visible: Vec<usize> = (0..projects.list.len())
-        .filter(|&i| projects.show_hidden || !projects.list[i].hidden)
+        .filter(|&i| projects.show_hidden || !projects.is_hidden(projects.list[i].id))
         .collect();
     for (idx, &li) in visible.iter().enumerate() {
+        let hidden_this = projects.is_hidden(projects.list[li].id);
         let proj = &projects.list[li];
         let row_top_window = rows_top_window + idx as f32 * ROW_H;
         let row_top_world = world_top_edge - row_top_window;
         let active = projects.active == Some(proj.id);
-        let renaming_this = renaming.id == Some(proj.id);
+        let renaming_this =
+            renaming.target == RenameTarget::Project && renaming.id == Some(proj.id);
         let dragging_this = drag.dragging && drag.candidate == Some(proj.id);
-        let hidden_this = proj.hidden;
 
         // Row bg — painted when active, renaming, or being dragged. Other
         // rows sit on the sidebar bg with no separator: the spacing from
@@ -1344,6 +1996,9 @@ fn spawn_eye(
 #[derive(Resource, Default)]
 pub struct ClickTracker {
     last_project: Option<u64>,
+    /// Set when the previous click landed on the workspace name, so the
+    /// header gets its own double-click without borrowing a project's.
+    last_workspace_name: bool,
     last_time: f64,
 }
 
@@ -1441,11 +2096,13 @@ pub fn sidebar_input(
             let now = time.elapsed_secs_f64();
             let is_double = tracker.last_project == Some(id) && now - tracker.last_time < 0.4;
             tracker.last_project = Some(id);
+            tracker.last_workspace_name = false;
             tracker.last_time = now;
 
             if is_double {
                 let current = projects.name_of(id).unwrap_or("").to_string();
                 renaming.id = Some(id);
+                renaming.target = RenameTarget::Project;
                 renaming.buffer = current;
             } else {
                 if renaming.id.is_some() {
@@ -1482,13 +2139,52 @@ pub fn sidebar_input(
             // empty so typing replaces the auto-generated "Project N"
             // instead of appending to it.
             renaming.id = Some(id);
+            renaming.target = RenameTarget::Project;
             renaming.buffer.clear();
+        }
+        SidebarHit::Workspace(id) => {
+            if renaming.id.is_some() {
+                commit_rename(&mut projects, &mut renaming);
+            }
+            projects.switch_workspace(id);
+        }
+        SidebarHit::NewWorkspace => {
+            if renaming.id.is_some() {
+                commit_rename(&mut projects, &mut renaming);
+            }
+            let id = projects.create_workspace(None);
+            // Straight into rename, like "+ New Project": an unnamed
+            // workspace is much harder to tell apart than an unnamed
+            // project, because only its name distinguishes it.
+            renaming.id = Some(id);
+            renaming.target = RenameTarget::Workspace;
+            renaming.buffer.clear();
+        }
+        SidebarHit::WorkspaceName => {
+            // Double-click the header to rename the workspace. A single
+            // click does nothing: the header is not a target you should
+            // be able to disturb by brushing past the list.
+            let now = time.elapsed_secs_f64();
+            let is_double = tracker.last_workspace_name && now - tracker.last_time < 0.4;
+            tracker.last_project = None;
+            tracker.last_workspace_name = true;
+            tracker.last_time = now;
+            if is_double {
+                let current = projects.workspace_name().to_string();
+                renaming.id = Some(projects.active_workspace);
+                renaming.target = RenameTarget::Workspace;
+                renaming.buffer = current;
+            } else if renaming.id.is_some() {
+                commit_rename(&mut projects, &mut renaming);
+            }
         }
     }
 }
 
 fn commit_rename(projects: &mut Projects, renaming: &mut Renaming) {
     if let Some(id) = renaming.id.take() {
+        let target = renaming.target;
+        renaming.target = RenameTarget::Project;
         let mut name = std::mem::take(&mut renaming.buffer);
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -1497,7 +2193,10 @@ fn commit_rename(projects: &mut Projects, renaming: &mut Renaming) {
             projects.layout_dirty = true;
         } else {
             name = trimmed.to_string();
-            projects.rename(id, name);
+            match target {
+                RenameTarget::Project => projects.rename(id, name),
+                RenameTarget::Workspace => projects.rename_workspace(id, name),
+            }
         }
     }
 }
@@ -2446,6 +3145,23 @@ fn save_if_dirty(world: &mut World) {
         projects: projects.list.clone(),
         active: projects.active,
         next_id: projects.next_id,
+        // Fold the live active project back into the workspace holding
+        // it, so a save taken mid-session records where you actually
+        // are — `switch_workspace` only writes that on the way out.
+        workspaces: projects
+            .workspaces
+            .iter()
+            .map(|w| WorkspaceData {
+                active: if w.id == projects.active_workspace {
+                    projects.active
+                } else {
+                    w.active
+                },
+                ..w.clone()
+            })
+            .collect(),
+        active_workspace: Some(projects.active_workspace),
+        next_workspace_id: projects.next_workspace_id,
         sidebar_width: Some(sidebar_width),
         terminals: Vec::new(),
         panes,
@@ -2738,7 +3454,7 @@ fn reorder_visible(projects: &mut Projects, id: u64, target_slot: usize) -> bool
     let mut changed = false;
     loop {
         let order: Vec<usize> = (0..projects.list.len())
-            .filter(|&i| projects.show_hidden || !projects.list[i].hidden)
+            .filter(|&i| projects.show_hidden || !projects.is_hidden(projects.list[i].id))
             .collect();
         let Some(cur) = order.iter().position(|&i| projects.list[i].id == id) else {
             return changed;
@@ -2753,5 +3469,238 @@ fn reorder_visible(projects: &mut Projects, id: u64, target_slot: usize) -> bool
             projects.list.swap(order[cur], order[cur - 1]);
         }
         changed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Projects` with `n` projects and one workspace, as
+    /// `load_or_seed_projects` would leave it.
+    fn seeded(n: usize) -> Projects {
+        let mut p = Projects {
+            next_id: 1,
+            next_workspace_id: 1,
+            ..Default::default()
+        };
+        p.create_workspace(Some(DEFAULT_WORKSPACE_NAME.into()));
+        for _ in 0..n {
+            p.create();
+        }
+        p
+    }
+
+    /// Upgrading must not change what the sidebar shows. An old save has
+    /// no workspaces and carries its parked projects as per-project
+    /// flags; those flags ARE a sidebar configuration, just the only one
+    /// that existed.
+    ///
+    /// Goes through real JSON on purpose. Building `ProjectData` in Rust
+    /// tests the migration but not the field name it reads from, and
+    /// that is exactly what broke first: renaming the field to
+    /// `legacy_hidden` renamed the serde key with it, so every save
+    /// migrated to "nothing parked" while this test stayed green.
+    #[test]
+    fn an_old_save_migrates_its_hidden_flags_into_one_workspace() {
+        let raw = serde_json::json!({
+            "projects": [
+                { "id": 1, "name": "p1" },
+                { "id": 2, "name": "p2", "hidden": true },
+                { "id": 3, "name": "p3", "hidden": false },
+            ],
+            "active": 3,
+            "next_id": 4,
+        });
+        let persisted: PersistedState =
+            serde_json::from_value(raw).expect("an old save must still parse");
+        assert!(
+            persisted.projects[1].legacy_hidden,
+            "the on-disk key is `hidden`, whatever the Rust field is called"
+        );
+        let projects = Projects::from_persisted(persisted);
+        assert_eq!(projects.workspaces.len(), 1);
+        assert_eq!(projects.workspace_name(), DEFAULT_WORKSPACE_NAME);
+        assert!(projects.is_hidden(2), "the parked project stays parked");
+        assert!(!projects.is_hidden(1));
+        assert_eq!(projects.switchable_ids(), vec![1, 3]);
+        assert_eq!(projects.active, Some(3));
+    }
+
+    /// The point of the whole feature: the same project can be listed in
+    /// one workspace and tucked away in the next, without either
+    /// workspace's choice leaking into the other.
+    #[test]
+    fn parking_is_per_workspace() {
+        let mut p = seeded(3);
+        let first = p.active_workspace;
+        p.set_hidden(2, true);
+        let second = p.create_workspace(Some("Other".into()));
+
+        // A new workspace forks the current one, so it inherits the park.
+        assert!(p.is_hidden(2));
+        p.set_hidden(2, false);
+        p.set_hidden(3, true);
+        assert_eq!(p.switchable_ids(), vec![1, 2]);
+
+        p.switch_workspace(first);
+        assert!(p.is_hidden(2), "the first workspace kept its own parking");
+        assert!(!p.is_hidden(3), "and never saw the second one's");
+        assert_eq!(p.switchable_ids(), vec![1, 3]);
+
+        p.switch_workspace(second);
+        assert_eq!(p.switchable_ids(), vec![1, 2]);
+    }
+
+    /// Swiping away and back has to land where you were, or a workspace
+    /// is just a filter rather than a place.
+    #[test]
+    fn a_workspace_remembers_the_project_you_left_it_in() {
+        let mut p = seeded(3);
+        let first = p.active_workspace;
+        p.set_active(3);
+        let second = p.create_workspace(None);
+        p.set_active(1);
+
+        p.switch_workspace(first);
+        assert_eq!(p.active, Some(3));
+        p.switch_workspace(second);
+        assert_eq!(p.active, Some(1));
+    }
+
+    /// The active-is-switchable invariant has to survive a workspace
+    /// change too, where the SET of switchable projects moves under
+    /// `active` rather than the other way round.
+    #[test]
+    fn switching_re_homes_an_active_project_parked_over_there() {
+        let mut p = seeded(3);
+        let first = p.active_workspace;
+        p.set_active(3);
+        let second = p.create_workspace(None);
+        // Park the project the other workspace is sitting in.
+        p.set_hidden(3, true);
+        p.switch_workspace(first);
+        p.set_active(3);
+        p.switch_workspace(second);
+        assert_ne!(p.active, Some(3), "never land on a parked project");
+        assert_eq!(p.active, p.first_switchable());
+    }
+
+    /// A deleted project must not leave an id behind that would re-park
+    /// whatever project inherits it, or restore a ghost on a swipe back.
+    #[test]
+    fn deleting_a_project_sweeps_it_out_of_every_workspace() {
+        let mut p = seeded(2);
+        let first = p.active_workspace;
+        p.set_active(2);
+        p.create_workspace(None);
+        p.set_hidden(2, true);
+        p.switch_workspace(first);
+        p.delete(2);
+        assert!(p.workspaces.iter().all(|w| w.hidden.is_empty()));
+        assert!(p.workspaces.iter().all(|w| w.active != Some(2)));
+    }
+
+    /// A project made in one workspace should not turn up in all of
+    /// them; that would make the separation pointless within a session.
+    #[test]
+    fn a_new_project_is_listed_only_where_it_was_made() {
+        let mut p = seeded(1);
+        let first = p.active_workspace;
+        let second = p.create_workspace(None);
+        let made_here = p.create();
+        assert!(!p.is_hidden(made_here));
+        p.switch_workspace(first);
+        assert!(
+            p.is_hidden(made_here),
+            "parked in the workspace it wasn't made in"
+        );
+        p.switch_workspace(second);
+        assert!(!p.is_hidden(made_here));
+    }
+
+    /// Every hide decision in the app lives inside a workspace, so there
+    /// always has to be one to stand on.
+    #[test]
+    fn the_last_workspace_cannot_be_deleted() {
+        let mut p = seeded(1);
+        let only = p.active_workspace;
+        assert!(!p.delete_workspace(only));
+        let second = p.create_workspace(None);
+        assert!(p.delete_workspace(second));
+        assert_eq!(p.workspaces.len(), 1);
+        assert_eq!(p.active_workspace, only);
+    }
+
+    /// Swipes wrap: the strip is a ring, not a line with dead ends.
+    #[test]
+    fn cycling_wraps_in_both_directions() {
+        let mut p = seeded(1);
+        let a = p.active_workspace;
+        let b = p.create_workspace(None);
+        let c = p.create_workspace(None);
+        p.switch_workspace(a);
+        assert_eq!(p.cycle_workspace(-1), Some(c), "back from the first wraps");
+        assert_eq!(p.cycle_workspace(1), Some(a), "forward from the last wraps");
+        assert_eq!(p.cycle_workspace(1), Some(b));
+    }
+
+    /// With one workspace there is nowhere to swipe to, and a swipe that
+    /// silently "succeeded" would latch the gesture for no reason.
+    #[test]
+    fn cycling_a_lone_workspace_does_nothing() {
+        let mut p = seeded(1);
+        assert_eq!(p.cycle_workspace(1), None);
+    }
+
+    /// The strip is the only readout of where a swipe landed. Dropping
+    /// the bar you are standing on would make it lie.
+    #[test]
+    fn an_overflowing_strip_keeps_the_current_workspace_visible() {
+        let mut p = seeded(0);
+        p.create_workspace(Some("w0".into()));
+        for i in 1..12 {
+            p.create_workspace(Some(format!("w{i}")));
+        }
+        for &target in &p.workspaces.iter().map(|w| w.id).collect::<Vec<_>>() {
+            p.switch_workspace(target);
+            let strip = workspace_strip(&p, SIDEBAR_MIN_WIDTH);
+            assert!(
+                strip.bars.len() < p.workspaces.len(),
+                "this test is pointless unless the strip actually overflows"
+            );
+            assert!(
+                strip.bars.iter().any(|(id, _)| *id == target),
+                "the current workspace fell out of the strip"
+            );
+        }
+    }
+
+    /// Hit rects and sprites both come from `workspace_strip`, so the
+    /// only way they can disagree is if the strip runs off the sidebar.
+    #[test]
+    fn the_strip_stays_inside_the_sidebar() {
+        let mut p = seeded(0);
+        p.create_workspace(Some("one".into()));
+        for w in [SIDEBAR_MIN_WIDTH, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH] {
+            for _ in 0..4 {
+                p.create_workspace(None);
+                let strip = workspace_strip(&p, w);
+                for (_, b) in &strip.bars {
+                    assert!(b.min.x >= 0.0 && b.max.x <= w, "bar outside sidebar at {w}");
+                }
+                if let Some(add) = strip.add {
+                    assert!(add.max.x <= w, "+ outside sidebar at {w}");
+                }
+                assert!(strip.left >= 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_workspace_name_is_clipped_not_overflowed() {
+        assert_eq!(truncate_to_width("MAIN", 100.0, 8.0), "MAIN");
+        assert_eq!(truncate_to_width("WORKSPACE", 24.0, 8.0), "WO…");
+        assert_eq!(truncate_to_width("WORKSPACE", 4.0, 8.0), "");
     }
 }

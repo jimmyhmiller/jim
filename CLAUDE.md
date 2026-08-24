@@ -51,7 +51,11 @@ Wait for the script to confirm that Jim launched before reporting completion.
   `TerminalInitialCwd`/`TerminalDirtyHook` closure-resources to wire in
   project policy without `jim-terminal` depending on the shell.
 - `crates/jim-app` — the **Jim** application shell (binary `jim`).
-  Hosts the canvas, project-prism "cube", radial menu, projects,
+  Hosts the canvas, project-prism "cube", radial menu, projects
+  (+ sidebar **workspaces**: saved sidebar configurations, swiped
+  between with two fingers over the sidebar — every project exists in
+  every workspace, a workspace only remembers which are parked and
+  which one you were last in; `jimctl workspace`),
   suggestion drawer, inbox, command palette, IPC socket, and
   run-button infrastructure. `AppShellPlugin` adds
   `jim_terminal::TerminalPlugin` plus all shell plugins, and keeps the

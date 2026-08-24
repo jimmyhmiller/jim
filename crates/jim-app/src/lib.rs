@@ -440,6 +440,31 @@ impl Plugin for AppShellPlugin {
             default_keys: const { &[KeyChord::cmd(KeyCode::Digit0)] },
             run: ActionRun::Custom(|ctx| canvas::zoom_reset_active(ctx.world)),
         })
+        // The swipe is the primary way to change workspace, but a
+        // gesture is unbindable and unscriptable — these give the same
+        // move a palette entry and a key.
+        .add_action(Action {
+            id: "workspace.next",
+            title: "Next Workspace",
+            category: "View",
+            keywords: &["sidebar", "space", "profile", "swipe"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(|ctx| {
+                ctx.world.resource_mut::<Projects>().cycle_workspace(1);
+            }),
+        })
+        .add_action(Action {
+            id: "workspace.prev",
+            title: "Previous Workspace",
+            category: "View",
+            keywords: &["sidebar", "space", "profile", "swipe"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(|ctx| {
+                ctx.world.resource_mut::<Projects>().cycle_workspace(-1);
+            }),
+        })
         .add_action(Action {
             id: "keybinds.reload",
             title: "Reload Keybindings",
@@ -1173,6 +1198,111 @@ fn drain_ipc_open_requests(
                     continue;
                 };
                 pending.move_panes.push((src_id, dest_id, kind, titles));
+            }
+            ipc::IpcRequest::Workspace {
+                op,
+                name,
+                to,
+                project,
+            } => {
+                use std::io::Write as _;
+                // Resolve the workspace this op is about: the named one,
+                // or the current one.
+                let target = match name.as_deref() {
+                    None => Some(projects.active_workspace),
+                    Some(n) => projects.workspace_id_by_name(n),
+                };
+                match op.as_str() {
+                    "list" => {
+                        let current = projects.active_workspace;
+                        let entries: Vec<Value> = projects
+                            .workspaces
+                            .iter()
+                            .map(|w| {
+                                let shown: Vec<&str> = projects
+                                    .list
+                                    .iter()
+                                    .filter(|p| !w.hidden.contains(&p.id))
+                                    .map(|p| p.name.as_str())
+                                    .collect();
+                                serde_json::json!({
+                                    "id": w.id,
+                                    "name": w.name,
+                                    "current": w.id == current,
+                                    "projects": shown,
+                                })
+                            })
+                            .collect();
+                        let body = serde_json::json!({ "workspaces": entries });
+                        match serde_json::to_vec(&body) {
+                            Ok(bytes) => {
+                                if let Err(e) = _stream.write_all(&bytes) {
+                                    eprintln!("[ipc] workspace list: write: {e}");
+                                }
+                                let _ = _stream.shutdown(std::net::Shutdown::Write);
+                            }
+                            Err(e) => eprintln!("[ipc] workspace list: serialize: {e}"),
+                        }
+                    }
+                    "new" => {
+                        let id = projects.create_workspace(to.clone());
+                        eprintln!("[ipc] workspace new: {id} {:?}", projects.workspace_name());
+                    }
+                    "switch" => match target {
+                        Some(id) => projects.switch_workspace(id),
+                        None => eprintln!("[ipc] workspace switch: no workspace named {name:?}"),
+                    },
+                    "next" => {
+                        projects.cycle_workspace(1);
+                    }
+                    "prev" => {
+                        projects.cycle_workspace(-1);
+                    }
+                    "rename" => match (target, to) {
+                        (Some(id), Some(new_name)) => projects.rename_workspace(id, new_name),
+                        (None, _) => {
+                            eprintln!("[ipc] workspace rename: no workspace named {name:?}")
+                        }
+                        (_, None) => eprintln!("[ipc] workspace rename: --to is required"),
+                    },
+                    "rm" => match target {
+                        Some(id) if projects.delete_workspace(id) => {}
+                        Some(_) => eprintln!(
+                            "[ipc] workspace rm: refusing to delete the last workspace \
+                             (every hide decision lives in one)"
+                        ),
+                        None => eprintln!("[ipc] workspace rm: no workspace named {name:?}"),
+                    },
+                    // `show` / `hide` park a project. They apply to the
+                    // NAMED workspace, which means switching there first:
+                    // parking is stored per-workspace and `set_hidden`
+                    // only ever touches the current one, so writing into
+                    // another would need a second, divergent code path.
+                    "show" | "hide" => {
+                        let Some(project_name) = project.as_deref() else {
+                            eprintln!("[ipc] workspace {op}: --project is required");
+                            continue;
+                        };
+                        let Some(pid) = projects
+                            .list
+                            .iter()
+                            .find(|p| p.name.eq_ignore_ascii_case(project_name))
+                            .map(|p| p.id)
+                        else {
+                            eprintln!("[ipc] workspace {op}: no project named {project_name:?}");
+                            continue;
+                        };
+                        let Some(ws) = target else {
+                            eprintln!("[ipc] workspace {op}: no workspace named {name:?}");
+                            continue;
+                        };
+                        let restore = projects.active_workspace;
+                        projects.switch_workspace(ws);
+                        projects.set_hidden(pid, op == "hide");
+                        projects.switch_workspace(restore);
+                    }
+                    other => eprintln!("[ipc] workspace: unknown op {other:?}"),
+                }
             }
             ipc::IpcRequest::SetPaneGroup {
                 project,
