@@ -724,8 +724,10 @@ fn spawn_picture(
         visible.len()
     );
 
-    // Layer 0: canvas background, sidebar, and every pane's chrome — the
-    // camera the window has at order 0, aimed at the image instead.
+    // Global chrome plus the sidebar. The sidebar gained its own clipped
+    // render layer when workspaces were added, so a recursive picture must
+    // explicitly photograph both layers (the normal window uses two
+    // cameras for the same composition).
     commands.spawn((
         Camera2d,
         Camera {
@@ -733,7 +735,7 @@ fn spawn_picture(
             ..default()
         },
         scene.clone(),
-        RenderLayers::layer(0),
+        RenderLayers::from_layers(&[0, crate::projects::SIDEBAR_LAYER]),
         bevy::render::view::Msaa::Off,
         PictureCamera,
         Name::new("slide-picture:chrome"),
@@ -855,6 +857,15 @@ mod tests {
         assert!(BLIT_LAYER >= 64, "below 64 the const ctor would be fine");
         let layers = RenderLayers::from_layers(&[BLIT_LAYER]);
         assert!(layers.intersects(&RenderLayers::from_layers(&[BLIT_LAYER])));
+    }
+
+    #[test]
+    fn recursive_picture_includes_the_workspace_sidebar_layer() {
+        let layers = RenderLayers::from_layers(&[0, crate::projects::SIDEBAR_LAYER]);
+        assert!(layers.intersects(&RenderLayers::layer(0)));
+        assert!(layers.intersects(&RenderLayers::from_layers(&[
+            crate::projects::SIDEBAR_LAYER,
+        ])));
     }
 
     /// The private cameras must never collide with the window's, and the

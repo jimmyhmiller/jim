@@ -16,10 +16,10 @@
 //!   picked decks in other projects, including hidden ones. Once a show is
 //!   running there is exactly one deck to stop, so F5 ends it from
 //!   anywhere, whatever holds focus.
-//! - `present.next` / `present.prev` (⌘⇧→ / ⌘⇧←) — advance from ANYWHERE,
-//!   including while a live terminal on the slide has the keyboard. That
-//!   is the whole reason for a chord: a slide can embed real panes, and
-//!   demoing them must not cost you the ability to advance.
+//! - `present.next` / `present.prev` (⌘⇧→ / ⌘⇧←) — advance the presenting
+//!   deck from anywhere, or the focused deck when it is still an ordinary
+//!   pane. That is the whole reason for a chord: the same controls work
+//!   before, during, and after full-screen presentation.
 //!
 //! Escape is deliberately NOT a presentation key. It belongs to whatever
 //! you are demoing — leaving insert mode in vim must not end your talk.
@@ -263,25 +263,31 @@ fn toggle_presentation(ctx: &mut ActionCtx) {
     }
 }
 
-/// Send a navigation key straight to the presenting deck's worker,
-/// bypassing focus entirely.
+/// Send a navigation key to the full-screen deck, or to the focused deck
+/// when it is still an ordinary pane. A running presentation wins over
+/// focus because a live slide may deliberately focus an embedded terminal.
 fn nav(ctx: &mut ActionCtx, key: &str) {
-    let Some(deck) = ctx.world.resource::<Presentation>().deck else {
-        warn!("[navdbg] {key}: no presenting deck");
+    let presenting = ctx.world.resource::<Presentation>().deck;
+    let focused = ctx.world.resource::<jim_pane::FocusedPane>().0;
+    let deck = nav_deck(presenting, focused, |entity| is_deck(ctx.world, entity));
+    let Some(deck) = deck else {
+        info!("[present] {key}: no presenting or focused deck");
         return;
     };
-    warn!(
-        "[navdbg] {key} -> deck {deck:?} (widget: {})",
-        ctx.world
-            .get::<jim_widget::script_widget::ScriptWidget>(deck)
-            .is_some()
-    );
     if let Some(widget) = ctx
         .world
         .get::<jim_widget::script_widget::ScriptWidget>(deck)
     {
         widget.send_key(key);
     }
+}
+
+fn nav_deck(
+    presenting: Option<Entity>,
+    focused: Option<Entity>,
+    is_deck: impl Fn(Entity) -> bool,
+) -> Option<Entity> {
+    presenting.or_else(|| focused.filter(|entity| is_deck(*entity)))
 }
 
 /// Keys that only apply while the DECK ITSELF holds focus: Space and
@@ -565,5 +571,25 @@ mod tests {
                 action.id
             );
         }
+    }
+
+    #[test]
+    fn navigation_uses_a_focused_deck_outside_full_screen() {
+        let focused = deck(7);
+        assert_eq!(
+            nav_deck(None, Some(focused), |e| e == focused),
+            Some(focused)
+        );
+        assert_eq!(nav_deck(None, Some(focused), |_| false), None);
+    }
+
+    #[test]
+    fn presenting_deck_wins_over_focus() {
+        let presenting = deck(3);
+        let focused = deck(7);
+        assert_eq!(
+            nav_deck(Some(presenting), Some(focused), |e| e == focused),
+            Some(presenting)
+        );
     }
 }

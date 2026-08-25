@@ -288,13 +288,32 @@ extern fn write_file(path, text)
 /// line consisting only of markers therefore becomes an empty run list,
 /// which still occupies a line so blank-line spacing survives.
 fn md_parse_to_json(text: &str) -> Json {
-    use markdown_core::{BlockKind, RunKind};
+    use markdown_core::BlockKind;
 
     let doc = markdown_core::parse(text);
     let blocks: Vec<Json> = doc
         .blocks
         .iter()
         .map(|b| {
+            // A standalone Markdown image is a layout block, not styled
+            // prose. markdown-core intentionally models editable text and
+            // therefore exposes it as a paragraph; recognize the compact
+            // CommonMark form here, at the widget boundary where an actual
+            // `Element::Image` exists.
+            let source: String = text
+                .chars()
+                .skip(b.src.start)
+                .take(b.src.end.saturating_sub(b.src.start))
+                .collect();
+            if b.kind == BlockKind::Paragraph {
+                if let Some((alt, path)) = standalone_markdown_image(&source) {
+                    return serde_json::json!({
+                        "kind": "image",
+                        "alt": alt,
+                        "path": path,
+                    });
+                }
+            }
             let (kind, level, ordered) = match b.kind {
                 BlockKind::Paragraph => ("paragraph", None, None),
                 BlockKind::Blank => ("blank", None, None),
@@ -344,6 +363,19 @@ fn md_parse_to_json(text: &str) -> Json {
         })
         .collect();
     Json::Array(blocks)
+}
+
+/// Parse `![alt](path)` when it occupies the whole block. Whitespace just
+/// inside the destination is ignored (browsers/CommonMark authors commonly
+/// tolerate it), which also makes pasted paths less fragile.
+fn standalone_markdown_image(source: &str) -> Option<(&str, &str)> {
+    let source = source.trim();
+    let rest = source.strip_prefix("![")?;
+    let alt_end = rest.find("](")?;
+    let alt = &rest[..alt_end];
+    let destination = &rest[alt_end + 2..];
+    let path = destination.strip_suffix(')')?.trim();
+    (!path.is_empty()).then_some((alt, path))
 }
 
 /// Expand a leading `~` / `~/` to the user's home dir for the filesystem
@@ -1805,6 +1837,25 @@ mod tests {
         assert_eq!(item["ordered"], false);
         let code = by_kind("code-block").expect("code block");
         assert_eq!(code["lang"], "rust");
+    }
+
+    #[test]
+    fn md_parse_turns_a_standalone_image_into_an_image_block() {
+        let parsed = md_parse_to_json("![editor](/tmp/editor-intro.webp )");
+        assert_eq!(
+            parsed,
+            serde_json::json!([{
+                "kind": "image",
+                "alt": "editor",
+                "path": "/tmp/editor-intro.webp",
+            }])
+        );
+    }
+
+    #[test]
+    fn image_syntax_inside_prose_stays_prose() {
+        let parsed = md_parse_to_json("Look at ![editor](/tmp/editor.webp) now");
+        assert_eq!(parsed[0]["kind"], "paragraph");
     }
 
     /// Evaluate the shipped `glaze_demo.ft` against the shipped

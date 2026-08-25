@@ -20,8 +20,8 @@ schemars = "0.8"
 # pid-liveness for the agent-roster staleness sweep (msgbus.rs).
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
-# PNG/JPEG decoding for widget sprite paths.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# PNG/JPEG/WebP decoding for widget sprite paths.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Layout engine — same one bevy_ui uses. Provides flexbox + grid +
 # block layout. We feed it the Element tree, get back computed
 # (x, y, width, height) per node, and render from those.

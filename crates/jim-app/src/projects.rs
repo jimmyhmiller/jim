@@ -851,6 +851,19 @@ impl Projects {
         self.switch_workspace_toward(id, delta);
         Some(id)
     }
+
+    /// Step along the workspace strip without wrapping. Sidebar swipes use
+    /// this so pushing past either physical end leaves the current workspace
+    /// in place.
+    fn swipe_workspace(&mut self, delta: i32) -> Option<u64> {
+        let next = self.workspace_index() as i32 + delta;
+        if next < 0 || next >= self.workspaces.len() as i32 {
+            return None;
+        }
+        let id = self.workspaces[next as usize].id;
+        self.switch_workspace_toward(id, delta);
+        Some(id)
+    }
     pub fn name_of(&self, id: u64) -> Option<&str> {
         self.list
             .iter()
@@ -1397,6 +1410,14 @@ struct SidebarSwipe {
     /// before the first one. A wall-clock stamp rather than a per-frame
     /// accumulator — see [`SWIPE_IDLE_SECS`].
     last_event: Option<f64>,
+    /// Magnitude of the last horizontal wheel burst. Used to distinguish
+    /// a fresh same-direction finger stroke from decaying momentum.
+    last_dx_abs: f32,
+    /// Consecutive, clearly shrinking bursts after a workspace switch.
+    decay_bursts: u8,
+    /// Once momentum is visibly decaying, a sharp increase means fingers
+    /// touched down for another swipe, even in the same direction.
+    tail_armed: bool,
 }
 
 impl SidebarSwipe {
@@ -1405,6 +1426,9 @@ impl SidebarSwipe {
         self.accum_y = 0.0;
         self.fired = false;
         self.axis = GestureAxis::Undecided;
+        self.last_dx_abs = 0.0;
+        self.decay_bursts = 0;
+        self.tail_armed = false;
     }
 
     /// Commit to an axis once the gesture has moved far enough to mean
@@ -1441,6 +1465,30 @@ impl SidebarSwipe {
     /// and never the tail of the old one.
     fn is_reversal(&self, dx: f32) -> bool {
         dx != 0.0 && self.accum != 0.0 && dx.signum() != self.accum.signum()
+    }
+
+    fn is_same_direction_restart(&self, dx: f32) -> bool {
+        const RESTART_MIN_PX: f32 = 3.0;
+        const RESTART_RATIO: f32 = 1.8;
+        self.fired
+            && self.tail_armed
+            && dx.abs() >= RESTART_MIN_PX
+            && dx.abs() >= self.last_dx_abs * RESTART_RATIO
+    }
+
+    fn observe_horizontal_burst(&mut self, dx: f32) {
+        let magnitude = dx.abs();
+        if self.fired {
+            // Two substantial drops distinguish the momentum tail from the
+            // acceleration at the beginning of one flick.
+            if magnitude < self.last_dx_abs * 0.85 {
+                self.decay_bursts = self.decay_bursts.saturating_add(1);
+                self.tail_armed |= self.decay_bursts >= 2;
+            } else if magnitude > self.last_dx_abs * 1.15 && !self.tail_armed {
+                self.decay_bursts = 0;
+            }
+        }
+        self.last_dx_abs = magnitude;
     }
 }
 
@@ -1507,10 +1555,10 @@ fn sidebar_wheel(
     let quiet = swipe.last_event.is_none_or(|t| now - t > SWIPE_IDLE_SECS);
     swipe.last_event = Some(now);
 
-    // Two things end a gesture and start the next one: a quiet gap, or a
-    // reversal (see `is_reversal` — the reversal is what survives
-    // momentum).
-    if quiet || swipe.is_reversal(dx) {
+    // A direction reversal is unambiguous. For repeated swipes in the same
+    // direction, a new finger stroke shows up as a sharp rebound after the
+    // old stroke's momentum has begun decaying.
+    if quiet || swipe.is_reversal(dx) || swipe.is_same_direction_restart(dx) {
         swipe.begin();
     }
 
@@ -1522,6 +1570,7 @@ fn sidebar_wheel(
     }
     swipe.accum += dx;
     swipe.accum_y += dy;
+    swipe.observe_horizontal_burst(dx);
 
     match swipe.decide_axis() {
         GestureAxis::Undecided => {}
@@ -1546,7 +1595,7 @@ fn sidebar_wheel(
             // canvas pan reads as "show me what's to the left" — so that
             // goes back a workspace.
             let delta = if swipe.accum > 0.0 { -1 } else { 1 };
-            if projects.cycle_workspace(delta).is_some() {
+            if projects.swipe_workspace(delta).is_some() {
                 swipe.fired = true;
             }
         }
@@ -4377,7 +4426,7 @@ mod tests {
         assert_eq!(p.active_workspace, only);
     }
 
-    /// Swipes wrap: the strip is a ring, not a line with dead ends.
+    /// Explicit next/previous commands retain their ring behavior.
     #[test]
     fn cycling_wraps_in_both_directions() {
         let mut p = seeded(1);
@@ -4388,6 +4437,20 @@ mod tests {
         assert_eq!(p.cycle_workspace(-1), Some(c), "back from the first wraps");
         assert_eq!(p.cycle_workspace(1), Some(a), "forward from the last wraps");
         assert_eq!(p.cycle_workspace(1), Some(b));
+    }
+
+    #[test]
+    fn swiping_stops_at_both_ends_of_the_strip() {
+        let mut p = seeded(1);
+        let first = p.active_workspace;
+        let second = p.create_workspace(None);
+
+        p.switch_workspace(first);
+        assert_eq!(p.swipe_workspace(-1), None);
+        assert_eq!(p.active_workspace, first);
+        assert_eq!(p.swipe_workspace(1), Some(second));
+        assert_eq!(p.swipe_workspace(1), None);
+        assert_eq!(p.active_workspace, second);
     }
 
     /// With one workspace there is nowhere to swipe to, and a swipe that
@@ -4473,6 +4536,44 @@ mod tests {
             !swipe.is_reversal(12.0),
             "a fresh gesture has no direction to contradict yet"
         );
+    }
+
+    #[test]
+    fn a_new_same_direction_stroke_ends_the_momentum_gesture() {
+        let mut swipe = SidebarSwipe {
+            accum: -SWIPE_THRESHOLD_PX - 10.0,
+            fired: true,
+            last_dx_abs: 16.0,
+            ..Default::default()
+        };
+
+        swipe.observe_horizontal_burst(-10.0);
+        assert!(!swipe.tail_armed);
+        swipe.observe_horizontal_burst(-6.0);
+        assert!(swipe.tail_armed, "two decaying bursts arm a new stroke");
+        assert!(
+            !swipe.is_same_direction_restart(-9.0),
+            "small momentum variation must stay in the old gesture"
+        );
+        assert!(
+            swipe.is_same_direction_restart(-12.0),
+            "a strong same-direction rebound is a fresh swipe"
+        );
+    }
+
+    #[test]
+    fn acceleration_within_one_flick_does_not_restart_it() {
+        let mut swipe = SidebarSwipe {
+            accum: -SWIPE_THRESHOLD_PX - 10.0,
+            fired: true,
+            last_dx_abs: 4.0,
+            ..Default::default()
+        };
+        for dx in [-7.0, -12.0, -18.0, -15.0] {
+            assert!(!swipe.is_same_direction_restart(dx));
+            swipe.observe_horizontal_burst(dx);
+        }
+        assert!(!swipe.tail_armed);
     }
 
     /// A slide has to know which way to travel, and cycling off the end

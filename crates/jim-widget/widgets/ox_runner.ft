@@ -15,7 +15,7 @@ import { rget } from "git"
 let ox_host = "computer.jimmyhmiller.com"
 let ox_bin = "/home/jimmyhmiller/ox-runner/bin/ox"
 // Snapshot schema this widget needs; see SCHEMA in ox-snapshot.py.
-let wanted_schema = 2
+let wanted_schema = 3
 
 
 fn init_state() = {
@@ -274,17 +274,24 @@ fn count_chip(label, n, color) = {
 }
 
 fn inflight_card(r) = {
-    kind: "vstack", gap: 2.0, pad: 8.0, children: [
+    let retrying = rget(r, "phase", "running") == "retrying"
+    { kind: "vstack", gap: 2.0, pad: 8.0, children: [
         { kind: "hstack", gap: 8.0, align: "center", children: [
-            { kind: "text", value: "▶", size: 12.0, color: "#7fb0e0" },
+            { kind: "text", value: if retrying { "↻" } else { "▶" },
+              size: 12.0, color: if retrying { "#e0b066" } else { "#7fb0e0" } },
             { kind: "text", value: rget(r, "repo", "?"), size: 12.0,
               weight: "bold", color: col_text() },
+            { kind: "text", value: if retrying { "retrying" } else { "running" },
+              size: 10.0, weight: "bold",
+              color: if retrying { "#e0b066" } else { "#7fb0e0" } },
+            { kind: "text", value: "attempt " + str(rget(r, "attempt", 1)),
+              size: 10.0, color: col_muted() },
             { kind: "text", value: dur(rget(r, "elapsed", 0)), size: 11.0,
               color: col_muted() },
         ]},
         { kind: "text", value: rget(r, "title", ""), size: 11.0, color: col_text() },
         { kind: "text", value: rget(r, "last", ""), size: 10.0, color: col_muted() },
-    ]
+    ]}
 }
 
 fn recent_row(r) {

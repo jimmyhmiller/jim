@@ -368,6 +368,11 @@ fn render_block(block, scale) {
     let body = sz("size_body", scale)
     let fg = glaze_token("fg")
 
+    if kind == "image" {
+        return { kind: "image", path: block.path, fit: "contain",
+                 style: { width: "100%", height: "100%", flex_grow: 1.0,
+                          flex_shrink: 1.0 } }
+    }
     if kind == "thematic-break" { return { kind: "divider" } }
     if kind == "heading" {
         let size = heading_size(block.level, scale)
@@ -522,7 +527,14 @@ fn render(w, h) {
     // draws exactly like any other one — a blank pane sitting on the canvas
     // during the demo was the old model leaking through.
 
-    let content = { kind: "vstack", gap: 0.0, children: kids }
+    // A lone image is the slide body, so give its stack the whole available
+    // content area. `fit: contain` then chooses the largest rectangle with
+    // the source aspect ratio. In a mixed slide images stay in normal flow.
+    let image_only = len(blocks) == 1 and blocks[0].kind == "image"
+    let content = { kind: "vstack", gap: 0.0,
+                    style: if image_only { { width: "100%", height: "100%",
+                                             flex_grow: 1.0 } } else { {} },
+                    children: kids }
     let padded = { ..base, padding: edges(h * pad_y_frac(), w * pad_x_frac(),
                                           h * pad_b_frac(), w * pad_x_frac()) }
 
