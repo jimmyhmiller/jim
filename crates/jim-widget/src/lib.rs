@@ -56,6 +56,7 @@ use serde_json::Value;
 pub mod anim;
 pub mod audio;
 pub mod button_material;
+pub mod fsops;
 pub mod funct_widget;
 pub(crate) mod glaze_host;
 pub mod glaze_material;
@@ -283,6 +284,17 @@ pub struct HoverWash {
     pub color: Color,
     /// Pre-resolved corner radius (theme `radius_sm`).
     pub radius: f32,
+    /// The row is already selected, so it must NOT get a hover wash: a
+    /// selected row paints its own background at `z + 0.001`, the exact
+    /// depth the wash would use, and two sprites at one depth z-fight —
+    /// the row flickers between the two states as you hover it. A
+    /// selected row simply stays selected.
+    ///
+    /// It still belongs in this list even though nothing paints it:
+    /// `update_widget_hover` uses membership to decide that a row needs
+    /// no re-render on hover. Dropping it here instead would make every
+    /// hover of a selected row re-render the pane and flash its text.
+    pub selected: bool,
 }
 
 /// A nested `Element::Canvas` occurrence collected during a flow render.
@@ -1039,6 +1051,7 @@ fn render_select_overlay(
         content_size: Vec2::new(menu_w, menu_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
+        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -1393,6 +1406,7 @@ fn render_dialog_overlay(
             content_size: Vec2::new(win_w, win_h),
             palette: render::WidgetPalette::from_theme(&theme),
             theme: theme.clone(),
+            ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
             fonts: fonts.clone(),
             focused_input: None,
             caret_visible: false,
@@ -1438,6 +1452,7 @@ fn render_dialog_overlay(
         content_size: Vec2::new(panel_w, win_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
+        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -1685,6 +1700,7 @@ fn render_popover_overlay(
         content_size: Vec2::new(width, win_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
+        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -1923,6 +1939,7 @@ fn render_toast_overlay(
             content_size: Vec2::new(toast_w, th),
             palette: render::WidgetPalette::from_theme(&theme),
             theme: theme.clone(),
+            ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
             fonts: fonts.clone(),
             focused_input: None,
             caret_visible: false,
@@ -2197,6 +2214,7 @@ fn render_tooltip_overlay(
         content_size: Vec2::new(bubble_w, bubble_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
+        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -2470,6 +2488,9 @@ fn update_widget_hover(
             Option<&mut WidgetRender>,
             Option<&mut script_widget::ScriptWidget>,
             Option<&WidgetScroll>,
+            // A DOCKED pane has a slim header instead of the full
+            // TITLE_H, which moves its content origin — see below.
+            Option<&jim_pane::PaneChromeOverride>,
         ),
         With<jim_pane::PaneTag>,
     >,
@@ -2500,7 +2521,7 @@ fn update_widget_hover(
 
     let mut want_pointer = false;
     let mut want_text = false;
-    for (pane, kind, mut hover, render_state, sw, scroll) in &mut widgets {
+    for (pane, kind, mut hover, render_state, sw, scroll, chrome_ov) in &mut widgets {
         let is_widget_kind = kind.0 == PANE_KIND || kind.0 == script_widget::PANE_KIND;
         if !is_widget_kind {
             continue;
@@ -2514,7 +2535,16 @@ fn update_widget_hover(
                 // Click rects are content-local (unscrolled); add the scroll
                 // offset to the cursor so hover matches the visible target —
                 // same correction the press handler applies.
-                let local = jim_pane::pt_to_content_local(pt, &rect) + Vec2::new(0.0, scroll_y);
+                //
+                // The title height must be the pane's ACTUAL one. A docked
+                // pane has a slim header, so assuming the full `TITLE_H`
+                // puts the content origin too low and every hover lands on
+                // the row above the cursor. Presses already went through
+                // `PaneContentPressed`, which accounts for the override —
+                // which is why clicking was right while hovering was not.
+                let title_h = jim_pane::override_title_h(chrome_ov);
+                let local =
+                    jim_pane::pt_to_content_local_th(pt, &rect, title_h) + Vec2::new(0.0, scroll_y);
                 if let Ok(t) = targets.get(pane) {
                     // An I-beam over an embedded editor portal. Presses there
                     // are owned by the real editor (not a click target), so the
@@ -2562,24 +2592,33 @@ fn update_widget_hover(
             if let Some(prev) = hover.hover_overlay.take() {
                 commands.entity(prev).try_despawn();
             }
-            let wash = new_id.as_deref().and_then(|id| {
-                pane_targets.and_then(|t| t.hover_washes.iter().find(|w| w.id == id))
-            });
+            let wash = new_id
+                .as_deref()
+                .and_then(|id| {
+                    pane_targets.and_then(|t| t.hover_washes.iter().find(|w| w.id == id))
+                })
+                .filter(|w| !w.selected);
             if let (Some(w), Ok(chrome)) = (wash, chromes.get(pane)) {
-                if let Some(ent) = crate::render::paint_rounded_panel_root(
-                    &mut commands,
-                    chrome.content_root,
-                    w.rect.min,
-                    w.rect.size(),
-                    w.radius,
-                    w.color,
-                    Color::srgba(0.0, 0.0, 0.0, 0.0),
-                    0.0,
-                    Color::srgba(0.0, 0.0, 0.0, 0.0),
-                    0.0,
-                    0.0,
-                    w.z + 0.001,
-                ) {
+                // A plain blended Sprite, NOT an SDF panel: the wash sits ON
+                // TOP of the row's own fills, so it must genuinely blend —
+                // the SDF material now renders opaque and flattens against a
+                // ground color, which would erase whatever the wash covers.
+                // Sprites blend reliably through per-pane cameras (unlike
+                // blend-mode Mesh2d). Square corners; at wash radii the
+                // difference is invisible.
+                {
+                    let ent = commands
+                        .spawn((
+                            ChildOf(chrome.content_root),
+                            Sprite {
+                                color: w.color,
+                                custom_size: Some(w.rect.size()),
+                                ..default()
+                            },
+                            Anchor::TOP_LEFT,
+                            Transform::from_xyz(w.rect.min.x, -w.rect.min.y, w.z + 0.001),
+                        ))
+                        .id();
                     // Stamp the pane's render layer up front so the wash never
                     // leaks onto the main camera for a frame before
                     // `propagate_render_layers` catches it.
@@ -2782,21 +2821,36 @@ fn apply_widget_scroll(
             &WidgetScroll,
             &jim_pane::PaneChrome,
             &jim_pane::PaneKindMarker,
+            Option<&jim_pane::PaneChromeOverride>,
         ),
         (
             With<jim_pane::PaneTag>,
-            Or<(Changed<WidgetScroll>, Changed<jim_pane::PaneChrome>)>,
+            Or<(
+                Changed<WidgetScroll>,
+                Changed<jim_pane::PaneChrome>,
+                Changed<jim_pane::PaneChromeOverride>,
+            )>,
         ),
     >,
     mut t_q: Query<&mut Transform>,
 ) {
-    use jim_pane::{MARGIN, TITLE_H};
-    for (scroll, chrome, kind) in &widgets {
+    use jim_pane::MARGIN;
+    for (scroll, chrome, kind, chrome_ov) in &widgets {
         if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             continue;
         }
         if let Ok(mut t) = t_q.get_mut(chrome.content_root) {
-            let want = -(TITLE_H + MARGIN) + scroll.y;
+            // The pane's ACTUAL title height, not `TITLE_H`. A docked
+            // pane has a slim header, and `sync_chrome_override_geometry`
+            // already places content_root by the override — hardcoding
+            // `TITLE_H` here meant these two systems fought over the same
+            // transform, and whichever ran last won. That left a docked
+            // widget's content sitting at one of two different offsets
+            // depending on the last thing that changed, which is why
+            // hover on a docked list was intermittently a row off: the
+            // hit-test and the render disagreed about where the content
+            // starts.
+            let want = -(jim_pane::override_title_h(chrome_ov) + MARGIN) + scroll.y;
             if t.translation.y != want {
                 t.translation.y = want;
             }
@@ -2910,6 +2964,7 @@ fn clip_widget_sprites(
         Option<&WidgetContentRoot>,
         Option<&jim_pane::PaneChrome>,
         Option<&WidgetScroll>,
+        Option<&jim_pane::PaneChromeOverride>,
     )>,
     changed_panes: Query<(), (With<PaneKindMarker>, Changed<PaneRect>)>,
     scrolled_panes: Query<(), (With<PaneKindMarker>, Changed<WidgetScroll>)>,
@@ -2940,7 +2995,7 @@ fn clip_widget_sprites(
     if changed_panes.is_empty() && !new_content && scrolled_panes.is_empty() {
         return;
     }
-    for (kind, rect, wcr, chrome, scroll) in &panes {
+    for (kind, rect, wcr, chrome, scroll, chrome_ov) in &panes {
         if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             continue;
         }
@@ -2949,7 +3004,11 @@ fn clip_widget_sprites(
         };
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
         let content_w = (rect.size.x - 2.0 * MARGIN).max(0.0);
-        let content_h = (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0);
+        // The pane's real header height — a docked pane's is slim, and
+        // assuming `TITLE_H` makes its content box short by the
+        // difference.
+        let content_h =
+            (rect.size.y - jim_pane::override_title_h(chrome_ov) - 2.0 * MARGIN).max(0.0);
 
         // Walk subtree depth-first. `offset` accumulates Bevy local
         // translations from `content_root` outward: x is right, y is up
@@ -3406,6 +3465,7 @@ fn rerender_widgets(
     themes: Res<jim_style::ProjectThemes>,
     fonts: Res<jim_style::FontRegistry>,
     time: Res<Time>,
+    mut theme_events: MessageReader<jim_style::ThemeChanged>,
     _pane_zoom: Res<jim_pane::PaneZoom>,
     mut clip_dirty: ResMut<WidgetClipDirty>,
     mut anim_store: ResMut<anim::WidgetAnim>,
@@ -3427,8 +3487,12 @@ fn rerender_widgets(
 ) {
     // Per-project theming: each widget renders in its OWN project's theme
     // (so the cube overview shows every project faithfully), falling back
-    // to the global/active theme when its project isn't cached.
-    let theme_changed = theme.is_changed() || themes.is_changed();
+    // to the global/active theme when its project isn't cached. Also
+    // trigger on the `ThemeChanged` MESSAGE — the style-picker /
+    // `set_active_style` path doesn't reliably fire `Res::is_changed`
+    // (see `forward_inputs_to_workers`).
+    let theme_changed =
+        theme_events.read().last().is_some() || theme.is_changed() || themes.is_changed();
     // Caret blink: visible during the first half of each 1s cycle.
     let blink_phase = time.elapsed_secs().rem_euclid(1.0);
     let caret_visible = blink_phase < 0.5;
@@ -3539,6 +3603,7 @@ fn rerender_widgets(
                 content_size,
                 palette: palette.clone(),
                 theme: w_theme.clone(),
+                ground: Color::LinearRgba(w_theme.color(jim_style::tokens::PANE_BG)),
                 fonts: fonts.clone(),
                 focused_input: input_focus.cloned(),
                 caret_visible,

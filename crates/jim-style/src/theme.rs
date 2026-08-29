@@ -177,20 +177,9 @@ pub mod tokens {
     pub const ERR: TokenId = TokenId("err");
     pub const FONT_SIZE: TokenId = TokenId("font_size");
     pub const LINE_HEIGHT_RATIO: TokenId = TokenId("line_height_ratio");
-    /// Wipe-mask tuning: minimum dust_seconds for mouse motion to
-    /// register as a wipe stroke. Below this the mask is not painted
-    /// (i.e. "no visible dust to wipe yet"). Default ~10 min.
-    pub const WIPE_DUST_GATE_SECS: TokenId = TokenId("wipe_dust_gate_secs");
-    /// Wipe-mask tuning: brush radius in mask pixels (the mask is
-    /// 1024×1024 UV-mapped over the canvas, so this is also roughly
-    /// "fraction of canvas wiped per stamp" × 1024).
-    pub const WIPE_BRUSH_RADIUS_PX: TokenId = TokenId("wipe_brush_radius_px");
-    /// Multiplier on dust output for this project. Default 1.0; set
-    /// to 0 in a project's `theme.ft` to completely opt out of
-    /// dust (e.g. "website" projects where the effect is distracting).
-    /// 0.5 = half-strength dust; >1 amplifies but the visible result
-    /// saturates fast.
-    pub const DUST_INTENSITY: TokenId = TokenId("dust_intensity");
+    // (The wipe_* / dust_* tokens that tuned the removed dust overlay
+    // are gone; theme files that still declare them just carry inert
+    // extra tokens.)
 
     // --- pane chrome (rounded-rect SDF material in pane-bevy) ---
     /// Body fill color of a pane.

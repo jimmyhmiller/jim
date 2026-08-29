@@ -208,9 +208,19 @@ extern fn proc_read(handle)
 extern fn proc_alive(handle)
 extern fn proc_kill(handle)
 
-// --- style / drawing surface ---
-extern fn uniform_set(name, value)
-extern fn mask_paint(name, x, y, radius, value)
+// --- filesystem mutations (see fsops.rs) ---
+// Each returns { ok, error } so a widget can SHOW why something failed.
+// `~` is expanded. Deleting means the Trash: there is deliberately no
+// irrecoverable remove.
+extern fn fs_rename(from, to)       // also "move"; never clobbers `to`
+extern fn fs_mkdir(path)
+extern fn fs_new_file(path)         // empty file; fails if one exists
+extern fn fs_copy(from, to)         // recurses into directories
+extern fn fs_trash(path)
+extern fn fs_duplicate_path(path)   // -> { ok, path, error }: free "x copy.rs"
+extern fn fs_exists(path)           // -> bool
+
+// --- color math ---
 extern fn oklch(l, c, h)
 
 // --- Glaze: the style language (see docs/GLAZE.md) ---
@@ -1226,6 +1236,98 @@ fn rename_kind_to_type(v: &mut Json) {
     }
 }
 
+/// One directory listing, shaped for the file tree: `{ name, is_dir, size }`
+/// per entry. Shared with the widget tests so they sort the way the real
+/// host does.
+fn list_entries_json(path: &str) -> Value {
+    let path = path.to_string();
+    let p = expand_tilde(&path);
+    let mut entries: Vec<(String, bool, u64)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&p) {
+        for e in rd.flatten() {
+            let (is_dir, is_file) = e
+                .file_type()
+                .map(|t| (t.is_dir(), t.is_file()))
+                .unwrap_or((false, false));
+            if !is_dir && !is_file {
+                continue; // skip sockets/fifos/broken symlinks
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            let size = if is_dir {
+                0
+            } else {
+                e.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            entries.push((name, is_dir, size));
+        }
+    }
+    // Directories before files; within each, case-insensitive by name.
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+    let arr: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|(name, is_dir, size)| {
+            serde_json::json!({ "name": name, "is_dir": is_dir, "size": size })
+        })
+        .collect();
+    Value::from_json(&serde_json::Value::Array(arr))
+}
+
+/// The `fs_*` host surface: the write half of a widget's filesystem access.
+/// Split out so the widget tests drive exactly the functions the real host
+/// installs, rather than a stubbed lookalike that can drift from it.
+fn register_fs_surface(vm: &mut Funct) {
+// The write half of the file tree's context menu. Each returns
+// `{ ok, error }` rather than a bare bool so a widget can show WHY an
+// operation failed ("already exists", "Permission denied") instead of a
+// silent no-op the user reads as a broken menu item.
+fn fs_result(r: Result<(), String>) -> Value {
+    match r {
+        Ok(()) => Value::from_json(&serde_json::json!({ "ok": true, "error": "" })),
+        Err(e) => Value::from_json(&serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+// fs_rename(from, to) -> { ok, error }. Also the move operation. Never
+// clobbers an existing destination.
+vm.register2("fs_rename", |from: String, to: String| -> Value {
+    fs_result(crate::fsops::rename(&from, &to))
+});
+// fs_mkdir(path) -> { ok, error }. Creates missing parents.
+vm.register1("fs_mkdir", |path: String| -> Value {
+    fs_result(crate::fsops::create_dir(&path))
+});
+// fs_new_file(path) -> { ok, error }. Creates an EMPTY file; fails rather
+// than truncating one that already exists.
+vm.register1("fs_new_file", |path: String| -> Value {
+    fs_result(crate::fsops::create_file(&path))
+});
+// fs_copy(from, to) -> { ok, error }. Recurses into directories.
+vm.register2("fs_copy", |from: String, to: String| -> Value {
+    fs_result(crate::fsops::copy(&from, &to))
+});
+// fs_trash(path) -> { ok, error }. Moves to the macOS Trash — a widget
+// has no way to delete irrecoverably, by design.
+vm.register1("fs_trash", |path: String| -> Value {
+    fs_result(crate::fsops::trash(&path))
+});
+// fs_duplicate_path(path) -> { ok, path, error }. The free `x copy.rs`
+// name beside `path`; pair with fs_copy to implement Duplicate.
+vm.register1("fs_duplicate_path", |path: String| -> Value {
+    match crate::fsops::duplicate_path(&path) {
+        Ok(p) => Value::from_json(&serde_json::json!({ "ok": true, "path": p, "error": "" })),
+        Err(e) => {
+            Value::from_json(&serde_json::json!({ "ok": false, "path": "", "error": e }))
+        }
+    }
+});
+// fs_exists(path) -> bool. `~` expanded, like every other fs host fn.
+vm.register1("fs_exists", |path: String| -> bool {
+    crate::fsops::expand_tilde(&path).exists()
+});
+}
+
 /// Register the host natives a funct widget can call. Mirrors
 /// `script_widget::register_host_functions`, pointing at the *same* editor
 /// subsystems (subprocess registry, msgbus outbox, clipboard). Natives
@@ -1449,6 +1551,9 @@ fn register_host_surface(
         std::fs::write(&p, text).is_ok()
     });
 
+    // ---- filesystem mutations (see fsops.rs) ----
+    register_fs_surface(vm);
+
     // ---- subprocess bridge (event-driven, same as rhai) ----
     let procs = Arc::new(Mutex::new(crate::subprocess::ProcRegistry::new()));
     {
@@ -1597,40 +1702,7 @@ fn register_host_surface(
     // directories, directories first then files, each alphabetical
     // (case-insensitive). Dotfiles are included but sort after non-dot
     // within their group. `~` is expanded. Powers the file-tree widget.
-    vm.register1("list_entries", |path: String| -> Value {
-        let p = expand_tilde(&path);
-        let mut entries: Vec<(String, bool, u64)> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&p) {
-            for e in rd.flatten() {
-                let (is_dir, is_file) = e
-                    .file_type()
-                    .map(|t| (t.is_dir(), t.is_file()))
-                    .unwrap_or((false, false));
-                if !is_dir && !is_file {
-                    continue; // skip sockets/fifos/broken symlinks
-                }
-                let name = e.file_name().to_string_lossy().into_owned();
-                let size = if is_dir {
-                    0
-                } else {
-                    e.metadata().map(|m| m.len()).unwrap_or(0)
-                };
-                entries.push((name, is_dir, size));
-            }
-        }
-        // Directories before files; within each, case-insensitive by name.
-        entries.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-        });
-        let arr: Vec<serde_json::Value> = entries
-            .into_iter()
-            .map(|(name, is_dir, size)| {
-                serde_json::json!({ "name": name, "is_dir": is_dir, "size": size })
-            })
-            .collect();
-        Value::from_json(&serde_json::Value::Array(arr))
-    });
+    vm.register1("list_entries", |path: String| -> Value { list_entries_json(&path) });
 
     // ---- native audio capture (audio-recorder widget) ----
     // Recording runs on cpal's own realtime thread (see audio.rs), so its
@@ -1903,6 +1975,263 @@ mod tests {
             .expect("render must return a tree");
         let _ = std::fs::remove_dir_all(&root);
         el
+    }
+
+    /// Boot the shipped `file_open.ft` over a scratch directory tree, with
+    /// the REAL `fs_*` host functions behind it (bar `fs_trash`, which would
+    /// otherwise fill the developer's Trash on every test run).
+    ///
+    /// This is the file tree's context menu end to end: the menu items a row
+    /// declares, and what picking one actually does to the disk.
+    fn boot_file_open(dir: &std::path::Path) -> (Funct, std::path::PathBuf) {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let src = std::fs::read_to_string(widgets.join("file_open.ft"))
+            .expect("file_open.ft must ship with the crate");
+        let root = scratch_root("file-open");
+        // The tree imports the shared `df` helpers for its colors.
+        std::fs::copy(widgets.join("df.ft"), root.join("df.ft")).expect("df.ft must ship");
+
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.register0("request_render", || {});
+        vm.register1("host_env", |name: String| -> String {
+            std::env::var(name).unwrap_or_default()
+        });
+        vm.register_raw("host_log", |_vm, _args| Ok(Value::Unit));
+        vm.register_raw("emit", |_vm, _args| Ok(Value::Unit));
+        vm.register1("clipboard_set", |_t: String| -> bool { true });
+        // `df.ft` resolves every color through the theme; the tree falls back
+        // to its own literals when a token is absent, which is all a test needs.
+        vm.register1("theme_get", |_token: String| -> Value { Value::Unit });
+        vm.register_raw("proc_spawn", |_vm, _args| Ok(Value::Int(0)));
+        register_fs_surface(&mut vm);
+        // Stubbed: the real one is exercised by fsops' own tests, and moving
+        // scratch files to the Trash on every `cargo test` is antisocial.
+        vm.register1("fs_trash", |path: String| -> Value {
+            let ok = std::fs::remove_file(crate::fsops::expand_tilde(&path)).is_ok();
+            Value::from_json(&serde_json::json!({ "ok": ok, "error": "" }))
+        });
+        vm.register1("list_entries", |path: String| -> Value {
+            list_entries_json(&path)
+        });
+        vm.set_global(
+            "params",
+            Value::from_json(&serde_json::json!({ "path": dir.to_string_lossy() })),
+        );
+        vm.eval(&src).expect("file_open.ft must compile and run");
+        (vm, root)
+    }
+
+    /// Walk the rendered FRAME (plain JSON) rather than the converted
+    /// `Element`: the tree is generic maps and arrays, so one walker covers
+    /// every element kind and stays correct as new ones are added.
+    fn walk_frame(node: &serde_json::Value, f: &mut impl FnMut(&serde_json::Value)) {
+        match node {
+            serde_json::Value::Object(_) => {
+                f(node);
+                for (_, v) in node.as_object().unwrap() {
+                    walk_frame(v, f);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    walk_frame(v, f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every `list-item` id in a rendered tree.
+    fn list_item_ids(frame: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        walk_frame(frame, &mut |n| {
+            if n.get("kind").and_then(|k| k.as_str()) == Some("list-item") {
+                if let Some(id) = n.get("id").and_then(|i| i.as_str()) {
+                    out.push(id.to_string());
+                }
+            }
+        });
+        out
+    }
+
+    /// The context-menu item ids a given row declares.
+    fn row_menu(frame: &serde_json::Value, want: &str) -> Option<Vec<String>> {
+        let mut found = None;
+        walk_frame(frame, &mut |n| {
+            if n.get("kind").and_then(|k| k.as_str()) == Some("list-item")
+                && n.get("id").and_then(|i| i.as_str()) == Some(want)
+            {
+                found = Some(
+                    n.get("context")
+                        .and_then(|c| c.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|it| {
+                                    it.get("id").and_then(|i| i.as_str()).map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+        });
+        found
+    }
+
+    /// Every `text` element's value in the tree.
+    fn frame_texts(frame: &serde_json::Value) -> Vec<String> {
+        let mut out = Vec::new();
+        walk_frame(frame, &mut |n| {
+            if n.get("kind").and_then(|k| k.as_str()) == Some("text") {
+                if let Some(v) = n.get("value").and_then(|v| v.as_str()) {
+                    out.push(v.to_string());
+                }
+            }
+        });
+        out
+    }
+
+    fn render_frame(vm: &mut Funct) -> serde_json::Value {
+        let frame = vm
+            .call("render", vec![Value::Float(320.0), Value::Float(600.0)])
+            .expect("call render");
+        // Converting proves the frame is a VALID element tree — a widget that
+        // renders JSON the host rejects shows up as a blank pane.
+        funct_frame_to_element(&frame)
+            .expect("frame must convert to a valid element tree")
+            .expect("render must return a tree");
+        frame.to_json().expect("frame is plain data")
+    }
+
+    fn click(vm: &mut Funct, id: &str) {
+        vm.call(
+            "on_click",
+            vec![
+                Value::Float(0.0),
+                Value::Float(0.0),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::str(id),
+            ],
+        )
+        .expect("on_click");
+    }
+
+    #[test]
+    fn file_tree_rows_offer_a_context_menu() {
+        let dir = scratch_root("file-open-tree");
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let (mut vm, root) = boot_file_open(&dir);
+
+        let el = render_frame(&mut vm);
+        let ids = list_item_ids(&el);
+        let file_row = format!("open:{}/a.txt", dir.display());
+        let dir_row = format!("dir:{}/sub", dir.display());
+        assert!(ids.contains(&file_row), "file row missing from {ids:?}");
+        assert!(ids.contains(&dir_row), "dir row missing from {ids:?}");
+
+        // A file's menu offers the destructive + clipboard verbs...
+        let menu = row_menu(&el, &file_row).expect("file row declares a context menu");
+        for verb in ["rename:", "dup:", "trash:", "copypath:", "copyrel:", "finder:"] {
+            assert!(
+                menu.iter().any(|m| m.starts_with(verb)),
+                "file menu is missing {verb} — {menu:?}"
+            );
+        }
+        // ...and a directory's offers creation inside itself, not "Open".
+        let dmenu = row_menu(&el, &dir_row).expect("dir row declares a context menu");
+        assert!(
+            dmenu.contains(&format!("newfile:{}/sub", dir.display())),
+            "dir menu should create INSIDE the dir — {dmenu:?}"
+        );
+        assert!(!dmenu.iter().any(|m| m.starts_with("open:")));
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_menu_rename_and_duplicate_reach_the_disk() {
+        let dir = scratch_root("file-open-ops");
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        let (mut vm, root) = boot_file_open(&dir);
+        let path = format!("{}/a.txt", dir.display());
+
+        // Rename: pick the menu item, type a name, press Enter.
+        click(&mut vm, &format!("rename:{path}"));
+        vm.call(
+            "on_input_submit",
+            vec![Value::str("dlg_name"), Value::str("b.txt")],
+        )
+        .expect("on_input_submit");
+        assert!(!dir.join("a.txt").exists(), "the old name is gone");
+        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "hello");
+
+        // Duplicate: no dialog, straight to disk, Finder-style name.
+        click(&mut vm, &format!("dup:{}/b.txt", dir.display()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("b copy.txt")).unwrap(),
+            "hello"
+        );
+
+        // A refused operation must SAY so rather than no-op silently.
+        click(&mut vm, &format!("rename:{}/b.txt", dir.display()));
+        vm.call(
+            "on_input_submit",
+            vec![Value::str("dlg_name"), Value::str("b copy.txt")],
+        )
+        .expect("on_input_submit");
+        assert!(dir.join("b.txt").exists(), "the clobbering rename was refused");
+        let el = render_frame(&mut vm);
+        let texts = frame_texts(&el);
+        assert!(
+            texts.iter().any(|t| t.contains("already exists")),
+            "the failure must be shown in the pane — got {texts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_file_lands_in_the_directory_that_was_right_clicked() {
+        let dir = scratch_root("file-open-new");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("top.txt"), "").unwrap();
+        let (mut vm, root) = boot_file_open(&dir);
+
+        // Right-clicking a FILE creates beside it, not inside it.
+        let el = render_frame(&mut vm);
+        let menu = row_menu(&el, &format!("open:{}/top.txt", dir.display()))
+            .expect("file row declares a context menu");
+        let newfile = menu
+            .iter()
+            .find(|m| m.starts_with("newfile:"))
+            .expect("New File… in a file's menu");
+        assert_eq!(newfile, &format!("newfile:{}", dir.display()));
+
+        click(&mut vm, &format!("newfile:{}/sub", dir.display()));
+        vm.call(
+            "on_input_submit",
+            vec![Value::str("dlg_name"), Value::str("made.rs")],
+        )
+        .expect("on_input_submit");
+        assert!(dir.join("sub/made.rs").exists());
+
+        // A name with a path separator in it is refused: "New File…" creates
+        // one entry in one place, it is not a mkdir -p.
+        click(&mut vm, &format!("newdir:{}", dir.display()));
+        vm.call(
+            "on_input_submit",
+            vec![Value::str("dlg_name"), Value::str("x/y")],
+        )
+        .expect("on_input_submit");
+        assert!(!dir.join("x").exists(), "slashed name must be refused");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// End-to-end for step two, in the order a real widget hits it:

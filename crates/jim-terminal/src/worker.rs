@@ -168,8 +168,18 @@ pub struct GridSnapshot {
     pub rows: u16,
     /// `cols * rows` cells, row-major.
     pub cells: Vec<SnapCell>,
-    /// `rows` flags. `true` if the row was rewritten in this update —
-    /// renderer can skip per-cell sprite mutation when false.
+    /// `rows` flags. `true` if the row has been rewritten since the
+    /// renderer last painted — it can skip per-cell mutation when false.
+    ///
+    /// These ACCUMULATE across publishes and are cleared by the consumer
+    /// (`sync_grid`) when it copies them out, not by the producer. The
+    /// worker publishes on its own cadence and only wakes winit through a
+    /// process-global throttle, so several publishes routinely land
+    /// between two rendered frames. If each publish replaced these flags,
+    /// every row dirtied by all but the last of those publishes would be
+    /// silently dropped: its new content sits in `cells` but no flag ever
+    /// tells the renderer to upload it, so the old glyphs stay on screen
+    /// until something forces a full repaint (a resize).
     pub dirty_rows: Vec<bool>,
     pub default_fg: RgbColor,
     pub default_bg: RgbColor,
@@ -1475,9 +1485,13 @@ fn publish_snapshot(
     if g.dirty_rows.len() != rows as usize {
         g.dirty_rows.resize(rows as usize, false);
     }
+    // OR, never assign: a row we extracted in an earlier publish that the
+    // renderer hasn't consumed yet is still unpainted, and clearing its
+    // flag here would strand that row's content in `cells` forever. The
+    // renderer clears the flags it consumes, under this same mutex.
     for (i, flag) in row_dirty_flags.iter().enumerate() {
         if i < g.dirty_rows.len() {
-            g.dirty_rows[i] = *flag;
+            g.dirty_rows[i] |= *flag;
         }
     }
     for prow in pending {

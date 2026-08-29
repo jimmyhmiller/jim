@@ -22,8 +22,17 @@ struct ButtonParams {
     shadow_blur: f32,
     // Push shadow down by this many pixels (positive = below).
     shadow_offset_y: f32,
-    _pad0: f32,
+    // > 0.5: shadow companion quad — output ONLY the soft shadow
+    // (outside the rect) with real alpha, for the blend phase.
+    shadow_only: f32,
     _pad1: f32,
+    // What sits visually behind this panel (linear RGB). The material
+    // renders in the OPAQUE phase — blend-mode Mesh2d intermittently
+    // fails to draw through per-pane cameras (quads vanished until the
+    // next re-render) — so translucency (corner AA, shadow falloff,
+    // semi-transparent fills) is composited against this color in the
+    // shader instead of by GPU blending.
+    ground: vec4<f32>,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: ButtonParams;
@@ -67,10 +76,19 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let shadow_falloff = 1.0 - shadow_t;
     let shadow_alpha = params.shadow_color.a * shadow_falloff * shadow_falloff;
 
+    // Shadow companion quad: soft falloff strictly outside the rect
+    // (the opaque body quad owns the inside pixels), with real alpha —
+    // this instance renders in the blend phase.
+    if (params.shadow_only > 0.5) {
+        return vec4<f32>(params.shadow_color.rgb, shadow_alpha * (1.0 - inside_coverage));
+    }
+
     // Composite: button on top of shadow. Where the button is opaque,
     // the shadow contributes nothing.
     let shadow_only_a = shadow_alpha * (1.0 - body_a);
     let out_rgb = inside_color * body_a + params.shadow_color.rgb * shadow_only_a;
     let out_a = body_a + shadow_only_a;
-    return vec4<f32>(out_rgb, out_a);
+    // Opaque-phase flatten: composite the premultiplied result over the
+    // ground color and output a fully opaque pixel (see `ground` above).
+    return vec4<f32>(params.ground.rgb * (1.0 - out_a) + out_rgb, 1.0);
 }

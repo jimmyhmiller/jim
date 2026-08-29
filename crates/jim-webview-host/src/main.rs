@@ -46,12 +46,31 @@ struct Frame {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 enum Command {
-    Resize { w: f32, h: f32 },
-    Mouse { x: f32, y: f32, kind: String },
-    Wheel { x: f32, y: f32, dx: f32, dy: f32 },
+    Resize {
+        w: f32,
+        h: f32,
+    },
+    Mouse {
+        x: f32,
+        y: f32,
+        kind: String,
+    },
+    Wheel {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
     /// `kind` is "down" | "up" | "char". `text` carries the character to
-    /// insert for "char"; `code` is a Windows virtual-key code.
-    Key { kind: String, code: i32, text: Option<String>, modifiers: u32 },
+    /// insert for "char"; `code` is a Windows virtual-key code and
+    /// `native_code` is the platform's physical key code.
+    Key {
+        kind: String,
+        code: i32,
+        native_code: i32,
+        text: Option<String>,
+        modifiers: u32,
+    },
     Back,
     Forward,
     Reload,
@@ -77,6 +96,16 @@ struct Shared {
 }
 
 fn main() {
+    // This executable lives inside Jim.app, but it is an off-screen browser
+    // service rather than another Jim application. CEF creates an
+    // NSApplication while initializing; unless we establish an accessory
+    // activation policy first, LaunchServices gives this process its own
+    // Jim-branded Dock tile every time a web pane opens. It must remain an
+    // accessory rather than a prohibited app: Chromium relies on AppKit's UI
+    // activation machinery for editable-field focus and editing commands.
+    #[cfg(target_os = "macos")]
+    configure_app_as_accessory();
+
     let mut argv = std::env::args().skip(1);
     let socket_path = argv.next().unwrap_or_default();
     let url = argv.next().unwrap_or_else(|| "about:blank".into());
@@ -104,7 +133,11 @@ fn main() {
 
     let args = Args::new();
     let mut app = AppBuilder::build(HostApp {});
-    let ret = execute_process(Some(args.as_main_args()), Some(&mut app), std::ptr::null_mut());
+    let ret = execute_process(
+        Some(args.as_main_args()),
+        Some(&mut app),
+        std::ptr::null_mut(),
+    );
     assert_eq!(ret, -1, "browser process expected");
 
     // Chromium enforces a process singleton on its cache directory, so two
@@ -247,6 +280,19 @@ fn main() {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn configure_app_as_accessory() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+
+    let mtm = MainThreadMarker::new().expect("webview host must start on the main thread");
+    let app = NSApplication::sharedApplication(mtm);
+    assert!(
+        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory),
+        "could not make webview host an accessory application"
+    );
+}
+
 fn helper_path() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let contents = exe.parent()?.parent()?.to_path_buf();
@@ -255,7 +301,9 @@ fn helper_path() -> Option<std::path::PathBuf> {
 }
 
 fn apply(browser: &Browser, shared: &Rc<Shared>, cmd: Command) {
-    let Some(mut host) = browser.host() else { return };
+    let Some(mut host) = browser.host() else {
+        return;
+    };
     match cmd {
         Command::Resize { w, h } => {
             *shared.size.borrow_mut() = (w.max(1.0), h.max(1.0));
@@ -269,18 +317,8 @@ fn apply(browser: &Browser, shared: &Rc<Shared>, cmd: Command) {
                 ..Default::default()
             };
             match kind.as_str() {
-                "down" => host.send_mouse_click_event(
-                    Some(&ev),
-                    MouseButtonType::default(),
-                    0,
-                    1,
-                ),
-                "up" => host.send_mouse_click_event(
-                    Some(&ev),
-                    MouseButtonType::default(),
-                    1,
-                    1,
-                ),
+                "down" => host.send_mouse_click_event(Some(&ev), MouseButtonType::default(), 0, 1),
+                "up" => host.send_mouse_click_event(Some(&ev), MouseButtonType::default(), 1, 1),
                 _ => host.send_mouse_move_event(Some(&ev), 0),
             }
         }
@@ -296,6 +334,7 @@ fn apply(browser: &Browser, shared: &Rc<Shared>, cmd: Command) {
         Command::Key {
             kind,
             code,
+            native_code,
             text,
             modifiers,
         } => {
@@ -304,7 +343,7 @@ fn apply(browser: &Browser, shared: &Rc<Shared>, cmd: Command) {
             let mut ev = KeyEvent {
                 modifiers,
                 windows_key_code: code,
-                native_key_code: 0,
+                native_key_code: native_code,
                 is_system_key: 0,
                 character: 0,
                 unmodified_character: 0,
@@ -323,8 +362,7 @@ fn apply(browser: &Browser, shared: &Rc<Shared>, cmd: Command) {
                 "char" => {
                     if let Some(txt) = text {
                         for u in txt.encode_utf16() {
-                            ev.type_ =
-                                KeyEventType::from(sys::cef_key_event_type_t::KEYEVENT_CHAR);
+                            ev.type_ = KeyEventType::from(sys::cef_key_event_type_t::KEYEVENT_CHAR);
                             ev.character = u;
                             ev.unmodified_character = u;
                             host.send_key_event(Some(&ev));

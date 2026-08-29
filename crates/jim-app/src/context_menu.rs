@@ -18,7 +18,7 @@ use bevy::text::LineHeight;
 
 use jim_pane::{
     InputConsumed, PanePinned, PaneRect, PaneRegion, PaneTag, PaneViewportReaders,
-    PendingPaneActions, pt_to_content_local, region_at, topmost_pane_at,
+    PendingPaneActions, region_at, topmost_pane_at,
 };
 use jim_widget::protocol::HostEvent;
 use jim_widget::script_widget::ScriptWidget;
@@ -154,6 +154,10 @@ fn context_open_close(
             &jim_pane::PaneProject,
             &Visibility,
             Has<PanePinned>,
+            // A docked pane's header is SLIM. Carried along here rather than
+            // as its own query because this system is already at Bevy's
+            // 16-parameter ceiling. See "Docked panes have a SLIM header".
+            Option<&jim_pane::PaneChromeOverride>,
         ),
         With<PaneTag>,
     >,
@@ -204,26 +208,26 @@ fn context_open_close(
         let target_project = views.project_at(pt);
         // Only consider visible panes; include pinned so the user can
         // right-click them to unpin.
-        let visible: Vec<(Entity, PaneRect, bool)> = panes
+        let visible: Vec<(Entity, PaneRect, bool, f32)> = panes
             .iter()
-            .filter(|(_, _, project, vis, _)| {
+            .filter(|(_, _, project, vis, _, _)| {
                 target_project.is_none_or(|id| project.0 == id)
                     && !matches!(vis, Visibility::Hidden)
             })
-            .map(|(e, r, _, _, pinned)| (e, *r, pinned))
+            .map(|(e, r, _, _, pinned, ov)| (e, *r, pinned, jim_pane::override_title_h(ov)))
             .collect();
         // First try to hit an unpinned pane (they sit on top); fall
         // back to pinned. Reuses topmost_pane_at's z-aware hit-test.
         let unpinned_rects: Vec<(Entity, PaneRect)> = visible
             .iter()
-            .filter(|(_, _, pinned)| !pinned)
-            .map(|(e, r, _)| (*e, *r))
+            .filter(|(_, _, pinned, _)| !pinned)
+            .map(|(e, r, _, _)| (*e, *r))
             .collect();
         let target = topmost_pane_at(pt_canvas, &unpinned_rects).or_else(|| {
             let pinned_rects: Vec<(Entity, PaneRect)> = visible
                 .iter()
-                .filter(|(_, _, pinned)| *pinned)
-                .map(|(e, r, _)| (*e, *r))
+                .filter(|(_, _, pinned, _)| *pinned)
+                .map(|(e, r, _, _)| (*e, *r))
                 .collect();
             topmost_pane_at(pt_canvas, &pinned_rects)
         });
@@ -242,19 +246,58 @@ fn context_open_close(
         }
         let rect = visible
             .iter()
-            .find(|(e, _, _)| *e == target)
-            .map(|(_, r, _)| *r);
+            .find(|(e, _, _, _)| *e == target)
+            .map(|(_, r, _, _)| *r);
         let is_pinned = visible
             .iter()
-            .find(|(e, _, _)| *e == target)
-            .map(|(_, _, p)| *p)
+            .find(|(e, _, _, _)| *e == target)
+            .map(|(_, _, p, _)| *p)
             .unwrap_or(false);
+        let title_h = visible
+            .iter()
+            .find(|(e, _, _, _)| *e == target)
+            .map(|(_, _, _, th)| *th)
+            .unwrap_or(jim_pane::TITLE_H);
+
+        // The widget's own per-row menu for the row under the cursor, if any
+        // (declared via `ListItem.context`). Computed once here because BOTH
+        // the docked-member branch and the content-region branch below need
+        // it: a docked file tree is the main consumer of row menus, and
+        // taking Undock unconditionally would mean it could never show one.
+        let widget_row_items = |rect: &PaneRect| -> Option<Vec<ContextMenuItem>> {
+            let (wtargets, wscroll) = widgets.get(target).ok()?;
+            let scroll_y = wscroll.map(|s| s.y).unwrap_or(0.0);
+            let hit = jim_pane::pt_to_content_local_th(pt_canvas, rect, title_h)
+                + Vec2::new(0.0, scroll_y);
+            let ct = wtargets
+                .context_menus
+                .iter()
+                .find(|c| !c.items.is_empty() && c.rect.contains(hit))?;
+            Some(
+                ct.items
+                    .iter()
+                    .map(|it| ContextMenuItem::WidgetClick {
+                        label: it.label.clone(),
+                        id: it.id.clone(),
+                    })
+                    .collect(),
+            )
+        };
 
         // A docked member has no chrome of its own — its whole surface is
         // "content" — so a plain right-click anywhere on it offers Undock
-        // (the only way to pop it back out). This takes priority over the
-        // content-region no-op below.
+        // (the only way to pop it back out), EXCEPT over a row that carries
+        // its own menu. Undock stays reachable from the header and from any
+        // empty space in the list.
         if members.get(target).is_ok() {
+            if let Some(items) = rect.as_ref().and_then(&widget_row_items) {
+                menu.origin = Some(pt);
+                menu.target = Some(target);
+                menu.items = items;
+                menu.hovered = None;
+                consumed.0 = true;
+                return;
+            }
             menu.origin = Some(pt);
             menu.target = Some(target);
             menu.items = vec![
@@ -279,28 +322,13 @@ fn context_open_close(
         // pane). Pinned panes hide their chrome, so they keep the old
         // anywhere-right-click → menu behavior (it's the only way to unpin).
         if !is_pinned && matches!(region, Some(Some(PaneRegion::Content))) {
-            if let (Some(rect), Ok((wtargets, wscroll))) = (rect, widgets.get(target)) {
-                let scroll_y = wscroll.map(|s| s.y).unwrap_or(0.0);
-                let hit = pt_to_content_local(pt_canvas, &rect) + Vec2::new(0.0, scroll_y);
-                if let Some(ct) = wtargets
-                    .context_menus
-                    .iter()
-                    .find(|c| !c.items.is_empty() && c.rect.contains(hit))
-                {
-                    menu.origin = Some(pt);
-                    menu.target = Some(target);
-                    menu.items = ct
-                        .items
-                        .iter()
-                        .map(|it| ContextMenuItem::WidgetClick {
-                            label: it.label.clone(),
-                            id: it.id.clone(),
-                        })
-                        .collect();
-                    menu.hovered = None;
-                    consumed.0 = true;
-                    return;
-                }
+            if let Some(items) = rect.as_ref().and_then(&widget_row_items) {
+                menu.origin = Some(pt);
+                menu.target = Some(target);
+                menu.items = items;
+                menu.hovered = None;
+                consumed.0 = true;
+                return;
             }
             consumed.0 = true;
             return;

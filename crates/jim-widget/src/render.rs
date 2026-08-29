@@ -98,6 +98,11 @@ pub struct LayoutCtx {
     /// Snapshot of the active theme — render fns use this to resolve
     /// token-named colors / numbers in `Style` overrides.
     pub theme: jim_style::Theme,
+    /// The pane body color behind this widget's content (`pane_bg` of the
+    /// pane's theme). SDF panels render opaque and flatten their corner
+    /// AA / shadows / translucent fills against this — see
+    /// [`crate::button_material::WidgetButtonMaterial::alpha_mode`].
+    pub ground: Color,
     /// Font registry; per-element `family` lookups go through here.
     pub fonts: jim_style::FontRegistry,
     /// While focused on this pane: id + buffered value + caret pos for
@@ -429,6 +434,7 @@ fn render_node(
                     .unwrap_or(Color::srgb(0.13, 0.14, 0.17))
                     .with_alpha(0.45),
                 radius: ctx.resolve_f32("radius_sm").unwrap_or(4.0),
+                selected: *selected,
             });
             recurse_children(commands, targets, children, style.as_ref());
             let rect = Rect::new(origin.x, origin.y, origin.x + size.x, origin.y + size.y);
@@ -1578,6 +1584,7 @@ pub(crate) fn paint_rounded_panel(
         shadow_blur,
         shadow_offset_y,
         z,
+        ctx.ground,
     );
 }
 
@@ -1599,6 +1606,10 @@ pub(crate) fn paint_rounded_panel_root(
     shadow_blur: f32,
     shadow_offset_y: f32,
     z: f32,
+    // What sits visually behind this panel. The material renders in the
+    // opaque phase (blend Mesh2d is unreliable through per-pane cameras)
+    // and the shader flattens all translucency against this color.
+    ground: Color,
 ) -> Option<Entity> {
     use crate::button_material::{ButtonParams, WidgetButtonMaterial, WidgetButtonMesh};
 
@@ -1607,39 +1618,73 @@ pub(crate) fn paint_rounded_panel_root(
     }
     // Clamp pill radius to half the shorter side.
     let radius = corner_radius.min(size.x * 0.5).min(size.y * 0.5).max(0.0);
-    let mesh_w = size.x + 2.0 * shadow_blur;
-    let mesh_h = size.y + 2.0 * shadow_blur;
+    // Body quad: OPAQUE (flattened against `ground`), and sized EXACTLY to
+    // the panel rect. It must not carry the shadow margin: with the opaque
+    // flatten, any margin renders as a solid ground-colored slab around the
+    // panel (and the old offset-compensation shift made it sit misaligned —
+    // the podcast's "dark blue boxes around buttons").
     let params = ButtonParams {
-        mesh_size: Vec2::new(mesh_w, mesh_h),
+        mesh_size: size,
         button_size: size,
         corner_radius: radius,
         border_width,
         bg: lin_vec4(bg),
         border: lin_vec4(border_color),
-        shadow_color: lin_vec4(shadow_color),
-        shadow_blur,
-        shadow_offset_y,
-        _pad0: 0.0,
+        shadow_color: Vec4::ZERO,
+        shadow_blur: 0.0,
+        shadow_offset_y: 0.0,
+        shadow_only: 0.0,
         _pad1: 0.0,
+        ground: lin_vec4(ground),
     };
-    // Shift the mesh up by shadow_offset_y so the rendered button rect
-    // lands at the LOGICAL origin (the shader places the SDF rect at
-    // p_button = p_mesh - vec2(0, offset_y), which moves the rect down
-    // by offset_y within the mesh). Without this compensation, tiles
-    // with bigger shadows visually slide downward in their row even
-    // though layout puts them at the same y.
     let entity = commands
         .spawn((
             ChildOf(content_root),
-            Transform::from_xyz(
-                origin.x + size.x * 0.5,
-                -(origin.y + size.y * 0.5) + shadow_offset_y,
-                z,
-            )
-            .with_scale(Vec3::new(mesh_w, mesh_h, 1.0)),
+            Transform::from_xyz(origin.x + size.x * 0.5, -(origin.y + size.y * 0.5), z)
+                .with_scale(Vec3::new(size.x, size.y, 1.0)),
             Visibility::Inherited,
         ))
         .id();
+    // Soft drop shadow: a SEPARATE blend-phase companion quad just below
+    // the body's z, masked to the outside of the rect. Blend Mesh2d is the
+    // per-pane-camera-flaky path, but a shadow that occasionally skips a
+    // re-render is imperceptible — unlike the panel face.
+    let shadow_visible = shadow_blur > 0.0 && shadow_color.to_srgba().alpha > 0.001;
+    let shadow_entity = if shadow_visible {
+        let mesh_w = size.x + 2.0 * shadow_blur;
+        let mesh_h = size.y + 2.0 * shadow_blur;
+        let sparams = ButtonParams {
+            mesh_size: Vec2::new(mesh_w, mesh_h),
+            button_size: size,
+            corner_radius: radius,
+            border_width: 0.0,
+            bg: Vec4::ZERO,
+            border: Vec4::ZERO,
+            shadow_color: lin_vec4(shadow_color),
+            shadow_blur,
+            shadow_offset_y,
+            shadow_only: 1.0,
+            _pad1: 0.0,
+            ground: lin_vec4(ground),
+        };
+        let se = commands
+            .spawn((
+                ChildOf(content_root),
+                // Centered on the panel; the shader applies offset_y to the
+                // SDF so the falloff extends downward.
+                Transform::from_xyz(
+                    origin.x + size.x * 0.5,
+                    -(origin.y + size.y * 0.5),
+                    z - 0.001,
+                )
+                .with_scale(Vec3::new(mesh_w, mesh_h, 1.0)),
+                Visibility::Inherited,
+            ))
+            .id();
+        Some((se, sparams))
+    } else {
+        None
+    };
     commands.queue(move |world: &mut World| {
         let mesh = match world.get_resource::<WidgetButtonMesh>() {
             Some(m) => m.0.clone(),
@@ -1647,12 +1692,30 @@ pub(crate) fn paint_rounded_panel_root(
         };
         let mat = world
             .resource_mut::<Assets<WidgetButtonMaterial>>()
-            .add(WidgetButtonMaterial { params });
+            .add(WidgetButtonMaterial {
+                params,
+                blend: false,
+            });
         if let Ok(mut ec) = world.get_entity_mut(entity) {
             ec.insert((
-                bevy::mesh::Mesh2d(mesh),
+                bevy::mesh::Mesh2d(mesh.clone()),
                 bevy::sprite_render::MeshMaterial2d(mat),
             ));
+        }
+        if let Some((se, sparams)) = shadow_entity {
+            let smat =
+                world
+                    .resource_mut::<Assets<WidgetButtonMaterial>>()
+                    .add(WidgetButtonMaterial {
+                        params: sparams,
+                        blend: true,
+                    });
+            if let Ok(mut ec) = world.get_entity_mut(se) {
+                ec.insert((
+                    bevy::mesh::Mesh2d(mesh),
+                    bevy::sprite_render::MeshMaterial2d(smat),
+                ));
+            }
         }
     });
     Some(entity)

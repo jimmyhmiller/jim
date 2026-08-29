@@ -119,6 +119,224 @@ com.jimmyhmiller.terminal-bevy`) is FROZEN despite the rename — changing
 it would lose the Dock pin. Same for the `TERMINAL_BEVY_*` runtime env
 vars and the `/tmp/.terminal-bevy` socket dir.
 
+## Emacs panes
+
+Two pane kinds, both in `crates/jim-emacs`:
+
+- `"emacs"` (`src/lib.rs`) — the fallback: a tty frame from
+  `emacsclient -t` on a shared `emacs --daemon=jim`, rendered through
+  the jim-terminal grid.
+- `"emacs-native"` (`src/native.rs`) — **the real one.** A forked GNU
+  Emacs (`~/Documents/Code/emacs-jim`, the `jim` window system, whose
+  port is written in Coil) serializes its own redisplay as draw-ops over
+  a unix socket; jim replays them into a per-pane RGBA framebuffer,
+  rasterising Emacs's glyph ids from Emacs's own font file. Emacs owns
+  every pixel *position*, jim owns every *pixel*.
+
+The GUI feel on top of that transport is a **duplex control channel**
+(`~/.jim/emacs-ctl.sock`, newline-delimited text; jim is the server,
+Emacs connects) plus `crates/jim-emacs/elisp/jim-integration.el`:
+
+| direction | message | what it does |
+| --- | --- | --- |
+| jim → emacs | `theme <json>` | jim's whole design-token palette → the Emacs face set (syntax, region, mode line, dividers, line numbers). Re-sent on every theme change. |
+| jim → emacs | `scroll <fid> <x> <y> <dy>` | trackpad PIXELS → `pixel-scroll-precision-scroll-*`. This is what makes scrolling smooth instead of 2-line notches. Consecutive same-frame scrolls are coalesced in the filter — see below. |
+| jim → emacs | `click <fid> <x> <y> <n>` | double/triple-click word/line selection. Emacs cannot do this itself: the port's input record has no timestamp, so `make_lispy_event` never promotes a click. |
+| jim → emacs | `focus <fid>` | Emacs's selected frame follows jim's focused pane. |
+| jim → emacs | `font-px <px>` | default font size in PIXELS, from the `font_size` token. Emacs text is sized like the rest of jim's UI; a point size would land a third too big, since the port reports 96dpi. |
+| jim → emacs | `open`/`font`/`cmd`/`eval` | visit a file, set the font size in points, run an interactive command, escape hatch. |
+| emacs → jim | `state <fid> <json>` | buffer, file, modified, mode, point, and the viewport's top/bottom fraction. Drives the pane's scroll indicator and the `emacs.state` bus topic. |
+
+`jim-integration.el` is loaded with `-l` at launch (written to
+`~/.jim/emacs/` from `include_str!`), **not** added to the fork's
+`lisp/term/jim-win.el` — that file is preloaded into the dump, so
+changing it costs a re-dump, while this reloads on the next pane.
+
+Syntax highlighting comes from tree-sitter: Emacs 30 ships `rust-ts-mode`
+and friends but wires none of them into `auto-mode-alist`, so a `.rs`
+file lands in Fundamental mode with no colour at all. `jim--setup-syntax`
+opts in per language, but ONLY where the grammar is installed
+(`M-x treesit-install-language-grammar`, which writes to
+`~/.emacs.d/tree-sitter/`), so a missing grammar changes nothing rather
+than erroring. It also raises `treesit-font-lock-level` to 4, because
+jim has a token for variables/properties/operators/brackets and level 3
+leaves all four the plain foreground colour.
+
+**Scrolling up costs about 5× scrolling down, and that is Emacs, not us.**
+Measured on a 2200-line buffer, 30px a step: down 1.4ms, up 6.6ms.
+`pixel-scroll-precision-scroll-up` has to call `window-text-pixel-size`
+with a negative offset from `window-start` — laying text out backwards —
+where scrolling down just walks forward from a position it already has.
+Nothing on the jim side changes that. What jim CAN do is not queue up
+behind it: `jim--coalesce-scrolls` merges each run of consecutive
+same-frame `scroll` lines in one filter chunk into a single larger
+scroll. It is self-regulating (when Emacs keeps up, a chunk holds one
+line and nothing changes) and it wins twice, because one 300px scroll is
+one backwards layout rather than ten: a ten-deep backlog retires in
+0.28s instead of 1.36s. Do NOT "improve" this with an idle timer —
+a continuous gesture never lets Emacs go idle, so the accumulator would
+never flush and scrolling would freeze until you let go.
+
+`jim--setup` turns `window-divider-mode` OFF. jim-win.el enables it with
+8px dividers for "GUI-style splits", but a split in jim is a *pane*
+(`C-x 2`/`C-x 3` make a frame that jim docks), so it rarely divides
+anything — and it does not survive Emacs's scroll optimization: the 8px
+bottom divider gets drawn once, a later `scroll_run` blits it up into the
+middle of the buffer, and nothing repaints that strip. The symptom is a
+solid `chrome_divider`-coloured band straight through a line of code.
+
+Two things to know when touching `jim-integration.el`: **byte-compiling
+it is not enough to know it loads** — verify with
+`emacs --batch -Q --eval '(load "…/jim-integration.el" nil t t)'`, since a
+form that byte-compiles can still fail at load (an unescaped quote in a
+docstring cost an hour here), and a load failure is SILENT in a pane: the
+theme, scrolling, and state reporting just never turn on. And the port's
+`defined_color` only understands `#rrggbb` — named colours like `grey85`
+fail to load, which is why the generated theme is hex throughout.
+
+**How to open one.** `emacs.workspace` — the "Emacs" action, ⌘K E, or
+the radial ring — spawns a file tree docked beside a native Emacs pane,
+rooted at the project's `default_cwd`. Agents and scripts get the same
+thing from `jimctl emacs [--project P] [--path DIR]`; both go through
+`open_emacs_workspace` in jim-app so there is one implementation. The
+bare `emacs-native` kind is deliberately kept out of the radial and named
+"Emacs Pane (no sidebar)" — an editor with no navigation beside it is
+rarely what anyone means, but the kind must stay registered because
+layout restore and Emacs-initiated splits spawn through it.
+
+Bus topics: widgets emit `emacs.open_file` `{path}` and `emacs.command`
+`{command}`, routed to the emacs pane docked with the sender (else the
+focused one); jim publishes `emacs.state` (retained, per project).
+`file_open.ft` is both ends of that — the "Emacs" action
+(`emacs.workspace`, ⌘K E) spawns it docked beside an emacs pane.
+
+Two things about `sync_emacs_frames`:
+
+- **Never present a batch that has no `flush`.** Ops go into the CPU `fb`
+  and are copied to the GPU image only on `flush`, precisely so a
+  half-finished redisplay never reaches the screen. Presenting early
+  (e.g. to chase a pane that looks stale) shows the old and new text
+  overlaid — glyphs colliding, letters doubled. Tried it, reverted it.
+  If a pane looks stale, the bug is upstream: ops not arriving, or the
+  main loop not waking — not the flush gate.
+- **OPEN BUG: the last text row still draws over the mode line.**
+  Rounding the FRAME height to a whole number of rows is not enough, and
+  the fit assertion in `sync_native_resize` confirms the frame height is
+  already an exact multiple — the artifact persists anyway. The mode line
+  and echo area are not necessarily one text-row tall, so a whole frame
+  height does not imply a whole TEXT AREA. Root cause is that
+  `draw_glyph_string` in the Coil port carries no clip rect: real Emacs
+  relies on the window system to clip a partially-visible last row, and
+  this port has nothing doing that, so the row is blitted whole and the
+  mode line only covers its bottom half. The durable fix is to clip runs
+  to the window's text area — either send the text-area bottom in the op
+  stream (`window_box` has it) or add a clip rect to the run op. Do NOT
+  try to fix this by rounding sizes; that has now failed twice.
+
+- **OPEN BUG: the bottom rows of TERMINAL panes go stale.** Separate
+  subsystem (`jim-terminal`'s `sync_grid`, not jim-emacs). Old cell
+  content stays on screen interleaved with new until the pane is
+  resized. Suspect the dirty-row bookkeeping around
+  `local_dirty_rows` / `force_all` in `sync_grid`.
+
+- **The frame's line height comes from a RUN's height, not from the font
+  op.** `asc + desc` omits line-spacing (a 14px font reports ascent 13 +
+  descent 3, while rows are 22px), and rounding the frame to the wrong
+  multiple is exactly as good as not rounding — you get a partial bottom
+  row drawing over the mode line, since the port has no clip rect.
+  Learning it late also means re-sending the fit: `sync_native_resize`
+  memoizes what it sent, so `resize_dirty` drops that memo. Learn it
+  ONCE per font — runs are not all the same height (a smaller face, the
+  echo area), and letting it change per batch re-fits the frame
+  constantly, a resize storm the pane never settles out of.
+
+Gotcha worth keeping: **never send a frame a resize before its
+create-frame has been written.** `store-event` in the port falls back to
+the *last* frame for an unknown id, so an early resize silently resizes
+some other pane's frame — and since `sync_native_resize` memoizes what
+it sent, the real frame then never gets sized at all and its pane stays
+blank forever. `sync_native_resize` skips panes still in
+`pending_create` for exactly this reason.
+
+**Bold and italic** work by way of a font registry in the port: each
+distinct `struct font *` is announced as `font … id=N wt= sl= path=…`
+and every `run` names the id that drew it. The path alone is not enough —
+Menlo.ttc holds regular, bold, italic and bold-italic behind one
+filename — so `face_index_for` in native.rs picks the face whose swash
+attributes match Emacs's numeric weight/slant (regular 80, bold 200).
+There is a unit test for that selection.
+
+**The caret** is a real bar, not a terminal block: the port emits
+`cursor … kind=2` as a bare rect and jim fills it with the `caret` token,
+so it tracks the theme live. `jim-cursor-type` in the elisp sets the
+shape; `box` restores the old inverted-glyph block.
+
+jim erases that caret itself, with a save-under (`restore_caret`).
+**Do not assume Emacs erases a bar cursor.** A block cursor IS the
+inverted glyph, so anything repainting the cell erases it; a bar is a
+separate rect on top, and `display_and_set_cursor` erases by calling
+`erase_phys_cursor` *directly* — never through the port's
+`draw_window_cursor` hook — which erases only by redrawing the character
+underneath, and skips even that on several paths (`goto mark_cursor_off`:
+hpos past the end of the row, zero visible height, cursor in the fringe).
+Those are the ghost carets that used to be left behind at a line's edge.
+The restore is gated on the pixels still being caret-coloured, so when
+Emacs *did* repaint we leave its work alone — restoring unconditionally
+would drag an `hl-line` highlight along behind the caret.
+
+Still missing in the port: `draw_glyph_string` passes no attribute flags,
+so **underline / overline / strike-through do not render** (`backend.coil`
+already reserves the `flags` bits for them). The Coil backend DOES build
+against current Coil again — see JIM.md for the build, and note that
+`coil build --lib` appends to an existing archive, so `rm -f
+libjimbackend.a` first or a stale member silently wins the link.
+
+Hover washes on list rows: a **selected** row gets no wash. It paints its
+own background at `z + 0.001`, which is the exact depth the wash uses, and
+two sprites at one depth z-fight — the row visibly flickers between the
+two states while hovered. It still has to stay in `hover_washes` though:
+`update_widget_hover` uses membership there to decide a row needs no
+re-render on hover, so removing it would make hovering a selected row
+re-render the pane and flash its text. Hence the `selected` flag on
+`HoverWash` — in the list, but not painted.
+
+## Docked panes have a SLIM header, not `TITLE_H`
+
+Anything mapping a cursor position into a pane's content space must use
+the pane's actual title height — `jim_pane::override_title_h(chrome_ov)`
+with `pt_to_content_local_th`, not the `TITLE_H`-assuming
+`pt_to_content_local`. A docked pane's content starts higher up, so
+assuming the full height shifts every hit-test down by the difference:
+in a docked file tree that is almost exactly one row, and hovering a row
+highlights the one above it. Presses are unaffected because
+`PaneContentPressed` already carries an override-aware `local_pt` —
+which is why clicking can be right while hovering is wrong, and why this
+is easy to misread as a rendering bug.
+
+The nastier half of this: `apply_widget_scroll` also placed
+`content_root` with a hardcoded `TITLE_H`, while
+`sync_chrome_override_geometry` places it by the override. Two systems
+writing the same transform with different answers, so a docked widget's
+content sat at one of two offsets depending on which ran last — hover was
+intermittently a row off, and "fixing" the hit-test alone just moved
+which half was wrong. Both now use `override_title_h`; so does the
+content-box height in the clip walk.
+
+Fixed in `update_widget_hover`, and in `context_menu.rs` (its widget
+row-menu hit-test, which the docked file tree depends on — the pane there
+is already at Bevy's 16-parameter ceiling, so the chrome override rides
+along in the `panes` query rather than in one of its own). The same
+assumption is still present in `jim-widget/src/lib.rs` at the popover
+origins (lines ~970, ~1658, ~2172), `update_tooltip_hover` (~2126), the
+two `pt_to_content_local` uses around ~2672/~2750, and
+`glaze_material.rs` (~371) — all latent for docked panes.
+
+A **docked member** pane also used to take `Undock`/`Close` for the whole
+of its surface, before any widget row menu could be considered — which
+would have made per-row menus impossible in exactly the panes that want
+them most. A row carrying a `ListItem.context` now wins; Undock stays
+reachable from the header and from empty space in the list.
+
 ## Chromium (CEF) webview gotchas
 
 Learned the hard way; all of these fail silently or crash rather than

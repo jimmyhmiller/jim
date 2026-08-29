@@ -117,6 +117,13 @@ fn stamp(
             }
         }
         None if has_override => {
+            // Should essentially never fire: it silently drops the pane back
+            // to the GLOBAL chrome style, which reads as the pane "changing
+            // theme". Loud so a regression here is attributable.
+            warn!(
+                "[chrome] pane {:?}: project {} vanished from ProjectThemes — removing override, falling back to GLOBAL style",
+                entity, project_id
+            );
             commands
                 .entity(entity)
                 .remove::<PaneChromeStyle>()

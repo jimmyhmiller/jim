@@ -1,14 +1,11 @@
-//! Per-project temporal state — the data behind Tier-2 shader uniforms.
+//! Per-project persisted style state — most importantly each project's
+//! chosen preset. Each known project gets a small JSON blob persisted
+//! under `<base>/<project_id>/state.json`.
 //!
-//! The "dust gathering" effect needs to know how long it's been since
-//! the user touched the project; that's what this file records. Each
-//! known project gets a small JSON blob persisted under
-//! `<base>/<project_id>/state.json`.
-//!
-//! Timestamps are stored as **wall-clock seconds since the Unix epoch
-//! (f64)** so they're meaningful across restarts. Shaders see derived
-//! quantities like `dust_seconds = now - last_focus_at`, computed each
-//! frame, not the absolute timestamps.
+//! The timestamp fields (`created_at` / `last_focus_at` /
+//! `last_edit_at`) fed the removed "dust gathering" effect; they're
+//! kept in the schema so existing state.json files round-trip, but
+//! nothing updates `last_focus_at` / `last_edit_at` anymore.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -44,9 +41,8 @@ pub struct ProjectStyleStateEntry {
     pub preset: Option<String>,
 }
 
-/// In-memory cache of every known project's state. The Tier-2 providers
-/// read from here; the host calls [`Self::note_focus`] /
-/// [`Self::note_edit`] to advance the timestamps.
+/// In-memory cache of every known project's state (chiefly its chosen
+/// preset). Loaded lazily per project, saved back when dirty.
 #[derive(Resource, Default, Debug, Clone)]
 pub struct ProjectStyleState {
     by_project: HashMap<u64, ProjectStyleStateEntry>,
@@ -80,29 +76,6 @@ impl ProjectStyleState {
             e.preset = preset;
             self.dirty.insert(project_id, ());
         }
-    }
-
-    /// Mark "user is engaging with this project right now."
-    pub fn note_focus(&mut self, project_id: u64) {
-        let now = unix_now();
-        let e = self.ensure(project_id);
-        e.last_focus_at = now;
-        if e.created_at == 0.0 {
-            e.created_at = now;
-        }
-        self.dirty.insert(project_id, ());
-    }
-
-    /// Mark "the user edited content tied to this project just now."
-    /// `host` signal: editor save, file watcher fire, terminal cd, …
-    pub fn note_edit(&mut self, project_id: u64) {
-        let now = unix_now();
-        let e = self.ensure(project_id);
-        e.last_edit_at = now;
-        if e.created_at == 0.0 {
-            e.created_at = now;
-        }
-        self.dirty.insert(project_id, ());
     }
 
     /// Make sure an entry exists (used when a project is first seen so

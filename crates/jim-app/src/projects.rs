@@ -950,6 +950,10 @@ pub struct PendingActions {
     /// `None` kind closes every pane in the project. Resolved to pane
     /// entities in `apply_pending_actions` (needs a world query).
     pub close_panes: Vec<(u64, Option<String>, Option<Vec<String>>)>,
+    /// "Open Emacs here": `(project_id, root_dir)`. Spawns a file tree
+    /// docked beside an Emacs pane — see `crate::open_emacs_workspace`.
+    /// `None` root means the project's own directory.
+    pub emacs_workspaces: Vec<(u64, Option<String>)>,
     /// `jimctl group assign|clear`: `(project_id, titles, group)`. `None`
     /// as the group clears membership. Applied by `apply_pane_group_sets`.
     pub set_pane_groups: Vec<(u64, Vec<String>, Option<String>)>,
@@ -3043,6 +3047,9 @@ fn rename_keyboard(
 fn apply_pending_actions(world: &mut World) {
     let _t_prof = jim_pane::prof::sys_span("apply_pending_actions");
     let actions = std::mem::take(&mut *world.resource_mut::<PendingActions>());
+    for (project_id, root) in &actions.emacs_workspaces {
+        crate::open_emacs_workspace(world, *project_id, root.clone());
+    }
     let sidebar_width = world.resource::<Sidebar>().width;
     // Project the user is currently looking at; new panes spawned into it
     // follow the current scroll/pan instead of sitting near the origin.

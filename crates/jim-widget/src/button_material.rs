@@ -34,6 +34,12 @@ fn init_button_mesh(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
 pub struct WidgetButtonMaterial {
     #[uniform(0)]
     pub params: ButtonParams,
+    /// Render in the blend phase instead of the default opaque phase.
+    /// Used ONLY for the shadow companion quad (`params.shadow_only`),
+    /// where the blend phase's per-pane-camera flakiness is harmless —
+    /// a soft shadow that skips a frame is imperceptible, unlike a
+    /// button face.
+    pub blend: bool,
 }
 
 impl Material2d for WidgetButtonMaterial {
@@ -44,7 +50,20 @@ impl Material2d for WidgetButtonMaterial {
         )
     }
     fn alpha_mode(&self) -> AlphaMode2d {
-        AlphaMode2d::Blend
+        // OPAQUE by default — this is the fix for widget quads (button
+        // fills, container surfaces, row highlights) intermittently not
+        // drawing through per-pane cameras until the next re-render:
+        // blend-mode Mesh2d is unreliable there (same Bevy 0.19 issue the
+        // vector paths dodge by flattening alpha). Translucency is
+        // composited in the shader against `ButtonParams::ground` instead
+        // of by GPU blending, so the quad renders in the dependable opaque
+        // phase while still looking soft-edged. Shadow companion quads opt
+        // back into Blend (see `blend`).
+        if self.blend {
+            AlphaMode2d::Blend
+        } else {
+            AlphaMode2d::Opaque
+        }
     }
 }
 
@@ -63,6 +82,13 @@ pub struct ButtonParams {
     pub shadow_color: Vec4,
     pub shadow_blur: f32,
     pub shadow_offset_y: f32,
-    pub _pad0: f32,
+    /// > 0.5: this quad draws ONLY the soft shadow (outside the rect;
+    /// the opaque body quad owns the inside pixels) with real alpha —
+    /// pair with `WidgetButtonMaterial::blend`.
+    pub shadow_only: f32,
     pub _pad1: f32,
+    /// What sits visually behind this panel — the shader composites all
+    /// translucency (corner AA, shadow falloff, semi-transparent fills)
+    /// against this and outputs opaque pixels. See `alpha_mode` below.
+    pub ground: Vec4,
 }

@@ -694,6 +694,7 @@ fn render_palette(world: &mut World) {
         content_root: root,
         content_size: Vec2::new(PALETTE_W, win_h),
         palette: colors,
+        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
         theme,
         fonts,
         focused_input: None,

@@ -68,6 +68,10 @@ hound = "3.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-text = "21"
 core-foundation = "0.10"
+# NSFileManager -trashItemAtURL: for the file tree's "Move to Trash" — the
+# only recoverable delete on macOS. See src/fsops.rs.
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSFileManager", "NSURL", "NSString", "NSError"] }
 
 [dev-dependencies]
 # The Style Lab generator (style-muse) emits protocol-shaped JSON; the

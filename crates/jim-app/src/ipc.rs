@@ -118,6 +118,17 @@ pub enum IpcRequest {
     /// `"ToggleExpose"`. Mirrors the Cmd+Shift+E keybind / `view.toggle_expose`
     /// action; handy for scripting and headless verification.
     ToggleExpose,
+    /// `jimctl emacs [--project P] [--path DIR]` — open the Emacs
+    /// workspace: a file tree docked beside a native Emacs pane, rooted
+    /// at `path` (default: the project's own directory). This is the
+    /// normal way to get an editor, for a person or an agent; spawning a
+    /// bare `emacs-native` pane gives you the editor with no navigation.
+    EmacsWorkspace {
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+    },
     /// Start or stop a presentation. Unit variant → wire form is the bare
     /// JSON string `"TogglePresent"`. Mirrors F5 / `present.toggle`:
     /// starting needs the focused pane to be a deck, stopping does not.

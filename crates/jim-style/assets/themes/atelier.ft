@@ -175,10 +175,4 @@
     font_family_mono: "mono",
     font_size: 14.0,
     line_height_ratio: 1.3,
-
-    // Wipe / dust shader tuning (kept theme-controllable so projects
-    // can dial it down without touching code).
-    wipe_dust_gate_secs: 60.0,
-    wipe_brush_radius_px: 80.0,
-    dust_intensity: 1.0,
 }

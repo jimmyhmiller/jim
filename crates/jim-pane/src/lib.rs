@@ -1351,21 +1351,22 @@ fn sync_chrome_uniforms(
             transform.scale.x = rect.size.x.max(1.0);
             transform.scale.y = rect.size.y.max(1.0);
             if let Some(mut mat) = chrome_mats.get_mut(&handle.0) {
-                mat.params = style.params_for(rect.size, is_focused);
+                let mut new_params = style.params_for(rect.size, is_focused);
                 if let Some(o) = ov {
                     // Docked cell: flat body — slim header, no rounded
                     // corners, no border. Content "melts into" the dock.
-                    mat.params.corner_radius = o.corner_radius;
-                    mat.params.border_width = o.border_width;
-                    mat.params.title_h = o.title_h;
+                    new_params.corner_radius = o.corner_radius;
+                    new_params.border_width = o.border_width;
+                    new_params.title_h = o.title_h;
                     if let Some(bg) = o.bg {
                         // Outer dock container: paint the CONTENT backdrop the
                         // divider color so the 1px gutter between cells reads as
                         // a hairline. Leave `title_bg` alone so the dock's
                         // header strip keeps its normal, readable color.
-                        mat.params.bg = bg;
+                        new_params.bg = bg;
                     }
                 }
+                mat.params = new_params;
                 if frag_changed {
                     mat.fragment = frag.clone();
                 }

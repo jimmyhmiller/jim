@@ -17,6 +17,7 @@ mod cmd_channel;
 mod cmd_close;
 mod cmd_codex;
 mod cmd_dock;
+mod cmd_emacs;
 mod cmd_git;
 mod cmd_group;
 mod cmd_inbox;
@@ -67,6 +68,7 @@ fn main() -> ExitCode {
         Some("move") => cmd_move::run(),
         Some("workspace") => cmd_workspace::run(),
         Some("dock") => cmd_dock::run(),
+        Some("emacs") => cmd_emacs::run(),
         Some("group") => cmd_group::run(),
         Some("issue") => cmd_issue::run(),
         Some("lsp") => cmd_lsp::run(),

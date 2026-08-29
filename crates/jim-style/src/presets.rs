@@ -15,8 +15,8 @@
 //! theme.ft whenever a preset is active — switch the preset to
 //! `None` (empty file) to fall back to per-project theming.
 //!
-//! Future-extension surface (manifest.toml + chrome.wgsl + dust.wgsl
-//! per preset) isn't built yet; today a preset is just one theme file.
+//! Presets may also ship a `chrome.wgsl` (see the registry scan);
+//! beyond that a preset is just one theme file.
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -1369,7 +1369,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Mostly-transparent body: just enough fill to read against the
-    // canvas, leaving the dust shader visible underneath.
+    // canvas showing through underneath.
     var color = params.bg.rgb;
     var alpha = params.bg.a * coverage;
 

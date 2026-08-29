@@ -618,6 +618,17 @@ pub struct ScriptWidget {
     /// worker's default-visible slot and to avoid a spurious wake on the first
     /// frame of a pane that spawns already visible.
     pub was_visible: bool,
+    /// Theme epoch this pane's tree was last laid out under (see the
+    /// `theme_epoch` Local in `apply_latest_frames`). The theme-change
+    /// signal itself (`is_changed` / `ThemeChanged`) is one-shot per system
+    /// run, so a pane that is `Visibility::Hidden` at that instant would
+    /// miss it — and the worker's `Rerender` safety net dedupes the
+    /// byte-identical tree (token-name colors resolve host-side), so
+    /// nothing would ever re-apply. The stamp survives being hidden: on
+    /// reveal it still mismatches and the pane re-lays-out under the
+    /// current theme. That was the "buttons keep the wrong accent/label
+    /// colors until you click" bug on project/workspace switches.
+    pub last_theme_epoch: u64,
 }
 
 /// A live `Element::Editor` portal tracked across re-render diffs.
@@ -944,7 +955,7 @@ fn setup_watcher(world: &mut World) {
             include_str!("../widgets/theme_editor.ft"),
         ),
         ("chess.ft", include_str!("../widgets/chess.ft")),
-        ("dev_panel.ft", include_str!("../widgets/dev_panel.ft")),
+        ("file_open.ft", include_str!("../widgets/file_open.ft")),
         ("style_lab.ft", include_str!("../widgets/style_lab.ft")),
     ] {
         let p = dir.join(name);
@@ -1159,6 +1170,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             force_render: false,
             last_layout_size: Vec2::ZERO,
             was_visible: true,
+            last_theme_epoch: 0,
         },
         WidgetTargets::default(),
         crate::WidgetScroll::default(),
@@ -1907,16 +1919,23 @@ fn apply_latest_frames(
     mut anim_store: ResMut<crate::anim::WidgetAnim>,
     pane_font: Res<PaneFont>,
     pane_metrics: Res<jim_pane::PaneFontMetrics>,
-    theme: Res<jim_style::Theme>,
-    fonts: Res<jim_style::FontRegistry>,
+    // Grouped so the system stays under Bevy's 16-param limit.
+    style: (
+        Res<jim_style::Theme>,
+        Res<jim_style::ProjectThemes>,
+        Res<jim_style::FontRegistry>,
+        MessageReader<jim_style::ThemeChanged>,
+    ),
     pane_zoom: Res<jim_pane::PaneZoom>,
     time: Res<Time>,
     budget: Res<WidgetRenderBudget>,
+    mut theme_epoch: Local<u64>,
     mut q: Query<(
         Entity,
         &PaneKindMarker,
         &PaneChrome,
         &PaneRect,
+        Option<&jim_pane::PaneProject>,
         &mut ScriptWidget,
         &mut WidgetTargets,
         &mut crate::WidgetScroll,
@@ -1929,7 +1948,18 @@ fn apply_latest_frames(
     children_q: Query<&Children>,
 ) {
     let _t_prof = jim_pane::prof::sys_span("apply_latest_frames");
-    let theme_changed = theme.is_changed();
+    let (theme, themes, fonts, mut theme_events) = style;
+    // Any theme movement bumps the epoch; each pane re-lays-out when its
+    // stamp no longer matches (`ScriptWidget::last_theme_epoch`). Trigger on
+    // the `ThemeChanged` MESSAGE as well as `is_changed` — the style-picker /
+    // `set_active_style` path doesn't reliably fire `Res::is_changed` (see
+    // the same fix in `forward_inputs_to_workers`) — and on the per-project
+    // theme cache, which is what panes actually resolve against below.
+    let theme_changed =
+        theme_events.read().last().is_some() || theme.is_changed() || themes.is_changed();
+    if theme_changed {
+        *theme_epoch += 1;
+    }
     let _zoom = pane_zoom.0.max(0.0001);
     // Caret blink: visible during the first half of each 1s cycle.
     let caret_visible = time.elapsed_secs().rem_euclid(1.0) < 0.5;
@@ -1943,6 +1973,7 @@ fn apply_latest_frames(
         kind,
         chrome,
         rect,
+        proj,
         mut w,
         mut targets,
         mut scroll,
@@ -1956,6 +1987,13 @@ fn apply_latest_frames(
         if kind.0 != PANE_KIND {
             continue;
         }
+        // Per-project theming: lay this pane out in its OWN project's theme
+        // (falling back to the global/active one), mirroring the subprocess
+        // path (`rerender_widgets`) and the chrome (`PaneChromeStyle`). The
+        // global theme swaps on every project switch, racing `sync_visibility`
+        // across frames — resolving per-pane makes that race irrelevant, and
+        // the cube overview shows every project's widgets faithfully.
+        let w_theme: &jim_style::Theme = proj.and_then(|p| themes.get(p.0)).unwrap_or(&theme);
         let title_h = jim_pane::override_title_h(chrome_ov);
         // Never rebuild a hidden pane's entity subtree. The worker already
         // suppresses renders while hidden, but a frame can still be sitting in
@@ -1993,8 +2031,12 @@ fn apply_latest_frames(
             (rect.size.y - title_h - 2.0 * MARGIN).max(0.0),
         );
         let size_changed = w.last_layout_size != content_size;
+        // Epoch mismatch (not the one-shot `theme_changed`): a pane hidden
+        // when a theme change went by keeps its stale stamp and re-lays-out
+        // on reveal, instead of silently keeping old-palette colors.
+        let theme_stale = w.last_theme_epoch != *theme_epoch;
         if current_gen == w.applied_frame_gen
-            && !theme_changed
+            && !theme_stale
             && !focus_changed
             && !forced
             && !size_changed
@@ -2018,8 +2060,9 @@ fn apply_latest_frames(
         // Committed to laying out at this size; record it so a later frame
         // with an unchanged size+tree doesn't re-render. Set only after the
         // budget-defer gate so a deferred pane keeps `size_changed` true and
-        // is retried next frame.
+        // is retried next frame. Same for the theme-epoch stamp.
         w.last_layout_size = content_size;
+        w.last_theme_epoch = *theme_epoch;
 
         // Grab the frame the worker last produced.
         let frame = w
@@ -2093,12 +2136,22 @@ fn apply_latest_frames(
                     &mut w.sprite_prev,
                     Vec2::ZERO,
                     0.0,
-                    // Top-level Canvas: no array-order z bump (these widgets
-                    // set explicit z; preserve the long-standing behavior).
-                    0.0,
+                    // Array-order z bump, same as nested regions. This path
+                    // used to pass 0.0 ("widgets set explicit z"), but most
+                    // items carry the DEFAULT z=0 — the podcast's full-body
+                    // bg, its section fills, and its button cells all tied,
+                    // and with diff reuse the winner is entity-creation
+                    // order, which scrambles across re-renders: the body
+                    // visibly flipped color between a click and a hover, and
+                    // buttons randomly vanished under the bg rect ("button
+                    // takes the background color"). Encode push order so
+                    // later-pushed items deterministically draw on top;
+                    // explicit z still dominates (total drift < one 0.01
+                    // z-step).
+                    0.009 / (children.len().max(1) as f32),
                     &pane_font.0,
                     &fonts,
-                    canvas_surface(&theme),
+                    canvas_surface(w_theme),
                 );
             }
             // Flow layout (vstack / hstack / text / button / divider /
@@ -2148,8 +2201,9 @@ fn apply_latest_frames(
                     owner_pane: entity,
                     content_root: chrome.content_root,
                     content_size,
-                    palette: crate::render::WidgetPalette::from_theme(&theme),
-                    theme: theme.clone(),
+                    palette: crate::render::WidgetPalette::from_theme(w_theme),
+                    theme: w_theme.clone(),
+                    ground: Color::LinearRgba(w_theme.color(jim_style::tokens::PANE_BG)),
                     fonts: fonts.clone(),
                     focused_input: input_focus.cloned(),
                     caret_visible,
@@ -2189,7 +2243,7 @@ fn apply_latest_frames(
                     &mut w.editor_portals,
                     &targets.editor_portals,
                     chrome.content_root,
-                    &theme,
+                    w_theme,
                 );
                 // Nested Canvas regions: draw their items at the laid-out
                 // box origin, here where the image assets are in scope.
@@ -2246,7 +2300,7 @@ fn apply_latest_frames(
                         0.009 / (region.items.len().max(1) as f32),
                         &pane_font.0,
                         &fonts,
-                        canvas_surface(&theme),
+                        canvas_surface(w_theme),
                     );
                 }
                 // Update scroll bounds based on what the render

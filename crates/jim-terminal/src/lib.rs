@@ -1989,12 +1989,20 @@ fn sync_grid(
         // dirty_rows vectors are only ever mutated during a publish, under
         // this very mutex. So an unchanged `generation` guarantees both the
         // cells AND the dirty_rows are byte-identical to what we'd have
-        // copied — there is nothing new to consume. The worker fully
-        // REPLACES dirty_rows each publish (it does not accumulate flags for
-        // the renderer to clear), so we never owe it a read.
+        // copied — there is nothing new to consume.
+        //
+        // Taking the copy is also what CONSUMES the dirty flags, so we clear
+        // them here in the same critical section. The worker ORs new flags in
+        // and never clears (worker.rs), because it publishes far more often
+        // than we paint — its wake of the event loop is throttled process-wide
+        // — and a publish that replaced the flags would drop every row dirtied
+        // by the publishes we never saw. Clearing under the lock is exactly
+        // the handoff that makes accumulation safe: a publish is either
+        // serialized before our copy (we see its flags) or after our clear (it
+        // re-sets them for the next frame), never lost between the two.
         let lock_t = Instant::now();
         let (cols, rows, default_fg, default_bg, cursor, generation, pool_changed, work_pending) = {
-            let g = data.worker.snapshot.lock().expect("snapshot lock");
+            let mut g = data.worker.snapshot.lock().expect("snapshot lock");
             let cols = g.cols;
             let rows = g.rows;
             let generation = g.generation;
@@ -2010,6 +2018,7 @@ fn sync_grid(
                 local_cells.extend_from_slice(&g.cells);
                 local_dirty_rows.clear();
                 local_dirty_rows.extend_from_slice(&g.dirty_rows);
+                g.dirty_rows.fill(false);
             }
             (
                 cols,

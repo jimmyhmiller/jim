@@ -1,12 +1,17 @@
-// file_open.ft — a real file TREE that opens files in a docked emacs pane.
+// file_open.ft — the file TREE half of the Emacs workspace.
 //
 // Roots at a directory (params.path, else params.project_root, else $HOME).
 // Directories expand/collapse in place; clicking a file emits
-// `emacs.open_file` {path}, which jim routes to a native-emacs pane docked
-// alongside this widget (the "mini editor") — or the focused emacs pane.
-// See `route_emacs_open_requests` in jim-app and the `list_entries` host fn.
+// `emacs.open_file` {path}, which jim routes to the native-emacs pane docked
+// alongside this widget (see `route_emacs_open_requests` in jim-app).
 //
-// Fully event-driven: re-renders only on click (expand/collapse or open).
+// It also follows Emacs the other way: the pane publishes `emacs.state`
+// (retained) every time its selected window changes buffer, point, or scroll,
+// and `on_message` reveals + highlights whatever file that is. Open something
+// with C-x C-f, or jump to a definition, and the tree moves to match — which
+// is what makes the two panes read as one application.
+//
+// Event-driven throughout: renders on click and on an emacs.state change.
 import "host"
 import { col_text, col_muted, col_accent, col_panel } from "df"
 
@@ -62,19 +67,112 @@ fn without(xs, x) {
     out
 }
 
-fn init_state() = { root: root_dir(), expanded: [] }
+// Every ancestor directory of `path` at or below `root`, so revealing a
+// file opens exactly the folders that lead to it and nothing else.
+fn ancestors_within(root, path) {
+    let mut out = []
+    if not starts_with(path, root + "/") { return out }
+    let rest = slice(path, len(root) + 1, len(path))
+    let parts = split(rest, "/")
+    let mut cur = root
+    let n = len(parts)
+    let mut i = 0
+    for p in parts {
+        // The last segment is the file itself, not a directory to open.
+        if i < n - 1 {
+            cur = cur + "/" + p
+            out = push(out, cur)
+        }
+        i = i + 1
+    }
+    out
+}
+
+// `dialog` is the open modal, if any: "" | "rename" | "new_file" | "new_dir"
+// | "trash". `target` is the path it acts on, `field` the text being typed,
+// and `status` the last result line shown under the header (an error from a
+// refused operation, or a confirmation) — a file operation that silently did
+// nothing is indistinguishable from a broken menu.
+fn parent_of(p) {
+    let parts = split(p, "/")
+    let n = len(parts)
+    let mut out = ""
+    let mut i = 0
+    for seg in parts {
+        // Join on index, not on `out == ""`: an absolute path's first
+        // segment IS empty, and treating that as "nothing yet" silently
+        // drops the leading slash and turns the result relative.
+        if i < n - 1 { out = if i == 0 { seg } else { out + "/" + seg } }
+        i = i + 1
+    }
+    out
+}
+
+// The directory a "New File/Folder" lands in: the row itself when it is a
+// directory, otherwise the directory holding it.
+fn dir_context(path, is_dir) = if is_dir { path } else { parent_of(path) }
+
+fn init_state() = { root: root_dir(), expanded: [], current: "", modified: false,
+                    dialog: "", target: "", field: "", status: "", status_err: false }
 let state = atom(init_state())
+
+// A hot reload keeps the live atom, so a state record written by an older
+// version of this file is missing every field added since. Merging over
+// `init_state()` gives those their defaults instead of faulting the render
+// with "record has no field".
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
 
 fn on_init() {
     request_render()
 }
 
+// The docked Emacs pane telling us where it is. Retained, so a tree opened
+// after the editor still lands on the right file.
+fn on_message(topic, payload, sender) {
+    if topic != "emacs.state" { return }
+    if typeof(payload) != "Record" { return }
+    let path = unwrap_or(get(payload, "path"), "")
+    let modified = unwrap_or(get(payload, "modified"), false)
+    let s = cur_state()
+    // A buffer with no file (*scratch*, a dired listing, magit) leaves the
+    // previous selection alone rather than clearing it — the tree should not
+    // flicker empty every time you hit a transient buffer.
+    if typeof(path) != "Str" or path == "" {
+        if s.modified != modified {
+            reset!(state, { ..s, modified: modified })
+            request_render()
+        }
+        return
+    }
+    if path == s.current and s.modified == modified { return }
+    let mut expanded = s.expanded
+    for d in ancestors_within(s.root, path) {
+        if not mem(expanded, d) { expanded = push(expanded, d) }
+    }
+    reset!(state, { ..s, current: path, modified: modified, expanded: expanded })
+    request_render()
+}
+
 // Flatten the tree into visible rows: each expanded directory contributes
 // its children (indented by depth) right after it. Directory I/O only
-// happens for the root and expanded dirs, and only on (click-driven) render.
+// happens for the root and expanded dirs, and only on (event-driven) render.
+// Directories sort ahead of files at every level, the way a file tree reads.
 fn visible_rows(dir, depth, expanded) {
+    let entries = list_entries(dir)
+    let mut dirs = []
+    let mut files = []
+    for e in entries {
+        if e.is_dir { dirs = push(dirs, e) } else { files = push(files, e) }
+    }
+    let mut ordered = []
+    for e in dirs { ordered = push(ordered, e) }
+    for e in files { ordered = push(ordered, e) }
+
     let mut out = []
-    for e in list_entries(dir) {
+    for e in ordered {
         let full = dir + "/" + e.name
         let is_open = e.is_dir and mem(expanded, full)
         out = push(out, { name: e.name, path: full, is_dir: e.is_dir,
@@ -88,12 +186,134 @@ fn visible_rows(dir, depth, expanded) {
     out
 }
 
+// The right-click menu for a row. Ids are `verb:path`, routed back through
+// `on_click` exactly like a button — the host turns a menu pick into a Click.
+fn row_context(path, is_dir) {
+    let mut items = []
+    if is_dir {
+        items = push(items, { label: "New File…",   id: "newfile:" + path })
+        items = push(items, { label: "New Folder…", id: "newdir:" + path })
+    } else {
+        items = push(items, { label: "Open",        id: "open:" + path })
+        items = push(items, { label: "New File…",   id: "newfile:" + parent_of(path) })
+        items = push(items, { label: "New Folder…", id: "newdir:" + parent_of(path) })
+    }
+    items = push(items, { label: "Rename…",          id: "rename:" + path })
+    items = push(items, { label: "Duplicate",        id: "dup:" + path })
+    items = push(items, { label: "Copy Path",        id: "copypath:" + path })
+    items = push(items, { label: "Copy Relative Path", id: "copyrel:" + path })
+    items = push(items, { label: "Reveal in Finder", id: "finder:" + path })
+    items = push(items, { label: "Move to Trash…",   id: "trash:" + path })
+    items
+}
+
+// Every mutation funnels through here so there is exactly one place that
+// reports failure. `res` is the { ok, error } record from an fs_* host fn.
+fn finish(s, res, ok_msg) {
+    if res.ok {
+        reset!(state, { ..s, dialog: "", target: "", field: "",
+                        status: ok_msg, status_err: false })
+    } else {
+        reset!(state, { ..s, dialog: "", target: "", field: "",
+                        status: res.error, status_err: true })
+        host_log("[file_open] " + res.error)
+    }
+    request_render()
+}
+
+fn open_dialog(s, kind, path, initial) {
+    reset!(state, { ..s, dialog: kind, target: path, field: initial, status: "" })
+    request_render()
+}
+
+// Escape closes whatever modal is open — the same key the host sends for a
+// scrim click, so both routes land here.
+fn on_dialog_close(id) {
+    let s = cur_state()
+    reset!(state, { ..s, dialog: "", target: "", field: "" })
+    request_render()
+}
+
+fn on_input_change(id, value) {
+    let s = cur_state()
+    reset!(state, { ..s, field: value })
+}
+
+// Enter in the name box commits, so a rename is type-and-return.
+fn on_input_submit(id, value) {
+    let s = cur_state()
+    reset!(state, { ..s, field: value })
+    commit(cur_state())
+}
+
+// Apply the open dialog. Named separately from on_click so Enter and the
+// Create/Rename button share one path.
+fn commit(s) {
+    let name = trim(s.field)
+    if s.dialog == "trash" {
+        finish(s, fs_trash(s.target), "Moved to Trash: " + basename(s.target))
+        return
+    }
+    if name == "" {
+        reset!(state, { ..s, status: "name cannot be empty", status_err: true })
+        request_render()
+        return
+    }
+    if contains(name, "/") {
+        reset!(state, { ..s, status: "name cannot contain \"/\"", status_err: true })
+        request_render()
+        return
+    }
+    if s.dialog == "rename" {
+        let dest = parent_of(s.target) + "/" + name
+        let res = fs_rename(s.target, dest)
+        // Follow the file: a renamed open buffer should stay selected.
+        let s2 = if res.ok and s.current == s.target { { ..s, current: dest } } else { s }
+        finish(s2, res, "Renamed to " + name)
+    } else if s.dialog == "new_file" {
+        let dest = s.target + "/" + name
+        let res = fs_new_file(dest)
+        // A new file is almost always about to be edited, so open it and
+        // make sure the directory it landed in is showing.
+        if res.ok {
+            let mut expanded = s.expanded
+            if not mem(expanded, s.target) { expanded = push(expanded, s.target) }
+            emit("emacs.open_file", { path: dest })
+            finish({ ..s, expanded: expanded, current: dest }, res, "Created " + name)
+        } else {
+            finish(s, res, "")
+        }
+    } else if s.dialog == "new_dir" {
+        let dest = s.target + "/" + name
+        let res = fs_mkdir(dest)
+        if res.ok {
+            let mut expanded = s.expanded
+            if not mem(expanded, s.target) { expanded = push(expanded, s.target) }
+            if not mem(expanded, dest) { expanded = push(expanded, dest) }
+            finish({ ..s, expanded: expanded }, res, "Created " + name)
+        } else {
+            finish(s, res, "")
+        }
+    }
+}
+
 fn on_click(x, y, shift, cmd, id) {
-    let s = @state
+    let s = cur_state()
     if id == "refresh" {
         request_render()
     } else if id == "collapse_all" {
         reset!(state, { ..s, expanded: [] })
+        request_render()
+    } else if id == "reveal" {
+        // Re-open the path to the file Emacs is showing, in case it was
+        // collapsed away since.
+        if s.current != "" {
+            let mut expanded = s.expanded
+            for d in ancestors_within(s.root, s.current) {
+                if not mem(expanded, d) { expanded = push(expanded, d) }
+            }
+            reset!(state, { ..s, expanded: expanded })
+        }
         request_render()
     } else if starts_with(id, "dir:") {
         let path = slice(id, 4, len(id))
@@ -102,64 +322,174 @@ fn on_click(x, y, shift, cmd, id) {
         request_render()
     } else if starts_with(id, "open:") {
         let path = slice(id, 5, len(id))
+        // Show the selection immediately; emacs.state confirms it a beat
+        // later, and would otherwise be the only thing that moved it.
+        reset!(state, { ..s, current: path })
         emit("emacs.open_file", { path: path })
+        request_render()
         host_log("[file_open] open " + path)
+    }
+    // ---- context-menu picks (and the dialog buttons they open) ----
+    else if starts_with(id, "rename:") {
+        let path = slice(id, 7, len(id))
+        open_dialog(s, "rename", path, basename(path))
+    } else if starts_with(id, "newfile:") {
+        open_dialog(s, "new_file", slice(id, 8, len(id)), "")
+    } else if starts_with(id, "newdir:") {
+        open_dialog(s, "new_dir", slice(id, 7, len(id)), "")
+    } else if starts_with(id, "trash:") {
+        open_dialog(s, "trash", slice(id, 6, len(id)), "")
+    } else if starts_with(id, "dup:") {
+        let path = slice(id, 4, len(id))
+        let d = fs_duplicate_path(path)
+        if not d.ok {
+            finish(s, { ok: false, error: d.error }, "")
+        } else {
+            finish(s, fs_copy(path, d.path), "Duplicated as " + basename(d.path))
+        }
+    } else if starts_with(id, "copypath:") {
+        let path = slice(id, 9, len(id))
+        clipboard_set(path)
+        reset!(state, { ..s, status: "Copied " + path, status_err: false })
+        request_render()
+    } else if starts_with(id, "copyrel:") {
+        let path = slice(id, 8, len(id))
+        // Relative to the tree's root, which is the project root in the
+        // workspace layout — the form you paste into a commit or an issue.
+        let rel = if starts_with(path, s.root + "/") {
+            slice(path, len(s.root) + 1, len(path))
+        } else { path }
+        clipboard_set(rel)
+        reset!(state, { ..s, status: "Copied " + rel, status_err: false })
+        request_render()
+    } else if starts_with(id, "finder:") {
+        // `open -R` selects the item in Finder rather than opening it, which
+        // is what "Reveal" means.
+        proc_spawn("open", ["-R", slice(id, 7, len(id))])
+    } else if id == "dlg_ok" {
+        commit(s)
+    } else if id == "dlg_cancel" {
+        reset!(state, { ..s, dialog: "", target: "", field: "" })
+        request_render()
+    } else if id == "status_clear" {
+        reset!(state, { ..s, status: "" })
+        request_render()
     }
 }
 
 fn spacer() = { kind: "frame", style: { flex_grow: 1.0 }, children: [] }
 
-fn row_el(r) {
+fn row_el(r, current, modified) {
     let indent = 8.0 + r.depth * 13.0
+    let is_current = (not r.is_dir) and r.path == current
     let lead = if r.is_dir {
         { kind: "text", value: if r.open { "▾" } else { "▸" }, size: 10.0,
           color: col_muted(), selectable: false, wrap: false }
     } else {
-        { kind: "text", value: "●", size: 8.0, color: dot_color(r.name),
+        { kind: "text", value: "●", size: 8.0,
+          color: if is_current { col_accent() } else { dot_color(r.name) },
           selectable: false, wrap: false }
     }
     let name = { kind: "text", value: r.name, family: "mono", size: 12.5,
-                 weight: if r.is_dir { "bold" } else { "normal" },
+                 weight: if r.is_dir or is_current { "bold" } else { "normal" },
                  color: if r.is_dir { col_accent() } else { col_text() },
                  selectable: false, wrap: false }
     let mut kids = [ lead, name ]
     if not r.is_dir {
         kids = push(kids, spacer())
-        kids = push(kids, { kind: "text", value: fmt_size(r.size), family: "mono",
-                            size: 10.0, color: col_muted(), selectable: false, wrap: false })
+        // An unsaved buffer gets a dot where the size usually goes, so the
+        // tree carries the same "modified" signal the pane title does.
+        if is_current and modified {
+            kids = push(kids, { kind: "text", value: "●", size: 9.0,
+                                color: col_accent(), selectable: false, wrap: false })
+        } else {
+            kids = push(kids, { kind: "text", value: fmt_size(r.size), family: "mono",
+                                size: 10.0, color: col_muted(), selectable: false, wrap: false })
+        }
     }
     let inner = { kind: "hstack", gap: 7.0, align: "center", style: { width: "100%" }, children: kids }
     let idp = if r.is_dir { "dir:" + r.path } else { "open:" + r.path }
-    { kind: "list-item", id: idp, selected: false, pad: 0.0,
+    { kind: "list-item", id: idp, selected: is_current, pad: 0.0,
+      context: row_context(r.path, r.is_dir),
       style: { padding: { top: 3.0, bottom: 3.0, left: indent, right: 8.0 },
                radius: "6", width: "100%" },
       children: [ inner ] }
 }
 
+// The modal behind Rename / New File / New Folder / Move to Trash. One
+// element covers all four: only the wording, and whether there is a name
+// box, differ.
+fn dialog_el(s) {
+    if s.dialog == "" { return () }
+    let name = basename(s.target)
+    let is_trash = s.dialog == "trash"
+    let title = if s.dialog == "rename" { "Rename " + name }
+                else if s.dialog == "new_file" { "New file in " + basename(s.target) }
+                else if s.dialog == "new_dir" { "New folder in " + basename(s.target) }
+                else { "Move to Trash" }
+    let ok_label = if s.dialog == "rename" { "Rename" }
+                   else if is_trash { "Move to Trash" }
+                   else { "Create" }
+    let mut body = []
+    if is_trash {
+        body = push(body, { kind: "text", size: 12.5, color: col_text(), wrap: true,
+                            value: "Move \"" + name + "\" to the Trash? You can put it back from Finder." })
+    } else {
+        body = push(body, { kind: "input", id: "dlg_name", value: s.field,
+                            focused: true, placeholder: "name" })
+    }
+    body = push(body, { kind: "hstack", gap: 8.0, children: [
+        { kind: "button", id: "dlg_ok", label: ok_label },
+        { kind: "button", id: "dlg_cancel", label: "Cancel" },
+    ] })
+    { kind: "dialog", id: "dlg", open: true, title: title, width: 420.0,
+      body: { kind: "vstack", gap: 10.0, children: body } }
+}
+
 fn render(w, h) {
-    let s = @state
+    let s = cur_state()
     let rowsData = visible_rows(s.root, 0, s.expanded)
     let mut rows = []
     for r in rowsData {
-        rows = push(rows, row_el(r))
+        rows = push(rows, row_el(r, s.current, s.modified))
     }
     if len(rows) == 0 {
         rows = push(rows, { kind: "text", value: "(empty)", size: 12.0,
                             color: col_muted(), selectable: false })
     }
-    let header = { kind: "hstack", gap: 8.0, align: "center", style: { width: "100%" },
-      children: [
+    let mut tools = [
         { kind: "text", value: basename(s.root), size: 13.5, weight: "bold",
           color: col_text(), selectable: false, wrap: false },
         spacer(),
-        { kind: "button", id: "collapse_all", label: "⤒" },
-        { kind: "button", id: "refresh", label: "↻" },
-      ] }
-    { kind: "vstack", gap: 8.0, pad: 12.0, children: [
+    ]
+    if s.current != "" {
+        tools = push(tools, { kind: "button", id: "reveal", label: "◎" })
+    }
+    tools = push(tools, { kind: "button", id: "collapse_all", label: "⤒" })
+    tools = push(tools, { kind: "button", id: "refresh", label: "↻" })
+    let header = { kind: "hstack", gap: 8.0, align: "center", style: { width: "100%" },
+                   children: tools }
+    // The subtitle follows the open buffer once there is one: the root path
+    // is only interesting until you are actually editing something.
+    let subtitle = if s.current != "" { s.current } else { s.root }
+    let mut kids = [
         header,
-        { kind: "text", value: s.root, size: 10.0, color: col_muted(),
+        { kind: "text", value: subtitle, size: 10.0,
+          color: if s.current != "" { col_accent() } else { col_muted() },
           selectable: false, wrap: false },
-        { kind: "divider" },
-        { kind: "scroll", gap: 1.0, children: rows },
-    ]}
+    ]
+    // Result of the last file operation. A refused rename ("already exists")
+    // has to be visible, or the menu item just looks broken; click it away.
+    if s.status != "" {
+        kids = push(kids, { kind: "list-item", id: "status_clear", pad: 0.0,
+            style: { padding: { top: 2.0, bottom: 2.0, left: 2.0, right: 2.0 }, radius: "4" },
+            children: [ { kind: "text", value: s.status, size: 10.5, wrap: true,
+                          selectable: false,
+                          color: if s.status_err { "#e0705f" } else { col_muted() } } ] })
+    }
+    kids = push(kids, { kind: "divider" })
+    kids = push(kids, { kind: "scroll", gap: 1.0, children: rows })
+    let d = dialog_el(s)
+    if typeof(d) == "Record" { kids = push(kids, d) }
+    { kind: "vstack", gap: 8.0, pad: 12.0, children: kids }
 }

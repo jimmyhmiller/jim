@@ -585,6 +585,39 @@ see "Driving a subprocess"), and the JSON bridge `parse_json(s)` →
 map/array/scalar (`()` on bad input) / `to_json(v)` → compact string,
 for talking JSON protocols with subprocesses (see `style_lab.ft`).
 
+#### Filesystem
+
+Reading: `read_file(path)` → `{ ok, text, error }`, `list_dir(path)`,
+`list_entries(path)` → `[{ name, is_dir, size }]` (directories first,
+then case-insensitive by name).
+
+Writing: `write_file(path, text)` → bool, plus the mutation set backing
+the file tree's right-click menu, each returning `{ ok, error }`:
+
+| function | what it does |
+| --- | --- |
+| `fs_rename(from, to)` | rename **and** move. Never clobbers an existing `to`. |
+| `fs_mkdir(path)` | create a directory, parents included |
+| `fs_new_file(path)` | create an EMPTY file; fails rather than truncating one that exists |
+| `fs_copy(from, to)` | copy a file or a whole tree |
+| `fs_trash(path)` | move to the macOS Trash |
+| `fs_duplicate_path(path)` | → `{ ok, path, error }`: the free `x copy.rs` name beside `path` |
+| `fs_exists(path)` | → bool |
+
+`~` is expanded by all of them. Three things to know:
+
+- **There is no irrecoverable delete, on purpose.** `fs_trash` is the
+  whole delete surface, because these hang off context menus one slip
+  away from destroying a tree, and the Trash is the only undo.
+- **`/`, `$HOME`, and the empty path are refused** (after canonicalizing,
+  so `~/x/..` cannot smuggle one past). No real file-tree action targets
+  them; every accident does.
+- **Show the `error`.** Every one of these can legitimately fail
+  ("already exists", "Permission denied"), and a widget that ignores the
+  field renders a refusal identically to a no-op — which reads as a
+  broken menu item. `file_open.ft` puts it in a status line under the
+  header.
+
 ---
 
 ## Writing a subprocess widget

@@ -212,8 +212,6 @@ impl Plugin for AppShellPlugin {
             //     a slide's picture of the app.
             //   - slide_view::DIVE_LAYER (4098): the full-window overlay
             //     that zooms into a recursive slide.
-            //   - jim_style::dynamic::OVERLAY_LAYER (30): the dust/shader
-            //     canvas overlay, drawn at order 1_000_001 above everything.
             // This is the single registry of global layers; anyone adding a
             // global overlay camera MUST add its layer here. See
             // `PaneLayerAllocator`.
@@ -225,7 +223,6 @@ impl Plugin for AppShellPlugin {
                     cube::CUBE_LAYER,
                     slide_view::BLIT_LAYER,
                     slide_view::DIVE_LAYER,
-                    jim_style::dynamic::OVERLAY_LAYER,
                     jim_pane::dock::DOCK_OVERLAY_LAYER,
                 ],
             })
@@ -297,15 +294,6 @@ impl Plugin for AppShellPlugin {
             run: ActionRun::Custom(action_new_markdown),
         })
         .add_action(Action {
-            id: "view.dev_panel",
-            title: "Style Dev Panel",
-            category: "View",
-            keywords: &["debug", "tokens"],
-            radial_icon: None,
-            default_keys: const { &[KeyChord::cmd_shift(KeyCode::KeyD)] },
-            run: ActionRun::Custom(action_open_dev_panel),
-        })
-        .add_action(Action {
             id: "view.theme_editor",
             title: "Theme Editor",
             category: "View",
@@ -322,6 +310,25 @@ impl Plugin for AppShellPlugin {
             radial_icon: None,
             default_keys: const { &[KeyChord::cmd_shift(KeyCode::KeyS)] },
             run: ActionRun::Custom(action_open_style_picker),
+        })
+        .add_action(Action {
+            id: "emacs.workspace",
+            title: "Emacs",
+            // Also reachable as `jimctl emacs [--project P] [--path DIR]`,
+            // which is how an agent asks for one.
+            category: "File",
+            keywords: &[
+                "editor",
+                "elisp",
+                "buffer",
+                "files",
+                "tree",
+                "gnu",
+                "emacsclient",
+            ],
+            radial_icon: Some("E"),
+            default_keys: const { &[KeyChord::cmd(KeyCode::KeyK), KeyChord::plain(KeyCode::KeyE)] },
+            run: ActionRun::Custom(action_open_emacs_workspace),
         })
         .add_action(Action {
             id: "view.chess",
@@ -528,7 +535,6 @@ impl Plugin for AppShellPlugin {
             (
                 mirror_active_project_to_style,
                 maintain_project_themes,
-                mirror_focus_to_style,
                 // AFTER the slide picture: it decides whether the loop
                 // keeps drawing, and a burst requested later in the same
                 // frame would not be seen until the next one — which, in
@@ -566,6 +572,7 @@ impl Plugin for AppShellPlugin {
                 drain_save_as_results,
                 dispatch_bus_actions,
                 route_emacs_open_requests,
+                publish_emacs_state,
             ),
         )
         // Focus-state + modifier reconciliation run in PreUpdate, right
@@ -977,6 +984,16 @@ fn drain_ipc_open_requests(
             }
             ipc::IpcRequest::ToggleExpose => {
                 expose.pending_toggle = true;
+            }
+            ipc::IpcRequest::EmacsWorkspace { project, path } => {
+                let target = match project.as_deref() {
+                    Some("active") | None => projects::OpenProjectTarget::Active,
+                    Some(name) => projects::OpenProjectTarget::ByName(name.to_string()),
+                };
+                match projects::resolve_project(&target, &projects) {
+                    Some(id) => pending.emacs_workspaces.push((id, path)),
+                    None => eprintln!("[ipc] emacs: no matching project"),
+                }
             }
             ipc::IpcRequest::TogglePresent { title } => {
                 presentation.pending_toggle = true;
@@ -1480,8 +1497,8 @@ fn widget_id_to_entity(id: &str) -> Option<Entity> {
     Entity::try_from_bits(bits)
 }
 
-/// Route `emacs.open_file` bus messages (payload `{ "path": "…" }`) to an
-/// emacs pane. Prefers a native-emacs pane docked with the sender (so a
+/// Route `emacs.open_file` (payload `{ "path": "…" }`) and `emacs.command`
+/// (payload `{ "command": "save-buffer" }`) bus messages to an emacs pane. Prefers a native-emacs pane docked with the sender (so a
 /// file widget in a dock drives its dock's editor — the "mini editor"),
 /// falling back to the focused pane if it's a native-emacs pane. This is
 /// the one consumer of the dock's co-member relationship: the sender's
@@ -1508,13 +1525,21 @@ fn route_emacs_open_requests(
             }
             continue;
         }
-        if ev.topic != "emacs.open_file" {
+        if ev.topic != "emacs.open_file" && ev.topic != "emacs.command" {
             continue;
         }
-        let Some(path) = ev.payload.get("path").and_then(|v| v.as_str()) else {
+        // `emacs.command` runs a named interactive command; `emacs.open_file`
+        // visits a path. Both pick their target pane the same way.
+        let command = ev.payload.get("command").and_then(|v| v.as_str());
+        let path = ev.payload.get("path").and_then(|v| v.as_str());
+        if ev.topic == "emacs.open_file" && path.is_none() {
             eprintln!("[emacs.open_file] missing 'path' from {}", ev.sender);
             continue;
-        };
+        }
+        if ev.topic == "emacs.command" && command.is_none() {
+            eprintln!("[emacs.command] missing 'command' from {}", ev.sender);
+            continue;
+        }
         // Prefer a native-emacs pane docked with the sender widget.
         let target = widget_id_to_entity(&ev.sender)
             .and_then(|sender| members.get(sender).ok().map(|dm| (sender, dm.dock)))
@@ -1528,17 +1553,58 @@ fn route_emacs_open_requests(
             // Fallback: the focused pane, if it's a native-emacs pane.
             .or_else(|| focused.0.filter(|&e| is_emacs(e)));
 
-        match target {
-            Some(pane) => {
+        match (target, ev.topic.as_str()) {
+            (Some(pane), "emacs.open_file") => {
+                let path = path.unwrap_or_default();
                 if !store.send_open_file(pane, path) {
                     eprintln!("[emacs.open_file] '{path}': emacs not ready / no frame");
                 }
             }
-            None => eprintln!(
-                "[emacs.open_file] '{path}' from {}: no docked or focused emacs pane",
+            (Some(pane), _) => {
+                let command = command.unwrap_or_default();
+                if !store.send_command(pane, command) {
+                    eprintln!("[emacs.command] '{command}': emacs not ready / no frame");
+                }
+            }
+            (None, topic) => eprintln!(
+                "[{topic}] from {}: no docked or focused emacs pane",
                 ev.sender
             ),
         }
+    }
+}
+
+/// Republish what Emacs reports about each native pane onto the
+/// `emacs.state` bus topic, so widgets can follow along — the file tree
+/// (`file_open.ft`) uses it to reveal and highlight whichever file the
+/// docked Emacs pane is showing, which is what makes the pair read as
+/// one application rather than two panes that happen to be adjacent.
+///
+/// Retained, so a tree spawned after the fact immediately learns where
+/// Emacs already is instead of waiting for the next buffer switch.
+fn publish_emacs_state(
+    mut store: ResMut<jim_emacs::native::EmacsNativeStore>,
+    mut msg_bus: ResMut<jim_widget::WidgetMsgBus>,
+    projects: Query<&jim_pane::PaneProject>,
+) {
+    for (pane, state) in store.take_state_changes() {
+        msg_bus.push_external(jim_widget::PendingMsg {
+            project: projects.get(pane).ok().map(|p| p.0),
+            topic: "emacs.state".to_string(),
+            payload: serde_json::json!({
+                "pane": format!("{:x}", pane.to_bits()),
+                "buffer": state.buffer,
+                "path": state.path,
+                "dir": state.dir,
+                "modified": state.modified,
+                "read_only": state.read_only,
+                "mode": state.mode,
+                "line": state.line,
+                "column": state.column,
+            }),
+            sender: "emacs".to_string(),
+            retain: true,
+        });
     }
 }
 
@@ -2505,7 +2571,7 @@ fn sync_dock_badge(_projects: Res<Projects>, _last: Local<u64>) {}
 
 /// Mirror `Projects.active` into style-bevy's `ActiveProject`. Also
 /// ensures each newly-observed project has its state.json loaded into
-/// memory so dust timers + the per-project preset are available.
+/// memory so the per-project preset is available.
 ///
 /// Note: this no longer touches `ActiveThemePath`. `presets.rs` is the
 /// sole owner of that resource — it derives it from `ActiveStylePreset`
@@ -2528,10 +2594,6 @@ fn mirror_active_project_to_style(
         if let Some(d) = data_dir.as_ref() {
             jim_style::state::load_project_state(d, &mut state, pid);
         }
-        // Intentionally NOT calling note_focus here — switching to a
-        // project on startup or via the sidebar shouldn't blow away
-        // accumulated dust. The mirror_focus_to_style hook records
-        // actual focus gestures.
     }
 }
 
@@ -2598,43 +2660,6 @@ fn maintain_project_themes(
             );
         }
     }
-}
-
-/// Cmd+Shift+D opens the style dev panel (a funct widget). Lets you
-/// scrub dust / edit / age / time_scale without waiting for real time
-/// to pass. Spawning goes through the same `PendingActions.new_panes`
-/// channel the radial menu uses, so all the usual pane-bevy chrome
-/// applies.
-/// `view.dev_panel` action (Cmd+Shift+D). Opens the style dev panel
-/// (a funct widget). Dedups: each spawn leaves a fresh funct worker thread
-/// ticking the script at 30 Hz (~50% CPU per duplicate), so if a dev
-/// panel already exists anywhere on the canvas, silently do nothing.
-fn action_open_dev_panel(ctx: &mut actions::ActionCtx) {
-    let exists = {
-        let mut q = ctx
-            .world
-            .query::<&jim_widget::script_widget::ScriptWidget>();
-        q.iter(ctx.world).any(|w| w.script == "dev_panel.ft")
-    };
-    if exists {
-        return;
-    }
-    let Some(active) = ctx.world.resource::<projects::Projects>().active else {
-        return;
-    };
-    ctx.world
-        .resource_mut::<projects::PendingActions>()
-        .new_panes
-        .push(projects::NewPaneRequest {
-            kind: jim_widget::script_widget::PANE_KIND,
-            project_id: active,
-            origin: None,
-            size: Some(Vec2::new(420.0, 280.0)),
-            config: serde_json::json!({
-                "script": "dev_panel.ft",
-                "title": "Style dev panel",
-            }),
-        });
 }
 
 /// `view.toggle_cube` action. Mirrors the `IpcRequest::ToggleCube` path
@@ -2821,8 +2846,8 @@ fn compute_keyboard_owner(
 }
 
 /// Track the active theme's `canvas_bg` token in `ClearColor` so a
-/// preset switch retones the void around the dust shader (visible at
-/// pane rounded-corners + during the windex sweep).
+/// preset switch retones the void behind the panes (visible at pane
+/// rounded-corners and wherever the canvas shows through).
 fn sync_canvas_clear_color(theme: Res<jim_style::Theme>, mut clear: ResMut<ClearColor>) {
     if !theme.is_changed() {
         return;
@@ -2848,8 +2873,8 @@ pub struct ChromeAnimations<'w> {
 /// Switch the winit update mode between Continuous (every frame) and
 /// Reactive (only on input + a 5s heartbeat) depending on whether the
 /// active visual preset needs to animate. Continuous burns ~1.5 cores
-/// at 60fps because the dust shader and chrome materials all redraw
-/// every frame; Reactive is battery-friendly. The transition itself
+/// at 60fps because the chrome materials all redraw every frame;
+/// Reactive is battery-friendly. The transition itself
 /// is event-driven (preset switch), so reactive mode reliably wakes
 /// up to handle it.
 ///
@@ -3118,6 +3143,89 @@ fn action_open_style_picker(ctx: &mut actions::ActionCtx) {
 /// `view.chess` action. Opens the chess widget — a funct widget that
 /// plays against Stockfish over UCI. Dedups on the script name: each
 /// instance spawns its own engine subprocess, so one board is plenty.
+/// "Emacs" — open the Emacs workspace: a file tree docked beside a
+/// native Emacs pane, rooted at the active project's directory.
+///
+/// Spawning the pair pre-docked is the whole point. The tree emits
+/// `emacs.open_file`, which `route_emacs_open_requests` delivers to the
+/// Emacs pane in the SAME dock, and Emacs's `emacs.state` comes back the
+/// other way to move the tree's selection — so clicking a file in the
+/// sidebar opens it in the editor beside it, the way an IDE does,
+/// instead of the two panes being unrelated neighbours.
+fn action_open_emacs_workspace(ctx: &mut actions::ActionCtx) {
+    let Some(active) = ctx.world.resource::<projects::Projects>().active else {
+        return;
+    };
+    open_emacs_workspace(ctx.world, active, None);
+}
+
+/// Open the Emacs workspace in `project_id`: a file tree docked beside a
+/// native Emacs pane, rooted at `root` (default: the project's own
+/// directory, else `$HOME`).
+///
+/// Shared by the `emacs.workspace` action (⌘K E / the palette) and the
+/// `jimctl emacs` IPC, so a person and an agent get the identical thing.
+pub(crate) fn open_emacs_workspace(
+    world: &mut World,
+    project_id: u64,
+    root: Option<String>,
+) -> Option<Entity> {
+    let active = project_id;
+    let root = root
+        .or_else(|| {
+            world
+                .resource::<projects::Projects>()
+                .list
+                .iter()
+                .find(|p| p.id == active)
+                .and_then(|p| p.default_cwd.clone())
+        })
+        .or_else(|| std::env::var("HOME").ok())
+        .unwrap_or_else(|| "/".to_string());
+
+    let z = jim_pane::next_pane_z(world);
+    let origin = Vec2::new(160.0, 140.0);
+    let tree_w = 280.0;
+    let height = 660.0;
+    let tree_rect = jim_pane::PaneRect {
+        pos: origin,
+        size: Vec2::new(tree_w, height),
+        z,
+    };
+    let emacs_rect = jim_pane::PaneRect {
+        pos: origin + Vec2::new(tree_w + 40.0, 0.0),
+        size: Vec2::new(900.0, height),
+        z,
+    };
+
+    let tree = jim_pane::spawn_pane_from_registry(
+        world,
+        jim_widget::script_widget::PANE_KIND,
+        "Files",
+        tree_rect,
+        Some(active),
+        &serde_json::json!({
+            "script": "file_open.ft",
+            "title": "Files",
+            "params": { "path": root, "project_root": root },
+        }),
+    )?;
+    let emacs = jim_pane::spawn_pane_from_registry(
+        world,
+        jim_emacs::native::PANE_KIND,
+        "Emacs",
+        emacs_rect,
+        Some(active),
+        &serde_json::json!({}),
+    )?;
+    jim_pane::dock::create_dock_template(
+        world,
+        &[tree, emacs],
+        jim_pane::dock::DockTemplate::Sidebar,
+    );
+    Some(emacs)
+}
+
 fn action_open_chess(ctx: &mut actions::ActionCtx) {
     let exists = {
         let mut q = ctx
@@ -3144,36 +3252,4 @@ fn action_open_chess(ctx: &mut actions::ActionCtx) {
                 "title": "Chess",
             }),
         });
-}
-
-/// When the user focuses any pane, mark that pane's project as
-/// recently-active so its dust timer resets. Skips the very first
-/// observation after startup — that one fires when the persistence
-/// layer restores focus, and counting "we restored your focus state"
-/// as engagement would zero out dust across restarts.
-fn mirror_focus_to_style(
-    focused: Res<jim_pane::FocusedPane>,
-    pane_projects: Query<&jim_pane::PaneProject>,
-    mut state: ResMut<jim_style::ProjectStyleState>,
-    mut last: Local<Option<Entity>>,
-    mut warmed_up: Local<bool>,
-) {
-    if !focused.is_changed() {
-        return;
-    }
-    let Some(entity) = focused.0 else {
-        *last = None;
-        return;
-    };
-    if *last == Some(entity) {
-        return;
-    }
-    *last = Some(entity);
-    if !*warmed_up {
-        *warmed_up = true;
-        return;
-    }
-    if let Ok(pp) = pane_projects.get(entity) {
-        state.note_focus(pp.0);
-    }
 }

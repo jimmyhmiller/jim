@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use serde::{Deserialize, Serialize};
 
@@ -39,12 +39,25 @@ struct UrlMsg {
 #[derive(Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Cmd {
-    Resize { w: f32, h: f32 },
-    Mouse { x: f32, y: f32, kind: &'static str },
-    Wheel { x: f32, y: f32, dx: f32, dy: f32 },
+    Resize {
+        w: f32,
+        h: f32,
+    },
+    Mouse {
+        x: f32,
+        y: f32,
+        kind: &'static str,
+    },
+    Wheel {
+        x: f32,
+        y: f32,
+        dx: f32,
+        dy: f32,
+    },
     Key {
         kind: &'static str,
         code: i32,
+        native_code: i32,
         text: Option<String>,
         modifiers: u32,
     },
@@ -66,10 +79,7 @@ pub struct HostClient {
 impl HostClient {
     pub fn spawn(url: &str, width: f32, height: f32, scale: f32) -> Result<Self, String> {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-        let host_bin = exe
-            .parent()
-            .ok_or("no exe dir")?
-            .join("jim-webview-host");
+        let host_bin = exe.parent().ok_or("no exe dir")?.join("jim-webview-host");
         if !host_bin.exists() {
             return Err(format!(
                 "{} is missing — make-bundle should copy it next to jim",

@@ -30,13 +30,12 @@ use bevy::sprite::Anchor;
 use bevy::window::{PrimaryWindow, RequestRedraw};
 use serde_json::Value;
 
-use bevy::input::keyboard::{Key, KeyboardInput};
 use bevy::input::ButtonState;
+use bevy::input::keyboard::{Key, KeyboardInput};
 use jim_pane::{
-    pt_to_content_local, topmost_pane_at, FocusedPane, KeyboardOwner, PaneContentDragged,
-    PaneContentHovered,
-    PaneContentPressed, PaneContentReleased, PaneKindMarker, PaneKindSpec, PaneRect, PaneRegistry,
-    PaneTag, PaneViewport, MARGIN, TITLE_H,
+    FocusedPane, KeyboardOwner, MARGIN, PaneContentDragged, PaneContentHovered, PaneContentPressed,
+    PaneContentReleased, PaneKindMarker, PaneKindSpec, PaneRect, PaneRegistry, PaneTag,
+    PaneViewport, TITLE_H, pt_to_content_local, topmost_pane_at,
 };
 
 mod client;
@@ -221,7 +220,11 @@ fn webview_spawn_from_config(
 
     // Back / forward / reload. Plain glyphs: the chrome font renders these,
     // and colour emoji would panic Bevy's rasterizer.
-    for (glyph, (x0, _)) in [("\u{2039}", BTN_BACK), ("\u{203A}", BTN_FWD), ("\u{21BB}", BTN_RELOAD)] {
+    for (glyph, (x0, _)) in [
+        ("\u{2039}", BTN_BACK),
+        ("\u{203A}", BTN_FWD),
+        ("\u{21BB}", BTN_RELOAD),
+    ] {
         world.spawn((
             ChildOf(content_root),
             Text2d::new(glyph),
@@ -274,23 +277,20 @@ fn webview_spawn_from_config(
     // field on a fresh pane does nothing.
     let focused_now = world.resource::<FocusedPane>().0 == Some(entity);
 
-    world
-        .non_send_resource_mut::<WebviewStore>()
-        .panes
-        .insert(
-            entity,
-            PaneWebview {
-                host,
-                image,
-                sprite,
-                px,
-                scroll_carry: Vec2::ZERO,
-                url_text,
-                editing: None,
-                scale_factor,
-                url,
-            },
-        );
+    world.non_send_resource_mut::<WebviewStore>().panes.insert(
+        entity,
+        PaneWebview {
+            host,
+            image,
+            sprite,
+            px,
+            scroll_carry: Vec2::ZERO,
+            url_text,
+            editing: None,
+            scale_factor,
+            url,
+        },
+    );
 
     if focused_now {
         if let Some(pane) = world
@@ -381,7 +381,10 @@ fn webview_pump(
         let Some(frame) = newest else { continue };
 
         let Some(pixels) = surface::read(frame.id) else {
-            warn!("[webview] IOSurface {} vanished before we read it", frame.id);
+            warn!(
+                "[webview] IOSurface {} vanished before we read it",
+                frame.id
+            );
             continue;
         };
         let (w, h) = (pixels.width, pixels.height);
@@ -708,6 +711,7 @@ fn webview_on_keys(
     for ev in events.read() {
         let modifiers = 0u32; // TODO: forward shift/ctrl/alt/cmd chords
         let code = windows_key_code(&ev.logical_key, &ev.key_code);
+        let native_code = macos_native_key_code(&ev.key_code);
 
         let Some(pane) = store.panes.get_mut(&pane_entity) else {
             continue;
@@ -754,6 +758,7 @@ fn webview_on_keys(
                 pane.host.send(Cmd::Key {
                     kind: "down",
                     code,
+                    native_code,
                     text: None,
                     modifiers,
                 });
@@ -763,6 +768,7 @@ fn webview_on_keys(
                     pane.host.send(Cmd::Key {
                         kind: "char",
                         code,
+                        native_code,
                         text: Some(s.to_string()),
                         modifiers,
                     });
@@ -770,6 +776,7 @@ fn webview_on_keys(
                     pane.host.send(Cmd::Key {
                         kind: "char",
                         code,
+                        native_code,
                         text: Some(" ".into()),
                         modifiers,
                     });
@@ -779,7 +786,10 @@ fn webview_on_keys(
                     // so a RAWKEYDOWN alone does nothing in a text field.
                     let ctrl_char = match ev.logical_key {
                         Key::Enter => Some("\r"),
-                        Key::Backspace => Some("\u{8}"),
+                        // NSEvent's characters value for the Mac Delete key
+                        // (the key labeled Backspace elsewhere) is DEL, not
+                        // the ASCII BS control character.
+                        Key::Backspace => Some("\u{7f}"),
                         Key::Tab => Some("\t"),
                         _ => None,
                     };
@@ -787,6 +797,7 @@ fn webview_on_keys(
                         pane.host.send(Cmd::Key {
                             kind: "char",
                             code,
+                            native_code,
                             text: Some(c.into()),
                             modifiers,
                         });
@@ -796,11 +807,36 @@ fn webview_on_keys(
             ButtonState::Released => pane.host.send(Cmd::Key {
                 kind: "up",
                 code,
+                native_code,
                 text: None,
                 modifiers,
             }),
         }
         store.mark_busy(now);
+    }
+}
+
+/// Carbon virtual key code used by Chromium to identify non-printable keys
+/// on macOS. Printable text arrives separately as a CHAR event, but editing
+/// keys such as Backspace must carry their physical native code as well as
+/// Chromium's cross-platform Windows key code.
+fn macos_native_key_code(code: &KeyCode) -> i32 {
+    match code {
+        KeyCode::Enter => 0x24,
+        KeyCode::Tab => 0x30,
+        KeyCode::Space => 0x31,
+        KeyCode::Backspace => 0x33,
+        KeyCode::Escape => 0x35,
+        KeyCode::Home => 0x73,
+        KeyCode::PageUp => 0x74,
+        KeyCode::Delete => 0x75,
+        KeyCode::End => 0x77,
+        KeyCode::PageDown => 0x79,
+        KeyCode::ArrowLeft => 0x7b,
+        KeyCode::ArrowRight => 0x7c,
+        KeyCode::ArrowDown => 0x7d,
+        KeyCode::ArrowUp => 0x7e,
+        _ => 0,
     }
 }
 
@@ -922,4 +958,18 @@ fn blank_image(width: u32, height: u32) -> Image {
     );
     img.asset_usage = bevy::asset::RenderAssetUsages::default();
     img
+}
+
+#[cfg(test)]
+mod tests {
+    use super::macos_native_key_code;
+    use bevy::prelude::KeyCode;
+
+    #[test]
+    fn macos_editing_keys_use_carbon_virtual_key_codes() {
+        assert_eq!(macos_native_key_code(&KeyCode::Backspace), 0x33);
+        assert_eq!(macos_native_key_code(&KeyCode::Delete), 0x75);
+        assert_eq!(macos_native_key_code(&KeyCode::Enter), 0x24);
+        assert_eq!(macos_native_key_code(&KeyCode::ArrowLeft), 0x7b);
+    }
 }

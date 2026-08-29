@@ -1,42 +1,25 @@
-//! Per-project styling — design tokens + canvas shader effects, driven
-//! by user-edited files on disk.
+//! Per-project styling — design tokens driven by user-edited files on
+//! disk.
 //!
-//! # Architecture (post-rewrite)
+//! # Architecture
 //!
-//! Everything visual is **data on disk + scripts**, not compiled-in
-//! Rust types. The runtime is a small fixed surface:
+//! Everything visual is **data on disk**, not compiled-in Rust types:
+//! per-project `theme.ft` token files and named presets under
+//! `~/.jim/styles/`, hot-reloaded by notify watchers. The runtime is a
+//! small fixed surface: the [`Theme`] resource (active project),
+//! [`ProjectThemes`] (per-project cache so every pane can render in its
+//! OWN project's look), the preset registry, chrome-theme glue, and the
+//! funct host-fn bridges for theme editing and color math.
 //!
-//! - [`material::register_style_asset_source`] sets up `style://`
-//!   hot-reloadable asset paths rooted at a host-provided base dir.
-//! - [`DynamicMaterialPlugin`] spawns the canvas-overlay quad backed
-//!   by [`DynamicMaterial`] — an opaque 2 KiB uniform buffer + 8
-//!   named texture slots + a `Handle<Shader>` chosen by `bind_group_data`
-//!   so per-shader pipelines stay cached.
-//! - [`introspect::Schema::from_wgsl`] parses the user's WGSL at load
-//!   time (via naga) and learns its `UserData` struct fields' offsets
-//!   plus its texture-binding names; the host writes values into the
-//!   buffer by **name**, not by type.
-//! - [`ScriptBridgePlugin`] registers funct host fns (`uniform_set`,
-//!   `mask_paint`, `emit`, `state_set`, etc.) and routes worker calls
-//!   to the main thread via mpsc + a read-side `ScriptSnapshot`.
-//!   (throttled to 30 Hz). Hot-reloads on disk save. Reads engine
-//!   events (`focus_changed`, `project_changed`, scheduled emits)
-//!   from the shared `EventBus`.
-//!
-//! Adding a visual behavior is *purely* on-disk:
-//! 1. Declare any fields you want in your shader's `UserData` struct.
-//! 2. Write a funct script that uses `uniform_set`/`mask_paint`/etc.
-//!    by those names.
-//! 3. Save. AssetServer + the notify watcher reload both files; no
-//!    rebuild.
+//! (The old dynamic canvas-shader pipeline — the fullscreen "dust"
+//! overlay with its script bridge and WGSL introspection — was removed;
+//! per-preset chrome shaders in `jim-pane` are unaffected.)
 
 use bevy::prelude::*;
 
 pub mod active;
 pub mod chrome_theme;
-pub mod dynamic;
 pub mod fonts;
-pub mod introspect;
 pub mod material;
 pub mod oklab;
 pub mod presets;
@@ -46,14 +29,13 @@ pub mod theme;
 pub mod theme_bridge;
 
 pub use active::ActiveProject;
-pub use dynamic::{DynamicMaterial, DynamicMaterialPlugin, ShaderSchemas};
 pub use fonts::{FontRegistry, FontRegistryPlugin};
 pub use material::{register_preset_asset_source, register_style_asset_source};
 pub use presets::{
     ActiveStylePreset, PresetsPlugin, StylePreset, StylePresetRegistry,
     register_preset_host_fns_funct, resolve_project_theme,
 };
-pub use script_bridge::{EventBus, ScriptBridgePlugin, register_script_host_fns_funct};
+pub use script_bridge::register_script_host_fns_funct;
 pub use state::{ProjectStyleState, StyleDataDir};
 pub use theme::{ProjectThemes, Theme, ThemeChanged, TokenId, TokenValue, tokens};
 pub use theme_bridge::{ThemeBridgePlugin, register_theme_host_fns_funct};
@@ -73,8 +55,8 @@ pub struct StyleErrors {
     pub theme_error: Option<String>,
 }
 
-/// Top-level plugin. Theme system + dynamic shader runtime + the
-/// dust system script as the canonical first effect.
+/// Top-level plugin: the theme system (tokens, presets, per-project
+/// cache, chrome glue, fonts, editing bridge).
 pub struct StylePlugin;
 
 impl Plugin for StylePlugin {
@@ -89,8 +71,6 @@ impl Plugin for StylePlugin {
             .add_plugins(FontRegistryPlugin)
             .add_plugins(chrome_theme::ChromeThemePlugin)
             .add_plugins(PresetsPlugin)
-            .add_plugins(ScriptBridgePlugin)
-            .add_plugins(ThemeBridgePlugin)
-            .add_plugins(DynamicMaterialPlugin);
+            .add_plugins(ThemeBridgePlugin);
     }
 }
