@@ -336,9 +336,10 @@ pub struct WorkerHandle {
     /// one byte here so the worker's blocking `poll(2)` returns even
     /// if no pty data is pending.
     wake_w: OwnedFd,
-    /// Held to keep the thread joinable; we never actually `join` from
-    /// the main thread — workers exit on `Shutdown` or PTY EOF.
-    _join: JoinHandle<()>,
+    /// Kept joinable so dropping the owner cannot leave a detached worker
+    /// (and its socket/file descriptors) behind. `Option` lets `Drop` take
+    /// ownership of the handle before joining it.
+    join: Option<JoinHandle<()>>,
 }
 
 impl WorkerHandle {
@@ -365,6 +366,22 @@ impl WorkerHandle {
     /// wakes it now so the reveal publish lands within ~1 frame.
     pub fn wake(&self) {
         let _ = nix::unistd::write(self.wake_w.as_fd(), b"x");
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // Cleanup must not depend on every pane-destruction path remembering
+        // to send Shutdown first. Wake the worker after enqueueing so an idle
+        // worker leaves poll(2) immediately, then join before releasing the
+        // final main-thread handle (including wake_w).
+        let _ = self.tx.send(WorkerMsg::Shutdown);
+        let _ = nix::unistd::write(self.wake_w.as_fd(), b"x");
+        if let Some(join) = self.join.take() {
+            if let Err(payload) = join.join() {
+                eprintln!("terminal worker panicked during shutdown: {payload:?}");
+            }
+        }
     }
 }
 
@@ -458,7 +475,7 @@ impl WorkerHandle {
             visible,
             tx,
             wake_w,
-            _join: join,
+            join: Some(join),
         })
     }
 }
@@ -1811,6 +1828,52 @@ impl ScrollbackLogWriter {
 mod tests {
     use super::*;
     use libghostty_vt::{Terminal, TerminalOptions};
+
+    #[test]
+    fn dropping_handle_stops_worker_and_closes_wake_pipe() {
+        let (tx, rx) = channel();
+        let (wake_r, wake_w) = nix::unistd::pipe().expect("wake pipe");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stopped_worker = stopped.clone();
+        let join = thread::spawn(move || {
+            assert!(matches!(rx.recv(), Ok(WorkerMsg::Shutdown)));
+            stopped_worker.store(true, Ordering::SeqCst);
+        });
+        let snapshot = Arc::new(Mutex::new(GridSnapshot {
+            cols: 0,
+            rows: 0,
+            cells: Vec::new(),
+            dirty_rows: Vec::new(),
+            default_fg: RgbColor { r: 0, g: 0, b: 0 },
+            default_bg: RgbColor { r: 0, g: 0, b: 0 },
+            cursor: None,
+            generation: 0,
+            child_alive: true,
+            viewport_offset: 0,
+            mouse_tracking: false,
+            mouse_motion: false,
+            alt_screen: false,
+            bracketed_paste: false,
+        }));
+
+        drop(WorkerHandle {
+            snapshot,
+            bell_count: Arc::new(AtomicU64::new(0)),
+            visible: Arc::new(AtomicBool::new(true)),
+            tx,
+            wake_w,
+            join: Some(join),
+        });
+
+        assert!(stopped.load(Ordering::SeqCst), "Drop must join the worker");
+        let mut byte = [0u8; 1];
+        assert_eq!(nix::unistd::read(&wake_r, &mut byte), Ok(1));
+        assert_eq!(
+            nix::unistd::read(&wake_r, &mut byte),
+            Ok(0),
+            "wake writer must be closed when the handle is gone"
+        );
+    }
 
     /// Build a terminal `cols` wide and feed it `data`.
     fn term_with(cols: u16, data: &str) -> Terminal<'static, 'static> {

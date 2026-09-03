@@ -334,6 +334,11 @@ impl Plugin for TerminalPlugin {
         app.add_plugins(TermMaterialPlugin)
             .add_plugins(selection::SelectionPlugin)
             .add_systems(Startup, (setup_terminal_font, register_terminal_kind))
+            // Pane kinds normally remove their entry in `on_close`, but an
+            // entity may also be despawned by bulk teardown or external code.
+            // Reconcile at the ownership boundary so such a path cannot keep
+            // a worker (and its wake-pipe descriptor) alive indefinitely.
+            .add_systems(First, reap_orphaned_terminal_workers)
             .add_systems(
                 Update,
                 (
@@ -346,6 +351,32 @@ impl Plugin for TerminalPlugin {
                     sync_grid,
                 ),
             );
+    }
+}
+
+fn reap_orphaned_terminal_workers(world: &mut World) {
+    let orphaned: Vec<Entity> = world
+        .get_resource::<TerminalStore>()
+        .map(|store| {
+            store
+                .map
+                .keys()
+                .copied()
+                .filter(|&entity| {
+                    world.get_entity(entity).is_err() || world.get::<TermGrid>(entity).is_none()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if orphaned.is_empty() {
+        return;
+    }
+
+    if let Some(mut store) = world.get_resource_mut::<TerminalStore>() {
+        for entity in orphaned {
+            store.map.remove(&entity);
+        }
     }
 }
 

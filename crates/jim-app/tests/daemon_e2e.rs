@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use jim_terminal::daemon_client::DaemonClient;
 use jim_terminal::daemon_proto::DaemonMessage;
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 
 /// Drain frames into a Vec for up to `timeout`.
 fn drain_for(
@@ -53,6 +55,39 @@ impl Drop for LogDumper {
             eprintln!("\n--- no daemon.log at {} ---", log.display());
         }
     }
+}
+
+#[test]
+fn fixture_drop_stops_detached_daemon() {
+    let env = common::setup_isolated_daemon_env();
+    let session = common::random_session_id();
+    let client = DaemonClient::open(session, 80, 24, vec!["/bin/cat".to_string()], None)
+        .expect("open daemon");
+    assert!(!client.attached_existing);
+
+    let pid_path = env.runtime_dir.join(format!("{session}.pid"));
+    let pid = Pid::from_raw(
+        std::fs::read_to_string(&pid_path)
+            .expect("daemon pid file")
+            .trim()
+            .parse()
+            .expect("numeric daemon pid"),
+    );
+    assert!(kill(pid, None).is_ok(), "daemon must be alive during test");
+
+    // Model a test that forgets its client without sending Kill. The fixture
+    // still owns the daemon and must tear it down when the test scope ends.
+    drop(client);
+    drop(env);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && kill(pid, None).is_ok() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        kill(pid, None).is_err(),
+        "fixture drop left detached daemon {pid} alive"
+    );
 }
 
 #[test]

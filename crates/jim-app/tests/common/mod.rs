@@ -1,6 +1,12 @@
 //! Shared setup for integration tests that need a working daemon.
 
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use jim_terminal::daemon_client::DaemonClient;
+use jim_terminal::daemon_proto::ClientMessage;
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
 pub struct DaemonTestEnv {
     /// Held so the temp dir survives the test. Backing store for HOME +
@@ -13,7 +19,66 @@ pub struct DaemonTestEnv {
 
 impl Drop for DaemonTestEnv {
     fn drop(&mut self) {
+        // A production terminal daemon deliberately survives its client, but
+        // an isolated test daemon belongs to this fixture. Stop every daemon
+        // while its socket still exists; deleting the runtime directory first
+        // strands a double-forked process with no remaining control path.
+        let daemons = daemon_pids(&self.runtime_dir);
+        for (session_id, _) in &daemons {
+            if let Ok(mut client) = DaemonClient::reattach(*session_id, 1, 1) {
+                client.send(&ClientMessage::Kill);
+                client.try_flush();
+            }
+        }
+
+        let graceful_deadline = Instant::now() + Duration::from_secs(2);
+        wait_until_dead(&daemons, graceful_deadline);
+
+        // A panic may have left a half-started daemon unable to complete the
+        // protocol handshake. PID files live in this fixture's unique runtime
+        // directory, so they identify only processes spawned by this test.
+        signal_survivors(&daemons, Signal::SIGTERM);
+        let term_deadline = Instant::now() + Duration::from_secs(1);
+        wait_until_dead(&daemons, term_deadline);
+        signal_survivors(&daemons, Signal::SIGKILL);
+
         let _ = std::fs::remove_dir_all(&self.runtime_dir);
+    }
+}
+
+fn daemon_pids(runtime_dir: &std::path::Path) -> Vec<(u64, Pid)> {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("pid") {
+                return None;
+            }
+            let session_id = path.file_stem()?.to_str()?.parse().ok()?;
+            let pid = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+            Some((session_id, Pid::from_raw(pid)))
+        })
+        .collect()
+}
+
+fn is_alive(pid: Pid) -> bool {
+    kill(pid, None).is_ok()
+}
+
+fn wait_until_dead(daemons: &[(u64, Pid)], deadline: Instant) {
+    while Instant::now() < deadline && daemons.iter().any(|(_, pid)| is_alive(*pid)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn signal_survivors(daemons: &[(u64, Pid)], signal: Signal) {
+    for (_, pid) in daemons {
+        if is_alive(*pid) {
+            let _ = kill(*pid, signal);
+        }
     }
 }
 
