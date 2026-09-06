@@ -97,12 +97,15 @@ turn full-auto (`approvalPolicy:"never"`). Code in `crates/jimctl/src/cmd_codex.
 **Inbound + outbound are split** (codex can't take an injected tool the way a
 pi extension can):
 - **Inbound** = the app-server injection below.
-- **Outbound** = the `jim` MCP tool server (`jimctl mcp`). `jimctl codex`
-  **auto-registers it** with codex on startup (`codex mcp add jim --env
-  JIM_AGENT_ID=<id> -- jimctl mcp`), so the live session gets the tools. There
-  is **no forced auto-reply** — the agent replies when it chooses, like pi.
-  (Because registration writes codex config, start `jimctl codex` *before*
-  launching `codex`.)
+- **Outbound** = one shared Streamable HTTP MCP service at
+  `http://127.0.0.1:37423/mcp`. `jimctl mcp install` installs it as the
+  `com.jimmyhmiller.jim-mcp` per-user launch agent, and `jimctl codex`
+  **auto-installs and registers it** with `codex mcp add jim --url ...`.
+  Codex sessions share this service instead of spawning one `jimctl mcp`
+  stdio child per retained thread. A bare `jimctl mcp` remains only for
+  compatibility with MCP clients that support stdio but not Streamable HTTP.
+  There is **no forced auto-reply** — the agent replies when it chooses, like
+  pi.
 
 How inbound works (verified against codex 0.139): `jimctl codex` runs `codex
 app-server daemon start` to expose the shared control socket

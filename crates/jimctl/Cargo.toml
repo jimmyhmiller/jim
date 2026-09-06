@@ -15,6 +15,7 @@ jim_review = { path = "../jim-review" }
 diff_core = { path = "../diff-core" }
 libc = "0.2"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+tiny_http = "0.12"
 
 [[bin]]
 name = "jimctl"

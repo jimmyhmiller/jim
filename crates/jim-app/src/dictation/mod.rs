@@ -255,23 +255,14 @@ pub struct Dictation {
 }
 
 impl Dictation {
-    /// True while the winit loop must keep waking us.
+    /// True while the winit loop must keep waking us at its dictation cadence.
     ///
     /// Not decoration: the idle baseline is `reactive(5s)`, and the capture's
     /// idle watchdog auto-stops a stream nobody polls within ~2s. Without a
-    /// Continuous pin, recording would die mid-sentence any time the user
-    /// held the key without moving the mouse.
+    /// A 30Hz reactive wake is sufficient; recording would die mid-sentence
+    /// at the normal five-second idle cadence if the user did not move.
     pub fn needs_frames(&self) -> bool {
         self.phase != Phase::Idle || self.error.is_some()
-    }
-
-    /// True only while the final pass is in flight. Reported to the
-    /// continuous-pin canary as a *transient* reason, so a wedged whisper
-    /// shows up as a named yellow bar instead of silently burning 60fps.
-    /// Recording isn't transient — it ends when the user lets go of the
-    /// key, however long that takes.
-    pub fn is_transcribing(&self) -> bool {
-        self.phase == Phase::Finishing
     }
 }
 

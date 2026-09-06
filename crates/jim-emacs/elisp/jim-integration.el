@@ -54,6 +54,31 @@
              jim--pane-frames)
     nil))
 
+(defun jim--display-buffer-in-split-frame (buffer alist)
+  "Display BUFFER in a native Jim pane and return its Emacs window.
+
+Reuse an existing window for BUFFER.  Otherwise make a Jim frame whose
+`jim-split-dir' parameter tells the host to dock it below the source pane.
+ALIST may override the direction with a `jim-split-dir' entry (1 means
+right, 2 means below)."
+  (or (get-buffer-window buffer t)
+      (let* ((dir (or (alist-get 'jim-split-dir alist) 2))
+             (frame (make-frame `((window-system . jim)
+                                  (jim-split-dir . ,dir))))
+             (window (frame-selected-window frame)))
+        (set-window-buffer window buffer)
+        window)))
+
+(defun jim--setup-native-display-rules ()
+  "Route tool buffers that deserve a pane through Jim's native dock."
+  ;; Coil owns creation and lifetime of its comint buffer.  This rule only
+  ;; chooses where `coil-repl' / `pop-to-buffer' presents it, so the normal
+  ;; Coil commands continue to work unchanged.
+  (add-to-list 'display-buffer-alist
+               '("\\`\\*coil-repl: "
+                 (jim--display-buffer-in-split-frame)
+                 (jim-split-dir . 2))))
+
 ;; ---------------------------------------------------------------------
 ;; emacs -> jim
 ;; ---------------------------------------------------------------------
@@ -331,6 +356,27 @@ Falls back to that frame's selected window."
               (and (windowp w) (eq (window-frame w) f) w)))
           (frame-selected-window f)))))
 
+(defun jim--clamp-scroll-at-buffer-end (win)
+  "Keep the last non-empty line at the bottom of WIN.
+
+Emacs normally allows scrolling until the last line reaches the top of
+the window.  That is useful for editing, but leaves an almost entirely
+blank jim pane.  Once the end of the buffer is visible, align its last
+non-empty line with the bottom instead.  `recenter' handles wrapped and
+variable-height lines using redisplay's own measurements."
+  (when (and (window-live-p win)
+             (>= (window-end win t)
+                 (with-current-buffer (window-buffer win) (point-max))))
+    (with-selected-window win
+      (save-excursion
+        (goto-char (point-max))
+        ;; A final newline puts point on a synthetic empty line.  The
+        ;; preceding character belongs to the last line users perceive
+        ;; as buffer content.
+        (when (and (> (point) (point-min)) (bolp))
+          (backward-char 1))
+        (recenter -1)))))
+
 (defun jim--scroll (fid x y dy)
   "Scroll the window at X,Y in pane FID by DY pixels.
 Positive DY scrolls toward the beginning of the buffer, matching a
@@ -351,7 +397,11 @@ wheel-up / two-finger-down gesture."
                     (pixel-scroll-precision-scroll-down (- delta))))
               (beginning-of-buffer nil)
               (end-of-buffer nil)
-              (error nil)))))
+              (error nil))
+            ;; Clamp after both normal precision scrolling and the
+            ;; whole-line fallback used for large trackpad flings.
+            (when (< delta 0)
+              (jim--clamp-scroll-at-buffer-end win)))))
       ;; Immediately, so the pane's scroll indicator tracks the gesture
       ;; without waiting for idle; then again once redisplay has run and
       ;; `window-end' is trustworthy.
@@ -686,6 +736,7 @@ the grammar is present."
   (setq window-divider-default-places nil
         window-divider-default-right-width 1
         window-divider-default-bottom-width 1)
+  (jim--setup-native-display-rules)
   (jim--setup-syntax)
   (add-hook 'post-command-hook #'jim--report-state-soon)
   (add-hook 'window-configuration-change-hook #'jim--report-state-soon)

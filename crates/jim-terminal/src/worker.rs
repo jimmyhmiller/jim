@@ -312,6 +312,13 @@ pub enum WorkerMsg {
         end: (i32, i64),
         reply: Sender<String>,
     },
+    /// Stop this GUI-side worker and disconnect from the daemon without
+    /// ending the terminal session. Used when the worker owner disappears
+    /// during GUI teardown; a later GUI instance can reattach to the same
+    /// daemon and recover its live PTY plus buffered output.
+    Detach,
+    /// Stop this worker and permanently close the terminal session.
+    /// Intentional pane-close paths send this explicitly.
     Shutdown,
 }
 
@@ -371,11 +378,13 @@ impl WorkerHandle {
 
 impl Drop for WorkerHandle {
     fn drop(&mut self) {
-        // Cleanup must not depend on every pane-destruction path remembering
-        // to send Shutdown first. Wake the worker after enqueueing so an idle
-        // worker leaves poll(2) immediately, then join before releasing the
-        // final main-thread handle (including wake_w).
-        let _ = self.tx.send(WorkerMsg::Shutdown);
+        // Dropping a GUI-side owner must stop and join its local worker, but
+        // it must not kill the persistent PTY daemon. GUI teardown drops all
+        // handles, and those sessions are specifically meant to survive so
+        // the next Jim process can reattach. Intentional pane close sends
+        // Shutdown before removing the handle; FIFO ordering ensures that
+        // Kill is processed before this fallback Detach.
+        let _ = self.tx.send(WorkerMsg::Detach);
         let _ = nix::unistd::write(self.wake_w.as_fd(), b"x");
         if let Some(join) = self.join.take() {
             if let Err(payload) = join.join() {
@@ -1045,6 +1054,7 @@ fn worker_loop(
                     // thread already moved on.
                     let _ = reply.send(extract_screen_selection(&terminal, start, end));
                 }
+                Ok(WorkerMsg::Detach) => return,
                 Ok(WorkerMsg::Shutdown) => {
                     // Explicit pane close → tell the daemon to die.
                     // Flush, give the kernel a tick to deliver, then exit.
@@ -1836,7 +1846,7 @@ mod tests {
         let stopped = Arc::new(AtomicBool::new(false));
         let stopped_worker = stopped.clone();
         let join = thread::spawn(move || {
-            assert!(matches!(rx.recv(), Ok(WorkerMsg::Shutdown)));
+            assert!(matches!(rx.recv(), Ok(WorkerMsg::Detach)));
             stopped_worker.store(true, Ordering::SeqCst);
         });
         let snapshot = Arc::new(Mutex::new(GridSnapshot {

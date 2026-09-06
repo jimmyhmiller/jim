@@ -30,12 +30,12 @@ use bevy::sprite::Anchor;
 use bevy::window::{PrimaryWindow, RequestRedraw};
 use serde_json::Value;
 
-use bevy::input::ButtonState;
 use bevy::input::keyboard::{Key, KeyboardInput};
+use bevy::input::ButtonState;
 use jim_pane::{
-    FocusedPane, KeyboardOwner, MARGIN, PaneContentDragged, PaneContentHovered, PaneContentPressed,
-    PaneContentReleased, PaneKindMarker, PaneKindSpec, PaneRect, PaneRegistry, PaneTag,
-    PaneViewport, TITLE_H, pt_to_content_local, topmost_pane_at,
+    pt_to_content_local, topmost_pane_at, FocusedPane, KeyboardOwner, PaneContentDragged,
+    PaneContentHovered, PaneContentPressed, PaneContentReleased, PaneKindMarker, PaneKindSpec,
+    PaneRect, PaneRegistry, PaneTag, PaneViewport, MARGIN, TITLE_H,
 };
 
 mod client;

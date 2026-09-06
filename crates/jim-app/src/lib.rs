@@ -404,6 +404,24 @@ impl Plugin for AppShellPlugin {
             run: ActionRun::Custom(action_close_focused),
         })
         .add_action(Action {
+            id: "emacs.split_right",
+            title: "Split Emacs Pane Right",
+            category: "Pane",
+            keywords: &["editor", "dock", "column"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(action_split_emacs_right),
+        })
+        .add_action(Action {
+            id: "emacs.split_below",
+            title: "Split Emacs Pane Below",
+            category: "Pane",
+            keywords: &["editor", "dock", "row"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(action_split_emacs_below),
+        })
+        .add_action(Action {
             id: "pane.focus_next",
             title: "Focus Next Pane",
             category: "Pane",
@@ -2773,6 +2791,24 @@ fn action_close_focused(ctx: &mut actions::ActionCtx) {
     }
 }
 
+fn action_split_emacs_right(ctx: &mut actions::ActionCtx) {
+    action_split_emacs(ctx.world, jim_emacs::native::NativeSplitDirection::Right);
+}
+
+fn action_split_emacs_below(ctx: &mut actions::ActionCtx) {
+    action_split_emacs(ctx.world, jim_emacs::native::NativeSplitDirection::Below);
+}
+
+fn action_split_emacs(world: &mut World, direction: jim_emacs::native::NativeSplitDirection) {
+    let Some(source) = world.resource::<jim_pane::FocusedPane>().0 else {
+        warn!("cannot split Emacs: no pane is focused");
+        return;
+    };
+    if !jim_emacs::native::request_native_split(world, source, direction) {
+        warn!("cannot split Emacs: focused pane is not a connected native Emacs pane");
+    }
+}
+
 /// `pane.focus_next` / `pane.focus_prev` — move keyboard focus to the next
 /// / previous pane in the active project, ordered back-to-front by z and
 /// wrapping around.
@@ -2954,10 +2990,6 @@ fn maintain_winit_mode_for_animation(
         // transient-pin warning below) and while it settles/closes.
         || expose.active
         || expose.continuous_cooldown > 0
-        // Push-to-talk dictation: the capture's idle watchdog kills a
-        // stream nobody polls within ~2s, so the reactive baseline would
-        // cut the user off mid-sentence. See `Dictation::needs_frames`.
-        || dictation.needs_frames()
         // Diving into a recursive slide: a ~0.75s transform, and the app is
         // reactive otherwise, so without this the zoom would advance one
         // frame per mouse twitch instead of playing.
@@ -3001,9 +3033,6 @@ fn maintain_winit_mode_for_animation(
     if prism.continuous_cooldown > 0 {
         transient_reasons.push("prism-cooldown".into());
     }
-    if dictation.is_transcribing() {
-        transient_reasons.push("dictation-whisper".into());
-    }
     if transient_reasons.is_empty() {
         pin_watch.held_secs = 0.0;
         pin_watch.reason.clear();
@@ -3037,6 +3066,16 @@ fn maintain_winit_mode_for_animation(
     // Clamp before the palette term: the [0.1s, 5s] floor exists to stop
     // *widget-requested* sub-100ms intervals, not host-side cadences.
     .map(|iv: f32| iv.clamp(0.1, 5.0));
+    // Dictation also needs ~30Hz to drain capture levels and keep the audio
+    // watchdog alive, but it does not need to redraw unchanged chrome at
+    // 60fps. Treat it like the palette: input still wakes immediately and
+    // preview/final messages appear within one 33ms polling interval.
+    let effective_tick = if dictation.needs_frames() {
+        const DICTATION_TICK: f32 = 1.0 / 30.0;
+        Some(effective_tick.map_or(DICTATION_TICK, |iv| iv.min(DICTATION_TICK)))
+    } else {
+        effective_tick
+    };
     // An open command palette tightens the cadence to ~30Hz — enough that
     // its DeepSeek worker result lands promptly and streamed transcript
     // updates read as live, at half the frames of the old Continuous pin.
@@ -3067,8 +3106,10 @@ fn maintain_winit_mode_for_animation(
     // the low-power floor (60s) would otherwise leave the transcript
     // sitting in its channel — the pane would look wedged in "Transcribing…"
     // until you came back. It resolves in seconds either way.
-    let unfocused_target = if widget_animating || dictation.needs_frames() {
+    let unfocused_target = if widget_animating {
         bevy::winit::UpdateMode::Continuous
+    } else if dictation.needs_frames() {
+        bevy::winit::UpdateMode::reactive_low_power(std::time::Duration::from_secs_f32(1.0 / 30.0))
     } else if let Some(iv) = widget_tick_min {
         // Keep slow pollers ticking while unfocused too, but no faster
         // than they asked and never tighter than the 60s low-power floor.

@@ -133,7 +133,7 @@ pub fn run() -> ExitCode {
     );
     ws_note(&mut ws, "initialized");
     agent_bus::announce(&id, &label);
-    ensure_codex_mcp(&id);
+    ensure_codex_mcp();
 
     let (tx, rx) = mpsc::channel::<(String, String, bool)>();
     {
@@ -265,44 +265,40 @@ fn bus_tail(self_id: String, tx: mpsc::Sender<(String, String, bool)>) {
     );
 }
 
-/// Ensure the `jim` MCP tool server is registered with codex so the live
-/// session gets jim_send/jim_roster/jim_do. Re-registers each start to keep
-/// `JIM_AGENT_ID` in sync with this bridge's id. Best-effort.
-fn ensure_codex_mcp(id: &str) {
+/// Ensure the single shared Jim MCP service is running and registered by URL.
+/// Unlike a stdio registration, this does not create one `jimctl` child for
+/// every Codex thread retained by the app-server.
+fn ensure_codex_mcp() {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or_else(|| "jimctl".to_string());
-    // Remove any stale entry, then add fresh with our id.
+    if let Err(e) = crate::cmd_mcp::install_shared_service(&exe) {
+        eprintln!("jimctl codex: could not install shared MCP service: {e}");
+        return;
+    }
+    // Replace the historical stdio entry with the shared HTTP endpoint.
     let _ = Command::new("codex")
         .args(["mcp", "remove", "jim"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     let status = Command::new("codex")
-        .args([
-            "mcp",
-            "add",
-            "jim",
-            "--env",
-            &format!("JIM_AGENT_ID={id}"),
-            "--",
-            &exe,
-            "mcp",
-        ])
+        .args(["mcp", "add", "jim", "--url", crate::cmd_mcp::MCP_URL])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     match status {
         Ok(s) if s.success() => {
             eprintln!(
-                "jimctl codex: registered the `jim` MCP server (jim_send/jim_roster/jim_do) for codex."
+                "jimctl codex: registered the shared `jim` MCP service (jim_send/jim_roster/jim_do) for codex."
             );
         }
         _ => {
             eprintln!(
                 "jimctl codex: could not auto-register the MCP server. Add it manually:\n  \
-                 codex mcp add jim --env JIM_AGENT_ID={id} -- {exe} mcp"
+                 codex mcp add jim --url {}",
+                crate::cmd_mcp::MCP_URL
             );
         }
     }

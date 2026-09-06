@@ -558,6 +558,16 @@ impl Default for PaneViewport {
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PaneViewportReaders;
 
+/// The pane press/drag pass has updated focus and floating-pane geometry.
+/// Dock layout runs after this set so member cells follow a dragged dock in
+/// the same frame, before chrome and camera consumers read their rectangles.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PaneMouseUpdated;
+
+/// Systems that project final pane rectangles into chrome/render geometry.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PaneGeometryReaders;
+
 impl PaneViewport {
     /// Window-pixel position of a canvas-space point.
     pub fn canvas_to_window(&self, canvas: Vec2) -> Vec2 {
@@ -853,10 +863,21 @@ impl Plugin for PanePlugin {
             .add_message::<PaneDoubleClicked>()
             .add_message::<PaneWindowDragReleased>()
             .add_plugins((TextInputPlugin, ChromeMaterialPlugin))
+            .configure_sets(
+                Update,
+                (PaneMouseUpdated, PaneGeometryReaders)
+                    .chain()
+                    .in_set(PaneViewportReaders),
+            )
+            .add_systems(
+                Update,
+                handle_pane_mouse
+                    .in_set(PaneViewportReaders)
+                    .in_set(PaneMouseUpdated),
+            )
             .add_systems(
                 Update,
                 (
-                    handle_pane_mouse,
                     update_pane_titles,
                     position_panes,
                     apply_pending_pane_actions,
@@ -867,10 +888,8 @@ impl Plugin for PanePlugin {
                     (update_pane_cursor, emit_pane_hover),
                 )
                     .chain()
-                    // The whole chain ends up after PaneViewportReaders'
-                    // ordering constraints — that's fine because the
-                    // only systems in the set are members of this chain.
-                    .in_set(PaneViewportReaders),
+                    .in_set(PaneViewportReaders)
+                    .in_set(PaneGeometryReaders),
             )
             // Phase 2 of pane close: the actual despawn, one frame after
             // the close was processed. `First` so it runs before any
@@ -1899,6 +1918,7 @@ struct PaneMouseAux<'w, 's> {
         Query<'w, 's, (Option<&'static PaneChromeOverride>, Has<dock::DockMember>), With<PaneTag>>,
     hot_zones: Query<'w, 's, &'static PaneHotZones>,
     projects: Query<'w, 's, &'static PaneProject, With<PaneTag>>,
+    docks: Query<'w, 's, (), With<dock::Dock>>,
     /// "Hold Fn to select locally" modifier (see [`ForceLocalSelect`]);
     /// packed here to keep `handle_pane_mouse` under the 16-arg ceiling.
     force_local: Res<'w, ForceLocalSelect>,
@@ -2047,6 +2067,12 @@ fn handle_pane_mouse(
             };
             let cur = hit_cursor(anchored, pt, pt_canvas);
             let (title_h, resizable) = geom(target);
+            // A dock and its members are one z-stack unit.  The dock system
+            // raises that unit after focus changes; raising one entity here
+            // compares the container against its own higher-z children and
+            // needlessly rewrites every pane camera order on every click.
+            let in_dock_group = aux.docks.get(target).is_ok()
+                || aux.chrome_ov.get(target).is_ok_and(|(_, member)| member);
             let region = region_at_ex(cur, &rect, title_h, resizable);
             // Double-click on a pane is a "zoom/jump to this pane"
             // gesture — but only when it isn't landing on an interactive
@@ -2069,7 +2095,9 @@ fn handle_pane_mouse(
                 Some(PaneRegion::TitleBar) => {
                     focused.0 = Some(target);
                     consumed.0 = true;
-                    bring_to_front(target, &mut panes);
+                    if !in_dock_group {
+                        bring_to_front(target, &mut panes);
+                    }
                     *mode = PaneMouseMode::WindowDrag {
                         pane: target,
                         grab_offset: cur - rect.pos,
@@ -2078,7 +2106,9 @@ fn handle_pane_mouse(
                 Some(PaneRegion::ResizeEdge(edges)) => {
                     focused.0 = Some(target);
                     consumed.0 = true;
-                    bring_to_front(target, &mut panes);
+                    if !in_dock_group {
+                        bring_to_front(target, &mut panes);
+                    }
                     *mode = PaneMouseMode::WindowResize {
                         pane: target,
                         edges,
@@ -2090,7 +2120,9 @@ fn handle_pane_mouse(
                 Some(PaneRegion::Content) => {
                     focused.0 = Some(target);
                     consumed.0 = true;
-                    bring_to_front(target, &mut panes);
+                    if !in_dock_group {
+                        bring_to_front(target, &mut panes);
+                    }
                     let shift =
                         mods.pressed(KeyCode::ShiftLeft) || mods.pressed(KeyCode::ShiftRight);
                     content_press.write(PaneContentPressed {
@@ -2578,37 +2610,40 @@ fn apply_pending_pane_actions(world: &mut World) {
         }
     }
 
-    let to_close = std::mem::take(&mut world.resource_mut::<PendingPaneActions>().close);
-    if to_close.is_empty() {
-        return;
-    }
-    for entity in to_close {
-        if world.get_entity(entity).is_err() {
-            continue;
+    // Callbacks may enqueue dependent panes (closing a dock closes every
+    // member). Drain to a fixed point so the entire ownership tree becomes
+    // hidden/closing atomically instead of leaving children orphaned for a
+    // frame and processing them only after another wakeup.
+    loop {
+        let to_close = std::mem::take(&mut world.resource_mut::<PendingPaneActions>().close);
+        if to_close.is_empty() {
+            break;
         }
-        // Already mid-close (queued twice in consecutive frames).
-        if world.get::<PaneClosing>(entity).is_some() {
-            continue;
-        }
-        // Look up the kind, then the spec's on_close callback.
-        let on_close = world
-            .get::<PaneKindMarker>(entity)
-            .and_then(|k| world.resource::<PaneRegistry>().get(k.0).copied())
-            .and_then(|s| s.on_close);
-        if let Some(cb) = on_close {
-            cb(world, entity);
-        }
-        // Phase 1 of the two-phase close: hide + mark. The despawn (and
-        // the camera/layer reclaim, which must not happen while the
-        // content still exists) runs next frame in
-        // `finalize_closing_panes` — see [`PaneClosing`] for why
-        // despawning here would leak orphaned content.
-        world
-            .entity_mut(entity)
-            .insert((PaneClosing, Visibility::Hidden));
-        let mut focused = world.resource_mut::<FocusedPane>();
-        if focused.0 == Some(entity) {
-            focused.0 = None;
+        for entity in to_close {
+            if world.get_entity(entity).is_err() {
+                continue;
+            }
+            // Already mid-close (queued twice or reached through two owners).
+            if world.get::<PaneClosing>(entity).is_some() {
+                continue;
+            }
+            // Look up the kind, then the spec's on_close callback.
+            let on_close = world
+                .get::<PaneKindMarker>(entity)
+                .and_then(|k| world.resource::<PaneRegistry>().get(k.0).copied())
+                .and_then(|s| s.on_close);
+            if let Some(cb) = on_close {
+                cb(world, entity);
+            }
+            // Phase 1 of the two-phase close: hide + mark. The despawn (and
+            // camera/layer reclaim) runs next frame.
+            world
+                .entity_mut(entity)
+                .insert((PaneClosing, Visibility::Hidden));
+            let mut focused = world.resource_mut::<FocusedPane>();
+            if focused.0 == Some(entity) {
+                focused.0 = None;
+            }
         }
     }
 }
@@ -2764,5 +2799,58 @@ fn enforce_pane_content_bounds(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[derive(Resource)]
+    struct Dependent(Entity);
+
+    fn queue_dependent(world: &mut World, _entity: Entity) {
+        let child = world.resource::<Dependent>().0;
+        world.resource_mut::<PendingPaneActions>().close.push(child);
+    }
+
+    fn noop_spawn(_: &mut World, _: Entity, _: Entity, _: &Value) {}
+    fn noop_snapshot(_: &World, _: Entity) -> Value {
+        Value::Null
+    }
+
+    #[test]
+    fn dependent_closes_are_drained_in_the_same_pass() {
+        let mut world = World::new();
+        world.init_resource::<PendingPaneActions>();
+        world.init_resource::<FocusedPane>();
+        world.init_resource::<PaneRegistry>();
+        world.resource_mut::<PaneRegistry>().register(PaneKindSpec {
+            kind: "close-parent-test",
+            display_name: "test",
+            radial_icon: None,
+            default_size: Vec2::ONE,
+            spawn: noop_spawn,
+            snapshot: noop_snapshot,
+            on_close: Some(queue_dependent),
+        });
+        let child = world
+            .spawn((PaneKindMarker("close-child-test"), Visibility::Inherited))
+            .id();
+        let parent = world
+            .spawn((PaneKindMarker("close-parent-test"), Visibility::Inherited))
+            .id();
+        world.insert_resource(Dependent(child));
+        world
+            .resource_mut::<PendingPaneActions>()
+            .close
+            .push(parent);
+
+        apply_pending_pane_actions(&mut world);
+
+        assert!(world.get::<PaneClosing>(parent).is_some());
+        assert!(world.get::<PaneClosing>(child).is_some());
+        assert_eq!(world.get::<Visibility>(parent), Some(&Visibility::Hidden));
+        assert_eq!(world.get::<Visibility>(child), Some(&Visibility::Hidden));
     }
 }

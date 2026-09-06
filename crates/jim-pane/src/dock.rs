@@ -549,12 +549,17 @@ impl Plugin for DockPlugin {
                     apply_undock,
                     collapse_member_chrome,
                     flatten_dock_container_chrome,
-                    dock_focus_raise,
-                    dock_layout,
-                    render_dock_slots,
                 )
                     .chain()
-                    .before(crate::PaneViewportReaders),
+                    .before(crate::PaneMouseUpdated),
+            )
+            .add_systems(
+                Update,
+                (dock_focus_raise, dock_layout, render_dock_slots)
+                    .chain()
+                    .in_set(crate::PaneViewportReaders)
+                    .after(crate::PaneMouseUpdated)
+                    .before(crate::PaneGeometryReaders),
             );
     }
 }
@@ -726,17 +731,16 @@ fn tree_from_json(v: &Value, map: &HashMap<usize, Entity>) -> Option<DockNode> {
     })
 }
 
-/// Closing a dock frees its members back to floating panes.
+/// Closing a dock closes every pane it owns.
 fn dock_on_close(world: &mut World, entity: Entity) {
     let members = world
         .get::<Dock>(entity)
         .map(|d| d.member_entities())
         .unwrap_or_default();
-    for m in members {
-        if world.get_entity(m).is_ok() {
-            world.entity_mut(m).remove::<DockMember>();
-        }
-    }
+    world
+        .resource_mut::<PendingPaneActions>()
+        .close
+        .extend(members);
 }
 
 // ---------- Layout system ----------
@@ -1808,4 +1812,31 @@ pub fn dock_co_members(world: &World, pane: Entity) -> Vec<Entity> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_a_dock_queues_every_member_for_close() {
+        let mut world = World::new();
+        world.init_resource::<PendingPaneActions>();
+        let left = world.spawn_empty().id();
+        let right = world.spawn_empty().id();
+        let dock = world
+            .spawn(Dock {
+                root: Some(wrap_pair(left, right, DropEdge::Right)),
+                collapse_chrome: true,
+                template: false,
+            })
+            .id();
+
+        dock_on_close(&mut world, dock);
+
+        let queued = &world.resource::<PendingPaneActions>().close;
+        assert_eq!(queued.len(), 2);
+        assert!(queued.contains(&left));
+        assert!(queued.contains(&right));
+    }
 }

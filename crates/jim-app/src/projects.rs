@@ -25,6 +25,7 @@
 //! avoids a separate "follow the window" system that would have to
 //! shadow every layout decision.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -71,6 +72,7 @@ struct SidebarPalette {
     bg: Color,
     divider: Color,
     row_active_bg: Color,
+    terminal_row_bg: Color,
     row_renaming_bg: Color,
     active_stripe: Color,
     edit_underline: Color,
@@ -82,10 +84,17 @@ struct SidebarPalette {
 fn sidebar_palette(theme: &jim_style::Theme) -> SidebarPalette {
     use jim_style::tokens as t;
     let c = |id| Color::LinearRgba(theme.color(id));
+    let sidebar_bg = theme.color(t::SIDEBAR_BG);
     SidebarPalette {
-        bg: c(t::SIDEBAR_BG),
+        bg: Color::LinearRgba(sidebar_bg),
         divider: c(t::CHROME_DIVIDER),
         row_active_bg: c(t::SIDEBAR_ROW_ACTIVE_BG),
+        terminal_row_bg: Color::LinearRgba(LinearRgba::new(
+            sidebar_bg.red * 0.88,
+            sidebar_bg.green * 0.88,
+            sidebar_bg.blue * 0.88,
+            sidebar_bg.alpha,
+        )),
         row_renaming_bg: c(t::SIDEBAR_ROW_RENAMING_BG),
         active_stripe: c(t::ACCENT),
         edit_underline: c(t::ACCENT),
@@ -1960,6 +1969,23 @@ fn truncate_to_width(s: &str, room: f32, advance: f32) -> String {
 #[derive(Default)]
 struct LastWindowDims(Option<Vec2>);
 
+/// Projects that owned at least one live terminal during the previous
+/// sidebar layout pass. Keeping this separate from persisted project state
+/// makes the presence marker follow actual ECS lifetime, including restores
+/// and pane closes.
+#[derive(Default)]
+struct LastTerminalProjects(HashSet<u64>);
+
+fn terminal_project_ids<'a>(
+    panes: impl Iterator<Item = (&'a ProjectMembership, &'a PaneKindMarker)>,
+) -> HashSet<u64> {
+    panes
+        .filter_map(|(membership, kind)| {
+            (kind.0 == jim_terminal::PANE_KIND).then_some(membership.0)
+        })
+        .collect()
+}
+
 /// Rebuild the sidebar entity tree when project state, rename state, or
 /// window size changes. Otherwise this system early-returns.
 fn sidebar_layout(
@@ -1975,11 +2001,13 @@ fn sidebar_layout(
     drag: Res<ProjectDrag>,
     font: Res<MonoFont>,
     metrics: Res<MonoMetrics>,
+    panes: Query<(&ProjectMembership, &PaneKindMarker)>,
     // Roots only. Each list is a parent with its rows as children, and
     // `despawn` takes the subtree — so despawning children too would
     // spam "entity is invalid" for every row on every rebuild.
     existing: Query<Entity, (With<SidebarEntity>, Without<ChildOf>)>,
     mut last_dims: Local<LastWindowDims>,
+    mut last_terminal_projects: Local<LastTerminalProjects>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -1989,9 +2017,12 @@ fn sidebar_layout(
     let width = sidebar.width;
     let dims = Vec2::new(win_w, win_h);
     let palette = sidebar_palette(&theme);
+    let terminal_projects = terminal_project_ids(panes.iter());
 
     let dims_changed = last_dims.0 != Some(dims);
-    let mut needs_rebuild = projects.layout_dirty || dims_changed || theme.is_changed();
+    let terminal_presence_changed = last_terminal_projects.0 != terminal_projects;
+    let mut needs_rebuild =
+        projects.layout_dirty || dims_changed || theme.is_changed() || terminal_presence_changed;
     if existing.iter().next().is_none() {
         needs_rebuild = true;
     }
@@ -1999,6 +2030,7 @@ fn sidebar_layout(
         return;
     }
     last_dims.0 = Some(dims);
+    last_terminal_projects.0 = terminal_projects.clone();
     for e in &existing {
         commands.entity(e).despawn();
     }
@@ -2174,15 +2206,18 @@ fn sidebar_layout(
             let renaming_this =
                 renaming.target == RenameTarget::Project && renaming.id == Some(proj.id);
             let dragging_this = drag.dragging && drag.candidate == Some(proj.id);
+            let has_terminal = terminal_projects.contains(&proj.id);
 
-            // Row bg — painted when active, renaming, or being dragged. Other
-            // rows sit on the sidebar bg with no separator: the spacing from
-            // ROW_H + the indent is enough visual structure.
-            if active || renaming_this || dragging_this {
+            // Row bg — terminal presence is a barely deeper version of the
+            // sidebar ground. Active, rename, and drag states remain stronger
+            // and take precedence because they describe an immediate action.
+            if active || renaming_this || dragging_this || has_terminal {
                 let bg_color = if renaming_this {
                     palette.row_renaming_bg
-                } else {
+                } else if active || dragging_this {
                     palette.row_active_bg
+                } else {
+                    palette.terminal_row_bg
                 };
                 commands.spawn((
                     SidebarEntity,
@@ -4276,6 +4311,25 @@ fn reorder_visible(projects: &mut Projects, id: u64, target_slot: usize) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_presence_uses_only_real_terminal_panes_and_deduplicates_projects() {
+        let memberships = [
+            PaneProject(7),
+            PaneProject(7),
+            PaneProject(11),
+            PaneProject(13),
+        ];
+        let kinds = [
+            PaneKindMarker(jim_terminal::PANE_KIND),
+            PaneKindMarker(jim_terminal::PANE_KIND),
+            PaneKindMarker(jim_terminal::PANE_KIND),
+            PaneKindMarker("emacs"),
+        ];
+        let ids = terminal_project_ids(memberships.iter().zip(kinds.iter()));
+
+        assert_eq!(ids, HashSet::from([7, 11]));
+    }
 
     /// A `Projects` with `n` projects and one workspace, as
     /// `load_or_seed_projects` would leave it.

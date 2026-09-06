@@ -16,7 +16,7 @@
 //! v1 is display-only (no keyboard/mouse yet — that needs the Coil
 //! read_socket_hook to consume input events off the same socket).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -271,6 +271,30 @@ fn parse_op(line: &str) -> Option<(u32, Op)> {
     Some((fid, op))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameLifecycle {
+    New { fid: u32, split: u8 },
+    Delete { fid: u32 },
+}
+
+fn parse_frame_lifecycle(line: &str) -> Option<FrameLifecycle> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let fid = kv(&fields, "f")?.parse().ok()?;
+    if fid == 0 {
+        return None;
+    }
+    match fields.first().copied()? {
+        "frame-new" => Some(FrameLifecycle::New {
+            fid,
+            split: kv(&fields, "split")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        }),
+        "frame-delete" => Some(FrameLifecycle::Delete { fid }),
+        _ => None,
+    }
+}
+
 // ---------- Shared connection: one emacs, many frames (panes) ----------
 //
 // A single Emacs process holds all buffers; each jim pane is a frame on
@@ -369,6 +393,9 @@ struct SharedConn {
     /// 2=below) — set by the worker, consumed by reconcile_frames to
     /// pick the dock edge.
     split_hints: Arc<Mutex<HashMap<u32, u8>>>,
+    /// Frame ids Emacs deleted on its own. Jim-originated deletes are
+    /// harmless here because their pane mapping is removed first.
+    deleted_frames: Arc<Mutex<Vec<u32>>>,
     generation: Arc<AtomicU64>,
     child: std::process::Child,
     sock_path: PathBuf,
@@ -836,16 +863,18 @@ impl SharedConn {
 
         let frame_ops: Arc<Mutex<HashMap<u32, Vec<Op>>>> = Arc::new(Mutex::new(HashMap::new()));
         let split_hints: Arc<Mutex<HashMap<u32, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+        let deleted_frames: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
         let generation = Arc::new(AtomicU64::new(0));
         let writer: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let fo_w = frame_ops.clone();
         let sh_w = split_hints.clone();
+        let df_w = deleted_frames.clone();
         let gen_w = generation.clone();
         let writer_w = writer.clone();
         let wakeup2 = wakeup.clone();
         let thread = std::thread::Builder::new()
             .name("emacs-native".into())
-            .spawn(move || conn_loop(listener, fo_w, sh_w, gen_w, writer_w, wakeup))
+            .spawn(move || conn_loop(listener, fo_w, sh_w, df_w, gen_w, writer_w, wakeup))
             .expect("spawn emacs-native thread");
 
         let ctl_writer: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
@@ -862,6 +891,7 @@ impl SharedConn {
             writer,
             frame_ops,
             split_hints,
+            deleted_frames,
             generation,
             child,
             sock_path,
@@ -956,6 +986,7 @@ fn conn_loop(
     listener: UnixListener,
     frame_ops: Arc<Mutex<HashMap<u32, Vec<Op>>>>,
     split_hints: Arc<Mutex<HashMap<u32, u8>>>,
+    deleted_frames: Arc<Mutex<Vec<u32>>>,
     generation: Arc<AtomicU64>,
     writer: Arc<Mutex<Option<UnixStream>>>,
     wakeup: Option<bevy::winit::EventLoopProxy<bevy::winit::WinitUserEvent>>,
@@ -973,16 +1004,18 @@ fn conn_loop(
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let Ok(line) = line else { break };
-        // Capture the split-direction hint that rides on frame-new.
-        if line.starts_with("frame-new") {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let fid = kv(&fields, "f").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let split = kv(&fields, "split")
-                .and_then(|v| v.parse::<u8>().ok())
-                .unwrap_or(0);
-            if fid != 0 && split != 0 {
+        match parse_frame_lifecycle(&line) {
+            Some(FrameLifecycle::New { fid, split }) if split != 0 => {
                 split_hints.lock().expect("split_hints").insert(fid, split);
             }
+            Some(FrameLifecycle::Delete { fid }) => {
+                deleted_frames.lock().expect("deleted_frames").push(fid);
+                if let Some(p) = wakeup.as_ref() {
+                    let _ = p.send_event(bevy::winit::WinitUserEvent::WakeUp);
+                }
+                continue;
+            }
+            _ => {}
         }
         if let Some((fid, op)) = parse_op(&line) {
             frame_ops
@@ -1086,6 +1119,9 @@ pub struct EmacsNativeStore {
     /// every frame until sent — otherwise a pane spawned before Emacs
     /// boots would silently never get its frame.
     pending_create: Vec<u32>,
+    /// Jim-originated split requests waiting for the corresponding
+    /// Emacs-created frame to appear on the draw-op stream.
+    pending_splits: VecDeque<PendingNativeSplit>,
     /// Latest state reported per pane. See [`EmacsFrameState`].
     state_of_pane: HashMap<Entity, EmacsFrameState>,
     /// Panes whose state changed since the last drain, for jim-app to
@@ -1097,7 +1133,72 @@ pub struct EmacsNativeStore {
     sent_palette: Option<EmacsPalette>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeSplitDirection {
+    Right,
+    Below,
+}
+
+impl NativeSplitDirection {
+    fn hint(self) -> u8 {
+        match self {
+            Self::Right => 1,
+            Self::Below => 2,
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Right => "jim-split-window-right",
+            Self::Below => "jim-split-window-below",
+        }
+    }
+
+    fn edge(self) -> jim_pane::dock::DropEdge {
+        match self {
+            Self::Right => jim_pane::dock::DropEdge::Right,
+            Self::Below => jim_pane::dock::DropEdge::Bottom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingNativeSplit {
+    source: Entity,
+    source_fid: u32,
+    direction: NativeSplitDirection,
+}
+
+fn take_matching_split(
+    pending: &mut VecDeque<PendingNativeSplit>,
+    frames: &HashMap<Entity, u32>,
+    hint: u8,
+) -> Option<PendingNativeSplit> {
+    pending.retain(|p| frames.get(&p.source) == Some(&p.source_fid));
+    let pos = pending.iter().position(|p| p.direction.hint() == hint);
+    pos.and_then(|p| pending.remove(p))
+}
+
 impl EmacsNativeStore {
+    fn request_split(&mut self, source: Entity, direction: NativeSplitDirection) -> bool {
+        let (Some(conn), Some(&source_fid)) =
+            (self.shared.as_ref(), self.frame_of_pane.get(&source))
+        else {
+            return false;
+        };
+        self.pending_splits.push_back(PendingNativeSplit {
+            source,
+            source_fid,
+            direction,
+        });
+        if conn.send_cmd(source_fid, direction.command()) {
+            true
+        } else {
+            self.pending_splits.pop_back();
+            false
+        }
+    }
+
     /// Ask the emacs pane `pane` to open `path` via `find-file` in its own
     /// frame. Returns false if there's no live emacs, `pane` isn't a known
     /// emacs frame, or the control channel isn't connected yet.
@@ -1143,6 +1244,22 @@ impl EmacsNativeStore {
     }
 }
 
+/// Split `source` into a second native Emacs pane. The new Emacs frame
+/// shows the same buffer; when its first draw operations arrive,
+/// [`reconcile_frames`] adopts it and docks it beside this exact pane.
+pub fn request_native_split(
+    world: &mut World,
+    source: Entity,
+    direction: NativeSplitDirection,
+) -> bool {
+    if !matches!(world.get::<PaneKindMarker>(source), Some(k) if k.0 == PANE_KIND) {
+        return false;
+    }
+    world
+        .resource_mut::<EmacsNativeStore>()
+        .request_split(source, direction)
+}
+
 /// Rasterizers for every font Emacs has announced, keyed by the id the
 /// port gave it.
 ///
@@ -1178,6 +1295,13 @@ pub struct EmacsFrame {
     /// Framebuffer dimensions in device pixels (emacs px * FB_SCALE).
     fb_w: u32,
     fb_h: u32,
+    /// Whether this Emacs process has supplied real dimensions.  The size
+    /// and the first flush are allowed to arrive in separate batches.
+    sized: bool,
+    /// The bootstrap image is deliberately hidden until Emacs has sent a
+    /// real frame size and completed a flush.  Exposing the 64x64 transport
+    /// placeholder is the tiny square bug.
+    ready: bool,
     /// Working CPU framebuffer (RGBA). Ops draw into this; it's copied
     /// to the GPU `image` only on `flush`, so partial redisplays never
     /// present (no divider/text flicker).
@@ -1469,7 +1593,12 @@ impl Plugin for EmacsNativePlugin {
             )
             // Exclusive (needs &mut World to spawn panes) — runs after
             // the op queues are populated.
-            .add_systems(Update, reconcile_frames.after(sync_emacs_frames))
+            .add_systems(
+                Update,
+                (reconcile_frame_deletes, reconcile_frames)
+                    .chain()
+                    .after(sync_emacs_frames),
+            )
             // Belt-and-suspenders: kill the shared emacs child on a clean
             // AppExit (the Coil read_socket_hook EOF path + the signal
             // handler cover the crash/force-quit paths).
@@ -1489,13 +1618,45 @@ fn kill_emacs_on_app_exit(mut exit: MessageReader<AppExit>, mut store: ResMut<Em
     }
 }
 
+/// Close the Jim pane when Emacs itself deletes its backing frame.
+/// Jim-originated close events find no mapping here, which prevents a loop.
+fn reconcile_frame_deletes(world: &mut World) {
+    let deleted = {
+        let store = world.resource::<EmacsNativeStore>();
+        let Some(conn) = store.shared.as_ref() else {
+            return;
+        };
+        std::mem::take(&mut *conn.deleted_frames.lock().expect("deleted_frames"))
+    };
+    if deleted.is_empty() {
+        return;
+    }
+
+    let panes: Vec<Entity> = {
+        let store = world.resource::<EmacsNativeStore>();
+        deleted
+            .into_iter()
+            .filter_map(|fid| {
+                store
+                    .frame_of_pane
+                    .iter()
+                    .find_map(|(&pane, &mapped)| (mapped == fid).then_some(pane))
+            })
+            .collect()
+    };
+    world
+        .resource_mut::<jim_pane::PendingPaneActions>()
+        .close
+        .extend(panes);
+}
+
 /// When Emacs creates a frame we didn't ask for (a `C-x 3`/`C-x 2`
 /// split, rebound to `make-frame`, or a pop-up frame), it shows up as a
 /// frame id with ops but no pane. Spawn a jim pane that ADOPTS that
 /// frame, placed beside the source pane — so an Emacs split becomes a
 /// real, draggable jim pane on the same shared buffer.
 fn reconcile_frames(world: &mut World) {
-    let orphans: Vec<u32> = {
+    let mut orphans: Vec<u32> = {
         let store = world.resource::<EmacsNativeStore>();
         let Some(conn) = store.shared.as_ref() else {
             return;
@@ -1519,67 +1680,14 @@ fn reconcile_frames(world: &mut World) {
             .filter(|id| *id > 1 && !mapped.contains(id))
             .collect()
     };
+    orphans.sort_unstable();
     if orphans.is_empty() {
         return;
     }
 
-    // The pane the split was issued from (the split's anchor).
-    let source = world.resource::<jim_pane::FocusedPane>().0;
-    let (base_rect, project) =
-        match source.and_then(|f| world.get::<PaneRect>(f).copied().map(|r| (f, r))) {
-            Some((f, r)) => (r, world.get::<jim_pane::PaneProject>(f).map(|p| p.0)),
-            None => (
-                PaneRect {
-                    pos: Vec2::new(80.0, 80.0),
-                    size: Vec2::new(820.0, 560.0),
-                    z: 1.0,
-                },
-                None,
-            ),
-        };
-
     // Project membership is a hard invariant for panes (jim-app asserts
-    // it and panics), and the anchor is gone in exactly the case that
-    // matters here: Emacs pops up a frame just after the last emacs pane
-    // was closed, so there is no focused pane to inherit from. Fall back
-    // to another emacs pane's project, then to any pane's, and if the
-    // canvas is genuinely empty, refuse to adopt rather than spawning an
-    // orphan — dropping the frame's ops so its queue cannot grow without
-    // bound while it repaints into nothing.
-    let project = project
-        .or_else(|| {
-            let panes: Vec<Entity> = world
-                .resource::<EmacsNativeStore>()
-                .frame_of_pane
-                .keys()
-                .copied()
-                .collect();
-            panes
-                .into_iter()
-                .find_map(|e| world.get::<jim_pane::PaneProject>(e).map(|p| p.0))
-        })
-        .or_else(|| {
-            let mut q = world.query_filtered::<&jim_pane::PaneProject, With<jim_pane::PaneTag>>();
-            q.iter(world).next().map(|p| p.0)
-        });
-    let Some(project) = project else {
-        let store = world.resource::<EmacsNativeStore>();
-        if let Some(conn) = store.shared.as_ref()
-            && let Ok(mut fo) = conn.frame_ops.lock()
-        {
-            for id in &orphans {
-                fo.remove(id);
-            }
-        }
-        eprintln!(
-            "[emacs-native] emacs made {} frame(s) with no pane to inherit a project from; \
-             not adopting them",
-            orphans.len()
-        );
-        return;
-    };
-    let project = Some(project);
-
+    // it and panics). Resolve it per orphan because explicit split requests
+    // may come from different panes before either new frame is realized.
     for (i, id) in orphans.iter().copied().enumerate() {
         // Split direction hint (1=right, 2=below); 0/none → floating.
         let hint = world
@@ -1589,6 +1697,58 @@ fn reconcile_frames(world: &mut World) {
             .and_then(|c| c.split_hints.lock().ok().and_then(|mut h| h.remove(&id)))
             .unwrap_or(0);
 
+        // A Jim menu/palette split records its exact source before asking
+        // Emacs to create the frame. Pair it with the matching directional
+        // frame-new event. Keyboard-originated splits have no pending record
+        // and retain the focused-pane fallback.
+        let pending = {
+            let mut store = world.resource_mut::<EmacsNativeStore>();
+            let store = &mut *store;
+            take_matching_split(&mut store.pending_splits, &store.frame_of_pane, hint)
+        };
+        let source = pending
+            .map(|p| p.source)
+            .or_else(|| world.resource::<jim_pane::FocusedPane>().0)
+            .filter(|e| world.get_entity(*e).is_ok());
+        let base_rect = source
+            .and_then(|e| world.get::<PaneRect>(e).copied())
+            .unwrap_or(PaneRect {
+                pos: Vec2::new(80.0, 80.0),
+                size: Vec2::new(820.0, 560.0),
+                z: 1.0,
+            });
+        let project = source
+            .and_then(|e| world.get::<jim_pane::PaneProject>(e).map(|p| p.0))
+            .or_else(|| {
+                let panes: Vec<Entity> = world
+                    .resource::<EmacsNativeStore>()
+                    .frame_of_pane
+                    .keys()
+                    .copied()
+                    .collect();
+                panes
+                    .into_iter()
+                    .find_map(|e| world.get::<jim_pane::PaneProject>(e).map(|p| p.0))
+            })
+            .or_else(|| {
+                let mut q =
+                    world.query_filtered::<&jim_pane::PaneProject, With<jim_pane::PaneTag>>();
+                q.iter(world).next().map(|p| p.0)
+            });
+        let Some(project) = project else {
+            let store = world.resource::<EmacsNativeStore>();
+            if let Some(conn) = store.shared.as_ref()
+                && let Ok(mut fo) = conn.frame_ops.lock()
+            {
+                fo.remove(&id);
+            }
+            eprintln!(
+                "[emacs-native] emacs made frame {id} with no pane to inherit a project from; \
+                 not adopting it"
+            );
+            continue;
+        };
+
         // Spawn the adopting pane somewhere sane; docking repositions it.
         let off = 24.0 * i as f32;
         let rect = PaneRect {
@@ -1597,22 +1757,28 @@ fn reconcile_frames(world: &mut World) {
             z: base_rect.z + 1.0,
         };
         let cfg = serde_json::json!({ "adopt_frame_id": id });
-        let Some(new_pane) =
-            jim_pane::spawn_pane_from_registry(world, PANE_KIND, "emacs", rect, project, &cfg)
-        else {
+        let Some(new_pane) = jim_pane::spawn_pane_from_registry(
+            world,
+            PANE_KIND,
+            "emacs",
+            rect,
+            Some(project),
+            &cfg,
+        ) else {
             continue;
         };
 
         // Dock it onto the source pane's edge → a real tiled split.
-        if let (Some(src), Some(edge)) = (
-            source,
-            match hint {
-                1 => Some(jim_pane::dock::DropEdge::Right),
-                2 => Some(jim_pane::dock::DropEdge::Bottom),
-                _ => None,
-            },
-        ) {
+        let edge = pending.map(|p| p.direction.edge()).or_else(|| match hint {
+            1 => Some(jim_pane::dock::DropEdge::Right),
+            2 => Some(jim_pane::dock::DropEdge::Bottom),
+            _ => None,
+        });
+        if let (Some(src), Some(edge)) = (source, edge) {
             jim_pane::dock::dock_split(world, src, new_pane, edge);
+            // A split is a navigation action: the newly-created editor is
+            // where subsequent typing and Emacs minibuffer commands belong.
+            world.resource_mut::<jim_pane::FocusedPane>().0 = Some(new_pane);
         }
     }
 }
@@ -1656,6 +1822,7 @@ fn respawn_emacs_if_dead(
     theme: Res<jim_style::Theme>,
     wakeup: Option<Res<bevy::winit::EventLoopProxyWrapper>>,
     mut panes: Query<(Entity, &PaneKindMarker, &mut EmacsFrame)>,
+    mut visibility: Query<&mut Visibility>,
 ) {
     if !store.shared.as_mut().is_some_and(|c| !c.is_alive()) {
         return;
@@ -1667,6 +1834,7 @@ fn respawn_emacs_if_dead(
     store.shared = None;
     store.frame_of_pane.clear();
     store.pending_create.clear();
+    store.pending_splits.clear();
     store.state_of_pane.clear();
     store.state_dirty.clear();
     // Force the palette out again — the new process has never seen it.
@@ -1677,7 +1845,11 @@ fn respawn_emacs_if_dead(
     *fonts = EmacsFonts::default();
 
     let proxy = wakeup.map(|w| bevy::winit::EventLoopProxy::clone(&w));
-    match SharedConn::start(EmacsPalette::from_theme(&theme), theme_font_px(&theme), proxy) {
+    match SharedConn::start(
+        EmacsPalette::from_theme(&theme),
+        theme_font_px(&theme),
+        proxy,
+    ) {
         Ok(conn) => store.shared = Some(conn),
         Err(e) => {
             // Leave `shared` None so the next pane spawn tries again
@@ -1714,6 +1886,11 @@ fn respawn_emacs_if_dead(
         frame.line_h = 0;
         frame.last_generation = 0;
         frame.caret_under = None;
+        frame.sized = false;
+        frame.ready = false;
+        if let Ok(mut vis) = visibility.get_mut(frame.sprite) {
+            *vis = Visibility::Hidden;
+        }
     }
 }
 
@@ -2538,7 +2715,10 @@ pub fn populate_native_pane(
             },
             Anchor::TOP_LEFT,
             Transform::from_xyz(0.0, 0.0, 0.0),
-            Visibility::Inherited,
+            // The native transport starts every frame at 64x64.  Keep that
+            // implementation detail invisible until the first complete,
+            // correctly-sized frame has been presented.
+            Visibility::Hidden,
         ))
         .id();
 
@@ -2600,7 +2780,10 @@ pub fn populate_native_pane(
             }
             store.frame_of_pane.insert(entity, id);
             if emacs_dbg() {
-                eprintln!("[emacs-dbg] pane {entity:?} claimed frame {id} (create queued: {})", id != 1);
+                eprintln!(
+                    "[emacs-dbg] pane {entity:?} claimed frame {id} (create queued: {})",
+                    id != 1
+                );
             }
             id
         }
@@ -2613,6 +2796,8 @@ pub fn populate_native_pane(
             sprite,
             fb_w,
             fb_h,
+            sized: false,
+            ready: false,
             fb: rgba_filled(fb_w, fb_h, bg_bytes),
             bg: bg_bytes,
             caret: caret_bytes,
@@ -2686,6 +2871,10 @@ fn blank_image_rgb(w: u32, h: u32, rgb: [u8; 3]) -> Image {
     img
 }
 
+fn native_frame_should_reveal(sized: bool, ready: bool, uploaded: bool) -> bool {
+    !ready && sized && uploaded
+}
+
 /// Drain each pane's op queue into its framebuffer and re-upload.
 fn sync_emacs_frames(
     store: Res<EmacsNativeStore>,
@@ -2693,7 +2882,7 @@ fn sync_emacs_frames(
     mut relearn: ResMut<EmacsRelearnLineH>,
     mut images: ResMut<Assets<Image>>,
     mut frames: Query<(Entity, &mut EmacsFrame, &PaneKindMarker)>,
-    mut sprites: Query<&mut Sprite>,
+    mut sprites: Query<(&mut Sprite, &mut Visibility)>,
     mut commands: Commands,
 ) {
     let Some(conn) = store.shared.as_ref() else {
@@ -2745,6 +2934,9 @@ fn sync_emacs_frames(
         let _ = entity;
 
         // Handle a resize first if present (rebuild the image + sprite).
+        if ops.iter().any(|op| matches!(op, Op::FrameSize { .. })) {
+            frame.sized = true;
+        }
         let mut new_dims: Option<(u32, u32)> = None;
         for op in &ops {
             if let Op::FrameSize { w, h } = op {
@@ -2780,7 +2972,7 @@ fn sync_emacs_frames(
                 );
             }
             // Resize the content sprite to the logical frame size.
-            if let Ok(mut sprite) = sprites.get_mut(frame.sprite) {
+            if let Ok((mut sprite, _)) = sprites.get_mut(frame.sprite) {
                 sprite.custom_size = Some(Vec2::new(
                     nw as f32 / FB_SCALE as f32,
                     nh as f32 / FB_SCALE as f32,
@@ -2791,6 +2983,8 @@ fn sync_emacs_frames(
         let (fb_w, fb_h) = (frame.fb_w, frame.fb_h);
         let fid = frame.frame_id;
         let image = frame.image.clone();
+        let should_reveal = native_frame_should_reveal(frame.sized, frame.ready, true);
+        let sprite_entity = frame.sprite;
         // Split-borrow the working buffer and the rasterizers (both need
         // &mut at once). Draw into `fb`, not the GPU image.
         let EmacsFrame {
@@ -2807,11 +3001,13 @@ fn sync_emacs_frames(
         } = &mut *fonts;
         let px = fb.as_mut_slice();
         let mut present = false;
+        let mut reveal = false;
         let mut new_title: Option<String> = None;
         let mut new_line_h: Option<i32> = None;
 
         for op in ops {
             match op {
+                Op::FrameSize { .. } => {}
                 Op::Flush => present = true,
                 Op::Title { text } => new_title = Some(text),
                 Op::Font {
@@ -2835,7 +3031,6 @@ fn sync_emacs_frames(
                     *default_font = id;
                     let _ = (asc, desc);
                 }
-                Op::FrameSize { .. } => {}
                 Op::ClearFrame { bg } => {
                     fill_rect(px, fb_w, fb_h, 0, 0, fb_w as i32, fb_h as i32, bg)
                 }
@@ -2982,9 +3177,9 @@ fn sync_emacs_frames(
         // present is skipped for the life of the pane.
         if present {
             match images.get_mut(&image) {
-                None => eprintln!(
-                    "[emacs-native] frame {fid}: no image asset — pane will stay blank"
-                ),
+                None => {
+                    eprintln!("[emacs-native] frame {fid}: no image asset — pane will stay blank")
+                }
                 Some(mut img) => match img.data.as_mut() {
                     None => eprintln!(
                         "[emacs-native] frame {fid}: image has no CPU data — pane will stay blank"
@@ -2997,6 +3192,10 @@ fn sync_emacs_frames(
                     ),
                     Some(data) => {
                         data.copy_from_slice(fb);
+                        // Reveal only after the correctly-sized image was
+                        // successfully uploaded.  A failed upload remains a
+                        // normal empty pane, never a transport-sized square.
+                        reveal = should_reveal;
                         // Diagnostic escape hatch: touch ~/.jim/emacs-dump to
                         // write the next presented framebuffer of every frame
                         // to a PPM, so what jim actually rasterized can be
@@ -3011,6 +3210,13 @@ fn sync_emacs_frames(
                         }
                     }
                 },
+            }
+        }
+
+        if reveal {
+            frame.ready = true;
+            if let Ok((_, mut vis)) = sprites.get_mut(sprite_entity) {
+                *vis = Visibility::Inherited;
             }
         }
 
@@ -3037,6 +3243,62 @@ fn sync_emacs_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_native_frame_lifecycle_events() {
+        assert_eq!(
+            parse_frame_lifecycle("frame-new f=17 w=900 h=600 split=2"),
+            Some(FrameLifecycle::New { fid: 17, split: 2 })
+        );
+        assert_eq!(
+            parse_frame_lifecycle("frame-delete f=17"),
+            Some(FrameLifecycle::Delete { fid: 17 })
+        );
+        assert_eq!(parse_frame_lifecycle("frame-delete f=0"), None);
+        assert_eq!(parse_frame_lifecycle("flush f=17"), None);
+    }
+
+    #[test]
+    fn bootstrap_framebuffer_is_never_revealed() {
+        assert!(!native_frame_should_reveal(false, false, true));
+        assert!(!native_frame_should_reveal(true, false, false));
+        assert!(native_frame_should_reveal(true, false, true));
+        assert!(!native_frame_should_reveal(true, true, true));
+    }
+
+    #[test]
+    fn split_completion_keeps_its_explicit_source() {
+        let right = Entity::from_raw_u32(7).expect("valid entity");
+        let below = Entity::from_raw_u32(8).expect("valid entity");
+        let stale = Entity::from_raw_u32(9).expect("valid entity");
+        let mut frames = HashMap::from([(right, 3), (below, 4), (stale, 99)]);
+        let mut pending = VecDeque::from([
+            PendingNativeSplit {
+                source: right,
+                source_fid: 3,
+                direction: NativeSplitDirection::Right,
+            },
+            PendingNativeSplit {
+                source: stale,
+                source_fid: 5,
+                direction: NativeSplitDirection::Right,
+            },
+            PendingNativeSplit {
+                source: below,
+                source_fid: 4,
+                direction: NativeSplitDirection::Below,
+            },
+        ]);
+
+        let matched = take_matching_split(&mut pending, &frames, 2).expect("below split");
+        assert_eq!(matched.source, below);
+        assert_eq!(pending.len(), 1);
+
+        // A request whose pane was rebound to another frame is stale and
+        // must not steal a later frame-new event with the same direction.
+        frames.insert(right, 30);
+        assert!(take_matching_split(&mut pending, &frames, 1).is_none());
+    }
 
     /// The whole point of `face_index_for`: one path, four faces.
     /// Without it every bold and italic face rasterised as index 0 —

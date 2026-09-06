@@ -1279,53 +1279,51 @@ fn list_entries_json(path: &str) -> Value {
 /// Split out so the widget tests drive exactly the functions the real host
 /// installs, rather than a stubbed lookalike that can drift from it.
 fn register_fs_surface(vm: &mut Funct) {
-// The write half of the file tree's context menu. Each returns
-// `{ ok, error }` rather than a bare bool so a widget can show WHY an
-// operation failed ("already exists", "Permission denied") instead of a
-// silent no-op the user reads as a broken menu item.
-fn fs_result(r: Result<(), String>) -> Value {
-    match r {
-        Ok(()) => Value::from_json(&serde_json::json!({ "ok": true, "error": "" })),
-        Err(e) => Value::from_json(&serde_json::json!({ "ok": false, "error": e })),
-    }
-}
-// fs_rename(from, to) -> { ok, error }. Also the move operation. Never
-// clobbers an existing destination.
-vm.register2("fs_rename", |from: String, to: String| -> Value {
-    fs_result(crate::fsops::rename(&from, &to))
-});
-// fs_mkdir(path) -> { ok, error }. Creates missing parents.
-vm.register1("fs_mkdir", |path: String| -> Value {
-    fs_result(crate::fsops::create_dir(&path))
-});
-// fs_new_file(path) -> { ok, error }. Creates an EMPTY file; fails rather
-// than truncating one that already exists.
-vm.register1("fs_new_file", |path: String| -> Value {
-    fs_result(crate::fsops::create_file(&path))
-});
-// fs_copy(from, to) -> { ok, error }. Recurses into directories.
-vm.register2("fs_copy", |from: String, to: String| -> Value {
-    fs_result(crate::fsops::copy(&from, &to))
-});
-// fs_trash(path) -> { ok, error }. Moves to the macOS Trash — a widget
-// has no way to delete irrecoverably, by design.
-vm.register1("fs_trash", |path: String| -> Value {
-    fs_result(crate::fsops::trash(&path))
-});
-// fs_duplicate_path(path) -> { ok, path, error }. The free `x copy.rs`
-// name beside `path`; pair with fs_copy to implement Duplicate.
-vm.register1("fs_duplicate_path", |path: String| -> Value {
-    match crate::fsops::duplicate_path(&path) {
-        Ok(p) => Value::from_json(&serde_json::json!({ "ok": true, "path": p, "error": "" })),
-        Err(e) => {
-            Value::from_json(&serde_json::json!({ "ok": false, "path": "", "error": e }))
+    // The write half of the file tree's context menu. Each returns
+    // `{ ok, error }` rather than a bare bool so a widget can show WHY an
+    // operation failed ("already exists", "Permission denied") instead of a
+    // silent no-op the user reads as a broken menu item.
+    fn fs_result(r: Result<(), String>) -> Value {
+        match r {
+            Ok(()) => Value::from_json(&serde_json::json!({ "ok": true, "error": "" })),
+            Err(e) => Value::from_json(&serde_json::json!({ "ok": false, "error": e })),
         }
     }
-});
-// fs_exists(path) -> bool. `~` expanded, like every other fs host fn.
-vm.register1("fs_exists", |path: String| -> bool {
-    crate::fsops::expand_tilde(&path).exists()
-});
+    // fs_rename(from, to) -> { ok, error }. Also the move operation. Never
+    // clobbers an existing destination.
+    vm.register2("fs_rename", |from: String, to: String| -> Value {
+        fs_result(crate::fsops::rename(&from, &to))
+    });
+    // fs_mkdir(path) -> { ok, error }. Creates missing parents.
+    vm.register1("fs_mkdir", |path: String| -> Value {
+        fs_result(crate::fsops::create_dir(&path))
+    });
+    // fs_new_file(path) -> { ok, error }. Creates an EMPTY file; fails rather
+    // than truncating one that already exists.
+    vm.register1("fs_new_file", |path: String| -> Value {
+        fs_result(crate::fsops::create_file(&path))
+    });
+    // fs_copy(from, to) -> { ok, error }. Recurses into directories.
+    vm.register2("fs_copy", |from: String, to: String| -> Value {
+        fs_result(crate::fsops::copy(&from, &to))
+    });
+    // fs_trash(path) -> { ok, error }. Moves to the macOS Trash — a widget
+    // has no way to delete irrecoverably, by design.
+    vm.register1("fs_trash", |path: String| -> Value {
+        fs_result(crate::fsops::trash(&path))
+    });
+    // fs_duplicate_path(path) -> { ok, path, error }. The free `x copy.rs`
+    // name beside `path`; pair with fs_copy to implement Duplicate.
+    vm.register1("fs_duplicate_path", |path: String| -> Value {
+        match crate::fsops::duplicate_path(&path) {
+            Ok(p) => Value::from_json(&serde_json::json!({ "ok": true, "path": p, "error": "" })),
+            Err(e) => Value::from_json(&serde_json::json!({ "ok": false, "path": "", "error": e })),
+        }
+    });
+    // fs_exists(path) -> bool. `~` expanded, like every other fs host fn.
+    vm.register1("fs_exists", |path: String| -> bool {
+        crate::fsops::expand_tilde(&path).exists()
+    });
 }
 
 /// Register the host natives a funct widget can call. Mirrors
@@ -1702,7 +1700,9 @@ fn register_host_surface(
     // directories, directories first then files, each alphabetical
     // (case-insensitive). Dotfiles are included but sort after non-dot
     // within their group. `~` is expanded. Powers the file-tree widget.
-    vm.register1("list_entries", |path: String| -> Value { list_entries_json(&path) });
+    vm.register1("list_entries", |path: String| -> Value {
+        list_entries_json(&path)
+    });
 
     // ---- native audio capture (audio-recorder widget) ----
     // Recording runs on cpal's own realtime thread (see audio.rs), so its
@@ -2134,7 +2134,14 @@ mod tests {
 
         // A file's menu offers the destructive + clipboard verbs...
         let menu = row_menu(&el, &file_row).expect("file row declares a context menu");
-        for verb in ["rename:", "dup:", "trash:", "copypath:", "copyrel:", "finder:"] {
+        for verb in [
+            "rename:",
+            "dup:",
+            "trash:",
+            "copypath:",
+            "copyrel:",
+            "finder:",
+        ] {
             assert!(
                 menu.iter().any(|m| m.starts_with(verb)),
                 "file menu is missing {verb} — {menu:?}"
@@ -2183,7 +2190,10 @@ mod tests {
             vec![Value::str("dlg_name"), Value::str("b copy.txt")],
         )
         .expect("on_input_submit");
-        assert!(dir.join("b.txt").exists(), "the clobbering rename was refused");
+        assert!(
+            dir.join("b.txt").exists(),
+            "the clobbering rename was refused"
+        );
         let el = render_frame(&mut vm);
         let texts = frame_texts(&el);
         assert!(

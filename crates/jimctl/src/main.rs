@@ -111,7 +111,7 @@ fn usage() {
          \tcodex                          bridge a Codex (codex-cli) session onto the agent bus\n\
          \tpi                             bridge a pi session onto the agent bus\n\
          \tagent ...                      bus convenience layer (roster/send/recv/announce)\n\
-         \tmcp                            MCP stdio server: jim_send/jim_roster/jim_do tools for any agent\n\
+         \tmcp [install|serve]            install/host shared MCP service; no arg is legacy stdio\n\
          \tinbox ...                      push to / read a project's inbox\n\
          \tproject ...                    project operations\n\
          \tsuggest ...                    park a pane in the suggestion drawer\n\

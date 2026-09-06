@@ -25,8 +25,9 @@
 //! assets, so the log ends with an unambiguous "here's what was huge"
 //! record right before the OOM.
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant, SystemTime};
 
 use bevy::camera::visibility::RenderLayers;
@@ -41,6 +42,14 @@ use jim_terminal::{FONT_SIZE, MonoFont, TerminalStore};
 /// How often both recorders sample. 5 s keeps the log small (a full day
 /// is a few MB) while still catching a runaway that doubles in minutes.
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Keep diagnostics useful for post-mortems without allowing an always-on
+/// editor to grow one file forever. The live log plus three archives is at
+/// most roughly 64 MiB (a pre-existing oversized log is tail-trimmed during
+/// its first rotation).
+const LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const LOG_ARCHIVES: usize = 3;
+static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -643,9 +652,8 @@ fn diag_log_path() -> Option<PathBuf> {
 }
 
 /// Append one timestamped line to the diagnostics log and mirror it to
-/// stderr. Each line is written with a single `write_all`, so concurrent
-/// writes from the heartbeat thread and the sampler stay line-atomic
-/// under `O_APPEND`.
+/// stderr. A process-local lock keeps rotation and writes atomic with respect
+/// to the heartbeat thread, main-thread sampler, and panic hook.
 ///
 /// Every write here ignores its error, including the stderr mirror. That
 /// is load-bearing, not laziness: this runs inside the panic hook, and
@@ -660,18 +668,88 @@ pub(crate) fn append_log(line: &str) {
         .unwrap_or(0);
     let full = format!("{} {}\n", epoch_ms, line);
     if let Some(p) = diag_log_path() {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&p)
-        {
-            let _ = f.write_all(full.as_bytes());
+        // Never block here: the panic hook calls append_log too. If a panic
+        // occurred inside a logging operation, waiting for our own lock would
+        // deadlock before unwinding could release it. The heartbeat and main
+        // sampler are redundant, so dropping one colliding ordinary line is
+        // preferable as well.
+        let guard = match LOG_WRITE_LOCK.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(_guard) = guard {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            rotate_log_if_needed(&p, full.len() as u64);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+            {
+                let _ = f.write_all(full.as_bytes());
+            }
         }
     }
     let _ = std::io::stderr().write_all(full.as_bytes());
+}
+
+fn rotated_log_path(path: &std::path::Path, generation: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{generation}"));
+    PathBuf::from(name)
+}
+
+fn rotate_log_if_needed(path: &std::path::Path, incoming_bytes: u64) {
+    rotate_log(path, incoming_bytes, LOG_MAX_BYTES, LOG_ARCHIVES);
+}
+
+fn rotate_log(path: &std::path::Path, incoming_bytes: u64, max_bytes: u64, archives: usize) {
+    let Ok(len) = path.metadata().map(|m| m.len()) else {
+        return;
+    };
+    if archives == 0 || len.saturating_add(incoming_bytes) <= max_bytes {
+        return;
+    }
+
+    let _ = std::fs::remove_file(rotated_log_path(path, archives));
+    for generation in (1..archives).rev() {
+        let from = rotated_log_path(path, generation);
+        let to = rotated_log_path(path, generation + 1);
+        if from.exists() {
+            let _ = std::fs::rename(from, to);
+        }
+    }
+
+    let archive = rotated_log_path(path, 1);
+    if len <= max_bytes {
+        let _ = std::fs::rename(path, archive);
+        return;
+    }
+
+    // A log created before rotation existed can be hundreds of MiB. Preserve
+    // its newest complete lines rather than carrying that oversized file
+    // forever or throwing away the most relevant end of the post-mortem.
+    let temp = rotated_log_path(path, 0);
+    let result = (|| -> std::io::Result<()> {
+        let mut source = std::fs::File::open(path)?;
+        source.seek(SeekFrom::Start(len - max_bytes))?;
+        let mut tail = Vec::with_capacity(max_bytes as usize);
+        source.read_to_end(&mut tail)?;
+        let start = tail
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(tail.len(), |i| i + 1);
+        let mut output = std::fs::File::create(&temp)?;
+        output.write_all(&tail[start..])?;
+        output.sync_all()?;
+        std::fs::rename(&temp, &archive)?;
+        std::fs::remove_file(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
 }
 
 /// Route any unwinding panic into the diagnostics log before the default
@@ -684,4 +762,56 @@ fn install_panic_breadcrumb() {
         append_log(&format!("[panic] {info}"));
         prev(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_log(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jim-diagnostics-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("diagnostics.log")
+    }
+
+    #[test]
+    fn rotation_shifts_bounded_generations() {
+        let path = temp_log("generations");
+        std::fs::write(&path, b"first\n").unwrap();
+        rotate_log(&path, 1, 6, 3);
+        assert_eq!(
+            std::fs::read(rotated_log_path(&path, 1)).unwrap(),
+            b"first\n"
+        );
+
+        std::fs::write(&path, b"second\n").unwrap();
+        rotate_log(&path, 1, 7, 3);
+        assert_eq!(
+            std::fs::read(rotated_log_path(&path, 1)).unwrap(),
+            b"second\n"
+        );
+        assert_eq!(
+            std::fs::read(rotated_log_path(&path, 2)).unwrap(),
+            b"first\n"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn oversized_legacy_log_keeps_only_newest_complete_lines() {
+        let path = temp_log("legacy-tail");
+        std::fs::write(&path, b"old-line\nkeep-one\nkeep-two\n").unwrap();
+        rotate_log(&path, 1, 19, 2);
+        let archive = std::fs::read_to_string(rotated_log_path(&path, 1)).unwrap();
+        assert_eq!(archive, "keep-one\nkeep-two\n");
+        assert!(!path.exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
 }

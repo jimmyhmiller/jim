@@ -49,6 +49,8 @@ pub enum ContextAction {
     EjectFromCanvas,
     /// Pop a docked member back out into a free-floating pane.
     Undock,
+    SplitRight,
+    SplitBelow,
     Close,
 }
 
@@ -59,6 +61,8 @@ impl ContextAction {
             ContextAction::Unpin => "Unpin",
             ContextAction::EjectFromCanvas => "Move out of canvas",
             ContextAction::Undock => "Undock",
+            ContextAction::SplitRight => "Split Right",
+            ContextAction::SplitBelow => "Split Below",
             ContextAction::Close => "Close",
         }
     }
@@ -89,6 +93,7 @@ pub struct ContextMenu {
     pub target: Option<Entity>,
     pub items: Vec<ContextMenuItem>,
     pub hovered: Option<usize>,
+    deferred: Vec<(ContextAction, Entity)>,
 }
 
 impl ContextMenu {
@@ -117,25 +122,27 @@ pub struct ContextMenuPlugin;
 
 impl Plugin for ContextMenuPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ContextMenu>().add_systems(
-            Update,
-            (
-                // MUST run before radial::radial_open_close so it can
-                // set `InputConsumed` on right-click-on-pane and the
-                // radial sees that flag and stays closed. Also before
-                // `PaneViewportReaders` (which holds `handle_pane_mouse`)
-                // so that when a left-click PICKS a menu item, we set
-                // `InputConsumed` first and the pane-mouse handler skips
-                // it — otherwise the same click would also leak through to
-                // the widget under the menu (e.g. toggling a diff line).
-                context_open_close
-                    .before(crate::radial::radial_open_close)
-                    .before(PaneViewportReaders),
-                context_hover,
-                context_render,
+        app.init_resource::<ContextMenu>()
+            .add_systems(
+                Update,
+                (
+                    // MUST run before radial::radial_open_close so it can
+                    // set `InputConsumed` on right-click-on-pane and the
+                    // radial sees that flag and stays closed. Also before
+                    // `PaneViewportReaders` (which holds `handle_pane_mouse`)
+                    // so that when a left-click PICKS a menu item, we set
+                    // `InputConsumed` first and the pane-mouse handler skips
+                    // it — otherwise the same click would also leak through to
+                    // the widget under the menu (e.g. toggling a diff line).
+                    context_open_close
+                        .before(crate::radial::radial_open_close)
+                        .before(PaneViewportReaders),
+                    context_hover,
+                    context_render,
+                )
+                    .chain(),
             )
-                .chain(),
-        );
+            .add_systems(Update, context_deferred_actions.after(context_open_close));
     }
 }
 
@@ -158,6 +165,7 @@ fn context_open_close(
             // as its own query because this system is already at Bevy's
             // 16-parameter ceiling. See "Docked panes have a SLIM header".
             Option<&jim_pane::PaneChromeOverride>,
+            &jim_pane::PaneKindMarker,
         ),
         With<PaneTag>,
     >,
@@ -208,26 +216,34 @@ fn context_open_close(
         let target_project = views.project_at(pt);
         // Only consider visible panes; include pinned so the user can
         // right-click them to unpin.
-        let visible: Vec<(Entity, PaneRect, bool, f32)> = panes
+        let visible: Vec<(Entity, PaneRect, bool, f32, bool)> = panes
             .iter()
-            .filter(|(_, _, project, vis, _, _)| {
+            .filter(|(_, _, project, vis, _, _, _)| {
                 target_project.is_none_or(|id| project.0 == id)
                     && !matches!(vis, Visibility::Hidden)
             })
-            .map(|(e, r, _, _, pinned, ov)| (e, *r, pinned, jim_pane::override_title_h(ov)))
+            .map(|(e, r, _, _, pinned, ov, kind)| {
+                (
+                    e,
+                    *r,
+                    pinned,
+                    jim_pane::override_title_h(ov),
+                    kind.0 == jim_emacs::native::PANE_KIND,
+                )
+            })
             .collect();
         // First try to hit an unpinned pane (they sit on top); fall
         // back to pinned. Reuses topmost_pane_at's z-aware hit-test.
         let unpinned_rects: Vec<(Entity, PaneRect)> = visible
             .iter()
-            .filter(|(_, _, pinned, _)| !pinned)
-            .map(|(e, r, _, _)| (*e, *r))
+            .filter(|(_, _, pinned, _, _)| !pinned)
+            .map(|(e, r, _, _, _)| (*e, *r))
             .collect();
         let target = topmost_pane_at(pt_canvas, &unpinned_rects).or_else(|| {
             let pinned_rects: Vec<(Entity, PaneRect)> = visible
                 .iter()
-                .filter(|(_, _, pinned, _)| *pinned)
-                .map(|(e, r, _, _)| (*e, *r))
+                .filter(|(_, _, pinned, _, _)| *pinned)
+                .map(|(e, r, _, _, _)| (*e, *r))
                 .collect();
             topmost_pane_at(pt_canvas, &pinned_rects)
         });
@@ -246,18 +262,23 @@ fn context_open_close(
         }
         let rect = visible
             .iter()
-            .find(|(e, _, _, _)| *e == target)
-            .map(|(_, r, _, _)| *r);
+            .find(|(e, _, _, _, _)| *e == target)
+            .map(|(_, r, _, _, _)| *r);
         let is_pinned = visible
             .iter()
-            .find(|(e, _, _, _)| *e == target)
-            .map(|(_, _, p, _)| *p)
+            .find(|(e, _, _, _, _)| *e == target)
+            .map(|(_, _, p, _, _)| *p)
             .unwrap_or(false);
         let title_h = visible
             .iter()
-            .find(|(e, _, _, _)| *e == target)
-            .map(|(_, _, _, th)| *th)
+            .find(|(e, _, _, _, _)| *e == target)
+            .map(|(_, _, _, th, _)| *th)
             .unwrap_or(jim_pane::TITLE_H);
+        let is_native_emacs = visible
+            .iter()
+            .find(|(e, _, _, _, _)| *e == target)
+            .map(|(_, _, _, _, native)| *native)
+            .unwrap_or(false);
 
         // The widget's own per-row menu for the row under the cursor, if any
         // (declared via `ListItem.context`). Computed once here because BOTH
@@ -300,10 +321,17 @@ fn context_open_close(
             }
             menu.origin = Some(pt);
             menu.target = Some(target);
-            menu.items = vec![
+            menu.items = Vec::new();
+            if is_native_emacs {
+                menu.items.extend([
+                    ContextMenuItem::Builtin(ContextAction::SplitRight),
+                    ContextMenuItem::Builtin(ContextAction::SplitBelow),
+                ]);
+            }
+            menu.items.extend([
                 ContextMenuItem::Builtin(ContextAction::Undock),
                 ContextMenuItem::Builtin(ContextAction::Close),
-            ];
+            ]);
             menu.hovered = None;
             consumed.0 = true;
             return;
@@ -345,6 +373,12 @@ fn context_open_close(
         if in_canvas {
             items.push(ContextMenuItem::Builtin(ContextAction::EjectFromCanvas));
         }
+        if is_native_emacs {
+            items.extend([
+                ContextMenuItem::Builtin(ContextAction::SplitRight),
+                ContextMenuItem::Builtin(ContextAction::SplitBelow),
+            ]);
+        }
         items.push(ContextMenuItem::Builtin(ContextAction::Close));
         menu.origin = Some(pt);
         menu.target = Some(target);
@@ -367,11 +401,18 @@ fn context_open_close(
             (Some(ContextMenuItem::Builtin(ContextAction::Unpin)), Some(e)) => {
                 pending.unpin.push(e)
             }
+            (Some(ContextMenuItem::Builtin(ContextAction::EjectFromCanvas)), Some(e)) => {
+                eject.0.push(e)
+            }
             (Some(ContextMenuItem::Builtin(ContextAction::Undock)), Some(e)) => {
                 pending.undock.push(e)
             }
             (Some(ContextMenuItem::Builtin(ContextAction::Close)), Some(e)) => {
                 pending.close.push(e)
+            }
+            (Some(ContextMenuItem::Builtin(action @ ContextAction::SplitRight)), Some(e))
+            | (Some(ContextMenuItem::Builtin(action @ ContextAction::SplitBelow)), Some(e)) => {
+                menu.deferred.push((action, e));
             }
             (Some(ContextMenuItem::WidgetClick { id, .. }), Some(e)) => {
                 // Route the pick back to the widget as a normal button click;
@@ -381,6 +422,20 @@ fn context_open_close(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn context_deferred_actions(world: &mut World) {
+    let actions = std::mem::take(&mut world.resource_mut::<ContextMenu>().deferred);
+    for (action, pane) in actions {
+        let direction = match action {
+            ContextAction::SplitRight => jim_emacs::native::NativeSplitDirection::Right,
+            ContextAction::SplitBelow => jim_emacs::native::NativeSplitDirection::Below,
+            _ => continue,
+        };
+        if !jim_emacs::native::request_native_split(world, pane, direction) {
+            warn!("could not split native Emacs pane {pane:?}");
         }
     }
 }

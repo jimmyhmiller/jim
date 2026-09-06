@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use jim_terminal::daemon_client::DaemonClient;
 use jim_terminal::daemon_proto::DaemonMessage;
+use jim_terminal::pty::PtySize;
+use jim_terminal::worker::WorkerHandle;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
@@ -55,6 +57,52 @@ impl Drop for LogDumper {
             eprintln!("\n--- no daemon.log at {} ---", log.display());
         }
     }
+}
+
+#[test]
+fn dropping_gui_worker_preserves_session_for_restart() {
+    let _env = common::setup_isolated_daemon_env();
+    let session = common::random_session_id();
+    let worker = WorkerHandle::spawn(
+        session,
+        vec!["/bin/cat".to_string()],
+        None,
+        PtySize {
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        },
+        1_000,
+        None,
+        None,
+        None,
+    )
+    .expect("spawn GUI worker and daemon");
+
+    // This is what GUI process teardown does to every terminal store entry.
+    // It must join the local worker without sending Kill to the daemon.
+    drop(worker);
+
+    let mut client = DaemonClient::reattach(session, 80, 24)
+        .expect("restart must reattach to the surviving terminal daemon");
+    client.send(&jim_terminal::daemon_proto::ClientMessage::Input(
+        b"still-running-after-restart\n".to_vec(),
+    ));
+    client.try_flush();
+    let (frames, alive) = drain_for(&mut client, Duration::from_millis(800));
+    assert!(alive, "surviving daemon disconnected the restarted GUI");
+    assert!(
+        frames.iter().any(|m| matches!(
+            m,
+            DaemonMessage::Output(bytes)
+                if String::from_utf8_lossy(bytes).contains("still-running-after-restart")
+        )),
+        "surviving terminal child did not accept input after restart: {frames:?}"
+    );
+
+    client.send(&jim_terminal::daemon_proto::ClientMessage::Kill);
+    client.try_flush();
 }
 
 #[test]

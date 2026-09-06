@@ -137,7 +137,9 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         }
         Ok(())
     } else {
-        std::fs::copy(from, to).map(|_| ()).map_err(|e| e.to_string())
+        std::fs::copy(from, to)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 

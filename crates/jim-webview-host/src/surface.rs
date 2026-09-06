@@ -9,8 +9,8 @@
 use std::ffi::c_void;
 
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, kCFBooleanTrue,
-    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+    kCFBooleanTrue, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFBoolean,
+    CFDictionary, CFNumber, CFRetained, CFString,
 };
 use objc2_io_surface::{IOSurfaceLockOptions, IOSurfaceRef};
 
