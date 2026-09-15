@@ -106,7 +106,7 @@ fi
 # bundled Frameworks dir. Tolerate "already present" if we re-run.
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS/$EXEC_NAME" 2>/dev/null || true
 
-# Pick a signing identity. A STABLE (self-signed) identity keeps the
+# Pick a signing identity. A STABLE identity keeps the
 # bundle's code identity constant across rebuilds, so macOS keys EVERY
 # identity-scoped grant to it and they persist instead of resetting each
 # build. That covers not just file/mic TCC, but the Developer Tools
@@ -114,10 +114,14 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS/$EXEC_NAME
 # macOS re-running its "Verifying…" malware scan on every freshly built
 # binary you launch from a shell inside Jim. Ad-hoc signing derives the
 # identity from the cdhash (changes every build), so it silently breaks all
-# of those. We therefore self-heal: if the identity is missing, create it
-# (setup-signing.sh) rather than degrading to ad-hoc. Override via
-# TB_SIGN_IDENTITY.
-SIGN_ID="${TB_SIGN_IDENTITY:-TerminalBevy Local Signing}"
+# of those. Prefer a valid Apple Development identity when one is installed:
+# it gives every nested executable a stable certificate and Team ID and avoids
+# the trust ambiguity of a self-signed leaf. The local TerminalBevy identity
+# remains the offline fallback. Override either choice via TB_SIGN_IDENTITY.
+APPLE_SIGN_ID=$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n 's/.*"\(Apple Development:.*\)"/\1/p' \
+    | head -1)
+SIGN_ID="${TB_SIGN_IDENTITY:-${APPLE_SIGN_ID:-TerminalBevy Local Signing}}"
 # NB: no -v — a self-signed identity is untrusted by Gatekeeper, which
 # -v filters out, but codesign still signs with it and the resulting
 # designated requirement (cert-leaf anchored) is stable across rebuilds.
@@ -254,6 +258,7 @@ cat > "$CONTENTS/Info.plist" <<EOF
     <key>NSPrincipalClass</key>               <string>NSApplication</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
     <key>NSMicrophoneUsageDescription</key>   <string>Programs you run in Jim (such as Claude Code voice dictation) use the microphone.</string>
+    <key>NSScreenCaptureUsageDescription</key> <string>Programs you run in Jim can capture the screen when you explicitly ask them to annotate or share it.</string>
     <key>NSDocumentsFolderUsageDescription</key>  <string>Jim and the programs you run in it work with files in your Documents folder.</string>
     <key>NSDesktopFolderUsageDescription</key>    <string>Jim and the programs you run in it work with files on your Desktop.</string>
     <key>NSDownloadsFolderUsageDescription</key>  <string>Jim and the programs you run in it work with files in your Downloads folder.</string>

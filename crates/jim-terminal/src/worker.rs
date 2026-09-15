@@ -39,7 +39,7 @@ use libghostty_vt::{
     terminal::{Mode, Point, PointCoordinate, ScrollViewport},
 };
 use nix::errno::Errno;
-use nix::fcntl::{self, OFlag};
+use nix::fcntl::{self, FdFlag, OFlag};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::daemon_client::DaemonClient;
@@ -455,6 +455,11 @@ impl WorkerHandle {
         // message lands on the channel. Non-blocking on both ends so
         // neither side ever stalls on it.
         let (wake_r, wake_w) = nix::unistd::pipe()?;
+        // macOS has no pipe2(2). nix::unistd::pipe creates inheritable
+        // descriptors, so without FD_CLOEXEC every terminal's wake pair
+        // survives into whisper-server (and every other subprocess).
+        set_cloexec(&wake_r)?;
+        set_cloexec(&wake_w)?;
         set_nonblock(&wake_r)?;
         set_nonblock(&wake_w)?;
 
@@ -493,6 +498,13 @@ fn set_nonblock(fd: &OwnedFd) -> std::io::Result<()> {
     let raw = fcntl::fcntl(fd, fcntl::F_GETFL)?;
     let flags = OFlag::from_bits_retain(raw) | OFlag::O_NONBLOCK;
     fcntl::fcntl(fd, fcntl::F_SETFL(flags))?;
+    Ok(())
+}
+
+fn set_cloexec(fd: &OwnedFd) -> std::io::Result<()> {
+    let raw = fcntl::fcntl(fd, fcntl::F_GETFD)?;
+    let flags = FdFlag::from_bits_retain(raw) | FdFlag::FD_CLOEXEC;
+    fcntl::fcntl(fd, fcntl::F_SETFD(flags))?;
     Ok(())
 }
 
@@ -1838,6 +1850,16 @@ impl ScrollbackLogWriter {
 mod tests {
     use super::*;
     use libghostty_vt::{Terminal, TerminalOptions};
+
+    #[test]
+    fn wake_pipe_does_not_survive_exec() {
+        let (read, write) = nix::unistd::pipe().expect("wake pipe");
+        for fd in [&read, &write] {
+            set_cloexec(fd).expect("set close-on-exec");
+            let flags = fcntl::fcntl(fd, fcntl::F_GETFD).expect("read descriptor flags");
+            assert!(FdFlag::from_bits_retain(flags).contains(FdFlag::FD_CLOEXEC));
+        }
+    }
 
     #[test]
     fn dropping_handle_stops_worker_and_closes_wake_pipe() {

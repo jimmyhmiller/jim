@@ -270,6 +270,9 @@ pub struct DictationPlugin;
 
 impl Plugin for DictationPlugin {
     fn build(&self, app: &mut App) {
+        // Before anything else: free the ~1GB a previous jim may have left
+        // behind if it died without running an exit hook.
+        whisper::reap_orphans();
         app.init_resource::<Dictation>()
             // Run immediately after Bevy gathers input. A hands-free Escape
             // is removed here before any Update keyboard consumer can see it.
@@ -296,7 +299,9 @@ fn dictation_tick(world: &mut World) {
     render_pill(world);
 }
 
-/// Don't let a ~1GB model outlive the GUI.
+/// Don't let a ~1GB model outlive the GUI — the graceful path only. Almost
+/// nothing reaches it (SIGTERM, ⌘Q and SIGKILL all skip `AppExit`); see the
+/// "Outliving jim" section of `whisper.rs` for the paths that catch those.
 fn shutdown_whisper_on_exit(mut exit: MessageReader<AppExit>) {
     if exit.read().next().is_some() {
         whisper::shutdown();

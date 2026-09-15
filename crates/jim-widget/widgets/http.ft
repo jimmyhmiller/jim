@@ -46,11 +46,21 @@ fn start_fetch() {
 // 60fps animation: `set_tick_interval` asks the host to call `on_frame`
 // every `interval` seconds from the reactive loop, so an idle poller
 // costs ~nothing instead of pinning the whole app at 60fps Continuous.
-fn on_init() { if interval_s() > 0.0 { set_tick_interval(interval_s()) } }
+fn publish_cached(s) {
+    if s.bytes > 0 {
+        emit_retained(out_topic(), { kind: "raw", body: s.body, url: url(),
+            fetched_at: time(), cached: true })
+    }
+}
 
-// The initial GET is a side effect → on_start, which runs ONLY on a fresh
-// spawn (not on restart). On restart the body is already in state.
-fn on_start() { start_fetch() }
+fn on_init() {
+    if interval_s() > 0.0 { set_tick_interval(interval_s()) }
+}
+
+// Side effects belong in on_start, which runs after saved state is restored
+// on a fresh spawn, restart, and hot reload. Publish the durable response
+// first so downstream views never wait on the network, then refresh it.
+fn on_start() { publish_cached(@state); start_fetch() }
 
 // Event-driven proc output (these handlers persist, so the result sticks).
 fn on_proc_output(handle, line) {
@@ -70,8 +80,17 @@ fn on_proc_exit(handle, code) {
                         last_at: "t=" + str(round(time())), bytes: len(body_text), body: parsed })
     } else {
         let msg = if body_text == "" { "empty response" } else { slice(body_text, 0, 120) }
-        emit_retained(out_topic(), { kind: "error", message: msg, stage: "http" })
-        reset!(state, { ..s, busy: false, proc: -1, lines: [], status: "error" })
+        if s.bytes > 0 {
+            // A failed refresh must not replace a valid retained response with
+            // an error and blank every downstream view. Keep serving the last
+            // successful body while making the stale state visible here.
+            emit_retained(out_topic(), { kind: "raw", body: s.body, url: url(),
+                fetched_at: time(), cached: true, refresh_error: msg })
+            reset!(state, { ..s, busy: false, proc: -1, lines: [], status: "stale: " + msg })
+        } else {
+            emit_retained(out_topic(), { kind: "error", message: msg, stage: "http" })
+            reset!(state, { ..s, busy: false, proc: -1, lines: [], status: "error" })
+        }
     }
     request_render()
 }

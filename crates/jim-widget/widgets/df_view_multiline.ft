@@ -1,43 +1,39 @@
-// df_view_multiline.ft — a VIEW node: multi-series TIME-SERIES line chart.
+// df_view_multiline.ft — full-dataset stacked hourly bars.
 //
-// One line per distinct `series`, positioned on a real time axis by the
-// numeric x column (epoch-ms `bucket_start_ms`), so hourly density and
-// uneven gaps render faithfully — not collapsed to an index. Works off
-// the long dataset `dsify` produces when params set `series_path`.
-// Right-side legend; hover snaps to the nearest point (series/date/value).
-//
-//   params : { in, x, y, series_path, label, points }
+// Every source series is retained. For each hour, non-zero values are stacked
+// into one bar. A square-root height scale keeps ordinary hours readable when
+// a real traffic spike is much larger. Hover reports the original values.
 import "host"
-import { cell, col_max, col_min, ms_to_date, trunc, tooltip, concat, dsify, pget, distinct,
+import { cell, ms_to_date, trunc, tooltip, concat, dsify, pget,
          col_text, col_muted, col_axis, col_err, col_warn, series_color } from "df"
 
 fn in_topic() = pget(params, "in", "http/out")
-let pi = 3.141592653589793
+let hour_ms = 3600000
 
 fn init_state() = { ds: { kind: "empty" }, w: 760.0, h: 380.0, hovx: -1.0, hovy: 0.0 }
 let state = atom(init_state())
 
 fn on_init() { request_render() }
-
 fn on_message(topic, payload, sender) {
     if topic != in_topic() { return }
     reset!(state, { ..(@state), ds: dsify(payload, params), hovx: -1.0 })
     request_render()
 }
-
 fn on_resize(w, h) { reset!(state, { ..(@state), w: w, h: h }); request_render() }
-
 fn on_hover(x, y) {
     let s = @state
-    if x > 100000.0 { if s.hovx >= 0.0 { reset!(state, { ..s, hovx: -1.0 }); request_render() } return }
+    if x > 100000.0 {
+        if s.hovx >= 0.0 { reset!(state, { ..s, hovx: -1.0 }); request_render() }
+        return
+    }
     reset!(state, { ..s, hovx: x, hovy: y })
     request_render()
 }
 
 fn geo(s) {
-    let pad_l = 38.0
-    let pad_r = 138.0
-    let pad_t = 32.0
+    let pad_l = 42.0
+    let pad_r = 18.0
+    let pad_t = 36.0
     let pad_b = 24.0
     {
         pad_l: pad_l, pad_t: pad_t,
@@ -49,7 +45,7 @@ fn geo(s) {
 
 fn banner(text, color) =
     { kind: "canvas", children: [
-        { kind: "text", id: "bt", x: 12.0, y: 10.0, value: "╱╱ series", size: 13.0, color: col_text() },
+        { kind: "text", id: "bt", x: 12.0, y: 10.0, value: "╱╱ hourly stacked views", size: 13.0, color: col_text() },
         { kind: "text", id: "bm", x: 12.0, y: 40.0, value: text, size: 12.0, color: color },
     ]}
 
@@ -60,88 +56,115 @@ fn render(w, h) {
     if ds.kind != "dataset" { return banner("waiting for data…", col_muted()) }
     let xcol = pget(params, "x", "bucket_start_ms")
     let ycol = pget(params, "y", "views")
-    let slist = distinct(ds, "series")
-    if len(ds.rows) < 2 or len(slist) == 0 { return banner("need a multi-series dataset", col_warn()) }
+    if len(ds.rows) == 0 { return banner("no timeline data", col_warn()) }
 
-    let xmin = col_min(ds, xcol)
-    let xmax = col_max(ds, xcol)
-    let span = if xmax > xmin { xmax - xmin } else { 1.0 }
-    let ymax = col_max(ds, ycol)
-    let g = geo(s)
+    let mut series = []
+    let mut by_hour = {}
+    let mut xmin = cell(unwrap_or(get(ds.rows, 0), {}), xcol, 0)
+    let mut xmax = xmin
 
-    // group points by series
-    let mut groups = {}
+    // One pass builds hour -> {series -> value}. All series remain present.
     for r in ds.rows {
-        let key = cell(r, "series", "")
-        let cur = unwrap_or(get(groups, key), [])
-        groups = assoc(groups, key, push(cur, { x: cell(r, xcol, 0), y: cell(r, ycol, 0) }))
+        let label = cell(r, "series", "")
+        if not contains(series, label) { series = push(series, label) }
+        let x = cell(r, xcol, 0)
+        if x < xmin { xmin = x }
+        if x > xmax { xmax = x }
+        let key = str(x)
+        let values = unwrap_or(get(by_hour, key), {})
+        by_hour = assoc(by_hour, key, assoc(values, label,
+            unwrap_or(get(values, label), 0) + cell(r, ycol, 0)))
     }
 
+    // Find the honest linear maximum of the hourly stack totals.
+    let mut ymax = 1.0
+    let mut x = xmin
+    while x <= xmax {
+        let values = unwrap_or(get(by_hour, str(x)), {})
+        let mut total = 0
+        for label in series { total = total + unwrap_or(get(values, label), 0) }
+        if total > ymax { ymax = total * 1.0 }
+        x = x + hour_ms
+    }
+
+    let g = geo(s)
+    let span = if xmax > xmin { xmax - xmin } else { hour_ms }
+    let hours = ((xmax - xmin) / hour_ms) + 1
+    let bar_w = max(1.0, g.plot_w / hours * 0.82)
     let mut items = []
     items = push(items, { kind: "text", id: "title", x: 10.0, y: 9.0,
-        value: "╱╱ " + ycol + " over time · " + str(len(slist)) + " series", size: 13.0, color: col_text() })
-    items = push(items, { kind: "rect", id: "axis", x: g.pad_l, y: g.baseline, w: g.plot_w, h: 1.0, color: col_axis() })
-    // y peak label
-    items = push(items, { kind: "text", id: "ymax", x: g.pad_l - 6.0, y: g.pad_t - 2.0,
-        value: str(to_int(round(ymax))), size: 9.0, color: col_muted(), anchor: "top-center", family: "mono" })
+        value: "╱╱ hourly views · all " + str(len(series)) + " posts · stacked · √ scale", size: 13.0, color: col_text() })
+    items = push(items, { kind: "rect", id: "axis", x: g.pad_l, y: g.baseline,
+        w: g.plot_w, h: 1.0, color: col_axis() })
 
-    // x date ticks (5 across)
+    // Grid labels are converted back to real view counts, so the nonlinear
+    // display remains quantitatively legible.
+    let mut gi = 1
+    while gi <= 4 {
+        let ratio = gi / 4.0
+        let gy = g.baseline - ratio * g.plot_h
+        let real_value = to_int(round(ymax * ratio * ratio))
+        items = push(items, { kind: "rect", id: "grid" + str(gi), x: g.pad_l, y: gy,
+            w: g.plot_w, h: 1.0, color: col_axis() + "33" })
+        items = push(items, { kind: "text", id: "yl" + str(gi), x: g.pad_l + 4.0, y: gy + 2.0,
+            value: str(real_value), size: 9.0, color: col_muted(),
+            anchor: "top-left", family: "mono" })
+        gi = gi + 1
+    }
+
     let mut ti = 0
     while ti <= 4 {
         let xv = xmin + span * ti / 4.0
-        let px = g.pad_l + (xv - xmin) / span * g.plot_w
+        let px = g.pad_l + ((xv - xmin) * 1.0 / span) * g.plot_w
         items = push(items, { kind: "text", id: "xt" + str(ti), x: px, y: g.baseline + 4.0,
             value: ms_to_date(to_int(xv)), size: 9.0, color: col_muted(),
-            anchor: if ti == 0 { "top-left" } else if ti == 4 { "top-center" } else { "top-center" }, family: "mono" })
+            anchor: if ti == 0 { "top-left" } else { "top-center" }, family: "mono" })
         ti = ti + 1
     }
 
-    // one polyline per series (sorted by time)
-    let mut si = 0
-    for label in slist {
-        let color = series_color(si)
-        let pts = sort_by(unwrap_or(get(groups, label), []), p => p.x)
-        let mut k = 0
-        while k < len(pts) - 1 {
-            let a = unwrap_or(get(pts, k), { x: 0, y: 0 })
-            let b = unwrap_or(get(pts, k + 1), { x: 0, y: 0 })
-            let ax = g.pad_l + (a.x - xmin) / span * g.plot_w
-            let ay = g.baseline - (a.y / ymax) * g.plot_h
-            let bx = g.pad_l + (b.x - xmin) / span * g.plot_w
-            let by = g.baseline - (b.y / ymax) * g.plot_h
-            let dx = bx - ax
-            let dy = by - ay
-            items = push(items, { kind: "rect", id: "s" + str(si) + "_" + str(k),
-                x: (ax + bx) / 2.0, y: (ay + by) / 2.0, w: sqrt(dx * dx + dy * dy), h: 1.5,
-                color: color, anchor: "center", rotation: atan2(dy, dx) * 180.0 / pi })
-            k = k + 1
+    // Each hour is one bar; every non-zero series owns its proportional slice.
+    x = xmin
+    let mut bi = 0
+    while x <= xmax {
+        let values = unwrap_or(get(by_hour, str(x)), {})
+        let px = g.pad_l + ((x - xmin) * 1.0 / span) * g.plot_w
+        let mut cumulative = 0.0
+        let mut si = 0
+        for label in series {
+            let value = unwrap_or(get(values, label), 0)
+            if value > 0 {
+                let bottom = sqrt(cumulative / ymax) * g.plot_h
+                cumulative = cumulative + value
+                let top = sqrt(cumulative / ymax) * g.plot_h
+                let sh = top - bottom
+                items = push(items, { kind: "rect", id: "b" + str(bi) + "_" + str(si),
+                    x: px, y: g.baseline - bottom - sh / 2.0, w: bar_w, h: max(1.0, sh),
+                    color: series_color(si), anchor: "center" })
+            }
+            si = si + 1
         }
-        // legend
-        items = push(items, { kind: "rect", id: "lg" + str(si), x: s.w - 132.0, y: g.pad_t + si * 15.0, w: 10.0, h: 10.0, color: color, anchor: "top-left" })
-        items = push(items, { kind: "text", id: "ll" + str(si), x: s.w - 118.0, y: g.pad_t + si * 15.0 - 1.0,
-            value: trunc(label, 15), size: 10.0, color: col_muted(), family: "mono" })
-        si = si + 1
+        x = x + hour_ms
+        bi = bi + 1
     }
 
-    // hover: nearest point overall
-    if s.hovx >= 0.0 {
-        let mut best_d = 1000000.0
-        let mut best = { ok: false }
-        for label in slist {
-            for p in unwrap_or(get(groups, label), []) {
-                let px = g.pad_l + (p.x - xmin) / span * g.plot_w
-                let py = g.baseline - (p.y / ymax) * g.plot_h
-                let dx = px - s.hovx
-                let dy = py - s.hovy
-                let d = dx * dx + dy * dy
-                if d < best_d { best_d = d; best = { ok: true, px: px, py: py, x: p.x, y: p.y, label: label } }
-            }
+    if s.hovx >= g.pad_l and s.hovx <= g.pad_l + g.plot_w {
+        let raw_x = xmin + (s.hovx - g.pad_l) / g.plot_w * span
+        let hx = xmin + to_int(round((raw_x - xmin) / hour_ms)) * hour_ms
+        let values = unwrap_or(get(by_hour, str(hx)), {})
+        let mut total = 0
+        let mut top_value = 0
+        let mut top_label = ""
+        for label in series {
+            let value = unwrap_or(get(values, label), 0)
+            total = total + value
+            if value > top_value { top_value = value; top_label = label }
         }
-        if best.ok and best_d < 900.0 {
-            items = push(items, { kind: "rect", id: "hp", x: best.px, y: best.py, w: 7.0, h: 7.0, color: col_text(), anchor: "center" })
-            items = concat(items, tooltip(best.px, best.py, s.w, s.h,
-                trunc(best.label, 18) + " " + ms_to_date(to_int(best.x)) + ": " + str(best.y)))
-        }
+        let px = g.pad_l + ((hx - xmin) * 1.0 / span) * g.plot_w
+        items = push(items, { kind: "rect", id: "hover-hour", x: px, y: g.pad_t,
+            w: max(2.0, bar_w), h: g.plot_h, color: col_text() + "22", anchor: "top-center" })
+        items = concat(items, tooltip(px, max(g.pad_t + 30.0, s.hovy), s.w, s.h,
+            ms_to_date(to_int(hx)) + " · " + str(total) + " total · " +
+            trunc(top_label, 24) + " " + str(top_value)))
     }
 
     { kind: "canvas", children: items }

@@ -20,7 +20,10 @@
 
 use std::io::Cursor;
 use std::net::TcpStream;
+use std::os::unix::process::CommandExt as _;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -45,6 +48,31 @@ struct Running {
 }
 
 static SERVER: Mutex<Option<Running>> = Mutex::new(None);
+
+/// PID of the live whisper-server — which is also its process-group id,
+/// since [`spawn_server`] gives it a group of its own — or 0 when there is
+/// none.
+///
+/// A plain atomic rather than a read through `SERVER`, because the two
+/// hooks that need it ([`handle_term_signal`] and [`kill_child_at_exit`])
+/// run on paths where taking a lock is either unsafe or already too late.
+///
+/// The pid is remembered rather than re-derived, so in principle it could
+/// name a recycled process if the server died without us noticing. Every
+/// path that observes the exit clears it, which leaves only the window
+/// between an unobserved crash and jim's own exit.
+static CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// Previous disposition of each signal we hook (indexed by
+/// [`prev_handler_slot`]), captured at install time so we CHAIN to it
+/// rather than replace it — see `jim_emacs::native`, which hooks the same
+/// signals for the same reason and whichever of the two installs second
+/// ends up calling the first.
+static PREV_SIG_HANDLERS: [AtomicUsize; 3] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 fn model_path() -> Option<std::path::PathBuf> {
     Some(
@@ -82,14 +110,8 @@ pub fn transcribe(samples: &[f32], rate: u32) -> Result<String, String> {
 fn discard_server(port: u16) {
     let Ok(mut g) = SERVER.lock() else { return };
     if g.as_ref().is_some_and(|r| r.port == port) {
-        if let Some(mut r) = g.take() {
-            eprintln!(
-                "[whisper] killing failed server: pid={} port={}",
-                r.child.id(),
-                r.port
-            );
-            let _ = r.child.kill();
-            let _ = r.child.wait();
+        if let Some(r) = g.take() {
+            kill_running(r, "killing failed server");
         }
     }
 }
@@ -104,14 +126,8 @@ pub fn idle_shutdown() {
         None => false,
     };
     if idle {
-        if let Some(mut r) = g.take() {
-            eprintln!(
-                "[whisper] idle shutdown: pid={} port={}",
-                r.child.id(),
-                r.port
-            );
-            let _ = r.child.kill();
-            let _ = r.child.wait();
+        if let Some(r) = g.take() {
+            kill_running(r, "idle shutdown");
         }
     }
 }
@@ -119,15 +135,34 @@ pub fn idle_shutdown() {
 /// Kill the server now — on app exit, so ~1GB doesn't outlive the GUI.
 pub fn shutdown() {
     let Ok(mut g) = SERVER.lock() else { return };
-    if let Some(mut r) = g.take() {
-        eprintln!(
-            "[whisper] app shutdown: pid={} port={}",
-            r.child.id(),
-            r.port
-        );
-        let _ = r.child.kill();
-        let _ = r.child.wait();
+    if let Some(r) = g.take() {
+        kill_running(r, "app shutdown");
     }
+}
+
+/// The one kill path: signal the server's whole process group, reap it, and
+/// drop the crash-recovery record so a later [`reap_orphans`] has nothing
+/// to chase.
+///
+/// The group rather than the pid alone because the server is its own group
+/// leader; whisper-server forks nothing today, but a stray grandchild would
+/// otherwise keep the model resident.
+fn kill_running(mut r: Running, why: &str) {
+    let pid = r.child.id();
+    eprintln!("[whisper] {why}: pid={pid} port={}", r.port);
+    // SAFETY: a negative pid is the group; SIGKILL to a group we created.
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    let _ = r.child.kill();
+    let _ = r.child.wait();
+    forget_child(pid);
+}
+
+/// Note that the server with this pid is gone: clear the pid the exit hooks
+/// would otherwise signal, and delete its crash-recovery record.
+fn forget_child(pid: u32) {
+    let _ = CHILD_PGID.compare_exchange(pid as i32, 0, Ordering::SeqCst, Ordering::SeqCst);
+    let Some(dir) = registry_dir() else { return };
+    let _ = std::fs::remove_file(dir.join(pid.to_string()));
 }
 
 /// Port of the live server, starting it if needed.
@@ -149,6 +184,7 @@ fn ensure_running() -> Result<u16, String> {
                 return Ok(r.port);
             }
             if !alive {
+                forget_child(r.child.id());
                 *g = None;
             }
         }
@@ -193,7 +229,11 @@ fn spawn_server() -> Result<Running, String> {
     ])
     // Its startup chatter (Metal init, model load) is noise in Jim's log.
     .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    .stderr(Stdio::null())
+    // Its own process group, so every teardown path can signal the server
+    // and any grandchild as a unit, and so a terminal signal to jim's group
+    // doesn't reach it at some other moment.
+    .process_group(0);
     // A Dock-launched Jim inherits launchd's minimal PATH — without this,
     // Homebrew's whisper-server isn't findable.
     if let Some(path) = jim_widget::subprocess::augmented_path() {
@@ -203,6 +243,11 @@ fn spawn_server() -> Result<Running, String> {
         .spawn()
         .map_err(|e| format!("whisper-server failed to launch: {e} (is it installed?)"))?;
     eprintln!("[whisper] server spawned: pid={} port={port}", child.id());
+    // Arm the teardown paths that `Drop` and `AppExit` never reach, and
+    // leave a record for the one path nothing in-process can reach.
+    CHILD_PGID.store(child.id() as i32, Ordering::SeqCst);
+    install_exit_hooks();
+    register_child(child.id(), port);
     Ok(Running {
         child,
         port,
@@ -227,6 +272,7 @@ fn wait_ready(port: u16) -> Result<(), String> {
             match g.as_mut() {
                 Some(r) if r.port == port => {
                     if let Ok(Some(status)) = r.child.try_wait() {
+                        forget_child(r.child.id());
                         *g = None;
                         return Err(format!("whisper-server exited during startup ({status})"));
                     }
@@ -240,6 +286,176 @@ fn wait_ready(port: u16) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+// ============================================================
+// Outliving jim
+// ============================================================
+//
+// `shutdown` runs from an `AppExit` reader, and in practice almost nothing
+// reaches it: of 158 spawns in one log there were 3 app shutdowns. SIGTERM
+// — what `scripts/dev-restart.sh` sends — is not one of them, because
+// bevy's `TerminalCtrlCHandlerPlugin` builds `ctrlc` without its
+// `termination` feature and so only turns SIGINT into an `AppExit`; ⌘Q
+// terminates through LaunchServices without another `App::update()`; and a
+// SIGKILL or a panic-abort observes nothing at all.
+//
+// Every one of those orphans a ~1GB server onto PID 1, where nothing ever
+// reaps it. `dev-restart.sh` looks for whisper children of the GUI it is
+// about to kill, which only helps while that GUI is still alive and only
+// when jim is restarted through the script at all — a Dock-launched
+// session never is.
+//
+// So the server is torn down from three places instead: `shutdown` on the
+// graceful path, a signal handler and an `atexit` hook for the paths where
+// jim still gets to run code, and `reap_orphans` at startup for the paths
+// where it doesn't.
+
+fn prev_handler_slot(sig: i32) -> Option<usize> {
+    match sig {
+        libc::SIGTERM => Some(0),
+        libc::SIGINT => Some(1),
+        libc::SIGHUP => Some(2),
+        _ => None,
+    }
+}
+
+/// SIGTERM/SIGINT/SIGHUP handler: kill the server's process group, then
+/// hand off to whatever handler was installed before us — bevy's ctrl-c
+/// handler, or `jim_emacs`'s equivalent — so the graceful path this may be
+/// stealing still happens. If there was none, restore the default
+/// disposition and re-raise so jim dies as it normally would.
+///
+/// ASYNC-SIGNAL-SAFE: an atomic load, `kill`, `signal`, `raise`, and a call
+/// into the previous handler. No allocation, no locks, no `wait` — which is
+/// why it leaves a zombie and the registry file behind for `reap_orphans`
+/// rather than tidying up here.
+extern "C" fn handle_term_signal(sig: i32) {
+    kill_child_now();
+    let prev = prev_handler_slot(sig)
+        .map(|i| PREV_SIG_HANDLERS[i].load(Ordering::SeqCst))
+        .unwrap_or(libc::SIG_DFL);
+    if prev == libc::SIG_IGN {
+        return;
+    }
+    if prev != libc::SIG_DFL && prev != libc::SIG_ERR {
+        // SAFETY: `prev` came from `signal`, so it is a handler of this type.
+        let f: extern "C" fn(i32) = unsafe { std::mem::transmute(prev) };
+        f(sig);
+        return;
+    }
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// `atexit` hook — the ⌘Q path, where `-[NSApplication terminate:]` calls
+/// `exit` without the app loop running another frame.
+extern "C" fn kill_child_at_exit() {
+    kill_child_now();
+}
+
+/// SIGKILL the server's process group if there is one. Shared by the two
+/// hooks, so it must stay async-signal-safe.
+fn kill_child_now() {
+    let pgid = CHILD_PGID.swap(0, Ordering::SeqCst);
+    if pgid > 0 {
+        // SAFETY: a negative pid is the group; SIGKILL to a group we created.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+}
+
+/// Install the signal handlers and the `atexit` hook, once per process,
+/// capturing the handlers that were there first so `handle_term_signal` can
+/// chain to them.
+fn install_exit_hooks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let h = handle_term_signal as *const () as libc::sighandler_t;
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            let prev = libc::signal(sig, h);
+            if let Some(i) = prev_handler_slot(sig) {
+                PREV_SIG_HANDLERS[i].store(prev, Ordering::SeqCst);
+            }
+        }
+        libc::atexit(kill_child_at_exit);
+    });
+}
+
+/// Where a live server records itself, one file per server pid holding the
+/// pid of the jim that owns it. Deliberately not the same thing as the
+/// `SERVER` mutex: this survives the process, and is only read by the jim
+/// that starts next.
+fn registry_dir() -> Option<PathBuf> {
+    Some(PathBuf::from(std::env::var("HOME").ok()?).join(".jim/whisper-servers"))
+}
+
+fn register_child(pid: u32, port: u16) {
+    let Some(dir) = registry_dir() else { return };
+    let write = std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(dir.join(pid.to_string()), format!("{}\n", std::process::id())));
+    if let Err(e) = write {
+        // Not fatal — the server still works, it just can't be recovered if
+        // this jim is SIGKILLed. Say so rather than leak in silence.
+        eprintln!("[whisper] could not record server pid={pid} port={port} for orphan cleanup: {e}");
+    }
+}
+
+/// Kill whisper servers left behind by a jim that died without running any
+/// of its exit hooks. Called once at startup.
+///
+/// A record whose owner is still alive belongs to another running jim and
+/// is left alone. Everything else is cleared out — but only after checking
+/// that the pid is still a whisper-server, since a recorded pid that has
+/// been recycled would otherwise name an innocent process.
+pub fn reap_orphans() {
+    let Some(dir) = registry_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(pid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let owner = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.split_whitespace().next()?.parse::<i32>().ok());
+        if owner.is_some_and(pid_alive) {
+            continue;
+        }
+        if pid_alive(pid) && proc_name(pid).as_deref() == Some("whisper-server") {
+            eprintln!("[whisper] reaping server orphaned by a dead jim: pid={pid}");
+            // SAFETY: SIGTERM by group (it is its own leader) and by pid, so
+            // this also reaches servers spawned before jim used groups.
+            unsafe {
+                libc::kill(-pid, libc::SIGTERM);
+                libc::kill(pid, libc::SIGTERM);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 checks for the process without delivering anything.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+/// The executable name behind a pid, used to make sure a recorded pid still
+/// names the server we recorded and not whatever reused the number.
+fn proc_name(pid: i32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `proc_name` writes at most `buf.len()` bytes and returns how
+    // many; a non-positive return means it wrote none.
+    let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    if n <= 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
 }
 
 /// Ask the OS for an unused port by binding one and letting it go.
@@ -318,6 +534,102 @@ fn post_inference(port: u16, wav: &[u8]) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// A record whose owner is gone, but whose pid has been recycled by
+    /// something that is not a whisper-server, must be cleaned up WITHOUT
+    /// signalling that process.
+    #[test]
+    fn reap_orphans_wont_kill_a_recycled_pid() {
+        let Some(dir) = registry_dir() else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A live process that is definitely not whisper-server, recorded
+        // under an owner pid that cannot exist.
+        let mut victim = Command::new("sleep").arg("30").spawn().unwrap();
+        let record = dir.join(victim.id().to_string());
+        std::fs::write(&record, format!("{}\n", DEAD_OWNER_PID)).unwrap();
+
+        reap_orphans();
+
+        assert!(
+            !record.exists(),
+            "a record with a dead owner should be cleared out"
+        );
+        assert!(
+            matches!(victim.try_wait(), Ok(None)),
+            "reap_orphans killed a recycled pid that was not a whisper-server"
+        );
+        let _ = victim.kill();
+        let _ = victim.wait();
+    }
+
+    /// A record whose owner is still running belongs to another live jim,
+    /// and must be left completely alone.
+    #[test]
+    fn reap_orphans_leaves_a_live_owners_record_alone() {
+        let Some(dir) = registry_dir() else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let record = dir.join(format!("{}", DEAD_OWNER_PID + 1));
+        // This process stands in for the other jim: it is certainly alive.
+        std::fs::write(&record, format!("{}\n", std::process::id())).unwrap();
+
+        reap_orphans();
+
+        assert!(
+            record.exists(),
+            "reap_orphans deleted a record still owned by a live process"
+        );
+        let _ = std::fs::remove_file(&record);
+    }
+
+    /// A pid no live process can have: `kern.maxproc` is far below this and
+    /// pids are allocated below `PID_MAX` (99999).
+    const DEAD_OWNER_PID: i32 = 900_000;
+
+    /// The kill both the signal handler and the `atexit` hook perform. They
+    /// signal the GROUP, which only reaches anything if the child was
+    /// actually given one — drop the `process_group(0)` in `spawn_server`
+    /// and this fails.
+    #[test]
+    fn kill_child_now_kills_the_whole_group() {
+        // A group leader with a child of its own, standing in for the
+        // server: `sh` is the leader, `sleep` the grandchild.
+        let mut leader = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 & echo $!; wait")
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let grandchild: i32 = {
+            use std::io::BufRead as _;
+            let out = leader.stdout.take().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(out).read_line(&mut line).unwrap();
+            line.trim().parse().unwrap()
+        };
+
+        CHILD_PGID.store(leader.id() as i32, Ordering::SeqCst);
+        kill_child_now();
+
+        let _ = leader.wait();
+        assert_eq!(
+            CHILD_PGID.load(Ordering::SeqCst),
+            0,
+            "the pid must be cleared so a second hook can't signal a recycled one"
+        );
+        // The leader is reaped above; the grandchild had no one to wait for
+        // it, so give the kill a moment to land before looking.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_alive(grandchild) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_alive(grandchild),
+            "grandchild {grandchild} survived — the kill did not reach the group"
+        );
+    }
+
     /// These share one process-global server, so they must not run
     /// concurrently:
     ///   cargo test -p jim_app --lib dictation::whisper \
@@ -384,6 +696,17 @@ mod tests {
         let first = transcribe(&samples, rate).expect("first transcribe should succeed");
         println!("first pass returned: {first:?}");
 
+        // While it is warm it must be recoverable: the record is the only
+        // thing that lets the next jim clean up after a SIGKILL.
+        let record = registry_dir()
+            .unwrap()
+            .join(SERVER.lock().unwrap().as_ref().unwrap().child.id().to_string());
+        assert!(
+            record.exists(),
+            "no crash-recovery record at {} — a SIGKILL here would strand the server",
+            record.display()
+        );
+
         // Second call must reuse the warm server rather than spawn another.
         let began = Instant::now();
         let second = transcribe(&samples, rate).expect("second transcribe should succeed");
@@ -398,6 +721,15 @@ mod tests {
         assert!(
             SERVER.lock().unwrap().is_none(),
             "shutdown should drop the server"
+        );
+        assert!(
+            !record.exists(),
+            "the crash-recovery record outlived the server it describes"
+        );
+        assert_eq!(
+            CHILD_PGID.load(Ordering::SeqCst),
+            0,
+            "shutdown left a pid the exit hooks would still signal"
         );
     }
 }
