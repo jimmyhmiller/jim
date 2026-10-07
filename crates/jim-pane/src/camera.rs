@@ -349,6 +349,18 @@ pub fn pane_camera_setup_for(
     }
 }
 
+/// A subtree inside a pane that renders on ITS OWN layer, drawn by a camera
+/// of its own instead of the pane camera — a widget scroll region, whose
+/// camera renders into a texture clipped to the region's box.
+///
+/// Layer stamping honours it: [`propagate_render_layers`] gives everything
+/// below a `LayerRoot(n)` layer `n`, and [`reconcile_pane_content_layers`]
+/// neither forces that subtree onto the pane's layer nor treats it as a
+/// leak. Without this, region content would be pulled back onto the pane
+/// camera and draw unclipped over the texture that shows it.
+#[derive(Component, Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LayerRoot(pub usize);
+
 /// Propagate `RenderLayers::layer(N)` to everything under each pane's
 /// content_root so the per-pane camera (and only it) renders that
 /// pane's content.
@@ -380,6 +392,7 @@ pub fn propagate_render_layers(
     new_layers: Query<(&PaneLayer, &crate::PaneChrome), Added<PaneLayer>>,
     new_children: Query<(Entity, &ChildOf), Added<ChildOf>>,
     pane_layers: Query<&PaneLayer>,
+    layer_roots: Query<&LayerRoot>,
     layers_q: Query<&RenderLayers>,
     children_q: Query<&Children>,
     parents_q: Query<&ChildOf>,
@@ -391,6 +404,7 @@ pub fn propagate_render_layers(
             chrome.content_root,
             pane_layer.0,
             &layers_q,
+            &layer_roots,
             &children_q,
             &mut commands,
         );
@@ -405,10 +419,18 @@ pub fn propagate_render_layers(
         if layers_q.get(child).is_ok() {
             continue;
         }
-        let Some(layer_n) = ancestor_pane_layer(child, &pane_layers, &parents_q) else {
+        let Some(layer_n) = ancestor_pane_layer(child, &pane_layers, &layer_roots, &parents_q)
+        else {
             continue;
         };
-        stamp_subtree(child, layer_n, &layers_q, &children_q, &mut commands);
+        stamp_subtree(
+            child,
+            layer_n,
+            &layers_q,
+            &layer_roots,
+            &children_q,
+            &mut commands,
+        );
     }
 }
 
@@ -470,6 +492,7 @@ pub fn reconcile_pane_content_layers(
     )>,
     changed_children: Query<Entity, Changed<ChildOf>>,
     pane_layers: Query<&PaneLayer>,
+    layer_roots: Query<&LayerRoot>,
     parents_q: Query<&ChildOf>,
     layers_q: Query<&RenderLayers>,
     children_q: Query<&Children>,
@@ -512,18 +535,23 @@ pub fn reconcile_pane_content_layers(
             continue;
         }
         let mut fixed = 0usize;
-        let mut stack = vec![chrome.content_root];
-        while let Some(e) = stack.pop() {
+        // Each entry carries the layer its subtree belongs on: the pane's,
+        // until a `LayerRoot` hands a subtree its own.
+        let mut stack = vec![(chrome.content_root, want.clone())];
+        while let Some((e, mut layer)) = stack.pop() {
+            if let Ok(root) = layer_roots.get(e) {
+                layer = RenderLayers::from_layers(&[root.0]);
+            }
             let leaking = match layers_q.get(e) {
                 Ok(rl) => *rl == layer0, // explicitly on the global layer
                 Err(_) => true,          // no layer → defaults to layer 0
             };
             if leaking {
-                commands.entity(e).insert(want.clone());
+                commands.entity(e).insert(layer.clone());
                 fixed += 1;
             }
             if let Ok(ch) = children_q.get(e) {
-                stack.extend(ch.iter());
+                stack.extend(ch.iter().map(|c| (c, layer.clone())));
             }
         }
         // Warn once per pane the first time we catch it leaking: a healthy
@@ -543,17 +571,21 @@ pub fn reconcile_pane_content_layers(
     }
 }
 
-/// Walk up the ChildOf chain from `entity` looking for an ancestor
-/// that carries `PaneLayer`. Returns the layer id, or `None` if the
-/// chain hits a parentless entity first.
+/// Walk up the ChildOf chain from `entity` looking for the nearest
+/// ancestor that carries `PaneLayer` or [`LayerRoot`]. Returns the layer
+/// id, or `None` if the chain hits a parentless entity first.
 fn ancestor_pane_layer(
     mut entity: Entity,
     pane_layers: &Query<&PaneLayer>,
+    layer_roots: &Query<&LayerRoot>,
     parents_q: &Query<&ChildOf>,
 ) -> Option<usize> {
     // Bound the walk so a pathological cycle (shouldn't happen, but)
     // can't hang the system.
     for _ in 0..256 {
+        if let Ok(root) = layer_roots.get(entity) {
+            return Some(root.0);
+        }
         if let Ok(pl) = pane_layers.get(entity) {
             return Some(pl.0);
         }
@@ -598,19 +630,23 @@ fn stamp_subtree(
     root: Entity,
     layer_n: usize,
     layers_q: &Query<&RenderLayers>,
+    layer_roots: &Query<&LayerRoot>,
     children_q: &Query<&Children>,
     commands: &mut Commands,
 ) {
     // Growable ctor: `layer_n` is an unbounded pane id (see `layers.rs`),
     // and the const `layer()` asserts it fits in one u64 block (< 64).
-    let target = RenderLayers::from_layers(&[layer_n]);
-    let mut stack: Vec<Entity> = vec![root];
-    while let Some(e) = stack.pop() {
+    // A nested `LayerRoot` switches its own subtree to its layer.
+    let mut stack: Vec<(Entity, usize)> = vec![(root, layer_n)];
+    while let Some((e, mut layer)) = stack.pop() {
+        if let Ok(own) = layer_roots.get(e) {
+            layer = own.0;
+        }
         if layers_q.get(e).is_err() {
-            commands.entity(e).insert(target.clone());
+            commands.entity(e).insert(RenderLayers::from_layers(&[layer]));
         }
         if let Ok(children) = children_q.get(e) {
-            stack.extend(children.iter());
+            stack.extend(children.iter().map(|c| (c, layer)));
         }
     }
 }

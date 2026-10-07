@@ -49,6 +49,7 @@ mod notify_setup;
 pub mod pane_annotation;
 pub mod pane_groups;
 pub mod present;
+pub mod trackpad;
 pub mod projects;
 pub mod radial;
 pub mod render_trace;
@@ -75,7 +76,7 @@ pub fn data_dir() -> Option<PathBuf> {
 }
 
 /// Directory holding the running `jim` executable. Both `cargo build` and
-/// the `.app` bundle co-locate our sibling binaries (`jimctl`, `glaze_ui`,
+/// the `.app` bundle co-locate our sibling binaries (`jimctl`,
 /// …) next to `jim` — `target/release/` in dev, `Contents/MacOS/` in the
 /// bundle — so this is the one place to resolve them without baking the
 /// builder's absolute paths into the binary (which break on another Mac).
@@ -208,23 +209,24 @@ impl Plugin for AppShellPlugin {
             //   - MENU_OVERLAY_LAYER (32): menus / FPS / status bar.
             //   - WHITEBOARD_OVERLAY_LAYER (31): the canvas drawing overlay.
             //   - cube::CUBE_LAYER (4096): the prism's structural geometry.
-            //   - slide_view::BLIT_LAYER (4097): the blit quad that copies
-            //     a slide's picture of the app.
-            //   - slide_view::DIVE_LAYER (4098): the full-window overlay
-            //     that zooms into a recursive slide.
+            //   - slide_view::reserved_layers(): the per-view blit quads
+            //     that copy a slide's picture of the app (4100..), and the
+            //     full-window overlay that zooms into a recursive slide
+            //     (DIVE_LAYER, 4098).
             // This is the single registry of global layers; anyone adding a
             // global overlay camera MUST add its layer here. See
             // `PaneLayerAllocator`.
             .add_plugins(PanePlugin {
-                reserved_layers: vec![
+                reserved_layers: [
                     MENU_OVERLAY_LAYER,
                     projects::SIDEBAR_LAYER,
                     WHITEBOARD_OVERLAY_LAYER,
                     cube::CUBE_LAYER,
-                    slide_view::BLIT_LAYER,
-                    slide_view::DIVE_LAYER,
                     jim_pane::dock::DOCK_OVERLAY_LAYER,
-                ],
+                ]
+                .into_iter()
+                .chain(slide_view::reserved_layers())
+                .collect(),
             })
             .add_plugins(jim_pane::DockPlugin)
             .add_plugins(diagnostics::DiagnosticsPlugin)
@@ -256,6 +258,7 @@ impl Plugin for AppShellPlugin {
             .add_plugins(pane_groups::PaneGroupsPlugin)
             .add_plugins(slide_targets::SlideTargetPlugin)
             .add_plugins(present::PresentPlugin)
+            .add_plugins(trackpad::TrackpadPlugin)
             .add_plugins(slide_view::SlideViewPlugin)
             .add_plugins(workflow_graph::WorkflowGraphPlugin)
             .add_plugins(fps::FpsOverlayPlugin)
@@ -489,6 +492,43 @@ impl Plugin for AppShellPlugin {
             default_keys: &[],
             run: ActionRun::Custom(|ctx| {
                 ctx.world.resource_mut::<Projects>().cycle_workspace(-1);
+            }),
+        })
+        // Deleting is SOFT: the workspace goes to `deleted_workspaces`
+        // whole and "Restore Deleted Workspace" brings it back as it was.
+        .add_action(Action {
+            id: "workspace.delete",
+            title: "Delete Workspace",
+            category: "View",
+            keywords: &["sidebar", "space", "profile", "remove"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(|ctx| {
+                let mut projects = ctx.world.resource_mut::<Projects>();
+                let current = projects.active_workspace;
+                let name = projects.workspace_name().to_string();
+                if projects.delete_workspace(current) {
+                    info!("[workspace] deleted {name:?} (restorable: Restore Deleted Workspace)");
+                } else {
+                    info!("[workspace] not deleting {name:?}: it is the last workspace");
+                }
+            }),
+        })
+        .add_action(Action {
+            id: "workspace.restore",
+            title: "Restore Deleted Workspace",
+            category: "View",
+            keywords: &["sidebar", "space", "profile", "undo", "undelete"],
+            radial_icon: None,
+            default_keys: &[],
+            run: ActionRun::Custom(|ctx| {
+                let mut projects = ctx.world.resource_mut::<Projects>();
+                match projects.last_deleted_workspace() {
+                    Some(id) => {
+                        projects.restore_workspace(id);
+                    }
+                    None => info!("[workspace] nothing to restore"),
+                }
             }),
         })
         .add_action(Action {
@@ -1013,6 +1053,18 @@ fn drain_ipc_open_requests(
                     None => eprintln!("[ipc] emacs: no matching project"),
                 }
             }
+            ipc::IpcRequest::OpenSlideshow { path, project } => {
+                let target = match project {
+                    Some(name) => OpenProjectTarget::ByName(name),
+                    None => OpenProjectTarget::Active,
+                };
+                match projects::resolve_project(&target, &projects) {
+                    Some(id) => pending
+                        .new_panes
+                        .push(present::deck_pane_request(std::path::Path::new(&path), id)),
+                    None => eprintln!("[ipc] open_slideshow: no matching project"),
+                }
+            }
             ipc::IpcRequest::TogglePresent { title } => {
                 presentation.pending_toggle = true;
                 presentation.pending_title = title;
@@ -1269,7 +1321,16 @@ fn drain_ipc_open_requests(
                                 })
                             })
                             .collect();
-                        let body = serde_json::json!({ "workspaces": entries });
+                        let deleted: Vec<Value> = projects
+                            .deleted_workspaces
+                            .iter()
+                            .rev()
+                            .map(|w| serde_json::json!({ "id": w.id, "name": w.name }))
+                            .collect();
+                        let body = serde_json::json!({
+                            "workspaces": entries,
+                            "deleted": deleted,
+                        });
                         match serde_json::to_vec(&body) {
                             Ok(bytes) => {
                                 if let Err(e) = _stream.write_all(&bytes) {
@@ -1301,6 +1362,7 @@ fn drain_ipc_open_requests(
                         }
                         (_, None) => eprintln!("[ipc] workspace rename: --to is required"),
                     },
+                    // Soft: restorable with `restore`.
                     "rm" => match target {
                         Some(id) if projects.delete_workspace(id) => {}
                         Some(_) => eprintln!(
@@ -1309,6 +1371,21 @@ fn drain_ipc_open_requests(
                         ),
                         None => eprintln!("[ipc] workspace rm: no workspace named {name:?}"),
                     },
+                    "restore" => {
+                        let id = match name.as_deref() {
+                            None => projects.last_deleted_workspace(),
+                            Some(n) => projects.deleted_workspace_id_by_name(n),
+                        };
+                        match id {
+                            Some(id) => {
+                                projects.restore_workspace(id);
+                            }
+                            None => eprintln!(
+                                "[ipc] workspace restore: no deleted workspace {}",
+                                name.as_deref().map_or("to restore".into(), |n| format!("named {n:?}"))
+                            ),
+                        }
+                    }
                     // `show` / `hide` park a project. They apply to the
                     // NAMED workspace, which means switching there first:
                     // parking is stored per-workspace and `set_hidden`
@@ -1784,15 +1861,12 @@ fn start_save_as_dialogs(
 fn drain_save_as_results(
     mut commands: Commands,
     channel: Option<NonSend<SaveAsChannel>>,
-    mut panes: Query<(
-        &jim_editor::EditorStateComp,
-        Option<&mut jim_pane::PaneTitle>,
-    )>,
+    panes: Query<&jim_editor::EditorStateComp>,
     mut projects: ResMut<Projects>,
 ) {
     let Some(channel) = channel else { return };
     while let Ok((entity, path)) = channel.rx.try_recv() {
-        let Ok((state, title)) = panes.get_mut(entity) else {
+        let Ok(state) = panes.get(entity) else {
             eprintln!(
                 "[editor] save as {}: pane is gone; not writing",
                 path.display()
@@ -1804,11 +1878,6 @@ fn drain_save_as_results(
             continue;
         }
         eprintln!("[editor] saved {}", path.display());
-        if let Some(mut title) = title {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                title.0 = name.to_string();
-            }
-        }
         commands
             .entity(entity)
             .insert(jim_editor::EditorFilePath(path));
@@ -2693,23 +2762,11 @@ fn action_cycle_pan_preset(ctx: &mut actions::ActionCtx) {
 }
 
 /// `style.glaze_ui_showcase` — open the Glaze design-system showcase.
-/// `glaze_ui` is a *subprocess widget* (NDJSON `WidgetMsg` on stdio), so
-/// it spawns as a widget pane in the active project, not as its own
-/// window. The binary is looked up next to the running executable
-/// first, then in the dev target dir this build came from.
+/// It used to be a subprocess widget (a `glaze_ui` binary beside `jim`
+/// speaking NDJSON over stdio); it is a funct widget now — `glaze_ui.ft`
+/// plus `glaze_ui.glz` in the widgets dir — so there is no binary to find
+/// and it hot-reloads like every other widget.
 fn action_open_glaze_ui(ctx: &mut actions::ActionCtx) {
-    // glaze_ui ships next to `jim` (target/release in dev, Contents/MacOS in
-    // the bundle), so resolve it relative to the running exe. No baked-in
-    // builder path — that only ever exists on the machine that compiled.
-    let candidate = exe_dir().map(|d| d.join("glaze_ui"));
-    let Some(bin) = candidate.filter(|p| p.exists()) else {
-        error!(
-            "glaze_ui binary not found next to {:?} — build it with \
-             `cargo build --release` (it's a default workspace member)",
-            exe_dir()
-        );
-        return;
-    };
     let Some(active) = ctx.world.resource::<projects::Projects>().active else {
         return;
     };
@@ -2717,12 +2774,12 @@ fn action_open_glaze_ui(ctx: &mut actions::ActionCtx) {
         .resource_mut::<projects::PendingActions>()
         .new_panes
         .push(projects::NewPaneRequest {
-            kind: jim_widget::PANE_KIND,
+            kind: jim_widget::script_widget::PANE_KIND,
             project_id: active,
             origin: None,
             size: Some(Vec2::new(820.0, 900.0)),
             config: serde_json::json!({
-                "command": bin.to_string_lossy(),
+                "script": "glaze_ui.ft",
                 "title": "Glaze UI",
             }),
         });

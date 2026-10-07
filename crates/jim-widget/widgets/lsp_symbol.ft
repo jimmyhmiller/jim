@@ -21,7 +21,6 @@ fn init_state() = {
     defs: [],  defs_label: "",
     pending: (),
     sidebar_hidden: false,
-    wrap: false,        // soft-wrap long source lines (issue #33)
 }
 
 fn cur_state() {
@@ -310,10 +309,6 @@ fn on_click(x, y, shift, cmd, id) {
         reset!(state, { ..cur_state(), sidebar_hidden: not cur_state().sidebar_hidden })
         request_render(); return
     }
-    if id == "togglewrap" {
-        reset!(state, { ..cur_state(), wrap: not cur_state().wrap })
-        request_render(); return
-    }
     let s = cur_state()
     if starts_with(id, "ref:") {
         let i = to_int(unwrap_or(parse_float(slice(id, 4, len(id))), 0.0))
@@ -360,29 +355,37 @@ fn lpad(s, w) {
     while len(out) < w { out = " " + out }
     out
 }
-fn code_line(i, runs, startline, wrap) {
+// One source line: the gutter number, then the line's syntax runs as a
+// SINGLE wrapped rich-text block.
+//
+// The runs used to be one text element each in a `flex_wrap` row. Laying a
+// line out that way wraps between runs rather than between words, and a
+// single-run line (every comment line is one run) had nothing to wrap at —
+// it just ran on, straight across the navigation sidebar. `richtext` is the
+// element built for this: one block, one wrap width, runs keeping their own
+// colors.
+//
+// `break_words` is the other half. Code is full of "words" wider than a
+// narrow column — `self.a.lock().unwrap().entry(k)` has no space to break
+// at — and a block can't shrink below its longest word, so that line still
+// ran into the sidebar. With it, such a word splits between characters.
+fn code_line(i, runs, startline) {
     let gut = { kind: "text", value: lpad(str(startline + i + 1), 4), family: "mono",
                 size: 11.0, color: col_muted(), selectable: false, wrap: false }
-    let mut kids = []
+    let mut rs = []
     if typeof(runs) != "List" or len(runs) == 0 {
-        kids = [ { kind: "text", value: " ", family: "mono", size: 12.5, color: col_text(), selectable: false, wrap: false } ]
+        rs = [ { value: " " } ]
     } else {
         for r in runs {
-            kids = push(kids, { kind: "text", value: unwrap_or(get(r, "text"), ""), family: "mono", size: 12.5,
-                                color: kc(unwrap_or(get(r, "kind"), "")), selectable: false, wrap: wrap })
+            rs = push(rs, { value: unwrap_or(get(r, "text"), ""),
+                            color: kc(unwrap_or(get(r, "kind"), "")) })
         }
     }
-    if wrap {
-        // Soft-wrap mode: let the row of colored runs flow onto multiple lines
-        // (flex_wrap) and grow vertically; gutter sits at the top. No clip/fixed
-        // height so the wrapped block claims its real height.
-        let runs_box = { kind: "hstack", gap: 0.0, align: "start",
-                         style: { flex_grow: 1.0, min_width: "0", flex_wrap: true }, children: kids }
-        { kind: "hstack", gap: 8.0, align: "start", style: { width: "100%" }, children: [ gut, runs_box ] }
-    } else {
-        { kind: "hstack", gap: 8.0, align: "start", style: { height: "18", min_height: "18", clip: true },
-          children: [ gut, { kind: "hstack", gap: 0.0, align: "start", style: { flex_shrink: 0.0 }, children: kids } ] }
-    }
+    // `richtext` takes no style; as a plain flex item it shrinks to the
+    // column and wraps there.
+    let block = { kind: "richtext", runs: rs, family: "mono", size: 12.5,
+                  color: col_text(), selectable: false, wrap: true, break_words: true }
+    { kind: "hstack", gap: 8.0, align: "start", style: { width: "100%" }, children: [ gut, block ] }
 }
 
 // ---- sidebar sections ----
@@ -488,8 +491,18 @@ fn sidebar(s) {
     if is_type_kind(the_kind()) { secs = push(secs, impls_section(s)) }
     secs = push(secs, refs_section(s))
     secs = push(secs, def_section(s))
-    { kind: "vstack", gap: 10.0, style: { width: "320", min_width: "320", flex_shrink: 0.0 }, children: secs }
+    // Its own scroll region: a long "Used by" list scrolls on its own,
+    // leaving the source where it is. `min_height: 0` lets the row it sits
+    // in size it to the pane instead of to its content.
+    { kind: "scroll", id: "sidebar", gap: 10.0,
+      style: { width: "320", min_width: "320", flex_shrink: 0.0, min_height: "0" },
+      children: secs }
 }
+
+// A ghost (label-only) button carrying a single glyph. `type` is a funct
+// keyword, so the element tag goes on with `assoc`; the record's own `kind`
+// is then the ButtonKind the host reads.
+fn icon_button(id, glyph) = assoc({ id: id, kind: "ghost", label: glyph }, "type", "button")
 
 fn render(w, h) {
     let s = cur_state()
@@ -498,29 +511,34 @@ fn render(w, h) {
         { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false },
         { kind: "spacer", style: { flex_grow: 1.0 } },
     ]
-    // Soft-wrap toggle for the source (issue #33).
+    // Icon-only ghost buttons: the header is narrow, and a labelled button
+    // here is most of the row. Sidebar toggle (issue #32) only once there is
+    // a sidebar to toggle.
     if s.found {
-        head_kids = push(head_kids, { kind: "button", id: "togglewrap",
-            label: if s.wrap { "↵ wrap on" } else { "↵ wrap" } })
+        head_kids = push(head_kids, icon_button("togglebar",
+            if s.sidebar_hidden { "◧" } else { "◨" }))
     }
-    // Sidebar show/hide toggle (issue #32) — only meaningful once a sidebar exists.
-    if s.found {
-        head_kids = push(head_kids, { kind: "button", id: "togglebar",
-            label: if s.sidebar_hidden { "◧ panel" } else { "◨ hide" } })
-    }
-    head_kids = push(head_kids, { kind: "button", id: "reload", label: "↻" })
+    head_kids = push(head_kids, icon_button("reload", "↻"))
     let head = { kind: "hstack", gap: 8.0, align: "center", children: head_kids }
     let mut body = []
     if s.found and typeof(s.lines) == "List" and len(s.lines) > 0 {
         let mut i = 0
-        for runs in s.lines { body = push(body, code_line(i, runs, s.anchor, s.wrap)); i = i + 1 }
+        for runs in s.lines { body = push(body, code_line(i, runs, s.anchor)); i = i + 1 }
     } else {
         body = [ { kind: "text", value: if s.found { "(empty)" } else { s.status }, color: col_muted() } ]
     }
-    let source_col = { kind: "vstack", gap: 8.0, style: { flex_grow: 1.0, min_width: "0" }, children: [
-        head, { kind: "divider" }, { kind: "vstack", gap: 0.0, children: body } ] }
+    // The header stays put; only the code under it scrolls — in a region of
+    // its own, so it and the sidebar scroll independently of each other.
+    let source_col = { kind: "vstack", gap: 8.0,
+        style: { flex_grow: 1.0, min_width: "0", min_height: "0" }, children: [
+        head, { kind: "divider" },
+        { kind: "scroll", id: "source", gap: 0.0,
+          style: { flex_grow: 1.0, min_height: "0" }, children: body } ] }
     let cols = if s.found and not s.sidebar_hidden {
-        { kind: "hstack", gap: 14.0, align: "start", children: [ source_col, sidebar(s) ] }
-    } else { source_col }
-    { kind: "vstack", gap: 0.0, pad: 12.0, children: [ cols ] }
+        { kind: "hstack", gap: 14.0, align: "stretch",
+          style: { flex_grow: 1.0, min_height: "0" }, children: [ source_col, sidebar(s) ] }
+    } else { { ..source_col, style: { ..source_col.style, flex_grow: 1.0 } } }
+    // Fill the pane's height, so the two regions have a real box to scroll
+    // within rather than growing to their content.
+    { kind: "vstack", gap: 0.0, pad: 12.0, style: { height: "100%" }, children: [ cols ] }
 }

@@ -13,45 +13,89 @@
 // screenful, so that per-frame cost collapses.
 //
 // Usage in a widget:
-//   import { virtual_list, should_rewindow } from "virtual"
+//   import { row_layout, virtual_list, should_rewindow } from "virtual"
+//
+//   // When the rows change (NOT per render): rows[i] renders at exactly
+//   // heights[i] px (force it with a fixed style.height so the scroll math is
+//   // exact); the wrapper is gap:0.
+//   reset!(state, { ..s, rows: rows, lay: row_layout(heights) })
 //
 //   fn on_scroll(y) {
 //       if should_rewindow(y, cur_state().last_sy, canvas_h) { request_render() }
 //   }
 //   fn render(w, h) {
 //       reset!(state, { ..cur_state(), last_sy: scroll_y })
-//       // rows[i] renders at exactly heights[i] px (force it with a fixed
-//       // style.height so the scroll math is exact); the wrapper is gap:0.
-//       virtual_list(rows, heights, scroll_y, h, (row, i) => row_view(row, i))
+//       virtual_list(s.rows, s.lay, scroll_y, h, (row, i) => row_view(row, i))
 //   }
+//
+// KEEP RENDER CHEAP. The pre-built window only covers `overscan` px past each
+// edge; if a re-window takes longer to land than the scroll takes to cross
+// that margin, the rows scroll out of the built window and the list shows
+// blank until the frame arrives — text visibly vanishing and reappearing
+// mid-scroll. So compute `row_layout` (and any filtering that produced the
+// rows) when the rows change, not in `render`: `virtual_list` is then a binary
+// search plus the visible rows, independent of the list's length.
 
-// Visible [first,last) window + the spacer heights that stand in for the rows
-// above/below it, given each row's height and the current scroll offset.
-fn window(heights, sy, vh) {
-    let n = len(heights)
+// Prefix offsets for a list of row heights: offs[i] is row i's top, total the
+// full content height. O(n) — call when the rows change, not per render.
+export fn row_layout(heights) {
     let mut offs = []
     let mut acc = 0.0
     for hgt in heights { offs = push(offs, acc); acc = acc + hgt }
-    let total = acc
-    // Half a screen of overscan each side: enough that a coalesced re-render
-    // (fired at ~1/3 screen of scroll) always stays ahead of the visible edge,
-    // and small offset errors (e.g. a header bar above the list) are absorbed.
-    let over = if vh > 1.0 { vh * 0.5 } else { 100000.0 }
-    let top_edge = sy - over
-    let bot_edge = sy + vh + over
-    let mut first = 0
-    while first < n and offs[first] + heights[first] < top_edge { first = first + 1 }
-    let mut last = first
-    while last < n and offs[last] < bot_edge { last = last + 1 }
-    let top = if first < n { offs[first] } else { total }
-    let bottom = if last < n { total - offs[last] } else { 0.0 }
+    { offs: offs, heights: heights, total: acc }
+}
+
+// First index whose bottom edge is below `y` (rows are top-sorted), i.e. the
+// first row at least partly at or past `y`. n when none is.
+fn first_below(lay, y) {
+    let mut lo = 0
+    let mut hi = len(lay.offs)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if lay.offs[mid] + lay.heights[mid] < y { lo = mid + 1 } else { hi = mid }
+    }
+    lo
+}
+
+// First index whose top edge is at or past `y`. n when none is.
+fn first_at_or_after(lay, y) {
+    let mut lo = 0
+    let mut hi = len(lay.offs)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if lay.offs[mid] < y { lo = mid + 1 } else { hi = mid }
+    }
+    lo
+}
+
+// One screen of overscan each side. A re-render fires after 1/4 screen of
+// drift (`should_rewindow`), so the built window stays 3/4 of a screen ahead
+// of the visible edge while that frame is in flight — enough that a fast
+// trackpad fling doesn't outrun it. Small offset errors (a header bar above
+// the list, so `scroll_y` isn't list-relative) are absorbed too.
+fn overscan(vh) = if vh > 1.0 { vh } else { 100000.0 }
+
+// Visible [first,last) window + the spacer heights that stand in for the rows
+// above/below it, given the precomputed layout and the current scroll offset.
+fn window(lay, sy, vh) {
+    let n = len(lay.offs)
+    let over = overscan(vh)
+    let first = first_below(lay, sy - over)
+    let last = first_at_or_after(lay, sy + vh + over)
+    let top = if first < n { lay.offs[first] } else { lay.total }
+    let bottom = if last < n { lay.total - lay.offs[last] } else { 0.0 }
     { first: first, last: last, top: top, bottom: bottom }
 }
 
 // Build the windowed vstack: top spacer, the visible rows, bottom spacer.
-// `render_fn(row, i)` returns the Element for one row.
-export fn virtual_list(rows, heights, scroll_y, viewport_h, render_fn) {
-    let win = window(heights, scroll_y, viewport_h)
+// `lay` is `row_layout(heights)` for exactly these rows; `render_fn(row, i)`
+// returns the Element for one row.
+export fn virtual_list(rows, lay, scroll_y, viewport_h, render_fn) {
+    if len(lay.offs) != len(rows) {
+        fail("virtual_list: layout has " + str(len(lay.offs)) + " rows but " +
+              str(len(rows)) + " were passed — rebuild row_layout when the rows change")
+    }
+    let win = window(lay, scroll_y, viewport_h)
     let mut body = []
     if win.top > 0.0 { body = push(body, { kind: "spacer", size: win.top }) }
     let mut i = win.first
@@ -64,8 +108,8 @@ export fn virtual_list(rows, heights, scroll_y, viewport_h, render_fn) {
 }
 
 // Coalesce scroll re-renders: only re-window once the view has drifted far
-// enough (~1/3 screen) that we're nearing the overscan edge. Between re-renders
-// the host just translates the already-built window (free).
+// enough (1/4 screen) to eat into the overscan. Between re-renders the host
+// just translates the already-built window (free).
 export fn should_rewindow(scroll_y, last_sy, viewport_h) {
-    abs(scroll_y - last_sy) > viewport_h * 0.3
+    abs(scroll_y - last_sy) > viewport_h * 0.25
 }

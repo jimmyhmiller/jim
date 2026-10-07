@@ -694,7 +694,7 @@ fn render_palette(world: &mut World) {
         content_root: root,
         content_size: Vec2::new(PALETTE_W, win_h),
         palette: colors,
-        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+        ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
         theme,
         fonts,
         focused_input: None,
@@ -703,24 +703,18 @@ fn render_palette(world: &mut World) {
         anim: Default::default(),
     };
     let mut targets = WidgetTargets::default();
-    {
-        let mut commands = world.commands();
-        render::render(
-            &mut commands,
-            &ctx,
-            &mut targets,
-            &el,
-            Vec2::ZERO,
-            PALETTE_W,
-            0.0,
-        );
-    }
-    world.flush();
+    render::render_in_world(world, &ctx, &mut targets, &el, Vec2::ZERO, PALETTE_W, 0.0);
     stamp_layer(world, root, MENU_OVERLAY_LAYER);
 
     let mut p = world.resource_mut::<CommandPalette>();
     p.root = Some(root);
-    p.last_sig = sig;
+    // A font not loaded yet left text unmeasured: don't record the
+    // signature, so the next frame (which the wakeup guarantees) re-renders.
+    if targets.layout_incomplete {
+        jim_widget::request_main_loop_wakeup();
+    } else {
+        p.last_sig = sig;
+    }
 }
 
 fn build_palette_element(palette: &CommandPalette) -> Element {

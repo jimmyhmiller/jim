@@ -24,23 +24,24 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 use bevy::text::{LineHeight, TextSpan};
 use editor_core::commands::{
-    cursor_char_left, cursor_char_right, cursor_doc_end, cursor_doc_start, cursor_line_down,
-    cursor_line_end, cursor_line_start, cursor_line_up, cursor_word_left, cursor_word_right,
-    delete_char_backward, delete_char_forward, delete_group_backward, indent_more,
-    insert_newline_and_indent, select_all, select_char_left, select_char_right, select_doc_end,
-    select_doc_start, select_line_down, select_line_end, select_line_start, select_line_up,
-    select_word_left, select_word_right,
+    cursor_line_down, cursor_line_end, cursor_line_up, insert_newline_and_indent, select_line_down,
+    select_line_up, toggle_comment,
 };
+use editor_core::comment::CommentTokens;
 use editor_core::history::{redo, undo};
 use editor_core::selection::{Range, Selection};
 use editor_core::state::EditorState;
+use editor_core::text_units;
 use editor_core::transaction::{Change, Transaction};
 use jim_pane::{
     FocusedPane, MARGIN, PaneChrome, PaneContentPressed, PaneFont, PaneKindMarker, PanePlugin,
     PaneRect, PaneRegistry, PaneTag, SpawnedPane, TITLE_H, spawn_pane,
 };
+use keymap::{Action, Mods, Step};
 use serde_json::Value;
 
+mod disk_sync;
+mod keymap;
 pub mod highlight;
 pub mod markdown;
 pub mod wrap;
@@ -127,9 +128,134 @@ fn sync_pane_editor_view(
     }
 }
 
-/// Anchor char offset of an in-progress text-selection drag.
+/// What a click selects, and what a drag after it extends by: one
+/// click places a caret, two select a word, three a line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectUnit {
+    Char,
+    Word,
+    Line,
+}
+
+/// Where an in-progress text-selection drag started: the span the press
+/// selected (empty for a single click) and the unit to extend by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DragOrigin {
+    pub from: usize,
+    pub to: usize,
+    pub unit: SelectUnit,
+}
+
+/// The origin of an in-progress text-selection drag, if any.
 #[derive(Component, Default)]
-pub struct TextDragAnchor(pub Option<usize>);
+pub struct TextDragAnchor(pub Option<DragOrigin>);
+
+/// Multi-click detection. A press counts toward the previous one when it
+/// lands on the same editor, within the system double-click interval,
+/// without the pointer having moved more than a few points.
+#[derive(Default)]
+struct ClickCounter {
+    last: Option<(Entity, f64, Vec2)>,
+    count: u32,
+}
+
+/// How far (content-local points) the pointer may drift between the
+/// clicks of a double/triple click.
+const CLICK_SLOP: f32 = 4.0;
+
+impl ClickCounter {
+    fn press(&mut self, target: Entity, now: f64, pt: Vec2, interval: f64) -> SelectUnit {
+        let chained = matches!(self.last, Some((e, t, p))
+            if e == target && now - t <= interval && p.distance(pt) <= CLICK_SLOP);
+        self.count = if chained { self.count + 1 } else { 1 };
+        self.last = Some((target, now, pt));
+        match self.count {
+            1 => SelectUnit::Char,
+            2 => SelectUnit::Word,
+            _ => SelectUnit::Line,
+        }
+    }
+}
+
+/// The user's double-click speed in seconds (System Settings → Mouse),
+/// read at startup.
+#[derive(Resource)]
+struct DoubleClickInterval(f64);
+
+impl Default for DoubleClickInterval {
+    fn default() -> Self {
+        Self(0.5)
+    }
+}
+
+/// AppKit is read on the main thread (`NonSendMarker`), since
+/// `NSEvent` makes no promise about other threads.
+#[cfg(target_os = "macos")]
+fn read_double_click_interval(
+    _main: bevy::ecs::system::NonSendMarker,
+    mut interval: ResMut<DoubleClickInterval>,
+) {
+    // SAFETY: a class property read on the main thread, with no arguments.
+    interval.0 = unsafe { objc2_app_kit::NSEvent::doubleClickInterval() };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_double_click_interval() {}
+
+fn unit_range(doc: &ropey::Rope, pos: usize, unit: SelectUnit) -> (usize, usize) {
+    match unit {
+        SelectUnit::Char => (pos, pos),
+        SelectUnit::Word => text_units::word_range_at(doc, pos),
+        SelectUnit::Line => text_units::line_range_at(doc, pos),
+    }
+}
+
+/// Start a selection at `pos` for a press. Shift extends the current
+/// selection by characters; otherwise the press selects the `unit` under
+/// the pointer and a following drag extends by that unit.
+fn begin_press(
+    state: &mut EditorState,
+    drag: &mut TextDragAnchor,
+    pos: usize,
+    shift: bool,
+    unit: SelectUnit,
+) {
+    if shift {
+        let anchor = state.selection.primary_range().anchor;
+        drag.0 = Some(DragOrigin {
+            from: anchor,
+            to: anchor,
+            unit: SelectUnit::Char,
+        });
+        *state = apply_selection(state, anchor, pos);
+    } else {
+        let (from, to) = unit_range(&state.doc, pos, unit);
+        drag.0 = Some(DragOrigin { from, to, unit });
+        *state = apply_selection(state, from, to);
+    }
+}
+
+/// The selection for a drag from `origin` to `pos`: the origin span
+/// united with the unit under the pointer, anchored at whichever end of
+/// the origin is away from the pointer.
+fn drag_range(doc: &ropey::Rope, origin: DragOrigin, pos: usize) -> (usize, usize) {
+    let (from, to) = unit_range(doc, pos, origin.unit);
+    if from < origin.from {
+        (origin.to, from)
+    } else {
+        (origin.from, to.max(origin.to))
+    }
+}
+
+/// Move a drag's selection to `pos`; no-op (and no change tick) when
+/// the selection wouldn't change.
+fn drag_to(state: &mut Mut<EditorStateComp>, origin: DragOrigin, pos: usize) {
+    let (anchor, head) = drag_range(&state.0.doc, origin, pos);
+    let cur = state.0.selection.primary_range();
+    if cur.anchor != anchor || cur.head != head {
+        state.0 = apply_selection(&state.0, anchor, head);
+    }
+}
 
 #[derive(Component)]
 pub struct EditorHighlighter(pub Highlighter);
@@ -193,6 +319,21 @@ impl Plugin for EditorEmbedPlugin {
             .add_systems(
                 Startup,
                 (register_editor_kind, markdown::setup_markdown_fonts),
+            )
+            .init_resource::<disk_sync::EditorDiskSync>()
+            .init_resource::<DoubleClickInterval>()
+            .add_systems(Startup, (disk_sync::setup_watcher, read_double_click_interval))
+            .add_systems(
+                Update,
+                (
+                    sync_file_title,
+                    sync_comment_tokens,
+                    disk_sync::track_editor_files,
+                    disk_sync::apply_disk_changes,
+                )
+                    .chain()
+                    .before(handle_input)
+                    .before(handle_embedded_keys),
             )
             .add_systems(
                 Update,
@@ -292,6 +433,7 @@ impl Plugin for HeadlessEditorPlugin {
             .init_resource::<jim_pane::KeyboardOwner>()
             .init_resource::<jim_pane::PaneZoom>()
             .init_resource::<SaveAsRequests>()
+            .init_resource::<disk_sync::EditorDiskSync>()
             .add_systems(Update, handle_input);
     }
 }
@@ -431,6 +573,75 @@ fn populate_editor_pane(
         .id();
 }
 
+/// Title an editor pane after the file it holds. Keyed on
+/// `EditorFilePath` changing, so opening, restoring, and save-as all
+/// retitle through here. Pathless (scratch) panes keep whatever title
+/// they were given.
+fn sync_file_title(
+    mut panes: Query<
+        (&EditorFilePath, &mut jim_pane::PaneTitle),
+        (With<PaneTag>, Changed<EditorFilePath>),
+    >,
+) {
+    for (path, mut title) in &mut panes {
+        let Some(name) = path.0.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if title.0 != name {
+            title.0 = name.to_string();
+        }
+    }
+}
+
+/// Comment syntax for a file, by extension (or name, for dotfiles and
+/// Makefiles). `None` for plain text and unknown types: ⌘/ then does
+/// nothing rather than guessing at `//`.
+fn comment_tokens_for(path: &std::path::Path) -> CommentTokens {
+    let c = |line: Option<&str>, block: Option<(&str, &str)>| CommentTokens {
+        line: line.map(str::to_string),
+        block: block.map(|(a, b)| (a.to_string(), b.to_string())),
+    };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match name {
+        "Makefile" | "makefile" | "Dockerfile" | "Gemfile" | "Rakefile" | ".gitignore"
+        | ".zshrc" | ".bashrc" | ".profile" | ".env" => return c(Some("#"), None),
+        _ => {}
+    }
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" | "c" | "h" | "cc" | "cpp" | "hpp" | "m" | "mm" | "js" | "mjs" | "cjs" | "jsx"
+        | "ts" | "tsx" | "go" | "java" | "kt" | "kts" | "swift" | "cs" | "scala" | "dart"
+        | "zig" | "wgsl" | "glsl" | "proto" | "ft" | "glz" | "bg" | "jsonc" => {
+            c(Some("//"), Some(("/*", "*/")))
+        }
+        "py" | "sh" | "bash" | "zsh" | "fish" | "rb" | "pl" | "r" | "toml" | "yaml" | "yml"
+        | "nix" | "conf" | "cfg" | "ini" | "mk" | "cmake" | "tf" | "ps1" => c(Some("#"), None),
+        "lua" | "sql" | "hs" | "elm" => c(Some("--"), None),
+        "clj" | "cljs" | "cljc" | "edn" | "el" | "lisp" | "scm" | "rkt" | "coil" | "asm"
+        | "s" => c(Some(";"), None),
+        "css" | "scss" | "less" => c(None, Some(("/*", "*/"))),
+        "html" | "htm" | "xml" | "svg" | "md" | "markdown" | "vue" => {
+            c(None, Some(("<!--", "-->")))
+        }
+        "tex" | "erl" => c(Some("%"), None),
+        "vim" => c(Some("\""), None),
+        _ => c(None, None),
+    }
+}
+
+/// Give a file-backed editor its language's comment syntax whenever its
+/// path is set or changes (open, restore, Save As).
+fn sync_comment_tokens(
+    mut editors: Query<(&EditorFilePath, &mut EditorStateComp), Changed<EditorFilePath>>,
+) {
+    for (path, mut state) in &mut editors {
+        let tokens = comment_tokens_for(&path.0);
+        if state.0.comment_tokens != tokens {
+            state.0.comment_tokens = tokens;
+        }
+    }
+}
+
 /// Marker for the caret child of an editor pane. Holds the parent
 /// pane entity so the caret-sync system can join its position back to
 /// the pane's editor state without needing the pane chrome to track
@@ -454,9 +665,11 @@ fn editor_spawn_from_config(
         .to_string();
     populate_editor_pane(world, entity, content_root, &text);
     if let Some(path) = config.get("path").and_then(|v| v.as_str()) {
-        world
-            .entity_mut(entity)
-            .insert(EditorFilePath(PathBuf::from(path)));
+        let disk_hash = config.get("disk_hash").and_then(|v| v.as_u64());
+        world.entity_mut(entity).insert((
+            EditorFilePath(PathBuf::from(path)),
+            disk_sync::RestoredDiskHash(disk_hash),
+        ));
     }
     // Explicit markdown mode for pathless (scratch) documents — the
     // "New Markdown Document" action and restored snapshots of one.
@@ -512,6 +725,12 @@ fn editor_snapshot(world: &World, entity: Entity) -> Value {
             "path".into(),
             Value::String(path.0.to_string_lossy().into()),
         );
+        if let Some(h) = world
+            .get_resource::<disk_sync::EditorDiskSync>()
+            .and_then(|s| s.baseline(entity))
+        {
+            obj.insert("disk_hash".into(), Value::from(h));
+        }
     } else if let Some(title) = world.get::<jim_pane::PaneTitle>(entity) {
         // Pathless (scratch) doc: the title is the only name it has.
         obj.insert("title".into(), Value::String(title.0.clone()));
@@ -1210,6 +1429,7 @@ fn handle_input(
         With<PaneTag>,
     >,
     mut save_as: ResMut<SaveAsRequests>,
+    mut disk: ResMut<disk_sync::EditorDiskSync>,
 ) {
     let zoom = pane_zoom.0;
     let Some(target) = focused.0 else {
@@ -1235,150 +1455,80 @@ fn handle_input(
     let state = &mut state_comp.0;
     let mut state_mutated = false;
 
-    let shift = mods.pressed(KeyCode::ShiftLeft) || mods.pressed(KeyCode::ShiftRight);
-    let ctrl = mods.pressed(KeyCode::ControlLeft) || mods.pressed(KeyCode::ControlRight);
-    let alt = mods.pressed(KeyCode::AltLeft) || mods.pressed(KeyCode::AltRight);
-    let meta = mods.pressed(KeyCode::SuperLeft) || mods.pressed(KeyCode::SuperRight);
-    let mod_word = alt || ctrl;
-    let mod_doc = meta || ctrl;
+    let m = read_mods(&mods);
+    let view_h = content_area_size_zoomed(rect, zoom).y;
 
     for ev in keys.read() {
         if !ev.state.is_pressed() {
             continue;
         }
 
-        let cmd_result = match ev.key_code {
-            KeyCode::ArrowLeft => Some(if shift {
-                if mod_word {
-                    run(state, select_word_left)
-                } else {
-                    run(state, select_char_left)
-                }
-            } else if mod_word {
-                run(state, cursor_word_left)
-            } else {
-                run(state, cursor_char_left)
-            }),
-            KeyCode::ArrowRight => Some(if shift {
-                if mod_word {
-                    run(state, select_word_right)
-                } else {
-                    run(state, select_char_right)
-                }
-            } else if mod_word {
-                run(state, cursor_word_right)
-            } else {
-                run(state, cursor_char_right)
-            }),
-            // Cmd/Ctrl+/ toggles the rendered/raw markdown view.
-            KeyCode::Slash if mod_doc => {
-                if let Some(m) = md.as_deref_mut() {
-                    if m.enabled {
-                        m.raw = !m.raw;
+        if let Some(action) = keymap::lookup(ev.key_code, m) {
+            let result = match action {
+                Action::Vertical { step, dir, extend } => {
+                    let wys = md.as_deref().map(|m| m.enabled && !m.raw).unwrap_or(false);
+                    let rows = match step {
+                        Step::Row => dir,
+                        Step::Page => dir * page_rows(view_h),
+                    };
+                    if step == Step::Page {
+                        let doc_h = if wys {
+                            md_layout.map(|l| l.total_height).unwrap_or(0.0)
+                        } else {
+                            doc_rows(state, wrap_layout) as f32 * LINE_HEIGHT
+                        };
+                        page_scroll(&mut scroll, rows, doc_h, view_h);
+                    }
+                    if wys {
+                        md_vertical_move(state, md_layout, extend, rows)
+                    } else {
+                        visual_vertical_move(state, wrap_layout, extend, rows)
                     }
                 }
-                Some(None)
-            }
-            KeyCode::ArrowUp => {
-                let wys = md.as_deref().map(|m| m.enabled && !m.raw).unwrap_or(false);
-                Some(if wys {
-                    md_vertical_move(state, md_layout, shift, -1)
-                } else {
-                    visual_vertical_move(state, wrap_layout, shift, -1)
-                })
-            }
-            KeyCode::ArrowDown => {
-                let wys = md.as_deref().map(|m| m.enabled && !m.raw).unwrap_or(false);
-                Some(if wys {
-                    md_vertical_move(state, md_layout, shift, 1)
-                } else {
-                    visual_vertical_move(state, wrap_layout, shift, 1)
-                })
-            }
-            KeyCode::Home => Some(if shift {
-                if mod_doc {
-                    run(state, select_doc_start)
-                } else {
-                    run(state, select_line_start)
+                // ⌘/ in a markdown document flips rendered/raw; comments
+                // mean nothing there.
+                Action::ToggleComment if md.as_deref().is_some_and(|m| m.enabled) => {
+                    if let Some(m) = md.as_deref_mut() {
+                        m.raw = !m.raw;
+                    }
+                    None
                 }
-            } else if mod_doc {
-                run(state, cursor_doc_start)
-            } else {
-                run(state, cursor_line_start)
-            }),
-            KeyCode::End => Some(if shift {
-                if mod_doc {
-                    run(state, select_doc_end)
-                } else {
-                    run(state, select_line_end)
-                }
-            } else if mod_doc {
-                run(state, cursor_doc_end)
-            } else {
-                run(state, cursor_line_end)
-            }),
-            KeyCode::Backspace if mod_word => Some(run_history(state, delete_group_backward)),
-            KeyCode::Backspace => Some(run_history(state, delete_char_backward)),
-            KeyCode::Delete => Some(run_history(state, delete_char_forward)),
-            KeyCode::Enter | KeyCode::NumpadEnter => {
-                Some(run_history(state, insert_newline_and_indent))
-            }
-            KeyCode::Tab => Some(run_history(state, indent_more)),
-            KeyCode::KeyA if mod_doc => Some(run(state, select_all)),
-            KeyCode::KeyZ if mod_doc => Some(if shift {
-                redo(state).map(|new| (new, true))
-            } else {
-                undo(state).map(|new| (new, true))
-            }),
-            KeyCode::KeyC if mod_doc => {
-                copy_selection(state);
-                Some(None)
-            }
-            KeyCode::KeyX if mod_doc => {
-                copy_selection(state);
-                Some(delete_selection(state))
-            }
-            // Paste is Cmd/Ctrl+V *without* Shift — Cmd+Shift+V is reserved
-            // for app-global shortcuts (e.g. the profiler's vsync toggle) so
-            // it must not leak into a focused editor as a paste.
-            KeyCode::KeyV if mod_doc && !shift => Some(paste_from_clipboard(state)),
-            // Cmd/Ctrl+S — save the buffer to its file. Side effect only
-            // (no document change), so it returns `Some(None)`.
-            KeyCode::KeyS if mod_doc => {
-                match file_path {
-                    Some(path) => {
-                        let text = state.doc.to_string();
-                        match std::fs::write(&path.0, text) {
-                            Ok(()) => eprintln!("[editor] saved {}", path.0.display()),
-                            Err(e) => {
-                                eprintln!("[editor] save failed {}: {}", path.0.display(), e)
+                Action::ToggleComment => run_history(state, toggle_comment),
+                Action::Save => {
+                    match file_path {
+                        Some(path) => {
+                            let text = state.doc.to_string();
+                            match std::fs::write(&path.0, &text) {
+                                Ok(()) => {
+                                    disk.record_saved(target, &text);
+                                    eprintln!("[editor] saved {}", path.0.display())
+                                }
+                                Err(e) => {
+                                    eprintln!("[editor] save failed {}: {}", path.0.display(), e)
+                                }
+                            }
+                        }
+                        // Scratch document: ask the host for a Save As
+                        // destination. It writes the buffer and attaches the
+                        // path, so the next ⌘S saves in place.
+                        None => {
+                            if !save_as.0.contains(&target) {
+                                save_as.0.push(target);
                             }
                         }
                     }
-                    // Scratch document: ask the host for a Save As
-                    // destination. It writes the buffer and attaches the
-                    // path, so the next ⌘S saves in place.
-                    None => {
-                        if !save_as.0.contains(&target) {
-                            save_as.0.push(target);
-                        }
-                    }
+                    None
                 }
-                Some(None)
+                other => run_action(state, other),
+            };
+            if let Some((new_state, _)) = result {
+                *state = new_state;
+                state_mutated = true;
             }
-            _ => None,
-        };
-
-        if let Some(Some((new_state, _))) = cmd_result {
-            *state = new_state;
-            state_mutated = true;
-            continue;
-        }
-        if let Some(None) = cmd_result {
             continue;
         }
 
-        if mod_doc || alt {
+        if !keymap::types_text(m) {
             continue;
         }
         let text: Option<String> = match &ev.logical_key {
@@ -1444,18 +1594,21 @@ fn visual_vertical_move(
             (false, true) => cursor_line_up,
             (false, false) => cursor_line_down,
         };
-        return run(state, cmd);
+        let mut moved: Option<EditorState> = None;
+        for _ in 0..delta.unsigned_abs() {
+            match run(moved.as_ref().unwrap_or(state), cmd) {
+                Some((next, _)) => moved = Some(next),
+                None => break,
+            }
+        }
+        return moved.map(|s| (s, true));
     };
     let layout = &layout.0;
     let range = state.selection.primary_range();
     let (line, col) = char_to_line_col(&state.doc, range.head);
     let (row, x_col) = layout.pos_to_visual(line, col);
     let total = layout.total_rows();
-    let target_row = if delta < 0 {
-        row.saturating_sub(1)
-    } else {
-        (row + 1).min(total.saturating_sub(1))
-    };
+    let target_row = (row as i64 + delta as i64).clamp(0, total.saturating_sub(1) as i64) as usize;
     if target_row == row {
         return None; // already at the top/bottom visual row
     }
@@ -1480,7 +1633,18 @@ fn md_vertical_move(
 ) -> Option<(EditorState, bool)> {
     let layout = layout?;
     let range = state.selection.primary_range();
-    let new_head = markdown::vertical_move(layout, range.head, delta)?;
+    // `vertical_move` steps one rendered row at a time.
+    let step = delta.signum();
+    let mut new_head = range.head;
+    for _ in 0..delta.unsigned_abs() {
+        match markdown::vertical_move(layout, new_head, step) {
+            Some(next) => new_head = next,
+            None => break,
+        }
+    }
+    if new_head == range.head {
+        return None;
+    }
     let new_sel = if shift {
         Selection::single(Range::new(range.anchor, new_head))
     } else {
@@ -1514,6 +1678,9 @@ pub fn char_from_line_col(state: &EditorState, line: usize, col: usize) -> usize
 fn handle_pane_content_press(
     mut presses: MessageReader<PaneContentPressed>,
     metrics: Option<Res<EditorMetrics>>,
+    time: Res<Time<Real>>,
+    interval: Res<DoubleClickInterval>,
+    mut clicks: Local<ClickCounter>,
     mut editors: Query<
         (
             &mut EditorStateComp,
@@ -1553,14 +1720,8 @@ fn handle_pane_content_press(
             let (line, col) = layout.0.visual_to_pos(row, x_col);
             char_from_line_col(state, line, col)
         };
-        if ev.shift {
-            let anchor = state.selection.primary_range().anchor;
-            drag.0 = Some(anchor);
-            *state = apply_selection(state, anchor, pos);
-        } else {
-            drag.0 = Some(pos);
-            *state = apply_selection(state, pos, pos);
-        }
+        let unit = clicks.press(ev.pane, time.elapsed_secs_f64(), ev.local_pt, interval.0);
+        begin_press(state, &mut drag, pos, ev.shift, unit);
     }
 }
 
@@ -1609,11 +1770,12 @@ fn handle_text_select_drag(
         if kind.0 != PANE_KIND {
             continue;
         }
-        let Some(anchor) = drag.0 else { continue };
+        let Some(origin) = drag.0 else { continue };
         let local = jim_pane::pt_to_content_local(pt_canvas, rect);
         let head = if wysiwyg_active(md) {
             let Some(md_layout) = md_layout else { continue };
-            markdown::offset_at_point(md_layout, local.x, local.y + scroll.y).unwrap_or(anchor)
+            markdown::offset_at_point(md_layout, local.x, local.y + scroll.y)
+                .unwrap_or(origin.from)
         } else {
             let Some(layout) = layout else { continue };
             let row = ((local.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
@@ -1621,10 +1783,7 @@ fn handle_text_select_drag(
             let (line, col) = layout.0.visual_to_pos(row, x_col);
             char_from_line_col(&state_comp.0, line, col)
         };
-        let cur = state_comp.0.selection.primary_range();
-        if cur.anchor != anchor || cur.head != head {
-            state_comp.0 = apply_selection(&state_comp.0, anchor, head);
-        }
+        drag_to(&mut state_comp, origin, head);
     }
 }
 
@@ -1818,6 +1977,9 @@ pub fn resync_embedded_editor(world: &mut World, editor: Entity, text: &str) {
 fn handle_embedded_press(
     mut presses: MessageReader<EmbeddedEditorPress>,
     metrics: Option<Res<EditorMetrics>>,
+    time: Res<Time<Real>>,
+    interval: Res<DoubleClickInterval>,
+    mut clicks: Local<ClickCounter>,
     mut editors: Query<
         (
             &mut EditorStateComp,
@@ -1842,14 +2004,8 @@ fn handle_embedded_press(
         let x_col = mouse_col_at_x(ev.local_pt.x, metrics.cell_width);
         let (line, col) = layout.0.visual_to_pos(row, x_col);
         let pos = char_from_line_col(state, line, col);
-        if ev.shift {
-            let anchor = state.selection.primary_range().anchor;
-            drag.0 = Some(anchor);
-            *state = apply_selection(state, anchor, pos);
-        } else {
-            drag.0 = Some(pos);
-            *state = apply_selection(state, pos, pos);
-        }
+        let unit = clicks.press(ev.editor, time.elapsed_secs_f64(), ev.local_pt, interval.0);
+        begin_press(state, &mut drag, pos, ev.shift, unit);
     }
 }
 
@@ -1874,16 +2030,13 @@ fn handle_embedded_drag(
         let Ok((mut sc, scroll, drag, layout)) = editors.get_mut(ev.editor) else {
             continue;
         };
-        let Some(anchor) = drag.0 else { continue };
+        let Some(origin) = drag.0 else { continue };
         let Some(layout) = layout else { continue };
         let row = ((ev.local_pt.y + scroll.y) / LINE_HEIGHT).floor().max(0.0) as usize;
         let x_col = mouse_col_at_x(ev.local_pt.x, metrics.cell_width);
         let (line, col) = layout.0.visual_to_pos(row, x_col);
         let head = char_from_line_col(&sc.0, line, col);
-        let cur = sc.0.selection.primary_range();
-        if cur.anchor != anchor || cur.head != head {
-            sc.0 = apply_selection(&sc.0, anchor, head);
-        }
+        drag_to(&mut sc, origin, head);
     }
 }
 
@@ -1946,6 +2099,7 @@ fn handle_embedded_keys(
         ),
         With<EmbeddedEditor>,
     >,
+    mut disk: ResMut<disk_sync::EditorDiskSync>,
 ) {
     let Some(target) = focused.0 else {
         keys.read().for_each(|_| {});
@@ -1961,22 +2115,17 @@ fn handle_embedded_keys(
     let state = &mut state_comp.0;
     let mut state_mutated = false;
 
-    let shift = mods.pressed(KeyCode::ShiftLeft) || mods.pressed(KeyCode::ShiftRight);
-    let ctrl = mods.pressed(KeyCode::ControlLeft) || mods.pressed(KeyCode::ControlRight);
-    let alt = mods.pressed(KeyCode::AltLeft) || mods.pressed(KeyCode::AltRight);
-    let meta = mods.pressed(KeyCode::SuperLeft) || mods.pressed(KeyCode::SuperRight);
-    let mod_word = alt || ctrl;
-    let mod_doc = meta || ctrl;
+    let m = read_mods(&mods);
 
     for ev in keys.read() {
         if !ev.state.is_pressed() {
             continue;
         }
+        let action = keymap::lookup(ev.key_code, m);
         // Submit/"run" chord: Cmd/Ctrl+Enter forwards the buffer to the host
-        // (drives `on_editor_submit`) instead of inserting a newline. Fires
-        // for read-only editors too (non-mutating). Pre-empts the plain
-        // Enter arm below.
-        if matches!(ev.key_code, KeyCode::Enter | KeyCode::NumpadEnter) && mod_doc {
+        // (drives `on_editor_submit`) instead of opening a line below. Fires
+        // for read-only editors too (non-mutating).
+        if matches!(action, Some(Action::InsertLineBelow)) {
             let range = state.selection.primary_range();
             let selection = if range.from() != range.to() {
                 state.doc.slice(range.from()..range.to()).to_string()
@@ -1990,106 +2139,51 @@ fn handle_embedded_keys(
             });
             continue;
         }
-        let cmd_result: Option<Option<(EditorState, bool)>> = match ev.key_code {
-            KeyCode::ArrowLeft => Some(if shift {
-                if mod_word {
-                    run(state, select_word_left)
-                } else {
-                    run(state, select_char_left)
-                }
-            } else if mod_word {
-                run(state, cursor_word_left)
-            } else {
-                run(state, cursor_char_left)
-            }),
-            KeyCode::ArrowRight => Some(if shift {
-                if mod_word {
-                    run(state, select_word_right)
-                } else {
-                    run(state, select_char_right)
-                }
-            } else if mod_word {
-                run(state, cursor_word_right)
-            } else {
-                run(state, cursor_char_right)
-            }),
-            KeyCode::ArrowUp => Some(visual_vertical_move(state, wrap_layout, shift, -1)),
-            KeyCode::ArrowDown => Some(visual_vertical_move(state, wrap_layout, shift, 1)),
-            KeyCode::Home => Some(if shift {
-                if mod_doc {
-                    run(state, select_doc_start)
-                } else {
-                    run(state, select_line_start)
-                }
-            } else if mod_doc {
-                run(state, cursor_doc_start)
-            } else {
-                run(state, cursor_line_start)
-            }),
-            KeyCode::End => Some(if shift {
-                if mod_doc {
-                    run(state, select_doc_end)
-                } else {
-                    run(state, select_line_end)
-                }
-            } else if mod_doc {
-                run(state, cursor_doc_end)
-            } else {
-                run(state, cursor_line_end)
-            }),
-            KeyCode::Backspace if mod_word => Some(run_history(state, delete_group_backward)),
-            KeyCode::Backspace => Some(run_history(state, delete_char_backward)),
-            KeyCode::Delete => Some(run_history(state, delete_char_forward)),
-            KeyCode::Enter | KeyCode::NumpadEnter => {
-                Some(run_history(state, insert_newline_and_indent))
-            }
-            KeyCode::Tab => Some(run_history(state, indent_more)),
-            KeyCode::KeyA if mod_doc => Some(run(state, select_all)),
-            KeyCode::KeyZ if mod_doc => Some(if shift {
-                redo(state).map(|new| (new, true))
-            } else {
-                undo(state).map(|new| (new, true))
-            }),
-            KeyCode::KeyC if mod_doc => {
-                copy_selection(state);
-                Some(None)
-            }
-            KeyCode::KeyX if mod_doc => {
-                copy_selection(state);
-                Some(delete_selection(state))
-            }
-            KeyCode::KeyV if mod_doc && !shift => Some(paste_from_clipboard(state)),
-            KeyCode::KeyS if mod_doc => {
-                match file_path {
-                    Some(path) if !read_only => {
-                        let text = state.doc.to_string();
-                        match std::fs::write(&path.0, text) {
-                            Ok(()) => eprintln!("[editor] saved {}", path.0.display()),
-                            Err(e) => eprintln!("[editor] save failed {}: {}", path.0.display(), e),
-                        }
+        if let Some(action) = action {
+            let result = match action {
+                Action::Vertical { step, dir, extend } => {
+                    let rows = match step {
+                        Step::Row => dir,
+                        Step::Page => dir * page_rows(view.size.y),
+                    };
+                    if step == Step::Page {
+                        let doc_h = doc_rows(state, wrap_layout) as f32 * LINE_HEIGHT;
+                        page_scroll(&mut scroll, rows, doc_h, view.size.y);
                     }
-                    _ => {}
+                    visual_vertical_move(state, wrap_layout, extend, rows)
                 }
-                Some(None)
+                Action::ToggleComment => run_history(state, toggle_comment),
+                Action::Save => {
+                    match file_path {
+                        Some(path) if !read_only => {
+                            let text = state.doc.to_string();
+                            match std::fs::write(&path.0, &text) {
+                                Ok(()) => {
+                                    disk.record_saved(target, &text);
+                                    eprintln!("[editor] saved {}", path.0.display())
+                                }
+                                Err(e) => eprintln!("[editor] save failed {}: {}", path.0.display(), e),
+                            }
+                        }
+                        _ => {}
+                    }
+                    None
+                }
+                other => run_action(state, other),
+            };
+            if let Some((new_state, _)) = result {
+                // Read-only: keep caret/selection moves (doc unchanged) but
+                // drop any command that would mutate the document (undo/redo,
+                // cut, …).
+                if read_only && new_state.doc != state.doc {
+                    continue;
+                }
+                *state = new_state;
+                state_mutated = true;
             }
-            _ => None,
-        };
-
-        if let Some(Some((new_state, _))) = cmd_result {
-            // Read-only: keep caret/selection moves (doc unchanged) but
-            // drop any command that would mutate the document (undo/redo,
-            // cut, …).
-            if read_only && new_state.doc != state.doc {
-                continue;
-            }
-            *state = new_state;
-            state_mutated = true;
             continue;
         }
-        if let Some(None) = cmd_result {
-            continue;
-        }
-        if mod_doc || alt || read_only {
+        if !keymap::types_text(m) || read_only {
             continue;
         }
         let text: Option<String> = match &ev.logical_key {
@@ -2115,6 +2209,63 @@ fn handle_embedded_keys(
     if state_mutated {
         if let Some(layout) = wrap_layout {
             ensure_caret_visible(state, view.size, &mut scroll, &layout.0);
+        }
+    }
+}
+
+fn read_mods(keys: &ButtonInput<KeyCode>) -> Mods {
+    Mods {
+        shift: keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]),
+        ctrl: keys.any_pressed([KeyCode::ControlLeft, KeyCode::ControlRight]),
+        alt: keys.any_pressed([KeyCode::AltLeft, KeyCode::AltRight]),
+        meta: keys.any_pressed([KeyCode::SuperLeft, KeyCode::SuperRight]),
+    }
+}
+
+/// Rows a Page Up/Down moves: a viewport's worth, less one row of overlap
+/// so the line you were reading stays on screen.
+fn page_rows(view_h: f32) -> i32 {
+    ((view_h / LINE_HEIGHT).floor() as i32 - 1).max(1)
+}
+
+fn doc_rows(state: &EditorState, layout: Option<&EditorWrapLayout>) -> usize {
+    layout
+        .map(|l| l.0.total_rows())
+        .unwrap_or_else(|| state.doc.len_lines())
+}
+
+/// Scroll the view by the same number of rows the caret pages, so the
+/// caret keeps its place on screen instead of pinning to an edge.
+fn page_scroll(scroll: &mut EditorScroll, rows: i32, doc_h: f32, view_h: f32) {
+    let y_max = (doc_h - view_h).max(0.0);
+    scroll.y = (scroll.y + rows as f32 * LINE_HEIGHT).clamp(0.0, y_max);
+}
+
+/// Run a keymap action that needs nothing from the host. Vertical motion,
+/// Save and ⌘/ depend on the host (layout, file, markdown mode) and are
+/// resolved by the key handler before it gets here.
+fn run_action(state: &EditorState, action: Action) -> Option<(EditorState, bool)> {
+    match action {
+        Action::Select(cmd) => run(state, cmd),
+        Action::Edit(cmd) => run_history(state, cmd),
+        Action::InsertLineBelow => {
+            let at_end = run(state, cursor_line_end).map(|(s, _)| s);
+            let base = at_end.as_ref().unwrap_or(state);
+            insert_newline_and_indent(base).map(|tr| (base.apply_with_history(&tr), true))
+        }
+        Action::Undo => undo(state).map(|new| (new, true)),
+        Action::Redo => redo(state).map(|new| (new, true)),
+        Action::Copy => {
+            copy_selection(state);
+            None
+        }
+        Action::Cut => {
+            copy_selection(state);
+            delete_selection(state)
+        }
+        Action::Paste => paste_from_clipboard(state),
+        Action::Vertical { .. } | Action::Save | Action::ToggleComment => {
+            panic!("run_action: {action:?} must be handled by the key handler")
         }
     }
 }
@@ -2167,4 +2318,52 @@ fn run_history(
     cmd: fn(&EditorState) -> Option<Transaction>,
 ) -> Option<(EditorState, bool)> {
     cmd(state).map(|tr| (state.apply_with_history(&tr), true))
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+
+    #[test]
+    fn clicks_chain_into_word_then_line() {
+        let e = Entity::from_raw_u32(1).unwrap();
+        let mut c = ClickCounter::default();
+        let pt = Vec2::new(10.0, 10.0);
+        assert_eq!(c.press(e, 0.0, pt, 0.5), SelectUnit::Char);
+        assert_eq!(c.press(e, 0.2, pt, 0.5), SelectUnit::Word);
+        assert_eq!(c.press(e, 0.4, pt + Vec2::X, 0.5), SelectUnit::Line);
+        assert_eq!(c.press(e, 0.6, pt, 0.5), SelectUnit::Line);
+    }
+
+    #[test]
+    fn slow_moved_or_elsewhere_clicks_start_over() {
+        let a = Entity::from_raw_u32(1).unwrap();
+        let b = Entity::from_raw_u32(2).unwrap();
+        let pt = Vec2::new(10.0, 10.0);
+        let mut c = ClickCounter::default();
+        c.press(a, 0.0, pt, 0.5);
+        assert_eq!(c.press(a, 0.9, pt, 0.5), SelectUnit::Char);
+        assert_eq!(c.press(a, 1.0, pt + Vec2::new(20.0, 0.0), 0.5), SelectUnit::Char);
+        assert_eq!(c.press(b, 1.1, pt + Vec2::new(20.0, 0.0), 0.5), SelectUnit::Char);
+    }
+
+    #[test]
+    fn word_drag_extends_by_words_both_ways() {
+        let doc = ropey::Rope::from_str("alpha beta gamma");
+        let (from, to) = text_units::word_range_at(&doc, 7);
+        let origin = DragOrigin { from, to, unit: SelectUnit::Word };
+        assert_eq!((from, to), (6, 10));
+        // Forward into "gamma": anchor stays at the start of "beta".
+        assert_eq!(drag_range(&doc, origin, 12), (6, 16));
+        // Backward into "alpha": anchor flips to the end of "beta".
+        assert_eq!(drag_range(&doc, origin, 2), (10, 0));
+    }
+
+    #[test]
+    fn line_drag_extends_by_lines() {
+        let doc = ropey::Rope::from_str("one\ntwo\nthree");
+        let origin = DragOrigin { from: 4, to: 8, unit: SelectUnit::Line };
+        assert_eq!(drag_range(&doc, origin, 10), (4, 13));
+        assert_eq!(drag_range(&doc, origin, 1), (8, 0));
+    }
 }

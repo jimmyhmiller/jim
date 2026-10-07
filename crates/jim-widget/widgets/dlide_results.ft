@@ -1,35 +1,38 @@
 // dlide_results.ft — datalog IDE: the executor + results table.
-// (funct port of dlide_results.rhai)
 //
 // The ONLY pane that runs queries. Listens for sql.run, shells out to the
 // `datalog` CLI (proc_* one-shot, event-driven via on_proc_output /
 // on_proc_exit), renders the result table, and broadcasts what happened.
 //
 //   listens: sql.run {sql}            run this command
-//            conn.state {host}        (retained) DB host
+//            conn.state {host, token_file}  (retained) DB connection
 //   emits:   sql.result {ok,summary,ms}   a command finished
 //            schema.changed            after define/drop/purge (DDL)
 //
-// Differences from the .rhai, by language design:
-//  - state is an atom; handlers copy it out (`let s = @state`) and write it
-//    back with reset!(state, ...) before returning
-//  - lists/records are immutable: push/assoc return new values
-//  - render items use `kind:` instead of rhai's `type:` (funct keyword)
-//  - index_of returns Option<Int>, not -1
+// Queries and `list` run with `--json`, so cells arrive as real values (no
+// parsing of the CLI's text table, whose ` | ` separators and quoting are
+// ambiguous). Other commands (status, schema, define, …) show their text.
+//
+// Every column gets a readable width (sized to its content, capped) even
+// when that's wider than the pane: the pane then scrolls sideways
+// (trackpad swipe or Shift+wheel). Cells are cut to one line so every row
+// is one line tall; `copy` still copies the full values.
 import "host"
 
 // ---- state ----
 fn init_state() = {
     host: "127.0.0.1:5557",
+    token_file: "",
     busy: false,
     proc: -1,
+    json: false,     // the running command was spawned with --json
     out: [],
     ran: "",
     t0: 0.0,
     ms: 0,
-    rkind: "",
+    rkind: "",       // "table" | "text" | ""
     rcols: [],
-    rrows: [],
+    rrows: [],       // full cell strings, row-major
     rtext: [],
 }
 let state = atom(init_state())
@@ -37,10 +40,17 @@ let state = atom(init_state())
 // ---- pure helpers ----
 fn dl_path() { let home = host_env("HOME"); if home == "" { "datalog" } else { home + "/.cargo/bin/datalog" } }
 
-fn spawn_args(host, args) {
+// `token_file` comes from conn.state (datalog_tunnel.ft); empty = no token.
+fn spawn_args(host, token_file, json, args) {
     let mut argv = ["--host", host]
+    if token_file != "" { argv = push(push(argv, "--auth-token-file"), token_file) }
+    if json { argv = push(argv, "--json") }
     for a in args { argv = push(argv, a) }
-    proc_spawn(dl_path(), argv)
+    // proc_spawn drops stderr, where the CLI reports connection failures;
+    // run it under sh so they show up in the output.
+    let mut sh = ["-c", "exec \"$0\" \"$@\" 2>&1", dl_path()]
+    for a in argv { sh = push(sh, a) }
+    proc_spawn("/bin/sh", sh)
 }
 
 fn trimmed(s) { trim(s) }
@@ -82,58 +92,92 @@ fn to_argv(line) {
     split_ws(s)
 }
 
-fn is_table(lines) { len(lines) >= 2 and starts_with(lines[1], "-") }
-
-fn split_cells(line) {
-    let mut out = []
-    for c in split(line, " | ") { out = push(out, trimmed(c)) }
-    out
-}
-
-fn parse_table(lines) {
-    let cols = split_cells(lines[0])
-    let mut rows = []
-    let mut i = 2
-    while i < len(lines) {
-        let line = lines[i]
-        i = i + 1
-        if line == "" { continue }
-        if starts_with(line, "(") { break }
-        rows = push(rows, split_cells(line))
-    }
-    { cols: cols, rows: rows }
-}
+// Commands whose result is a table: run them with --json.
+fn wants_json(argv) { len(argv) > 0 and (argv[0] == "query" or argv[0] == "list") }
 
 fn has_error(lines) {
     for l in lines { if starts_with(l, "ERROR") { return true } }
     false
 }
 
-fn join_tab(arr) {
-    let mut s = ""
-    let mut first = true
-    for x in arr {
-        if first { s = x; first = false }
-        else { s = s + "\t" + x }
+fn opt_or(o, d) = match o { Some(v) => v, None => d }
+
+fn one_line(s) { replace(replace(s, "\n", " ⏎ "), "\t", " ") }
+
+fn is_num(v) { let t = typeof(v); t == "Int" or t == "Float" }
+
+// One cell value → display string. JSON null → "", refs → "#id", long
+// numeric lists and {vec} embeddings → a size summary, other lists →
+// comma-joined.
+fn fmt_cell(v) {
+    let t = typeof(v)
+    if t == "Unit" { return "" }
+    if t == "Str" { return one_line(v) }
+    if t == "Int" or t == "Float" or t == "Bool" { return str(v) }
+    if t == "List" {
+        let mut all_num = len(v) > 0
+        for x in v { if not is_num(x) { all_num = false } }
+        if all_num and len(v) > 8 { return "[" + str(len(v)) + " numbers]" }
+        let mut parts = []
+        for x in v { parts = push(parts, fmt_cell(x)) }
+        return join(parts, ", ")
     }
-    s
+    if t == "Record" {
+        if has(v, "ref") { return "#" + str(opt_or(get(v, "ref"), "?")) }
+        if has(v, "vec") { return "[" + str(len(opt_or(get(v, "vec"), []))) + "-d vector]" }
+        return one_line(to_json(v))
+    }
+    one_line(str(v))
 }
+
+// Parse a --json response. → { kind: "table", cols, rows } or
+// { kind: "text", lines }. Output that isn't a JSON object (the CLI's own
+// errors, e.g. "unknown entity type") is shown as text.
+fn parse_result(lines) { result_of(parse_json(join(lines, "\n")), lines) }
+
+fn result_of(v, lines) {
+    if typeof(v) != "Record" { return { kind: "text", lines: lines } }
+    let status = opt_or(get(v, "status"), "")
+    if status != "ok" {
+        let err = opt_or(get(v, "error"), join(lines, " "))
+        return { kind: "text", lines: ["ERROR: " + str(err)] }
+    }
+    let data = opt_or(get(v, "data"), ())
+    if typeof(data) == "Record" and has(data, "columns") and has(data, "rows") {
+        let mut cols = []
+        for c in opt_or(get(data, "columns"), []) { cols = push(cols, str(c)) }
+        let mut rows = []
+        for r in opt_or(get(data, "rows"), []) {
+            let mut row = []
+            for c in r { row = push(row, fmt_cell(c)) }
+            rows = push(rows, row)
+        }
+        return { kind: "table", cols: cols, rows: rows }
+    }
+    { kind: "text", lines: [one_line(to_json(data))] }
+}
+
+fn join_tab(arr) { join(arr, "\t") }
 
 // ---- handlers ----
 fn on_message(topic, payload, sender) {
     if sender == my_id() { return }
     if topic == "conn.state" {
-        reset!(state, { ..(@state), host: payload.host })
+        reset!(state, { ..(@state), host: payload.host, token_file: unwrap_or(get(payload, "token_file"), "") })
         request_render()
         return
     }
     if topic == "sql.run" {
         let s = @state
-        if s.busy { return }
+        // Latest request wins: a still-running query is superseded, and its
+        // exit is ignored because its handle no longer matches s.proc.
+        if s.busy and s.proc != -1 { proc_kill(s.proc) }
         let line = payload.sql
-        let h = spawn_args(s.host, to_argv(line))
+        let argv = to_argv(line)
+        let json = wants_json(argv)
+        let h = spawn_args(s.host, s.token_file, json, argv)
         if h != -1 {
-            reset!(state, { ..s, proc: h, busy: true, out: [], ran: trimmed(line), t0: time() })
+            reset!(state, { ..s, proc: h, json: json, busy: true, out: [], ran: trimmed(line), t0: time() })
             host_log("[dlide_results] run: " + trimmed(line))
         }
         request_render()
@@ -152,18 +196,18 @@ fn on_proc_exit(handle, code) {
     if handle != s.proc { return }
     let out = s.out
     let ms = to_int((time() - s.t0) * 1000.0)
-    let mut s2 = { ..s, busy: false, proc: -1, ms: ms }
+    let mut s2 = { ..s, busy: false, proc: -1, ms: ms, out: [] }
 
+    let r = if s.json { parse_result(out) } else { { kind: "text", lines: out } }
     let mut ok = true
     let mut summary = ""
-    if is_table(out) {
-        let t = parse_table(out)
-        s2 = { ..s2, rkind: "table", rcols: t.cols, rrows: t.rows, rtext: [] }
-        summary = str(len(s2.rrows)) + " rows"
+    if r.kind == "table" {
+        s2 = { ..s2, rkind: "table", rcols: r.cols, rrows: r.rows, rtext: [] }
+        summary = str(len(r.rows)) + " rows"
     } else {
-        s2 = { ..s2, rkind: "text", rtext: out, rcols: [], rrows: [] }
-        ok = not has_error(out)
-        summary = if len(out) > 0 { out[len(out) - 1] } else { "(done)" }
+        s2 = { ..s2, rkind: "text", rtext: r.lines, rcols: [], rrows: [] }
+        ok = code == 0 and not has_error(r.lines)
+        summary = if len(r.lines) > 0 { r.lines[len(r.lines) - 1] } else { "(done)" }
     }
     reset!(state, s2)
     emit("sql.result", { ok: ok, summary: summary, ms: ms })
@@ -172,62 +216,63 @@ fn on_proc_exit(handle, code) {
     request_render()
 }
 
-// ---- style helpers (pure) ----
+// ---- layout helpers (pure) ----
+let char_px = 7.5    // approx. width of one character at the table's size
+let col_pad = 16.0   // per-column padding + gap
+let max_chars = 42   // a column never grows past this many characters
+
 fn is_number(s) {
     if s == "" { return false }
     let mut seen = false
     for ch in chars(s) {
         if ch >= "0" and ch <= "9" { seen = true }
-        else if ch == "." or ch == "-" or ch == "+" { }
+        else if ch == "." or ch == "-" or ch == "+" or ch == "e" { }
         else { return false }
     }
     seen
 }
 
 // Right-align a column when every non-empty cell in it is numeric.
-fn col_aligns(cols, rows) {
-    let mut aligns = []
-    let mut c = 0
-    while c < len(cols) {
-        let mut numeric = true
-        let mut any = false
-        for r in rows {
-            if c < len(r) and r[c] != "" { any = true; if not is_number(r[c]) { numeric = false } }
-        }
-        aligns = push(aligns, if any and numeric { "end" } else { "start" })
-        c = c + 1
+fn col_align(c, rows) {
+    let mut any = false
+    for r in rows {
+        if c < len(r) and r[c] != "" { any = true; if not is_number(r[c]) { return "start" } }
     }
-    aligns
+    if any { "end" } else { "start" }
 }
 
-// Explicit per-column widths that sum to `avail` (the usable canvas width).
-// The renderer's auto columns + content-box panel overflow the pane when
-// content is wide, so we size columns ourselves: proportional to content
-// length (clamped), then scaled to exactly fill `avail` — so the table fills
-// its pane and never spills past it. Returns a width per column.
-fn col_widths(cols, rows, avail) {
-    let n = len(cols)
-    let mut nat = []
-    let mut total = 0.0
+// Natural width (px) of column c: its longest cell or header, capped.
+fn col_nat(c, header, rows) {
+    let mut m = len(header)
+    for r in rows { if c < len(r) { let l = len(r[c]); if l > m { m = l } } }
+    if m > max_chars { m = max_chars }
+    if m < 3 { m = 3 }
+    to_float(m) * char_px + col_pad
+}
+
+// Cut a cell to fit `px` on one line.
+fn clip(s, px) {
+    let fit = to_int((px - col_pad) / char_px)
+    let n = if fit < 1 { 1 } else { fit }
+    if len(s) <= n { s } else { slice(s, 0, n - 1) + "…" }
+}
+
+fn header_label(h) { if starts_with(h, "?") { slice(h, 1, len(h) - 1) } else { h } }
+
+// Natural width of every column, and the total the table needs.
+fn column_widths(cols, rows) {
+    let mut widths = []
     let mut c = 0
-    while c < n {
-        let mut m = len(cols[c])
-        for r in rows { if c < len(r) { let l = len(r[c]); if l > m { m = l } } }
-        let mut wpx = (to_float(m) + 2.0) * 7.5   // ~7.5px/char + padding
-        if wpx < 36.0 { wpx = 36.0 }
-        if wpx > 380.0 { wpx = 380.0 }
-        nat = push(nat, wpx); total = total + wpx; c = c + 1
+    while c < len(cols) {
+        widths = push(widths, col_nat(c, cols[c], rows))
+        c = c + 1
     }
-    if total <= 0.0 { return nat }
-    let scale = avail / total            // fill if room, shrink if over
-    let mut out = []
-    for x in nat { out = push(out, x * scale) }
-    out
+    widths
 }
 
 fn on_click(x, y, shift, cmd, id) {
+    let s = @state
     if id == "copy" {
-        let s = @state
         let mut txt = ""
         if s.rkind == "table" {
             txt = txt + join_tab(s.rcols) + "\n"
@@ -239,47 +284,46 @@ fn on_click(x, y, shift, cmd, id) {
     }
 }
 
-// Re-render on pane resize so layout (e.g. table widths) tracks the
-// new canvas size — render() depends on `w`/`h`.
+// Re-render on pane resize.
 fn on_resize(w, h) { request_render() }
 
 fn render(w, h) {
     let s = @state
-    // slim status bar
     let head = if s.busy { "running query…" }
                else if s.ran == "" { "Run a query from the editor below." }
-               else { str(len(s.rrows)) + " rows · " + str(s.ms) + " ms" }
+               else if s.rkind == "table" { str(len(s.rrows)) + " rows · " + str(s.ms) + " ms" }
+               else { str(s.ms) + " ms" }
     let head_color = if s.busy { "warn" } else { "fg_muted" }
 
     let mut bar = [{ kind: "text", value: head, size: 12.0, color: head_color }]
     if s.ran != "" {
         bar = push(bar, { kind: "text", value: "  ·  " + s.ran, size: 11.0, color: "fg_muted", family: "mono" })
     }
-    // widget text isn't selectable, so offer copy-to-clipboard of the result
-    if s.rkind != "" {
-        bar = push(bar, { kind: "button", id: "copy", label: "copy", kind: "ghost" })
-    }
 
-    // result body
     let mut inner = []
     if s.rkind == "table" {
         if len(s.rrows) == 0 {
             inner = push(inner, { kind: "text", value: "no rows", size: 12.0, color: "fg_muted" })
         } else {
-            let aligns = col_aligns(s.rcols, s.rrows)
-            // usable width = canvas minus our paddings/border minus column gaps
-            let nc = len(s.rcols)
-            let gaps = if nc > 1 { 12.0 * to_float(nc - 1) } else { 0.0 }
-            let mut avail = w - 52.0 - gaps
-            if avail < 60.0 { avail = 60.0 }
-            let widths = col_widths(s.rcols, s.rrows, avail)
+            let widths = column_widths(s.rcols, s.rrows)
             let mut cols = []
             let mut i = 0
-            while i < nc {
-                cols = push(cols, { header: s.rcols[i], align: aligns[i], width: widths[i] })
+            while i < len(s.rcols) {
+                cols = push(cols, { header: clip(header_label(s.rcols[i]), widths[i]),
+                                    align: col_align(i, s.rrows), width: widths[i] })
                 i = i + 1
             }
-            inner = push(inner, { kind: "table", zebra: true, columns: cols, rows: s.rrows })
+            let mut rows = []
+            for r in s.rrows {
+                let mut row = []
+                let mut j = 0
+                while j < len(s.rcols) {
+                    row = push(row, clip(if j < len(r) { r[j] } else { "" }, widths[j]))
+                    j = j + 1
+                }
+                rows = push(rows, row)
+            }
+            inner = push(inner, { kind: "table", zebra: true, columns: cols, rows: rows })
         }
     } else if s.rkind == "text" {
         for line in s.rtext {
@@ -291,6 +335,10 @@ fn render(w, h) {
     } else {
         inner = push(inner, { kind: "text", value: "Results will appear here.", size: 12.0, color: "fg_muted" })
     }
+    // widget text isn't selectable everywhere, so offer copy-to-clipboard
+    if s.rkind != "" {
+        bar = push(bar, { kind: "button", id: "copy", label: "copy" })
+    }
 
     {
         kind: "vstack", gap: 8.0,
@@ -298,9 +346,13 @@ fn render(w, h) {
                  padding: { top: 10.0, right: 12.0, bottom: 12.0, left: 12.0 } },
         children: [
             { kind: "hstack", gap: 6.0, align: "center", children: bar },
+            // Grow past the pane with a wide table (the pane scrolls
+            // sideways) instead of stretching to the pane width and letting
+            // the table spill out of its panel.
             { kind: "frame", pad: 10.0, gap: 4.0,
               style: { background: "surface_2", radius: "radius_md",
-                       border: { color: "surface_3", width: 1.0 } },
+                       border: { color: "surface_3", width: 1.0 },
+                       align_self: "start", min_width: "100%" },
               children: [ { kind: "scroll", pad: 0.0, gap: 2.0, children: inner } ] },
         ]
     }

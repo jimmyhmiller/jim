@@ -50,15 +50,20 @@ impl Material2d for WidgetButtonMaterial {
         )
     }
     fn alpha_mode(&self) -> AlphaMode2d {
-        // OPAQUE by default — this is the fix for widget quads (button
-        // fills, container surfaces, row highlights) intermittently not
-        // drawing through per-pane cameras until the next re-render:
-        // blend-mode Mesh2d is unreliable there (same Bevy 0.19 issue the
-        // vector paths dodge by flattening alpha). Translucency is
-        // composited in the shader against `ButtonParams::ground` instead
-        // of by GPU blending, so the quad renders in the dependable opaque
-        // phase while still looking soft-edged. Shadow companion quads opt
-        // back into Blend (see `blend`).
+        // OPAQUE by default. Blend-mode Mesh2d is unreliable through per-pane
+        // cameras (widget quads intermittently don't draw until the next
+        // re-render — the Bevy 0.19 issue the vector paths dodge by flattening
+        // alpha), and alpha-MASK is no better: switching to it to discard the
+        // pixels outside the rounded rect made every panel face disappear and
+        // the pane read as transparent. So translucency is composited in the
+        // shader against `ButtonParams::ground` and the quad renders in the
+        // dependable opaque phase. The cost is that the pixels OUTSIDE the
+        // rounded shape are painted in the assumed ground, which shows as a
+        // flat box whenever that guess is wrong (a control on a gradient or a
+        // shader wash). Fixing that needs real geometry — a rounded-rect mesh
+        // instead of an SDF in a quad — not another alpha mode.
+        // Shadow companion quads opt into Blend (see `blend`); a soft halo
+        // skipping a frame is imperceptible.
         if self.blend {
             AlphaMode2d::Blend
         } else {
@@ -89,6 +94,6 @@ pub struct ButtonParams {
     pub _pad1: f32,
     /// What sits visually behind this panel — the shader composites all
     /// translucency (corner AA, shadow falloff, semi-transparent fills)
-    /// against this and outputs opaque pixels. See `alpha_mode` below.
+    /// against this for the pixels it covers. See `alpha_mode` above.
     pub ground: Vec4,
 }

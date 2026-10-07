@@ -48,6 +48,14 @@ pub struct MeasureCtx {
     /// measured with each half at its own size. Empty means the leaf is
     /// a single uniform run described by `value` / `font_size`.
     pub runs: Vec<MeasureRun>,
+    /// `RichText.break_words`: a word too long for a line of its own breaks
+    /// between characters. Only the rich path reads it.
+    pub break_words: bool,
+    /// Font family the leaf is DRAWN in (`Element::Text.family`), `None` for
+    /// the pane's default UI font. Every non-text leaf (button, badge, …)
+    /// draws in the default font. A shaping measurer needs this to measure
+    /// the same glyphs the renderer draws.
+    pub family: Option<String>,
 }
 
 /// One run inside a [`MeasureCtx`] for a rich-text leaf.
@@ -55,6 +63,8 @@ pub struct MeasureCtx {
 pub struct MeasureRun {
     pub value: String,
     pub font_size: f32,
+    /// The run's own family, else the block's, else `None` (default font).
+    pub family: Option<String>,
 }
 
 impl MeasureCtx {
@@ -66,6 +76,8 @@ impl MeasureCtx {
             font_size,
             wrap,
             runs: Vec::new(),
+            break_words: false,
+            family: None,
         }
     }
 
@@ -94,6 +106,24 @@ pub struct LaidOut {
 impl LaidOut {
     pub fn layout(&self, id: NodeId) -> Layout {
         *self.taffy.layout(id).expect("missing layout for node")
+    }
+
+    /// Rightmost edge reached by any node, relative to the root's origin.
+    /// Differs from the root's own width when a child overflows it — a
+    /// table whose fixed column widths sum past the pane, say — and is
+    /// what the host uses as the content width for horizontal scrolling.
+    pub fn content_right(&self) -> f32 {
+        let mut right = 0.0_f32;
+        let mut stack = vec![(self.root, 0.0_f32)];
+        while let Some((id, parent_x)) = stack.pop() {
+            let l = self.layout(id);
+            let x = if id == self.root { 0.0 } else { parent_x + l.location.x };
+            right = right.max(x + l.size.width);
+            for child in self.taffy.children(id).expect("missing node") {
+                stack.push((child, x));
+            }
+        }
+        right
     }
 }
 
@@ -153,8 +183,18 @@ fn build_node(
                 .collect();
             taffy.new_with_children(st, &kids).unwrap()
         }
-        Element::Scroll { gap, pad, children } => {
-            let st = stack_style(*gap, *pad, None, FlexDirection::Column);
+        Element::Scroll {
+            gap,
+            pad,
+            style,
+            children,
+            ..
+        } => {
+            let mut st = stack_style(*gap, *pad, style.as_ref(), FlexDirection::Column);
+            // Content taller than the box overflows into the scroll range
+            // instead of growing the box, and a flex parent may shrink the
+            // box below its content (CSS `overflow-y: scroll` semantics).
+            st.overflow.y = taffy::Overflow::Scroll;
             let kids: Vec<NodeId> = children
                 .iter()
                 .map(|c| build_node(taffy, c, metrics))
@@ -176,18 +216,33 @@ fn build_node(
             taffy.new_with_children(st, &kids).unwrap()
         }
         Element::Text {
-            value, size, wrap, ..
+            value,
+            size,
+            wrap,
+            family,
+            ..
         } => {
             let font_size = size.unwrap_or(crate::render::DEFAULT_FONT_SIZE);
             let st = taffy::Style {
                 ..taffy::Style::DEFAULT
             };
             taffy
-                .new_leaf_with_context(st, MeasureCtx::plain(value.clone(), font_size, *wrap))
+                .new_leaf_with_context(
+                    st,
+                    MeasureCtx {
+                        family: family.clone(),
+                        ..MeasureCtx::plain(value.clone(), font_size, *wrap)
+                    },
+                )
                 .unwrap()
         }
         Element::RichText {
-            runs, size, wrap, ..
+            runs,
+            size,
+            wrap,
+            break_words,
+            family,
+            ..
         } => {
             let base = size.unwrap_or(crate::render::DEFAULT_FONT_SIZE);
             taffy
@@ -205,8 +260,11 @@ fn build_node(
                             .map(|r| MeasureRun {
                                 value: r.value.clone(),
                                 font_size: r.size.unwrap_or(base),
+                                family: r.family.clone().or_else(|| family.clone()),
                             })
                             .collect(),
+                        break_words: *break_words,
+                        family: family.clone(),
                     },
                 )
                 .unwrap()
@@ -238,12 +296,16 @@ fn build_node(
                 ..taffy::Style::DEFAULT
             })
             .unwrap(),
+        // `size` px along the PARENT's main axis, and nothing across it —
+        // `flex_basis` is exactly that. It used to be a `size × size`
+        // square, so `virtual_list`'s stand-in for thousands of off-screen
+        // rows (one spacer, tens of thousands of px tall) was just as WIDE,
+        // and every virtualized widget scrolled sideways into nothing.
         Element::Spacer { size } => taffy
             .new_leaf(taffy::Style {
-                size: Size {
-                    width: Dimension::length(*size),
-                    height: Dimension::length(*size),
-                },
+                flex_basis: Dimension::length(*size),
+                flex_grow: 0.0,
+                flex_shrink: 0.0,
                 ..taffy::Style::DEFAULT
             })
             .unwrap(),
@@ -258,27 +320,43 @@ fn build_node(
                     },
                     ..taffy::Style::DEFAULT
                 },
-                MeasureCtx::plain(value.clone(), crate::render::BADGE_FONT_SIZE, true),
+                MeasureCtx::plain(value.clone(), crate::render::BADGE_FONT_SIZE, false),
             )
             .unwrap(),
-        Element::Button { label, .. } => taffy
-            .new_leaf_with_context(
-                taffy::Style {
-                    padding: Rect {
-                        left: LengthPercentage::length(crate::render::BUTTON_PAD_X),
-                        right: LengthPercentage::length(crate::render::BUTTON_PAD_X),
-                        top: LengthPercentage::length(crate::render::BUTTON_PAD_Y),
-                        bottom: LengthPercentage::length(crate::render::BUTTON_PAD_Y),
-                    },
-                    ..taffy::Style::DEFAULT
+        Element::Button { label, style, .. } => {
+            // A button is one line: `render_button_at` draws its label with
+            // `no_wrap`, so measuring the label as wrappable made a squeezed
+            // button grow TALL and narrow with its label spilling out the
+            // sides. Measured as a single line, and `flex_shrink: 0` so a
+            // tight row shrinks its text and spacers instead of its buttons.
+            // A widget that really wants a shrinking button can say so with
+            // `style: { flex_shrink: 1 }`.
+            let mut st = taffy::Style {
+                padding: Rect {
+                    left: LengthPercentage::length(crate::render::BUTTON_PAD_X),
+                    right: LengthPercentage::length(crate::render::BUTTON_PAD_X),
+                    top: LengthPercentage::length(crate::render::BUTTON_PAD_Y),
+                    bottom: LengthPercentage::length(crate::render::BUTTON_PAD_Y),
                 },
-                MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, true),
-            )
-            .unwrap(),
+                flex_shrink: 0.0,
+                ..taffy::Style::DEFAULT
+            };
+            apply_style_overrides(&mut st, style.as_ref());
+            taffy
+                .new_leaf_with_context(
+                    st,
+                    MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, false),
+                )
+                .unwrap()
+        }
+        // Same one-line story as Button: both are drawn `no_wrap`.
         Element::Link { label, .. } => taffy
             .new_leaf_with_context(
-                taffy::Style::DEFAULT,
-                MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, true),
+                taffy::Style {
+                    flex_shrink: 0.0,
+                    ..taffy::Style::DEFAULT
+                },
+                MeasureCtx::plain(label.clone(), crate::render::DEFAULT_FONT_SIZE, false),
             )
             .unwrap(),
         Element::Tooltip { label, .. } => taffy
@@ -815,9 +893,54 @@ fn align_to_taffy(a: Align) -> AlignItems {
     }
 }
 
+/// Sizes text leaves for Taffy.
+///
+/// Two implementations. [`GridMeasure`] treats every string as monospace
+/// cells — exact for code, an approximation for proportional text, and
+/// needs no fonts, so unit tests use it. The renderer uses
+/// `text_shape::ShapedMeasure`, which shapes each leaf with the same font
+/// engine Bevy draws with; anything else lets a proportional label's box
+/// disagree with its glyphs, and a text whose box is a hair too narrow
+/// wraps — or flickers between wrapped and not as the pane resizes.
+pub trait TextMeasure {
+    fn measure(
+        &mut self,
+        node: NodeId,
+        ctx: &MeasureCtx,
+        known: Size<Option<f32>>,
+        available: Size<AvailableSpace>,
+    ) -> Size<f32>;
+}
+
+/// The monospace-cell measurer. See [`TextMeasure`].
+pub struct GridMeasure<'a>(pub &'a PaneFontMetrics);
+
+impl TextMeasure for GridMeasure<'_> {
+    fn measure(
+        &mut self,
+        _node: NodeId,
+        ctx: &MeasureCtx,
+        known: Size<Option<f32>>,
+        available: Size<AvailableSpace>,
+    ) -> Size<f32> {
+        measure_text(ctx, known, available, self.0)
+    }
+}
+
 /// Compute layout for the tree rooted at `root` within the given
-/// `(max_w, max_h)` viewport. `metrics` is used to size text leaves.
+/// `(max_w, max_h)` viewport, sizing text on the monospace grid. For tests
+/// and tools; the renderer calls [`compute_with`] with a shaping measurer.
 pub fn compute(laid: &mut LaidOut, max_w: f32, max_h: f32, metrics: &PaneFontMetrics) {
+    compute_with(laid, max_w, max_h, &mut GridMeasure(metrics));
+}
+
+/// [`compute`], with text leaves sized by `measure`.
+pub fn compute_with(
+    laid: &mut LaidOut,
+    max_w: f32,
+    max_h: f32,
+    measure: &mut dyn TextMeasure,
+) {
     let _prof = jim_pane::prof::sys_span_nested("taffy_layout");
     // Force the root to fill the available content width. Without this the root
     // (auto width) shrinks to its content, so `grow`/stretch children have no
@@ -829,7 +952,6 @@ pub fn compute(laid: &mut LaidOut, max_w: f32, max_h: f32, metrics: &PaneFontMet
         s.size.width = Dimension::length(max_w);
         let _ = laid.taffy.set_style(laid.root, s);
     }
-    let m = *metrics;
     laid.taffy
         .compute_layout_with_measure(
             laid.root,
@@ -837,11 +959,11 @@ pub fn compute(laid: &mut LaidOut, max_w: f32, max_h: f32, metrics: &PaneFontMet
                 width: AvailableSpace::Definite(max_w),
                 height: AvailableSpace::Definite(max_h),
             },
-            move |known, available, _node, context, _style| {
+            |known, available, node, context, _style| {
                 let Some(ctx) = context else {
                     return Size::ZERO;
                 };
-                measure_text(ctx, known, available, &m)
+                measure.measure(node, ctx, known, available)
             },
         )
         .expect("taffy compute_layout");
@@ -903,21 +1025,42 @@ fn measure_text(
             continue;
         }
         // Word-wrap this segment: accumulate words per line until the next
-        // word would overflow, then start a new line.
+        // word would overflow, then start a new line. The segment's leading
+        // whitespace is indentation — drawn, so it counts on the first line
+        // (the same rule as `measure_runs`); a gap at a wrap point is dropped.
+        // Gaps are measured at their real width, not as one space: aligned
+        // code has runs of spaces, and under-counting them wraps late.
         let mut lines: u32 = 1;
         let mut line_w: f32 = 0.0;
         let mut first_word = true;
-        for word in segment.split_whitespace() {
-            let w = word.chars().count() as f32 * char_w;
-            let added = if first_word { w } else { char_w + w };
-            if !first_word && line_w + added > max_w {
-                max_line_w = max_line_w.max(line_w);
+        let mut gap_w: f32 = 0.0;
+        let mut word_w: f32 = 0.0;
+        let mut place = |gap: f32, w: f32, first: &mut bool, line_w: &mut f32| {
+            if *first {
+                *line_w += gap + w;
+                *first = false;
+            } else if *line_w + gap + w > max_w {
+                max_line_w = max_line_w.max(*line_w);
                 lines += 1;
-                line_w = w;
+                *line_w = w;
             } else {
-                line_w += added;
-                first_word = false;
+                *line_w += gap + w;
             }
+        };
+        for ch in segment.chars() {
+            if ch.is_whitespace() {
+                if word_w > 0.0 {
+                    place(gap_w, word_w, &mut first_word, &mut line_w);
+                    gap_w = 0.0;
+                    word_w = 0.0;
+                }
+                gap_w += char_w;
+            } else {
+                word_w += char_w;
+            }
+        }
+        if word_w > 0.0 {
+            place(gap_w, word_w, &mut first_word, &mut line_w);
         }
         max_line_w = max_line_w.max(line_w);
         total_lines += lines;
@@ -941,8 +1084,9 @@ fn measure_text(
 /// be assembled from several runs) or a hard line break.
 #[derive(Debug, PartialEq)]
 enum Token {
-    /// A maximal run of non-whitespace, and its width. Unbreakable.
-    Word(f32),
+    /// A maximal run of non-whitespace, as the width of each of its
+    /// characters. Unbreakable unless the block has `break_words`.
+    Word(Vec<f32>),
     /// A stretch of spaces/tabs between words, and its width.
     Gap(f32),
     /// A hard `\n`.
@@ -959,19 +1103,18 @@ enum Token {
 /// boundary — is what closes a word.
 fn tokenize_runs(runs: &[MeasureRun], metrics: &PaneFontMetrics) -> Vec<Token> {
     let mut out: Vec<Token> = Vec::new();
-    // Width accumulated into the word/gap currently being built.
-    let mut pending: f32 = 0.0;
+    // Character widths accumulated into the word/gap currently being built.
+    let mut pending: Vec<f32> = Vec::new();
     let mut in_word = false;
 
-    let flush = |out: &mut Vec<Token>, pending: &mut f32, in_word: &mut bool| {
-        if *pending > 0.0 {
+    let flush = |out: &mut Vec<Token>, pending: &mut Vec<f32>, in_word: &mut bool| {
+        if !pending.is_empty() {
             out.push(if *in_word {
-                Token::Word(*pending)
+                Token::Word(std::mem::take(pending))
             } else {
-                Token::Gap(*pending)
+                Token::Gap(pending.drain(..).sum())
             });
         }
-        *pending = 0.0;
     };
 
     for run in runs {
@@ -987,11 +1130,11 @@ fn tokenize_runs(runs: &[MeasureRun], metrics: &PaneFontMetrics) -> Vec<Token> {
             // A word→gap or gap→word transition closes the pending token;
             // staying in the same class (even across a run boundary) just
             // keeps accumulating, which is what makes `un**bold**ed` one word.
-            if is_space == in_word && pending > 0.0 {
+            if is_space == in_word && !pending.is_empty() {
                 flush(&mut out, &mut pending, &mut in_word);
             }
             in_word = !is_space;
-            pending += char_w;
+            pending.push(char_w);
         }
     }
     flush(&mut out, &mut pending, &mut in_word);
@@ -1011,10 +1154,14 @@ fn measure_runs(
 ) -> Size<f32> {
     let line_h = crate::render::line_height(ctx.max_font_size());
     let tokens = tokenize_runs(&ctx.runs, metrics);
+    // The min-content floor: the widest thing that can't be split. With
+    // `break_words` that is a single character, which is what lets the
+    // block shrink into a column narrower than its longest word.
     let longest_word = tokens
         .iter()
         .filter_map(|t| match t {
-            Token::Word(w) => Some(*w),
+            Token::Word(chars) if ctx.break_words => chars.iter().copied().reduce(f32::max),
+            Token::Word(chars) => Some(chars.iter().sum()),
             _ => None,
         })
         .fold(0.0_f32, f32::max);
@@ -1029,6 +1176,16 @@ fn measure_runs(
     let mut lines: u32 = 1;
     let mut line_w: f32 = 0.0;
     let mut max_line_w: f32 = 0.0;
+    // Has the current line placed a word yet? Distinct from `line_w > 0`,
+    // which leading indentation also makes true.
+    let mut has_word = false;
+    // Is the current line a HARD line start (text start or after `\n`)?
+    // Whitespace there is indentation and is drawn, so it takes width —
+    // dropping it made every indented source line measure a few characters
+    // narrower than it renders, so Bevy wrapped it into a line the layout
+    // never reserved and it drew over the row below. Whitespace at a SOFT
+    // wrap point is different: it collapses and is dropped.
+    let mut hard_start = true;
     // A gap that would land at a wrap point is dropped rather than carried
     // to the next line — trailing spaces must not push the following word
     // off the edge (and every renderer collapses them anyway).
@@ -1041,22 +1198,46 @@ fn measure_runs(
                 lines += 1;
                 line_w = 0.0;
                 pending_gap = 0.0;
+                has_word = false;
+                hard_start = true;
             }
             Token::Gap(w) => {
-                if line_w > 0.0 {
+                if has_word {
                     pending_gap += w;
+                } else if hard_start {
+                    line_w += w;
                 }
             }
-            Token::Word(w) => {
+            Token::Word(chars) => {
+                let w: f32 = chars.iter().sum();
                 let with_gap = line_w + pending_gap + w;
-                if wrappable && line_w > 0.0 && with_gap > max_w {
+                if wrappable && has_word && with_gap > max_w {
                     max_line_w = max_line_w.max(line_w);
                     lines += 1;
-                    line_w = *w;
+                    line_w = 0.0;
+                    hard_start = false;
                 } else {
-                    line_w = with_gap;
+                    line_w += pending_gap;
                 }
                 pending_gap = 0.0;
+                has_word = true;
+                if wrappable && ctx.break_words && line_w + w > max_w {
+                    // The word does not fit even at the start of a line, so
+                    // split it between characters — CSS `overflow-wrap:
+                    // anywhere`, which is what Bevy's
+                    // `LineBreak::WordOrCharacter` asks the text engine for.
+                    for &c in chars {
+                        if line_w > 0.0 && line_w + c > max_w {
+                            max_line_w = max_line_w.max(line_w);
+                            lines += 1;
+                            line_w = 0.0;
+                            hard_start = false;
+                        }
+                        line_w += c;
+                    }
+                } else {
+                    line_w += w;
+                }
             }
         }
     }
@@ -1269,6 +1450,7 @@ mod tests {
         MeasureRun {
             value: text.into(),
             font_size: size,
+            family: None,
         }
     }
 
@@ -1283,7 +1465,7 @@ mod tests {
         let widths: Vec<f32> = tokens
             .iter()
             .map(|t| match t {
-                Token::Word(w) => *w,
+                Token::Word(chars) => chars.iter().sum(),
                 _ => panic!("expected a single word token, got {t:?}"),
             })
             .collect();
@@ -1298,9 +1480,10 @@ mod tests {
     fn word_width_sums_per_run_font_size() {
         let m = metrics();
         let tokens = tokenize_runs(&[run("ab", 10.0), run("cd", 20.0)], &m);
-        let Token::Word(w) = tokens[0] else {
+        let Token::Word(chars) = &tokens[0] else {
             panic!("expected one word");
         };
+        let w: f32 = chars.iter().sum();
         let expected = 2.0 * m.char_width(10.0) + 2.0 * m.char_width(20.0);
         assert!((w - expected).abs() < 0.01, "got {w}, want {expected}");
     }
@@ -1331,6 +1514,8 @@ mod tests {
             font_size: 14.0,
             wrap: true,
             runs: vec![run("one two ", 14.0), run("three four", 14.0)],
+            break_words: false,
+            family: None,
         };
         let line_h = crate::render::line_height(14.0);
         // Wide enough for everything: one line.
@@ -1361,6 +1546,116 @@ mod tests {
         assert!(narrow.width <= m.char_width(14.0) * 10.0 + 0.01);
     }
 
+    fn rich(value: &str, break_words: bool) -> MeasureCtx {
+        MeasureCtx {
+            value: value.into(),
+            font_size: 14.0,
+            wrap: true,
+            runs: vec![run(value, 14.0)],
+            break_words,
+            family: None,
+        }
+    }
+
+    fn at_width(ctx: &MeasureCtx, w: AvailableSpace) -> Size<f32> {
+        measure_runs(
+            ctx,
+            Size {
+                width: w,
+                height: AvailableSpace::Definite(1000.0),
+            },
+            &metrics(),
+        )
+    }
+
+    /// `break_words` drops the min-content floor from the longest word to
+    /// one character. That floor is what a flex container shrinks a leaf
+    /// down to, so without this a chained call in lsp_symbol's source
+    /// could never get narrower than itself and ran into the sidebar.
+    #[test]
+    fn break_words_lets_a_block_shrink_below_its_longest_word() {
+        let cw = metrics().char_width(14.0);
+        let word = "self.clients.lock().unwrap().entry(root)";
+        let code = format!("x = {word}");
+        let word_w = word.chars().count() as f32 * cw;
+        let whole = at_width(&rich(&code, false), AvailableSpace::MinContent);
+        assert!((whole.width - word_w).abs() < 0.01, "longest word: {}", whole.width);
+        let broken = at_width(&rich(&code, true), AvailableSpace::MinContent);
+        assert!((broken.width - cw).abs() < 0.01, "one character: {}", broken.width);
+    }
+
+    /// A word too long for any line splits across lines at the box width,
+    /// and the box never reports itself wider than it was given.
+    #[test]
+    fn break_words_splits_an_overlong_word_at_the_box_width() {
+        let cw = metrics().char_width(14.0);
+        // 20 characters into a 8-character box: 8 + 8 + 4.
+        let out = at_width(&rich("abcdefghijklmnopqrst", true), AvailableSpace::Definite(8.0 * cw + 0.5));
+        assert!((out.height - 3.0 * crate::render::line_height(14.0)).abs() < 0.01);
+        assert!(out.width <= 8.0 * cw + 0.5);
+    }
+
+    /// A word that fits on a line of its own still moves down whole rather
+    /// than being split to fill the end of the current line — CSS
+    /// `overflow-wrap: anywhere`, and what Bevy's `WordOrCharacter` draws.
+    #[test]
+    fn break_words_only_splits_a_word_that_cannot_fit_on_its_own_line() {
+        let cw = metrics().char_width(14.0);
+        // "aaaa bbbbbb" in 8 columns: "aaaa" then "bbbbbb", never "aaaa bbb".
+        let out = at_width(&rich("aaaa bbbbbb", true), AvailableSpace::Definite(8.0 * cw + 0.5));
+        assert!((out.height - 2.0 * crate::render::line_height(14.0)).abs() < 0.01);
+        assert!((out.width - 6.0 * cw).abs() < 0.01, "widest line is bbbbbb: {}", out.width);
+    }
+
+    /// Indentation at the start of a line is drawn, so it takes width.
+    /// Dropping it measured `    let socket = …` four characters narrower
+    /// than Bevy draws it; Bevy then wrapped it into a line layout never
+    /// reserved, and it drew over the next source line.
+    #[test]
+    fn leading_indentation_counts_toward_width() {
+        let cw = metrics().char_width(14.0);
+        let line = "    let socket = crate::socket_path()";
+        let w = at_width(&rich(line, true), AvailableSpace::Definite(1000.0)).width;
+        assert!((w - line.chars().count() as f32 * cw).abs() < 0.01, "got {w}");
+        // Same for the second hard line of a block.
+        let two = "fn a() {\n        b()";
+        let w = at_width(&rich(two, true), AvailableSpace::Definite(1000.0)).width;
+        assert!((w - 11.0 * cw).abs() < 0.01, "got {w}");
+    }
+
+    /// A soft wrap still drops the whitespace it breaks at — only a HARD
+    /// line start keeps it.
+    #[test]
+    fn whitespace_at_a_soft_wrap_is_dropped() {
+        let cw = metrics().char_width(14.0);
+        // "aaaa    bbbb" in 6 columns: "aaaa" / "bbbb", never "    bbbb".
+        let out = at_width(&rich("aaaa    bbbb", true), AvailableSpace::Definite(6.0 * cw + 0.5));
+        assert!((out.height - 2.0 * crate::render::line_height(14.0)).abs() < 0.01);
+        assert!((out.width - 4.0 * cw).abs() < 0.01, "got {}", out.width);
+    }
+
+    /// The plain-text path measures indentation and multi-space gaps at
+    /// their real width too.
+    #[test]
+    fn plain_text_counts_indentation_and_wide_gaps() {
+        let m = metrics();
+        let cw = m.char_width(14.0);
+        let ctx = MeasureCtx::plain("    a    b".into(), 14.0, true);
+        // Narrower than the line, so the word-wrap path runs: 4 + 1 fits,
+        // the 4-space gap + b does not.
+        let out = measure_text(
+            &ctx,
+            Size { width: None, height: None },
+            Size {
+                width: AvailableSpace::Definite(6.0 * cw + 0.5),
+                height: AvailableSpace::Definite(1000.0),
+            },
+            &m,
+        );
+        assert!((out.height - 2.0 * crate::render::line_height(14.0)).abs() < 0.01);
+        assert!((out.width - 5.0 * cw).abs() < 0.01, "indent + a: {}", out.width);
+    }
+
     /// Line height comes from the tallest run — a big inline run makes the
     /// whole line taller, like an inline box in a browser.
     #[test]
@@ -1370,6 +1665,8 @@ mod tests {
             font_size: 10.0,
             wrap: true,
             runs: vec![run("small ", 10.0), run("BIG", 30.0)],
+            break_words: false,
+            family: None,
         };
         let out = measure_runs(
             &ctx,
@@ -1391,6 +1688,8 @@ mod tests {
             font_size: 14.0,
             wrap: false,
             runs: vec![run("one two three", 14.0)],
+            break_words: false,
+            family: None,
         };
         let out = measure_runs(
             &ctx,
@@ -1672,6 +1971,95 @@ mod tests {
         );
     }
 
+    /// A table whose fixed column widths sum past the pane overflows its
+    /// root; `content_right` reports that real width (what the host scrolls
+    /// sideways to reach) while the root itself stays pane-wide.
+    #[test]
+    fn content_right_reports_overflowing_table_width() {
+        use crate::protocol::TableColumn;
+        let m = metrics();
+        let col = |h: &str| TableColumn {
+            header: h.into(),
+            width: Some(300.0),
+            align: Align::Start,
+        };
+        let table = Element::Table {
+            columns: vec![col("a"), col("b"), col("c")],
+            rows: vec![vec!["1".into(), "2".into(), "3".into()]],
+            zebra: false,
+            selectable: false,
+            style: None,
+        };
+        let el = Element::Vstack {
+            gap: 0.0,
+            pad: 0.0,
+            style: Some(Style {
+                width: Some("100%".into()),
+                ..Default::default()
+            }),
+            children: vec![table],
+        };
+        let mut laid = build_tree(&el, &m);
+        compute(&mut laid, 400.0, 600.0, &m);
+
+        let root_w = laid.layout(laid.root).size.width;
+        assert!((root_w - 400.0).abs() < 0.5, "root stays pane-wide, got {root_w}");
+        let want = 3.0 * 300.0 + 2.0 * crate::render::TABLE_COL_GAP;
+        let got = laid.content_right();
+        assert!((got - want).abs() < 0.5, "content_right {got}, want {want}");
+    }
+
+    /// The datalog results pane's shape: a pane-wide root, a frame that may
+    /// grow past it, a scroll region, and a wide fixed-width table. The
+    /// table's full width must reach `content_right` through all of them.
+    #[test]
+    fn content_right_sees_table_inside_frame_and_scroll() {
+        let m = metrics();
+        let cols: Vec<serde_json::Value> = (0..20)
+            .map(|i| serde_json::json!({"header": format!("c{i}"), "width": 100.0}))
+            .collect();
+        let el: Element = serde_json::from_value(serde_json::json!({
+            "type": "vstack", "gap": 8.0,
+            "style": {"width": "100%", "min_height": "100%"},
+            "children": [
+                {"type": "hstack", "gap": 6.0, "children": [{"type": "text", "value": "50 rows"}]},
+                {"type": "frame", "pad": 10.0, "gap": 4.0,
+                 "style": {"align_self": "start", "min_width": "100%"},
+                 "children": [{"type": "scroll", "pad": 0.0, "gap": 2.0, "children": [
+                     {"type": "table", "zebra": true, "columns": cols,
+                      "rows": [vec!["x"; 20]]}
+                 ]}]}
+            ]
+        }))
+        .unwrap();
+        let mut laid = build_tree(&el, &m);
+        compute(&mut laid, 1000.0, 600.0, &m);
+        let table_w = 20.0 * 100.0 + 19.0 * crate::render::TABLE_COL_GAP;
+        let got = laid.content_right();
+        assert!(got >= table_w, "content_right {got} should reach the table width {table_w}");
+    }
+
+    /// Content that fits reports the root's width — no phantom overflow.
+    #[test]
+    fn content_right_matches_root_when_content_fits() {
+        let m = metrics();
+        let el = Element::Vstack {
+            gap: 0.0,
+            pad: 0.0,
+            style: Some(Style {
+                width: Some("100%".into()),
+                ..Default::default()
+            }),
+            children: vec![
+                serde_json::from_value(serde_json::json!({"type": "text", "value": "short"}))
+                    .unwrap(),
+            ],
+        };
+        let mut laid = build_tree(&el, &m);
+        compute(&mut laid, 400.0, 600.0, &m);
+        assert!((laid.content_right() - 400.0).abs() < 0.5);
+    }
+
     /// Default (no height set) still content-sizes, so taller-than-pane
     /// content grows past the pane and scrolls — passing the pane height
     /// as the available space must NOT clamp an auto-height root.
@@ -1703,5 +2091,138 @@ mod tests {
             "auto-height root should grow to content 300, got {}",
             root.size.height
         );
+    }
+}
+
+/// A spacer takes space along its parent's main axis only.
+#[cfg(test)]
+mod spacer_layout {
+    use super::*;
+
+    fn laid(dir: &str) -> LaidOut {
+        let root: Element = serde_json::from_value(serde_json::json!({
+            "type": dir, "gap": 0.0, "children": [
+                { "type": "text", "value": "row" },
+                { "type": "spacer", "size": 100000.0 },
+            ]
+        }))
+        .unwrap();
+        let m = PaneFontMetrics { cell_width: 8.4, font_size: 14.0 };
+        let mut laid = build_tree(&root, &m);
+        compute(&mut laid, 400.0, 300.0, &m);
+        laid
+    }
+
+    /// `virtual_list`'s stand-in for off-screen rows: tall, never wide.
+    #[test]
+    fn a_tall_spacer_in_a_column_is_not_wide() {
+        let l = laid("vstack");
+        let spacer = l.taffy.children(l.root).unwrap()[1];
+        assert_eq!(l.layout(spacer).size.height, 100000.0);
+        assert!(l.content_right() <= 400.0 + 0.5, "content_right {}", l.content_right());
+    }
+
+    #[test]
+    fn a_spacer_in_a_row_is_wide_not_tall() {
+        let l = laid("hstack");
+        let spacer = l.taffy.children(l.root).unwrap()[1];
+        assert_eq!(l.layout(spacer).size.width, 100000.0);
+        assert!(l.layout(spacer).size.height < 100.0);
+    }
+}
+
+/// A scroll element keeps the height it was given however tall its content
+/// is — the overflow is what it scrolls through.
+#[cfg(test)]
+mod scroll_layout {
+    use super::*;
+
+    #[test]
+    fn a_sized_scroll_does_not_grow_to_its_content() {
+        let rows: Vec<serde_json::Value> = (0..40)
+            .map(|i| serde_json::json!({ "type": "text", "value": format!("row {i}") }))
+            .collect();
+        let root: Element = serde_json::from_value(serde_json::json!({
+            "type": "vstack", "gap": 0.0, "style": { "height": "100%" }, "children": [
+                { "type": "scroll", "id": "list", "style": { "flex_grow": 1.0, "min_height": "0" },
+                  "children": rows }
+            ]
+        }))
+        .unwrap();
+        let m = PaneFontMetrics { cell_width: 8.4, font_size: 14.0 };
+        let mut laid = build_tree(&root, &m);
+        compute(&mut laid, 300.0, 200.0, &m);
+        let scroll = laid.taffy.children(laid.root).unwrap()[0];
+        assert_eq!(laid.layout(scroll).size.height, 200.0);
+        let last = *laid.taffy.children(scroll).unwrap().last().unwrap();
+        let l = laid.layout(last);
+        assert!(l.location.y + l.size.height > 200.0, "content still extends past the box");
+    }
+}
+
+/// lsp_symbol's source column beside its 320px sidebar, built the way the
+/// widget builds it. Regression for code running straight across the
+/// sidebar: a chained call is one "word" wider than the column, so a block
+/// that can only break at spaces could not shrink to fit and overflowed.
+#[cfg(test)]
+mod lsp_symbol_layout {
+    use super::*;
+
+    fn tree(break_words: bool) -> Element {
+        let code = "        let client = self.clients.lock().unwrap().entry(root.to_path_buf()).or_insert_with(|| spawn(root));";
+        let runs: Vec<serde_json::Value> = code
+            .split_inclusive(' ')
+            .map(|t| serde_json::json!({ "value": t, "color": "#7b8494" }))
+            .collect();
+        let line = serde_json::json!({ "type": "hstack", "gap": 8.0, "align": "start",
+            "style": { "width": "100%" }, "children": [
+                { "type": "text", "value": "  12", "family": "mono", "size": 11.0, "wrap": false },
+                { "type": "richtext", "runs": runs, "family": "mono", "size": 12.5,
+                  "wrap": true, "break_words": break_words }
+            ]});
+        let source_col = serde_json::json!({ "type": "vstack", "gap": 8.0,
+            "style": { "flex_grow": 1.0, "min_width": "0" }, "children": [
+                { "type": "text", "value": "ensure_running", "size": 13.0, "wrap": false },
+                { "type": "divider" },
+                { "type": "vstack", "gap": 0.0, "children": [line] } ]});
+        let sidebar = serde_json::json!({ "type": "vstack", "gap": 10.0,
+            "style": { "width": "320", "min_width": "320", "flex_shrink": 0.0 },
+            "children": [ { "type": "text", "value": "REFERENCES" } ]});
+        serde_json::from_value(serde_json::json!({ "type": "vstack", "gap": 0.0, "pad": 12.0,
+            "children": [ { "type": "hstack", "gap": 14.0, "align": "start",
+                            "children": [ source_col, sidebar ] } ]}))
+            .expect("element")
+    }
+
+    /// (source column right edge, code block right edge, sidebar left edge)
+    fn edges(break_words: bool) -> (f32, f32, f32) {
+        let m = PaneFontMetrics { cell_width: 8.4, font_size: 14.0 };
+        let mut laid = build_tree(&tree(break_words), &m);
+        compute(&mut laid, 700.0, 600.0, &m);
+        let cols = laid.taffy.children(laid.root).unwrap()[0];
+        let [col, bar] = laid.taffy.children(cols).unwrap()[..] else {
+            panic!("two columns");
+        };
+        let body = laid.taffy.children(col).unwrap()[2];
+        let line = laid.taffy.children(body).unwrap()[0];
+        let block = laid.taffy.children(line).unwrap()[1];
+        let right = |n| absolute_position(&laid, n, laid.root).x + laid.layout(n).size.width;
+        (right(col), right(block), absolute_position(&laid, bar, laid.root).x)
+    }
+
+    #[test]
+    fn code_stays_inside_its_column() {
+        let (col_right, code_right, sidebar_left) = edges(true);
+        assert!(code_right <= col_right + 0.5, "code {code_right} past column {col_right}");
+        assert!(code_right < sidebar_left, "code {code_right} reaches sidebar {sidebar_left}");
+    }
+
+    /// Guards the test itself: without `break_words` this tree DOES
+    /// overflow, so the passing case above is the flag working and not a
+    /// line that happened to fit.
+    #[test]
+    fn without_break_words_the_same_line_overflows() {
+        let (col_right, code_right, _) = edges(false);
+        assert!(code_right > col_right + 0.5, "expected overflow, got {code_right} <= {col_right}");
     }
 }

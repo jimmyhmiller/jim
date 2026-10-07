@@ -28,9 +28,10 @@
 //! the same way, into an image instead of the window:
 //!
 //! ```text
-//!   order 76_000   layer 0, whole image   → canvas + sidebar + chrome
-//!   order 76_001+  one per visible pane   → that pane's content, clipped
-//!   order 79_999   blit scene → shown     → what the slide samples
+//!   order -100_000  layer 0, whole image   → canvas + sidebar + chrome
+//!   order  -99_999+ one per visible pane   → that pane's content, clipped
+//!   order      -1   blit scene → shown     → what the slide samples
+//!   order       0+  normal window cameras  → consume the completed picture
 //! ```
 //!
 //! [`jim_pane::camera::pane_camera_setup_for`] already takes the target's
@@ -47,6 +48,33 @@
 //! `shown` afterwards, and the sprite samples `shown`: one frame behind,
 //! which is what makes the nesting infinite instead of one level deep.
 //!
+//! ## A slide that names a project, or drops the sidebar
+//!
+//! `project: Coil` and `<!-- sidebar: false -->` change what full screen
+//! shows, so they have to change the picture too — otherwise a deck in a
+//! floating pane previews the app as it stands while the talk would show
+//! something else entirely. Each host's request resolves to a
+//! [`PictureView`]; hosts that agree share one picture, and each distinct
+//! view gets its own images and cameras (up to [`MAX_VIEWS`]).
+//!
+//! A view of the ACTIVE project is the window, photographed, exactly as
+//! above. A view of any other project has to photograph panes that are
+//! `Hidden`, because that is how a non-active project is kept off the
+//! screen — and every hit-test in the app keys on it. So the pane roots
+//! STAY `Hidden` (a pictured pane can never take a click) and only their
+//! children are made `Visible`, which Bevy honours whatever the parent says.
+//! All of those children are on the pane's own render layer, and nothing
+//! draws that layer to the window: a pane's window camera is only active
+//! for the active project (`cube::suppress_window_pane_cams`).
+//! [`jim_pane::PanePictured`] tells the kinds that pause while hidden
+//! (terminal grids, script widgets) to keep painting.
+//!
+//! Every pane in every project is placed in the world through the ACTIVE
+//! project's viewport. A picture of another project therefore aims each
+//! camera at where the pane really is and zooms it by `active zoom / that
+//! project's zoom` — the same affine map for every canvas pane — so the
+//! pane lands where that project's own pan and zoom would put it.
+//!
 //! ## MSAA
 //!
 //! Every camera here is `Msaa::Off`, without exception. An image render
@@ -55,17 +83,20 @@
 //! it quits the app. One straggler is enough. This is the constraint
 //! `cube.rs` satisfies the same way.
 
+use std::collections::HashMap;
+
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{Camera, ClearColorConfig, ImageRenderTarget, RenderTarget};
+use bevy::ecs::system::SystemParam;
 use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 
-use jim_pane::camera::{PaneCanvasRegion, pane_camera_setup_for};
+use jim_pane::camera::{PaneCameraSetup, PaneCanvasRegion, pane_camera_setup_for};
 use jim_pane::{
-    MARGIN, PaneChromeOverride, PaneLayer, PaneRect, PaneScreenAnchored, PaneTag, PaneViewport,
-    TITLE_H,
+    MARGIN, PaneCanvas, PaneChromeOverride, PaneClosing, PaneGroup, PaneLayer, PanePictured,
+    PaneProject, PaneRect, PaneScreenAnchored, PaneTag, PaneViewport, TITLE_H,
 };
 
 /// World z for the picture inside a host pane.
@@ -129,12 +160,56 @@ const DIVE_WARMUP_FRAMES: u32 = 2;
 /// long as the slide is up would cost ~1.5 cores for no further depth.
 const REBUILD_FRAMES: u32 = 45;
 
-/// Camera order band, above every window pane camera (which top out at
-/// 75_150) and below the whiteboard overlay (80_000). These cameras never
-/// draw to the window, but orders are global and must not collide — Bevy
-/// logs "unpredictable render results" every frame when they do.
-const BAND_START: isize = 76_000;
-const BAND_BLIT: isize = 79_999;
+/// Camera order band before every window camera.
+///
+/// Camera order is global even across render targets. The picture used to
+/// run at 76_000–79_999, after the window's ordinary pane cameras. That made
+/// the window sample `shown` before this frame had composed and copied it:
+/// entering a live slide exposed the texture's empty initial contents, then
+/// one or two intermediate recursion levels as visible flashes.
+///
+/// Compose `scene`, copy it to `shown`, and only then let order-zero-and-up
+/// window cameras consume it. Each view owns [`SLOT_BAND`] orders of the
+/// band, its blit last, which leaves room for far more pane cameras than
+/// Jim can reasonably display.
+const BAND_START: isize = -100_000;
+
+/// Camera orders owned by one view, blit included.
+const SLOT_BAND: isize = 20_000;
+
+/// Distinct views composed at once.
+///
+/// Every host showing the same view shares one picture, so this bounds
+/// the number of DIFFERENT `project:`/`sidebar:` requests among the decks
+/// on screen at one moment — normally one. Past it a host gets no picture
+/// and an error in the log, never somebody else's picture.
+pub const MAX_VIEWS: usize = 4;
+
+/// The first view's blit layer; view `n` uses `BLIT_LAYER_BASE + n`.
+///
+/// Always construct these with `RenderLayers::from_layers` — the const
+/// `RenderLayers::layer()` asserts the id fits one inline u64 block and
+/// PANICS above 63. `jim_pane::camera` carries the same warning for pane
+/// layer ids.
+const BLIT_LAYER_BASE: usize = 4100;
+
+fn slot_order(slot: usize) -> isize {
+    BAND_START + slot as isize * SLOT_BAND
+}
+
+fn slot_blit_order(slot: usize) -> isize {
+    slot_order(slot) + SLOT_BAND - 1
+}
+
+fn blit_layer(slot: usize) -> usize {
+    BLIT_LAYER_BASE + slot
+}
+
+/// Every global layer this module's cameras render. The shell reserves
+/// them in `PanePlugin.reserved_layers` so no pane is ever allocated one.
+pub fn reserved_layers() -> impl Iterator<Item = usize> {
+    std::iter::once(DIVE_LAYER).chain((0..MAX_VIEWS).map(blit_layer))
+}
 
 /// The dive overlay draws to the WINDOW, over everything — sidebar,
 /// whiteboard overlay, panes — because the whole app is what appears to
@@ -142,32 +217,83 @@ const BAND_BLIT: isize = 79_999;
 /// underneath it.
 const DIVE_CAMERA_ORDER: isize = 95_000;
 
-/// The two images behind a slide's picture.
-#[derive(Resource)]
-struct SlidePicture {
+/// What a slide's picture shows: which project's canvas, and whether the
+/// sidebar is in it — what full screen would show for the same slide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PictureView {
+    /// The slide's `project:`, or the active project for `application:`.
+    project: u64,
+    /// `<!-- sidebar: false -->` turns it off.
+    sidebar: bool,
+}
+
+/// One view's picture: its two images, and what to put in them.
+struct ViewPicture {
+    view: PictureView,
+    /// Which slice of the camera band and which blit layer it owns.
+    slot: usize,
     /// What the private cameras draw into, this frame.
     scene: Handle<Image>,
     /// A copy of `scene` from last frame — what the slide samples.
     shown: Handle<Image>,
-    /// Physical size of both images.
+    /// Recomputed every frame by [`resolve_views`] from here down.
+    ///
+    /// The view is of the active project: what the window already shows.
+    live: bool,
+    /// Host panes showing this view.
+    hosts: Vec<Entity>,
+    /// Panes to photograph in draw order: (pane, render layer, anchored).
+    panes: Vec<(Entity, usize, bool)>,
+    /// The canvas mapping this view's panes are laid out through.
+    viewport: PaneViewport,
+    /// Where pane cameras may draw — clear of the sidebar only when the
+    /// view has one.
+    region: PaneCanvasRegion,
+    /// Canvas colour behind a view of another project: its own theme's.
+    clear: Color,
+    /// What the current camera set was built for.
+    ///
+    /// Rebuilt only when this changes. Respawning ~10 cameras every frame
+    /// thrashes Bevy's view and texture caches, and this repo has already
+    /// learned once that per-frame entity churn is what turns a working
+    /// feature into an unusable one.
+    built: Option<BuiltFor>,
+}
+
+#[derive(Debug, PartialEq)]
+struct BuiltFor {
+    live: bool,
+    sidebar: bool,
+    panes: Vec<(Entity, usize, bool)>,
+    hosts: Vec<Entity>,
+    size: UVec2,
+}
+
+/// Every picture currently being composed.
+#[derive(Resource, Default)]
+struct SlidePicture {
+    /// Physical size of every image.
     size: UVec2,
     /// Resolution reduction folded into the render targets' scale factor,
     /// so viewports stay in the window's logical units.
     cap: f32,
-    /// Which panes the current cameras were built for, in draw order.
-    ///
-    /// The camera set is rebuilt only when this changes. Respawning ~10
-    /// cameras every frame thrashes Bevy's view and texture caches, and
-    /// this repo has already learned once that per-frame entity churn is
-    /// what turns a working feature into an unusable one.
-    built_for: Vec<(Entity, usize)>,
-    /// Hosts the current sprites were built for.
-    hosts: Vec<Entity>,
+    views: Vec<ViewPicture>,
     /// Last `SlideTargets::bump` acted on. Any change means a slide moved,
     /// which needs a burst of frames even when nothing about the camera set
     /// does.
     last_bump: u64,
 }
+
+impl SlidePicture {
+    fn view_of(&self, host: Entity) -> Option<&ViewPicture> {
+        self.views.iter().find(|v| v.hosts.contains(&host))
+    }
+}
+
+/// Panes of a non-active project that a picture is photographing, and the
+/// children this module made `Visible` to do it — so they can be put back.
+#[derive(Resource, Default)]
+struct PicturedPanes(HashMap<Entity, Vec<Entity>>);
 
 /// Is a dive in flight? Read by the shell's update-mode decision.
 ///
@@ -209,14 +335,20 @@ struct Diving {
     host: Entity,
 }
 
-/// One of this module's private cameras.
+/// Everything spawned for one view's picture, by slot. A rebuild despawns
+/// exactly its own slot's set.
+#[derive(Component, Clone, Copy)]
+struct PictureSlot(usize);
+
+/// The camera a view of another project clears with that project's canvas
+/// colour (and draws the sidebar with, when the view has one).
 #[derive(Component)]
-struct PictureCamera;
+struct PictureBase;
 
 /// The full-window camera that draws a dive overlay.
 ///
-/// Deliberately NOT a `PictureCamera`: that marker means "part of the set
-/// that composes the picture", and those are despawned wholesale whenever
+/// Deliberately NOT a `PictureSlot`: that marker means "part of the set
+/// that composes a picture", and those are despawned wholesale whenever
 /// the pane set changes. Sharing it would have let a rebuild mid-dive kill
 /// the overlay, and — worse — let the end of a dive despawn the chrome and
 /// blit cameras the picture itself depends on.
@@ -231,10 +363,6 @@ struct PictureCameraOf(Entity);
 /// A picture sprite shown inside this host pane.
 #[derive(Component)]
 struct PictureSpriteOf(Entity);
-
-/// The sprite that shows the picture inside a host pane.
-#[derive(Component)]
-struct PictureSprite;
 
 /// Everything this module does in `Update`.
 ///
@@ -253,10 +381,18 @@ pub struct SlideViewPlugin;
 impl Plugin for SlideViewPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SlideDive>()
-            .add_systems(Startup, create_images)
+            .init_resource::<SlidePicture>()
+            .init_resource::<PicturedPanes>()
             .add_systems(
                 Update,
-                (drive_picture, start_dive, spawn_pending_dive, apply_dive)
+                (
+                    resolve_views,
+                    picture_hidden_panes,
+                    drive_picture,
+                    start_dive,
+                    spawn_pending_dive,
+                    apply_dive,
+                )
                     .chain()
                     .in_set(SlideViewSet)
                     .after(crate::present::PresentSet)
@@ -290,19 +426,6 @@ fn image_target(image: &Handle<Image>, scale_factor: f32) -> RenderTarget {
     })
 }
 
-/// Claim both handles up front; a resize replaces the asset behind them.
-fn create_images(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
-    commands.insert_resource(SlidePicture {
-        scene: images.add(target_image(UVec2::ONE)),
-        shown: images.add(target_image(UVec2::ONE)),
-        size: UVec2::ZERO,
-        cap: 1.0,
-        built_for: Vec::new(),
-        hosts: Vec::new(),
-        last_bump: 0,
-    });
-}
-
 /// Fit `source` inside `region` without cropping, preserving aspect.
 fn contain(region: Vec2, source: Vec2) -> Vec2 {
     if region.x <= 0.0 || region.y <= 0.0 || source.x <= 0.0 || source.y <= 0.0 {
@@ -319,6 +442,11 @@ fn contain(region: Vec2, source: Vec2) -> Vec2 {
 /// and zoom for free.
 fn to_world(screen: Vec2, window: Vec2) -> Vec2 {
     Vec2::new(screen.x - window.x * 0.5, window.y * 0.5 - screen.y)
+}
+
+/// The inverse of [`to_world`].
+fn from_world(world: Vec2, window: Vec2) -> Vec2 {
+    Vec2::new(world.x + window.x * 0.5, window.y * 0.5 - world.y)
 }
 
 /// The pane's on-screen rect: already window pixels when anchored, else
@@ -355,31 +483,50 @@ type PaneQuery<'w, 's> = Query<
     With<PaneTag>,
 >;
 
-/// Keep the picture's cameras and sprites matching the world.
+/// The world a picture can be of: every project's canvas, not just the
+/// active one's.
+#[derive(SystemParam)]
+struct Canvases<'w> {
+    projects: Res<'w, crate::projects::Projects>,
+    sidebar: Res<'w, crate::projects::Sidebar>,
+    nav: Res<'w, crate::canvas_pane::CanvasNav>,
+    groups: Res<'w, crate::pane_groups::VisibleGroups>,
+    views: Res<'w, crate::canvas::CanvasView>,
+    config: Res<'w, crate::canvas::CanvasConfig>,
+    themes: Res<'w, jim_style::ProjectThemes>,
+    clear: Res<'w, ClearColor>,
+    viewport: Option<Res<'w, PaneViewport>>,
+}
+
+type MemberQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static PaneProject,
+        Option<&'static PaneCanvas>,
+        Option<&'static PaneGroup>,
+    ),
+    (With<PaneTag>, Without<PaneClosing>),
+>;
+
+/// Work out what every host's slide wants to show, and keep one picture
+/// per distinct answer.
 ///
-/// Two rates, deliberately. The camera SET is rebuilt only when the panes
-/// being photographed change — a slide change, a pane opening or closing.
-/// Their viewports and transforms are updated every frame, which is what
-/// `jim_pane::camera::sync_pane_cameras` does for the real ones and costs a
-/// few field writes. Respawning them per frame instead would churn Bevy's
-/// view caches for no benefit.
+/// "What full screen would show" is the whole specification: the slide's
+/// project (or the active one), laid out by that project's own pan and
+/// zoom, with the sidebar only if the slide keeps it.
 #[allow(clippy::too_many_arguments)]
-fn drive_picture(
-    mut commands: Commands,
+fn resolve_views(
     mut picture: ResMut<SlidePicture>,
     mut dive: ResMut<SlideDive>,
     mut images: ResMut<Assets<Image>>,
     targets: Res<crate::slide_targets::SlideTargets>,
+    canvases: Canvases,
     windows: Query<&Window>,
-    viewport: Option<Res<PaneViewport>>,
-    region: Option<Res<PaneCanvasRegion>>,
     panes: PaneQuery,
-    mut cameras: Query<(Entity, &PictureCameraOf, &mut Camera, &mut Transform)>,
-    mut sprites: Query<
-        (Entity, &PictureSpriteOf, &mut Sprite, &mut Transform),
-        Without<PictureCameraOf>,
-    >,
-    all_owned: Query<Entity, Or<(With<PictureCamera>, With<PictureSprite>)>>,
+    members: MemberQuery,
+    mut over_limit: Local<bool>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -389,19 +536,7 @@ fn drive_picture(
         return;
     }
 
-    // Every pane whose deck is on an `application:`/`project:` slide. NOT
-    // gated on presenting: "any pane that has that presentation should show
-    // it" — a deck sitting on the canvas recurses too, which is also the
-    // only way to look at one while using the app normally.
-    let mut hosts: Vec<Entity> = targets
-        .by_host
-        .keys()
-        .copied()
-        .filter(|host| panes.get(*host).is_ok_and(|p| p.3.get()))
-        .collect();
-    hosts.sort();
-
-    // A slide moved. Burst BEFORE the no-hosts bail: leaving an
+    // A slide moved. Burst BEFORE anything can bail: leaving an
     // `application:` slide needs frames just as much as arriving on one —
     // the deck still has to draw whatever it moved to.
     if picture.last_bump != targets.bump {
@@ -409,95 +544,424 @@ fn drive_picture(
         dive.cooldown = REBUILD_FRAMES;
     }
 
-    if hosts.is_empty() {
-        if !picture.built_for.is_empty() || !picture.hosts.is_empty() {
-            for entity in &all_owned {
-                commands.entity(entity).despawn();
-            }
-            picture.built_for.clear();
-            picture.hosts.clear();
-        }
-        return;
-    }
-
-    let viewport = viewport.as_deref().copied().unwrap_or_default();
-    let region = region.as_deref().copied();
-
-    // Panes to photograph, in the order the window draws them.
-    let mut visible: Vec<(Entity, PaneRect, usize, f32)> = panes
+    // Every pane whose deck is on an `application:`/`project:` slide. NOT
+    // gated on presenting: "any pane that has that presentation should show
+    // it" — a deck sitting on the canvas previews the slide too, which is
+    // also the only way to look at one while using the app normally.
+    let active = canvases.projects.active;
+    let mut hosts: Vec<(Entity, PictureView)> = targets
+        .by_host
         .iter()
-        .filter(|(_, _, _, vis, _, _)| vis.get())
-        .map(|(entity, rect, layer, _, anchored, _)| {
-            (
-                entity,
-                screen_rect(rect, anchored.is_some(), &viewport),
-                layer.0,
-                rect.z,
-            )
+        .filter(|(host, _)| panes.get(**host).is_ok_and(|p| p.3.get()))
+        .filter_map(|(host, target)| {
+            // `application:` with no active project has nothing to show.
+            let project = target.project.or(active)?;
+            Some((
+                *host,
+                PictureView {
+                    project,
+                    sidebar: target.show_sidebar,
+                },
+            ))
         })
         .collect();
-    visible.sort_by(|a, b| a.3.total_cmp(&b.3).then(a.0.cmp(&b.0)));
-    let signature: Vec<(Entity, usize)> = visible.iter().map(|(e, _, l, _)| (*e, *l)).collect();
+    hosts.sort_by_key(|(host, _)| *host);
+    let mut wanted: Vec<(PictureView, Vec<Entity>)> = Vec::new();
+    for (host, view) in hosts {
+        match wanted.iter_mut().find(|(v, _)| *v == view) {
+            Some((_, list)) => list.push(host),
+            None => wanted.push((view, vec![host])),
+        }
+    }
+    if wanted.len() > MAX_VIEWS {
+        if !*over_limit {
+            error!(
+                "[slide-view] {} different slide views are on screen at once; only {MAX_VIEWS} \
+                 can be composed, so decks showing the rest get no picture",
+                wanted.len()
+            );
+            *over_limit = true;
+        }
+        wanted.truncate(MAX_VIEWS);
+    } else {
+        *over_limit = false;
+    }
 
     let cap = picture_scale(window);
     let size = (logical * cap).ceil().as_uvec2().max(UVec2::ONE);
     let resized = picture.size != size;
-    if resized {
-        for handle in [picture.scene.clone(), picture.shown.clone()] {
-            if let Err(error) = images.insert(handle.id(), target_image(size)) {
-                error!("[slide-view] could not size the picture: {error}");
-                return;
-            }
-        }
-        picture.size = size;
-    }
+    picture.size = size;
     picture.cap = cap;
 
-    if picture.built_for != signature || picture.hosts != hosts || resized {
-        for entity in &all_owned {
+    // Views nobody asks for any more. Their handles go with them, which
+    // frees the images; `drive_picture` despawns their cameras.
+    picture
+        .views
+        .retain(|v| wanted.iter().any(|(w, _)| *w == v.view));
+    if resized {
+        for view in &picture.views {
+            for handle in [&view.scene, &view.shown] {
+                if let Err(error) = images.insert(handle.id(), target_image(size)) {
+                    error!("[slide-view] could not size the picture: {error}");
+                }
+            }
+        }
+    }
+
+    let live_vp = canvases.viewport.as_deref().copied().unwrap_or_default();
+    for (view, hosts) in wanted {
+        let index = match picture.views.iter().position(|v| v.view == view) {
+            Some(index) => index,
+            None => {
+                let slot = (0..MAX_VIEWS)
+                    .find(|slot| picture.views.iter().all(|v| v.slot != *slot))
+                    .expect("at most MAX_VIEWS views, so a slot is free");
+                picture.views.push(ViewPicture {
+                    view,
+                    slot,
+                    scene: images.add(target_image(size)),
+                    shown: images.add(target_image(size)),
+                    live: false,
+                    hosts: Vec::new(),
+                    panes: Vec::new(),
+                    viewport: live_vp,
+                    region: PaneCanvasRegion::default(),
+                    clear: Color::NONE,
+                    built: None,
+                });
+                picture.views.len() - 1
+            }
+        };
+
+        let live = Some(view.project) == active;
+        let viewport = if live {
+            live_vp
+        } else {
+            // What `canvas::publish_canvas_region` would publish were this
+            // project active. The origin is the same for every project: it
+            // does not move when the sidebar hides, which is why a slide
+            // without one simply shows more canvas on the left.
+            let state = canvases
+                .views
+                .state_for((view.project, canvases.nav.level(view.project)));
+            PaneViewport {
+                origin: live_vp.origin,
+                pan: state.pan,
+                zoom: if canvases.config.zoom_enabled {
+                    state.zoom
+                } else {
+                    1.0
+                },
+            }
+        };
+        let gutter = if view.sidebar {
+            canvases.sidebar.width
+        } else {
+            0.0
+        };
+        let region = PaneCanvasRegion {
+            min: Vec2::new(gutter, 0.0),
+            max: logical,
+            active: true,
+        };
+        // The window's own pane set when it IS the window; otherwise the
+        // same rule `sync_visibility` applies, for the other project.
+        let mut shown: Vec<(Entity, usize, bool, f32)> = if live {
+            panes
+                .iter()
+                .filter(|p| p.3.get())
+                .map(|(entity, rect, layer, _, anchored, _)| {
+                    (entity, layer.0, anchored.is_some(), rect.z)
+                })
+                .collect()
+        } else {
+            members
+                .iter()
+                .filter(|(_, project, canvas, group)| {
+                    crate::projects::pane_on_project_canvas(
+                        project.0,
+                        *canvas,
+                        *group,
+                        view.project,
+                        &canvases.nav,
+                        &canvases.groups,
+                    )
+                })
+                .filter_map(|(entity, ..)| panes.get(entity).ok())
+                .map(|(entity, rect, layer, _, anchored, _)| {
+                    (entity, layer.0, anchored.is_some(), rect.z)
+                })
+                .collect()
+        };
+        shown.sort_by(|a, b| a.3.total_cmp(&b.3).then(a.0.cmp(&b.0)));
+        let clear = canvases
+            .themes
+            .get(view.project)
+            .map(|theme| Color::LinearRgba(theme.color(jim_style::tokens::CANVAS_BG)))
+            .unwrap_or(canvases.clear.0);
+
+        let entry = &mut picture.views[index];
+        entry.live = live;
+        entry.hosts = hosts;
+        entry.panes = shown.into_iter().map(|(e, l, a, _)| (e, l, a)).collect();
+        entry.viewport = viewport;
+        entry.region = region;
+        entry.clear = clear;
+    }
+}
+
+/// Make the panes a picture of another project needs drawable, and put
+/// back the ones it no longer needs.
+///
+/// Only CHILDREN are touched. The pane root stays `Hidden`, which is what
+/// every hit-test checks, so a pane that is only being photographed can
+/// never take a click. A child somebody else hid on purpose (a docked
+/// pane's title bar, the presenting deck's chrome) is left alone.
+fn picture_hidden_panes(
+    mut commands: Commands,
+    picture: Res<SlidePicture>,
+    mut pictured: ResMut<PicturedPanes>,
+    panes: Query<&Children, With<PaneTag>>,
+    layers: Query<&RenderLayers>,
+    mut visibility: Query<&mut Visibility, Without<PaneTag>>,
+) {
+    let wanted: Vec<Entity> = picture
+        .views
+        .iter()
+        .filter(|v| !v.live)
+        .flat_map(|v| v.panes.iter().map(|(pane, _, _)| *pane))
+        .collect();
+
+    let released: Vec<Entity> = pictured
+        .0
+        .keys()
+        .filter(|pane| !wanted.contains(pane))
+        .copied()
+        .collect();
+    for pane in released {
+        let forced = pictured.0.remove(&pane).unwrap_or_default();
+        for child in forced {
+            if let Ok(mut vis) = visibility.get_mut(child)
+                && *vis == Visibility::Visible
+            {
+                *vis = Visibility::Inherited;
+            }
+        }
+        if let Ok(mut entity) = commands.get_entity(pane) {
+            entity.remove::<PanePictured>();
+        }
+    }
+
+    let layer0 = RenderLayers::layer(0);
+    for pane in wanted {
+        let Ok(children) = panes.get(pane) else {
+            continue;
+        };
+        let forced = pictured.0.entry(pane).or_insert_with(|| {
+            commands.entity(pane).insert(PanePictured);
+            Vec::new()
+        });
+        for child in children.iter() {
+            // Only what the pane's own camera draws. Anything that could be
+            // on layer 0 would be drawn into the WINDOW by the main camera —
+            // a ghost of another project on this one's canvas.
+            if !layers.get(child).is_ok_and(|l| !l.intersects(&layer0)) {
+                continue;
+            }
+            let Ok(mut vis) = visibility.get_mut(child) else {
+                continue;
+            };
+            match *vis {
+                Visibility::Inherited => {
+                    *vis = Visibility::Visible;
+                    if !forced.contains(&child) {
+                        forced.push(child);
+                    }
+                }
+                // Somebody hid it on purpose; that decision is theirs.
+                Visibility::Hidden => forced.retain(|c| *c != child),
+                Visibility::Visible => {}
+            }
+        }
+    }
+}
+
+/// Where a picture's camera looks for one pane.
+struct Aim {
+    setup: PaneCameraSetup,
+    /// World position the camera sits at.
+    centre: Vec2,
+    /// Orthographic scale: world units per picture pixel.
+    scale: f32,
+}
+
+/// Aim a picture camera at `rect` as `view` lays it out.
+///
+/// The pane is laid out in the picture by the VIEW's canvas mapping, but it
+/// exists in the world where the LIVE mapping put it — every pane in every
+/// project is positioned through the active project's viewport. So the
+/// viewport comes from the view, and the camera is aimed at the same canvas
+/// point in the world, zoomed by the ratio of the two. For the active
+/// project the two mappings are one and this is the window's own camera.
+fn aim_pane(
+    rect: &PaneRect,
+    anchored: bool,
+    view: &PaneViewport,
+    live: &PaneViewport,
+    logical: Vec2,
+    cap: f32,
+    region: PaneCanvasRegion,
+) -> Aim {
+    if anchored {
+        // Window pixels in both, and never zoomed.
+        let setup = pane_camera_setup_for(rect, logical, cap, Some(region));
+        return Aim {
+            centre: setup.cam_center,
+            setup,
+            scale: 1.0,
+        };
+    }
+    let setup = pane_camera_setup_for(&view.projected_rect(rect), logical, cap, Some(region));
+    let seen = from_world(setup.cam_center, logical);
+    let actual = live.canvas_to_window(view.window_to_canvas(seen));
+    Aim {
+        centre: to_world(actual, logical),
+        scale: live.zoom / view.zoom.max(1e-4),
+        setup,
+    }
+}
+
+fn projection(scale: f32) -> Projection {
+    Projection::from(OrthographicProjection {
+        scale,
+        ..OrthographicProjection::default_2d()
+    })
+}
+
+/// Keep every picture's cameras and sprites matching the world.
+///
+/// Two rates, deliberately. A view's camera SET is rebuilt only when what
+/// it photographs changes — a slide change, a pane opening or closing.
+/// Viewports and transforms are updated every frame, which is what
+/// `jim_pane::camera::sync_pane_cameras` does for the real ones and costs a
+/// few field writes. Respawning them per frame instead would churn Bevy's
+/// view caches for no benefit.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn drive_picture(
+    mut commands: Commands,
+    mut picture: ResMut<SlidePicture>,
+    windows: Query<&Window>,
+    viewport: Option<Res<PaneViewport>>,
+    panes: PaneQuery,
+    owned: Query<(Entity, &PictureSlot)>,
+    mut cameras: Query<(
+        &PictureSlot,
+        Option<&PictureCameraOf>,
+        Has<PictureBase>,
+        &mut Camera,
+        &mut Transform,
+        &mut Projection,
+    )>,
+    mut sprites: Query<
+        (&PictureSlot, &PictureSpriteOf, &mut Sprite, &mut Transform),
+        Without<Camera>,
+    >,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let logical = Vec2::new(window.width(), window.height());
+    if logical.x <= 0.0 || logical.y <= 0.0 {
+        return;
+    }
+    let live_vp = viewport.as_deref().copied().unwrap_or_default();
+    let (size, cap) = (picture.size, picture.cap);
+
+    // Views that went away.
+    for (entity, slot) in &owned {
+        if picture.views.iter().all(|v| v.slot != slot.0) {
             commands.entity(entity).despawn();
         }
-        spawn_picture(
-            &mut commands,
-            &picture,
-            &visible,
-            &hosts,
-            &panes,
-            &viewport,
-            region,
-            logical,
-            cap,
-        );
-        picture.built_for = signature;
-        picture.hosts = hosts;
-        return;
+    }
+
+    let mut rebuilt: Vec<usize> = Vec::new();
+    for view in &mut picture.views {
+        let want = BuiltFor {
+            live: view.live,
+            sidebar: view.view.sidebar,
+            panes: view.panes.clone(),
+            hosts: view.hosts.clone(),
+            size,
+        };
+        if view.built.as_ref() == Some(&want) {
+            continue;
+        }
+        for (entity, slot) in &owned {
+            if slot.0 == view.slot {
+                commands.entity(entity).despawn();
+            }
+        }
+        spawn_view(&mut commands, view, &panes, &live_vp, logical, cap);
+        view.built = Some(want);
+        rebuilt.push(view.slot);
     }
 
     // Steady state: move what already exists.
-    for (_, owner, mut camera, mut transform) in &mut cameras {
-        let Some((_, screen, _, _)) = visible.iter().find(|(e, _, _, _)| *e == owner.0) else {
+    for (slot, owner, base, mut camera, mut transform, mut proj) in &mut cameras {
+        if rebuilt.contains(&slot.0) {
+            continue;
+        }
+        let Some(view) = picture.views.iter().find(|v| v.slot == slot.0) else {
             continue;
         };
-        let setup = pane_camera_setup_for(screen, logical, cap, region);
-        camera.is_active = setup.visible;
+        if base {
+            let want = ClearColorConfig::Custom(view.clear);
+            if !matches!(camera.clear_color, ClearColorConfig::Custom(c) if c == view.clear) {
+                camera.clear_color = want;
+            }
+            continue;
+        }
+        let Some(owner) = owner else {
+            continue;
+        };
+        let Ok((_, rect, _, _, anchored, _)) = panes.get(owner.0) else {
+            continue;
+        };
+        let aim = aim_pane(
+            rect,
+            anchored.is_some(),
+            &view.viewport,
+            &live_vp,
+            logical,
+            cap,
+            view.region,
+        );
+        camera.is_active = aim.setup.visible;
         let changed = camera.viewport.as_ref().is_none_or(|current| {
-            current.physical_position != setup.viewport.physical_position
-                || current.physical_size != setup.viewport.physical_size
+            current.physical_position != aim.setup.viewport.physical_position
+                || current.physical_size != aim.setup.viewport.physical_size
         });
         if changed {
-            camera.viewport = Some(setup.viewport);
+            camera.viewport = Some(aim.setup.viewport);
         }
-        let want = Vec3::new(setup.cam_center.x, setup.cam_center.y, 0.0);
+        let want = Vec3::new(aim.centre.x, aim.centre.y, 0.0);
         if transform.translation != want {
             transform.translation = want;
         }
+        let scaled = matches!(&*proj, Projection::Orthographic(o) if o.scale == aim.scale);
+        if !scaled {
+            *proj = projection(aim.scale);
+        }
     }
-    for (_, owner, mut sprite, mut transform) in &mut sprites {
+    for (slot, owner, mut sprite, mut transform) in &mut sprites {
+        if rebuilt.contains(&slot.0) {
+            continue;
+        }
         let Ok((_, rect, _, _, anchored, chrome)) = panes.get(owner.0) else {
             continue;
         };
         let Some((centre, shown)) =
-            host_placement(rect, anchored.is_some(), chrome, &viewport, logical)
+            host_placement(rect, anchored.is_some(), chrome, &live_vp, logical)
         else {
             continue;
         };
@@ -553,13 +1017,23 @@ fn dive_rect(t: f32, content_pos: Vec2, area: Vec2, logical: Vec2, cap: f32) -> 
 /// app, so it must not appear until that copy is CURRENT — see
 /// [`DIVE_WARMUP_FRAMES`]. Arming also starts frames flowing, which is what
 /// makes the copy current.
+///
+/// Only a picture of the window itself can be dived into. The dive ends by
+/// dropping the overlay onto the live app, which is seamless only when the
+/// picture IS the live app; a picture of another project, or one without
+/// the sidebar the window has, would jump at the end — and contains no
+/// nested copy of the host to zoom into in the first place.
 fn start_dive(
     mut dive: ResMut<SlideDive>,
     mut clicks: MessageReader<jim_pane::PaneDoubleClicked>,
-    hosts: Query<&PictureSpriteOf>,
+    picture: Res<SlidePicture>,
+    presentation: Res<crate::present::Presentation>,
 ) {
     for click in clicks.read() {
-        if !hosts.iter().any(|owner| owner.0 == click.pane) {
+        let Some(view) = picture.view_of(click.pane) else {
+            continue;
+        };
+        if !view.live || view.view.sidebar != presentation.sidebar_visible() {
             continue;
         }
         dive.pending = Some((click.pane, DIVE_WARMUP_FRAMES));
@@ -584,6 +1058,9 @@ fn spawn_pending_dive(
         return;
     }
     dive.pending = None;
+    let Some(view) = picture.view_of(host) else {
+        return;
+    };
     let Ok(window) = windows.single() else {
         return;
     };
@@ -612,7 +1089,7 @@ fn spawn_pending_dive(
     ));
     commands.spawn((
         Sprite {
-            image: picture.shown.clone(),
+            image: view.shown.clone(),
             custom_size: Some(logical),
             ..default()
         },
@@ -701,66 +1178,108 @@ fn host_placement(
     (shown.x > 0.0).then(|| (to_world(pos + area * 0.5, logical), shown))
 }
 
-/// Build the whole camera + sprite set from scratch.
-#[allow(clippy::too_many_arguments)]
-fn spawn_picture(
+/// Build one view's whole camera + sprite set from scratch.
+fn spawn_view(
     commands: &mut Commands,
-    picture: &SlidePicture,
-    visible: &[(Entity, PaneRect, usize, f32)],
-    hosts: &[Entity],
+    view: &ViewPicture,
     panes: &PaneQuery,
-    viewport: &PaneViewport,
-    region: Option<PaneCanvasRegion>,
+    live_vp: &PaneViewport,
     logical: Vec2,
     cap: f32,
 ) {
-    let scene = image_target(&picture.scene, cap);
+    let scene = image_target(&view.scene, cap);
+    let slot = PictureSlot(view.slot);
+    let base_order = slot_order(view.slot);
     // Rebuilds are rare (a slide change, a pane opening), so this is quiet
     // — and it is the one line that says whether a slide that shows nothing
     // found a host at all.
     info!(
-        "[slide-view] picture rebuilt: {} host(s), {} pane(s)",
-        hosts.len(),
-        visible.len()
+        "[slide-view] picture rebuilt: project {}{}, sidebar {}, {} host(s), {} pane(s)",
+        view.view.project,
+        if view.live { " (active)" } else { "" },
+        if view.view.sidebar { "on" } else { "off" },
+        view.hosts.len(),
+        view.panes.len()
     );
 
     // Global chrome plus the sidebar. The sidebar gained its own clipped
-    // render layer when workspaces were added, so a recursive picture must
-    // explicitly photograph both layers (the normal window uses two
-    // cameras for the same composition).
-    commands.spawn((
-        Camera2d,
-        Camera {
-            order: BAND_START,
-            ..default()
-        },
-        scene.clone(),
-        RenderLayers::from_layers(&[0, crate::projects::SIDEBAR_LAYER]),
-        bevy::render::view::Msaa::Off,
-        PictureCamera,
-        Name::new("slide-picture:chrome"),
-    ));
-
-    for (index, (pane, screen, layer, _)) in visible.iter().enumerate() {
-        let setup = pane_camera_setup_for(screen, logical, cap, region);
+    // render layer when workspaces were added, so a picture that shows it
+    // must photograph that layer explicitly (the window uses two cameras
+    // for the same composition).
+    if view.live {
+        let mut layers = RenderLayers::layer(0);
+        if view.view.sidebar {
+            layers = layers.with(crate::projects::SIDEBAR_LAYER);
+        }
         commands.spawn((
             Camera2d,
             Camera {
-                order: BAND_START + 1 + index as isize,
-                viewport: Some(setup.viewport),
-                is_active: setup.visible,
+                order: base_order,
+                ..default()
+            },
+            scene.clone(),
+            layers,
+            bevy::render::view::Msaa::Off,
+            slot,
+            Name::new("slide-picture:chrome"),
+        ));
+    } else {
+        // Layer 0 is the ACTIVE project's canvas furniture, so a picture of
+        // another project leaves it out and clears to that project's own
+        // canvas colour instead.
+        let layers = if view.view.sidebar {
+            RenderLayers::from_layers(&[crate::projects::SIDEBAR_LAYER])
+        } else {
+            RenderLayers::none()
+        };
+        commands.spawn((
+            Camera2d,
+            Camera {
+                order: base_order,
+                clear_color: ClearColorConfig::Custom(view.clear),
+                ..default()
+            },
+            scene.clone(),
+            layers,
+            bevy::render::view::Msaa::Off,
+            slot,
+            PictureBase,
+            Name::new("slide-picture:canvas"),
+        ));
+    }
+
+    for (index, (pane, layer, anchored)) in view.panes.iter().enumerate() {
+        let Ok((_, rect, _, _, _, _)) = panes.get(*pane) else {
+            continue;
+        };
+        let aim = aim_pane(
+            rect,
+            *anchored,
+            &view.viewport,
+            live_vp,
+            logical,
+            cap,
+            view.region,
+        );
+        commands.spawn((
+            Camera2d,
+            Camera {
+                order: base_order + 1 + index as isize,
+                viewport: Some(aim.setup.viewport),
+                is_active: aim.setup.visible,
                 // Don't clear: each pane camera overlays what the chrome
                 // camera drew, exactly as on the window.
                 clear_color: ClearColorConfig::None,
                 ..default()
             },
             scene.clone(),
-            Transform::from_xyz(setup.cam_center.x, setup.cam_center.y, 0.0),
+            Transform::from_xyz(aim.centre.x, aim.centre.y, 0.0),
+            projection(aim.scale),
             // Growable ctor: pane layer ids are unbounded and the const
             // `layer()` asserts < 64.
             RenderLayers::from_layers(&[*layer]),
             bevy::render::view::Msaa::Off,
-            PictureCamera,
+            slot,
             PictureCameraOf(*pane),
             Name::new("slide-picture:pane"),
         ));
@@ -769,70 +1288,62 @@ fn spawn_picture(
     // Copy the finished picture, so the sprites sample a COMPLETE frame —
     // and, being last frame's, one that already contains them. That lag is
     // what makes the nesting infinite instead of one level deep.
+    let blit = RenderLayers::from_layers(&[blit_layer(view.slot)]);
     commands.spawn((
         Camera2d,
         Camera {
-            order: BAND_BLIT,
+            order: slot_blit_order(view.slot),
             ..default()
         },
-        image_target(&picture.shown, cap),
-        RenderLayers::from_layers(&[BLIT_LAYER]),
+        image_target(&view.shown, cap),
+        blit.clone(),
         bevy::render::view::Msaa::Off,
-        PictureCamera,
+        slot,
         Name::new("slide-picture:blit"),
     ));
     commands.spawn((
         Sprite {
-            image: picture.scene.clone(),
+            image: view.scene.clone(),
             custom_size: Some(logical),
             ..default()
         },
         Transform::default(),
-        RenderLayers::from_layers(&[BLIT_LAYER]),
-        PictureSprite,
+        blit,
+        slot,
         Name::new("slide-picture:blit-quad"),
     ));
 
     // And show it inside each host, on that host's own render layer — so
-    // the host's camera draws it, INCLUDING the private one above. That is
-    // where the recursion comes from.
-    for host in hosts {
+    // the host's camera draws it, INCLUDING the private one above when the
+    // host is itself in the picture. That is where the recursion comes from.
+    for host in &view.hosts {
         let Ok((_, rect, layer, _, anchored, chrome)) = panes.get(*host) else {
             continue;
         };
         let Some((centre, shown)) =
-            host_placement(rect, anchored.is_some(), chrome, viewport, logical)
+            host_placement(rect, anchored.is_some(), chrome, live_vp, logical)
         else {
             continue;
         };
         commands.spawn((
             Sprite {
-                image: picture.shown.clone(),
+                image: view.shown.clone(),
                 custom_size: Some(shown),
                 ..default()
             },
             Transform::from_xyz(centre.x, centre.y, PICTURE_Z),
             RenderLayers::from_layers(&[layer.0]),
-            PictureSprite,
+            slot,
             PictureSpriteOf(*host),
             Name::new("slide-picture:in-slide"),
         ));
     }
 }
 
-/// Render layer for the full-screen dive overlay. Reserved like
-/// [`BLIT_LAYER`], and constructed the same way — `RenderLayers::layer()`
-/// panics above 63.
+/// Render layer for the full-screen dive overlay. Reserved like the blit
+/// layers (see [`reserved_layers`]), and constructed the same way —
+/// `RenderLayers::layer()` panics above 63.
 pub const DIVE_LAYER: usize = 4098;
-
-/// Render layer for the blit quad. Reserved in `PaneLayerAllocator` so no
-/// pane is ever allocated it.
-///
-/// Always construct it with `RenderLayers::from_layers` — the const
-/// `RenderLayers::layer()` asserts the id fits one inline u64 block and
-/// PANICS above 63. `jim_pane::camera` carries the same warning for pane
-/// layer ids; this one is 4097.
-pub const BLIT_LAYER: usize = 4097;
 
 #[cfg(test)]
 mod tests {
@@ -850,13 +1361,30 @@ mod tests {
     }
 
     /// `RenderLayers::layer()` is a const ctor that PANICS for ids that do
-    /// not fit one inline u64 block, and this one is 4097. It took the app
-    /// down once; `from_layers` is the only correct constructor here.
+    /// not fit one inline u64 block, and these are above 4096. It took the
+    /// app down once; `from_layers` is the only correct constructor here.
     #[test]
-    fn the_blit_layer_needs_the_growable_constructor() {
-        assert!(BLIT_LAYER >= 64, "below 64 the const ctor would be fine");
-        let layers = RenderLayers::from_layers(&[BLIT_LAYER]);
-        assert!(layers.intersects(&RenderLayers::from_layers(&[BLIT_LAYER])));
+    fn the_blit_layers_need_the_growable_constructor() {
+        for slot in 0..MAX_VIEWS {
+            let layer = blit_layer(slot);
+            assert!(layer >= 64, "below 64 the const ctor would be fine");
+            let layers = RenderLayers::from_layers(&[layer]);
+            assert!(layers.intersects(&RenderLayers::from_layers(&[layer])));
+        }
+    }
+
+    /// Two views sharing a blit layer would each copy the other's picture
+    /// over its own, and a reserved layer colliding with the dive overlay
+    /// would draw the blit quads over the window.
+    #[test]
+    fn every_reserved_layer_is_distinct() {
+        let layers: Vec<usize> = reserved_layers().collect();
+        let mut unique = layers.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), layers.len(), "{layers:?}");
+        assert_eq!(layers.len(), MAX_VIEWS + 1);
+        assert!(!layers.contains(&crate::cube::CUBE_LAYER));
     }
 
     #[test]
@@ -868,16 +1396,142 @@ mod tests {
         ])));
     }
 
-    /// The private cameras must never collide with the window's, and the
-    /// blit must run after every camera that contributes to the picture.
+    /// The private cameras must finish before the window consumes the
+    /// picture, and the blit must run after every contributing camera.
     #[test]
     fn the_camera_band_is_clear_of_the_window_cameras() {
-        assert!(BAND_START > 75_150, "above every pane camera");
-        assert!(
-            BAND_BLIT < crate::WHITEBOARD_OVERLAY_CAMERA_ORDER,
-            "below the overlays"
+        for slot in 0..MAX_VIEWS {
+            assert!(slot_order(slot) < slot_blit_order(slot));
+            assert!(
+                slot_blit_order(slot) < 0,
+                "before the first ordinary window camera"
+            );
+            assert!(
+                slot_order(slot) + 10_000 < slot_blit_order(slot),
+                "room for pane cameras before the private blit"
+            );
+            if slot > 0 {
+                assert!(
+                    slot_blit_order(slot - 1) < slot_order(slot),
+                    "views never share camera orders"
+                );
+            }
+        }
+    }
+
+    fn assert_near(a: Vec2, b: Vec2) {
+        assert!((a - b).length() < 1e-3, "{a:?} vs {b:?}");
+    }
+
+    /// A pane of another project exists in the world where the ACTIVE
+    /// project's viewport put it, but belongs in the picture where ITS
+    /// project's viewport would. The camera has to frame exactly the pane's
+    /// real world rect into exactly its slot in the picture, or the picture
+    /// shows the wrong part of the canvas at the wrong size.
+    #[test]
+    fn another_projects_pane_is_framed_where_its_own_view_puts_it() {
+        let logical = Vec2::new(1600.0, 1000.0);
+        let region = PaneCanvasRegion {
+            min: Vec2::ZERO,
+            max: logical,
+            active: true,
+        };
+        let live = PaneViewport {
+            origin: Vec2::new(250.0, 0.0),
+            pan: Vec2::new(-40.0, 10.0),
+            zoom: 1.0,
+        };
+        let view = PaneViewport {
+            origin: Vec2::new(250.0, 0.0),
+            pan: Vec2::new(60.0, 30.0),
+            zoom: 2.0,
+        };
+        let rect = PaneRect {
+            pos: Vec2::new(100.0, 100.0),
+            size: Vec2::new(200.0, 150.0),
+            z: 0.0,
+        };
+        let aim = aim_pane(&rect, false, &view, &live, logical, 1.0, region);
+
+        // Where it lands in the picture: the view's projection.
+        let slot = view.projected_rect(&rect);
+        assert_eq!(aim.setup.viewport.physical_position, slot.pos.as_uvec2());
+        assert_eq!(aim.setup.viewport.physical_size, slot.size.as_uvec2());
+
+        // What the camera sees: the pane's real world rect, exactly.
+        let world = live.projected_rect(&rect);
+        let seen = slot.size * aim.scale;
+        assert_near(seen, world.size);
+        let world_centre = to_world(world.pos + world.size * 0.5, logical);
+        assert_near(aim.centre, world_centre);
+    }
+
+    /// For the active project the two mappings are the same, so the camera
+    /// must be exactly the window's own — the recursive picture depends on
+    /// it lining up with what is on screen.
+    #[test]
+    fn the_active_projects_pane_is_framed_like_the_window() {
+        let logical = Vec2::new(1600.0, 1000.0);
+        let region = PaneCanvasRegion {
+            min: Vec2::new(250.0, 0.0),
+            max: logical,
+            active: true,
+        };
+        let live = PaneViewport {
+            origin: Vec2::new(250.0, 0.0),
+            pan: Vec2::new(-40.0, 10.0),
+            zoom: 1.5,
+        };
+        let rect = PaneRect {
+            pos: Vec2::new(-300.0, 100.0),
+            size: Vec2::new(400.0, 300.0),
+            z: 0.0,
+        };
+        let aim = aim_pane(&rect, false, &live, &live, logical, 2.0, region);
+        let window = pane_camera_setup_for(&live.projected_rect(&rect), logical, 2.0, Some(region));
+        assert_eq!(
+            aim.setup.viewport.physical_position,
+            window.viewport.physical_position
         );
-        assert!(BAND_BLIT > BAND_START);
+        assert_eq!(
+            aim.setup.viewport.physical_size,
+            window.viewport.physical_size
+        );
+        assert_near(aim.centre, window.cam_center);
+        assert!((aim.scale - 1.0).abs() < 1e-6);
+    }
+
+    /// A screen-anchored pane is window pixels in every project: no pan, no
+    /// zoom, whatever the view.
+    #[test]
+    fn an_anchored_pane_ignores_both_viewports() {
+        let logical = Vec2::new(1600.0, 1000.0);
+        let region = PaneCanvasRegion {
+            min: Vec2::ZERO,
+            max: logical,
+            active: true,
+        };
+        let live = PaneViewport::default();
+        let view = PaneViewport {
+            origin: Vec2::ZERO,
+            pan: Vec2::new(500.0, 500.0),
+            zoom: 3.0,
+        };
+        let rect = PaneRect {
+            pos: Vec2::new(10.0, 20.0),
+            size: Vec2::new(300.0, 40.0),
+            z: 0.0,
+        };
+        let aim = aim_pane(&rect, true, &view, &live, logical, 1.0, region);
+        assert_eq!(aim.scale, 1.0);
+        assert_near(aim.centre, to_world(rect.pos + rect.size * 0.5, logical));
+    }
+
+    #[test]
+    fn from_world_undoes_to_world() {
+        let logical = Vec2::new(1600.0, 1000.0);
+        let p = Vec2::new(123.0, 456.0);
+        assert_near(from_world(to_world(p, logical), logical), p);
     }
 
     /// A dive travels exactly one level: at `t = 1` the sampled window is

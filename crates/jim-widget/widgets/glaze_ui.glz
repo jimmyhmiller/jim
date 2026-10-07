@@ -1,0 +1,356 @@
+// glaze_ui.glz — the Glaze stylesheet behind the Glaze UI showcase widget.
+//
+// The palette tokens below are DEFAULTS. `glaze_ui.ft` prepends the same
+// token names resolved from the live editor theme before compiling this
+// sheet, and the first definition of a token wins — so the showcase follows
+// theme switches (including Style Lab's "Try Live"), and these values are
+// what you get if a theme is missing one. Everything else here — shape,
+// depth, gradients, shaders, breakpoints, component slots — is the sheet's
+// own, and editing this file hot-reloads the widget.
+
+token surface = oklch(0.21 0.012 255)
+token surf2   = oklch(0.26 0.012 255)
+token line    = oklch(0.45 0.012 255 / 0.5)
+token fg      = oklch(0.94 0.008 255)
+token muted   = oklch(0.66 0.012 255)
+token gold    = oklch(0.80 0.13 85)
+token teal    = oklch(0.76 0.10 195)
+token violet  = oklch(0.66 0.16 290)
+token green   = oklch(0.76 0.14 150)
+token rose    = oklch(0.67 0.19 18)
+
+// ---- functions: a spacing scale + a reusable shader circle ----
+fn space(n)     = n * 4px
+fn circle(p, r) = smoothstep(r, r - 0.04, length(p - vec2(0.5, 0.5)))
+
+style card {
+    fill   surface
+    radius space(4)        // 16px, from the spacing fn
+    border line 1px
+    pad    space(4.5)      // 18px
+    grow   1
+    min_width 0
+}
+style stat {
+    let r  = space(3)      // a local variable
+    fill   surf2
+    radius r
+    border line 1px
+    pad    space(4)
+    grow   1
+    min_width 0
+}
+
+// Interactive gradient CTA. `hover` is fed by the host every frame and
+// eased in the material runtime, without rebuilding the widget tree.
+style cta {
+    radius 10px
+    pad    12px 22px
+    overlay shader {
+        let base = mix(violet, gold, uv.x)
+        emit mix(base, gold, hover * 0.35)
+    }
+}
+// gradient header banner — violet→teal
+style banner {
+    radius 12px
+    pad    14px
+    overlay shader { emit mix(violet, teal, uv.x) }
+}
+
+// glassy card: opaque base + a soft top sheen
+style glass {
+    fill   surface
+    radius 16px
+    border line 1px
+    pad    18px
+    grow   1
+    min_width 0
+    overlay shader {
+        let d = length(uv - vec2(0.5, 0.0))
+        emit vec4(1.0, 1.0, 1.0, smoothstep(1.1, 0.0, d) * 0.10)
+    }
+}
+
+// RESPONSIVE: a row of cards that stacks into a column when the pane is
+// narrow. The breakpoint lives here, in Glaze — not in the widget's code.
+style row_resp {
+    direction row
+    when vw < 560 {
+        direction column
+    }
+}
+
+// ---- Phase 1b: the widened layer stack (things flat Style can't say) ----
+// multi-stop linear gradient fill (no shader authored — `gradient` is a layer)
+style g_linear {
+    radius 12px
+    height 72px
+    grow   1
+    min_width 0
+    pad    space(3)
+    gradient 90 violet teal gold
+}
+// angled gradient with explicit stop offsets
+style g_diag {
+    radius 12px
+    height 72px
+    grow   1
+    min_width 0
+    pad    space(3)
+    gradient 45 rose 0% gold 60% teal 100%
+}
+// per-side borders: a thick left accent + a thin bottom rule
+style edged {
+    fill   surf2
+    radius 0px
+    height 72px
+    grow   1
+    min_width 0
+    pad    space(3)
+    border_left   gold 4px
+    border_bottom teal 2px
+}
+// inner (inset) shadow over a solid fill — a "pressed well". Uses a light
+// teal fill so the dark inner shadow reads clearly.
+style insets {
+    fill   teal
+    radius 12px
+    height 72px
+    grow   1
+    min_width 0
+    pad    space(3)
+    inset_shadow oklch(0 0 0 / 0.85) 22px 0 3px
+}
+// outset drop shadow with spread, on a gold tile
+style raised {
+    fill   gold
+    radius 12px
+    height 72px
+    grow   1
+    min_width 0
+    pad    space(3)
+    shadow oklch(0 0 0 / 0.55) 20px 9px 2px
+}
+
+// ---- Phase 1c: a slot-styled component. `Bar` has two slots (track, fill);
+// Glaze styles each `part {}` independently. Here the fill is a 1b gradient
+// and the track carries an inset shadow — composing 1b + 1c.
+style progress {
+    track {
+        fill   surf2
+        radius 999px
+        inset_shadow oklch(0 0 0 / 0.6) 7px 0 1px
+    }
+    fill {
+        radius 999px
+        gradient 90 teal violet
+    }
+}
+style progress_gold {
+    track {
+        fill   surf2
+        radius 999px
+    }
+    fill {
+        fill   gold
+        radius 999px
+    }
+}
+
+// ---- Phase 1d: retrofit components, styled by slots + discrete state ----
+// `transition <state> <duration> [easing]` turns the discrete state change
+// into a continuous eased input: the knob slides and the track crossfades
+// muted→teal instead of snapping.
+style toggle {
+    track {
+        fill   surf2
+        radius 999px
+        transition checked 180ms ease_in_out
+        :checked { fill teal }   // discrete state: on → teal track
+    }
+    knob {
+        fill   fg
+        radius 999px
+    }
+}
+
+// ---- Animation showcase: same component, different transitions ----
+// a slow linear crossfade (deliberately exaggerated to read on screen)
+style toggle_slow {
+    track {
+        fill   surf2
+        radius 999px
+        transition checked 700ms linear
+        :checked { fill violet }
+    }
+    knob {
+        fill   fg
+        radius 999px
+    }
+}
+// the eased `checked` builtin reaching a SHADER: a soft halo centred on
+// the knob — its position AND intensity ride the same eased clock the
+// knob slides on, so the light travels with the dot. State animation on
+// the GPU, no per-frame style recompute.
+style toggle_glow {
+    track {
+        fill   surf2
+        radius 999px
+        transition checked 450ms ease_in_out
+        :checked { fill rose }
+        overlay shader {
+            let c = vec2(0.26 + 0.47 * checked, 0.5)
+            let p = (uv - c) * vec2(size.x / size.y, 1.0)
+            let halo = smoothstep(1.2, 0.2, length(p))
+            emit vec4(1.0, 0.78, 0.6, halo * checked * 0.85)
+        }
+    }
+    knob {
+        fill   fg
+        radius 999px
+    }
+}
+style tabbar {
+    strip {
+        fill   surf2
+        radius 8px
+    }
+    tab {
+        radius 6px
+        :selected { fill line }  // active tab gets a raised cell
+    }
+    indicator {
+        height 3px
+        radius 999px
+        gradient 90 teal violet  // a 1b gradient under the active tab
+    }
+}
+// ---- Phase 2: a net-new component (Slider) built on the slot system ----
+style slider {
+    track {
+        fill   surf2
+        radius 999px
+    }
+    range {
+        radius 999px
+        gradient 90 teal violet   // value-driven fill is a 1b gradient
+    }
+    thumb {
+        fill   fg
+        radius 999px
+        overlay shader {           // a soft glow on the handle (1b shader)
+            let d = length(uv - vec2(0.5, 0.5))
+            emit vec4(0.55, 0.85, 0.95, smoothstep(0.5, 0.1, d) * 0.5)
+        }
+    }
+}
+style notif {
+    surface {
+        fill   surf2
+        radius 8px
+        border teal 1px
+    }
+}
+style pop {
+    trigger {
+        fill   surf2
+        radius 6px
+        border line 1px
+    }
+    surface {
+        fill   surface
+        radius 10px
+        border line 1px
+    }
+}
+style modal {
+    scrim {
+        fill oklch(0 0 0 / 0.6)
+    }
+    panel {
+        fill   surface
+        radius 14px
+        border line 1px
+    }
+}
+style tip {
+    bubble {
+        fill   surf2
+        radius 6px
+        border line 1px
+    }
+}
+// ---- Phase 3: floating overlay component. The trigger is in-pane; the
+// menu renders on the overlay layer, escaping pane bounds. item:selected.
+style picker {
+    trigger {
+        fill   surf2
+        radius 6px
+        border line 1px
+    }
+    menu {
+        fill   surface
+        radius 8px
+        border line 1px
+    }
+    item {
+        radius 5px
+        :selected { fill line }
+    }
+}
+style stepper {
+    field {
+        fill   surf2
+        radius 6px
+        border line 1px
+    }
+    button {
+        fill   surf2
+        radius 6px
+        border teal 1px
+    }
+}
+style radiogroup {
+    dot {
+        radius 999px
+        gradient 135 teal violet   // the selected dot is a 1b gradient
+    }
+}
+style checkbox {
+    box {
+        fill   surf2
+        radius 5px
+        border line 1px
+        :checked { border teal 1px }
+    }
+    check {
+        radius 3px
+        gradient 135 teal violet   // the tick is a 1b gradient
+    }
+}
+style datatable {
+    panel {
+        fill   surface
+        radius 10px
+        border line 1px
+    }
+    header {
+        fill   surf2
+    }
+    zebra {
+        fill   surf2
+    }
+}
+
+// glowing circular avatar
+style avatar {
+    width  58px
+    height 58px
+    radius 999px
+    overlay shader {
+        let c    = circle(uv, 0.48)                       // reuse the fn
+        let glow = smoothstep(0.5, 0.0, length(uv - vec2(0.5, 0.5))) * 0.5
+        emit vec4(0.66 * (c + glow), 0.42 * (c + glow), 0.95 * (c + glow), c)
+    }
+}

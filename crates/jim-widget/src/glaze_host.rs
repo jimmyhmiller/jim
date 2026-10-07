@@ -277,14 +277,27 @@ fn slot_style(
 /// Register the `glaze_*` natives on a widget's funct VM. `sheet` is the
 /// worker's own stylesheet slot (see [`GlazeSheet`]).
 pub(crate) fn register(vm: &mut Funct, sheet: &GlazeSheet) {
-    // glaze_load(src) -> true. Compile literal Glaze source. Faults with
-    // the compiler's message on a parse error.
+    // glaze_load(src[, watch_path]) -> true. Compile literal Glaze source.
+    // Faults with the compiler's message on a parse error.
+    //
+    // `watch_path` is for a sheet the widget ASSEMBLES — e.g. a palette
+    // preamble built from the live theme, prepended to a `.glz` read off
+    // disk. The source is what compiles; the path is what the file watcher
+    // keys on, so editing that `.glz` still hot-reloads the widget. Without
+    // it an assembled sheet is invisible to the watcher.
     {
         let sheet = sheet.clone();
         vm.register_raw("glaze_load", move |_vm, args| {
             let src = arg_str(&args, 0, "glaze_load", "Glaze source")?;
             let prog = glaze::parse(&src).map_err(|e| Fault::new(format!("glaze_load: {e}")))?;
-            sheet.set(prog, None);
+            let watch = match args.get(1) {
+                Some(Value::Str(p)) if !p.is_empty() => {
+                    let path = PathBuf::from(expand_tilde(p));
+                    Some(std::fs::canonicalize(&path).unwrap_or(path))
+                }
+                _ => None,
+            };
+            sheet.set(prog, watch);
             Ok(Value::Bool(true))
         });
     }

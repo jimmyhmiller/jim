@@ -66,9 +66,11 @@ pub mod msgbus;
 pub mod playback;
 pub mod protocol;
 pub mod render;
+pub mod scroll_region;
 pub mod script_widget;
 pub mod subprocess;
 pub mod syntax;
+pub mod text_shape;
 pub mod system_font;
 pub mod text_fallback;
 pub mod vector;
@@ -107,12 +109,15 @@ pub fn request_main_loop_wakeup() {
     }
 }
 
-/// Per-widget-pane vertical scroll state. Updated by
+/// Per-widget-pane scroll state, both axes. Updated by
 /// `handle_widget_wheel` when the user scrolls over the pane; applied
-/// to `PaneChrome.content_root.transform.y` by
-/// `apply_widget_scroll`. The two render paths (`rerender_widgets`
-/// here and `apply_latest_frames` in script_widget) write `max_y`
-/// after they know how tall the content drew.
+/// to `PaneChrome.content_root`'s transform by `apply_widget_scroll`.
+/// The render paths (`rerender_widgets` here and `apply_latest_frames`
+/// in script_widget) write `max_y` / `max_x` after they know how big
+/// the content drew.
+///
+/// Hit-testing works in content-local (unscrolled) coordinates, so every
+/// cursor → content conversion adds [`WidgetScroll::offset`].
 #[derive(Component, Default, Debug)]
 pub struct WidgetScroll {
     /// Pixels scrolled down from the top. Always non-negative.
@@ -120,6 +125,47 @@ pub struct WidgetScroll {
     /// `content_height - viewport_height`, clamped ≥ 0. When 0 the
     /// content fits and no scrolling is allowed.
     pub max_y: f32,
+    /// Pixels scrolled right from the left edge. Always non-negative.
+    pub x: f32,
+    /// `content_width - viewport_width`, clamped ≥ 0. Non-zero only when
+    /// something laid out wider than the pane (e.g. a table with fixed
+    /// column widths), which is what makes the pane scroll sideways.
+    pub max_x: f32,
+}
+
+impl WidgetScroll {
+    /// The scroll offset as a content-space vector (x right, y down).
+    pub fn offset(&self) -> Vec2 {
+        Vec2::new(self.x, self.y)
+    }
+
+    /// Record a new content extent and clamp the current offset into it,
+    /// so a shrinking result (or a wider pane) can't strand the view past
+    /// the content's edge.
+    pub fn set_extent(&mut self, consumed: Vec2, viewport: Vec2) {
+        let max_y = (consumed.y - viewport.y).max(0.0);
+        // Ignore sub-pixel overflow (rounding in layout) so a pane that
+        // fits doesn't pick up a pointless 1px sideways wobble.
+        let over_x = consumed.x - viewport.x;
+        let max_x = if over_x > 1.0 { over_x } else { 0.0 };
+        if (self.max_y - max_y).abs() > 0.1 {
+            self.max_y = max_y;
+        }
+        if (self.max_x - max_x).abs() > 0.1 {
+            self.max_x = max_x;
+        }
+        if self.y > self.max_y {
+            self.y = self.max_y;
+        }
+        if self.x > self.max_x {
+            self.x = self.max_x;
+        }
+    }
+}
+
+/// [`WidgetScroll::offset`] for an optional component (zero when absent).
+pub fn scroll_offset(scroll: Option<&WidgetScroll>) -> Vec2 {
+    scroll.map(WidgetScroll::offset).unwrap_or(Vec2::ZERO)
 }
 
 use protocol::{CanvasAnchor, CanvasItem, Element, HostEvent, ImageRef, Weight, WidgetMsg};
@@ -209,8 +255,13 @@ pub struct WidgetHover {
 }
 
 /// Hit-test geometry collected while rendering the current frame.
-#[derive(Component, Default)]
+#[derive(Component, Default, Clone)]
 pub struct WidgetTargets {
+    /// The last layout could not measure some text because its font was not
+    /// loaded yet (see `text_shape::ShapedMeasure::incomplete`). The host
+    /// must lay the pane out again rather than keep boxes sized from
+    /// nothing.
+    pub layout_incomplete: bool,
     pub clicks: Vec<ClickTarget>,
     pub links: Vec<LinkTarget>,
     /// Selectable text runs (from `Text`/`Table` with `selectable: true`).
@@ -257,6 +308,48 @@ pub struct WidgetTargets {
     /// pane menu; picking an item routes a `Click {id}` back to the widget.
     /// `rect` is content_root-local (y-down), pre-scroll (add `scroll.y`).
     pub context_menus: Vec<ContextTarget>,
+    /// Overflowing `Element::Scroll` regions collected this render. Each
+    /// holds its own content's targets in REGION-local space; the host
+    /// merges them into the lists above at the region's scroll offset (see
+    /// `scroll_region::reconcile_scroll_regions`).
+    pub scroll_regions: Vec<ScrollRegionTarget>,
+}
+
+impl WidgetTargets {
+    /// For hosts that draw widget content outside a pane — overlays, the
+    /// command palette — which have no render layer or camera to give a
+    /// scroll region. An overflowing region there is reported, not quietly
+    /// shown wrong: its content draws unclipped at scroll 0.
+    pub fn reject_scroll_regions(&mut self, host: &str) {
+        if !self.scroll_regions.is_empty() {
+            eprintln!(
+                "[widget] {host} cannot show a scrolling region ({} overflowing); its content \
+                 is drawn unclipped. Give the region room to fit, or move it into a pane.",
+                self.scroll_regions.len()
+            );
+            self.scroll_regions.clear();
+        }
+    }
+}
+
+/// An overflowing `Element::Scroll` collected during render. See
+/// [`WidgetTargets::scroll_regions`].
+#[derive(Clone)]
+pub struct ScrollRegionTarget {
+    /// Identity across re-renders: the element's `id`, else `#<order>`.
+    pub key: String,
+    /// The box, content_root-local (y-down), pre-scroll.
+    pub rect: Rect,
+    /// Height of the content inside it (≥ `rect` height).
+    pub content_h: f32,
+    /// Render depth of the region element.
+    pub z: f32,
+    /// Parent of the region's rendered content (a child of `content_root`).
+    pub root: Entity,
+    /// What the region's texture clears to: its background.
+    pub ground: Color,
+    /// The content's hit targets, region-local and unscrolled.
+    pub targets: WidgetTargets,
 }
 
 /// A right-click context-menu region collected during render: the row's
@@ -295,6 +388,24 @@ pub struct HoverWash {
     /// no re-render on hover. Dropping it here instead would make every
     /// hover of a selected row re-render the pane and flash its text.
     pub selected: bool,
+    /// Set for a row inside a scroll region: `rect` is then where the row
+    /// SHOWS in the pane (for hit-testing), and the wash itself is painted
+    /// inside the region, where the row really is — behind its text and
+    /// scrolling with it. Painted in the pane instead, it would sit on top
+    /// of the region's texture and tint the row's text.
+    pub region: Option<RegionWash>,
+}
+
+/// Where a scroll-region row's wash is painted. See [`HoverWash::region`].
+#[derive(Clone, Debug)]
+pub struct RegionWash {
+    /// The region's content root.
+    pub root: Entity,
+    /// The region's render layer.
+    pub layer: usize,
+    /// The row in region-local space, and its region-local depth.
+    pub rect: Rect,
+    pub z: f32,
 }
 
 /// A nested `Element::Canvas` occurrence collected during a flow render.
@@ -543,12 +654,14 @@ pub struct SelectMenuHits {
 /// `ClickTarget.rect` and `PaneContentPressed.local_pt`. `rect.min` is
 /// the text's top-left (the glyph origin), so character offsets measure
 /// left-to-right from there.
+#[derive(Clone)]
 pub struct TextSpan {
     pub text: String,
     pub rect: Rect,
     pub font_size: f32,
 }
 
+#[derive(Clone)]
 pub struct ClickTarget {
     pub id: String,
     /// What HostEvent to emit when this rect is clicked. Plain buttons
@@ -583,6 +696,7 @@ pub enum ClickKind {
     InputFocus,
 }
 
+#[derive(Clone)]
 pub struct LinkTarget {
     pub url: String,
     pub rect: Rect,
@@ -770,8 +884,7 @@ fn begin_text_selection(
         let Ok((targets, scroll)) = widgets.get(ev.pane) else {
             continue;
         };
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-        let hit = ev.local_pt + Vec2::new(0.0, scroll_y);
+        let hit = ev.local_pt + scroll_offset(scroll);
         let span = targets.spans.iter().find(|s| s.rect.contains(hit));
         // One selection at a time, app-wide.
         for e in &existing {
@@ -807,8 +920,7 @@ fn update_text_selection(
         }
         // Match the press path: spans live in content-local (unscrolled)
         // coords, so fold the pane's scroll back into the drag point.
-        let scroll_y = scrolls.get(ev.pane).map(|s| s.y).unwrap_or(0.0);
-        let hit = ev.local_pt + Vec2::new(0.0, scroll_y);
+        let hit = ev.local_pt + scroll_offset(scrolls.get(ev.pane).ok());
         sel.focus = point_to_char(&sel.text, sel.rect, sel.font_size, &metrics, hit);
     }
 }
@@ -866,8 +978,7 @@ fn begin_slider_drag(
         let Ok((targets, io, sw, scroll)) = widgets.get(ev.pane) else {
             continue;
         };
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-        let hit = ev.local_pt + Vec2::new(0.0, scroll_y);
+        let hit = ev.local_pt + scroll_offset(scroll);
         let Some(t) = targets.sliders.iter().find(|s| s.rect.contains(hit)) else {
             continue;
         };
@@ -974,14 +1085,14 @@ fn render_select_overlay(
     };
     let (win_w, win_h) = (window.width(), window.height());
     let cursor_pos = window.cursor_position();
-    let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
+    let scroll_off = scroll_offset(scroll);
     let to_world = |p: Vec2| Vec2::new(p.x - win_w * 0.5, win_h * 0.5 - p.y);
 
     // content-local (unscrolled) → visual canvas → window.
     let content_origin =
         rect.pos + Vec2::new(jim_pane::MARGIN, jim_pane::TITLE_H + jim_pane::MARGIN);
     let local_to_window = |local: Vec2| {
-        viewport.canvas_to_window(content_origin + Vec2::new(local.x, local.y - scroll_y))
+        viewport.canvas_to_window(content_origin + local - scroll_off)
     };
     // trigger window rect (so the dismiss handler can ignore the toggling click)
     let tr_min = local_to_window(target.anchor.min);
@@ -1051,7 +1162,7 @@ fn render_select_overlay(
         content_size: Vec2::new(menu_w, menu_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
-        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+        ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -1364,6 +1475,7 @@ fn render_dialog_overlay(
     panes: Query<(Entity, &WidgetTargets), With<jim_pane::PaneTag>>,
     existing: Query<Entity, With<WidgetDialogRoot>>,
     mut hits: ResMut<WidgetOverlayHits>,
+    mut shaper: text_shape::TextShaper,
 ) {
     for e in &existing {
         commands.entity(e).try_despawn();
@@ -1406,7 +1518,7 @@ fn render_dialog_overlay(
             content_size: Vec2::new(win_w, win_h),
             palette: render::WidgetPalette::from_theme(&theme),
             theme: theme.clone(),
-            ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+            ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
             fonts: fonts.clone(),
             focused_input: None,
             caret_visible: false,
@@ -1452,7 +1564,7 @@ fn render_dialog_overlay(
         content_size: Vec2::new(panel_w, win_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
-        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+        ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -1494,12 +1606,19 @@ fn render_dialog_overlay(
     let consumed = render::render(
         &mut commands,
         &pctx,
+        &mut shaper,
         &mut body_targets,
         &content,
         Vec2::splat(pad),
         panel_w - 2.0 * pad,
         0.02,
     );
+    // The overlay is rebuilt every time this runs; an unmeasured font only
+    // needs the loop to run again.
+    if body_targets.layout_incomplete {
+        request_main_loop_wakeup();
+    }
+    body_targets.reject_scroll_regions("a widget dialog");
     let panel_h = consumed.y + 2.0 * pad;
 
     // Center the panel; the children move with the root transform.
@@ -1631,6 +1750,7 @@ fn render_popover_overlay(
     panes: Query<(&PaneRect, &WidgetTargets, Option<&WidgetScroll>)>,
     existing: Query<Entity, With<WidgetPopoverRoot>>,
     mut hits: ResMut<PopoverHits>,
+    mut shaper: text_shape::TextShaper,
 ) {
     for e in &existing {
         commands.entity(e).try_despawn();
@@ -1667,12 +1787,12 @@ fn render_popover_overlay(
         return;
     };
     let (win_w, win_h) = (window.width(), window.height());
-    let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
+    let scroll_off = scroll_offset(scroll);
     let to_world = |p: Vec2| Vec2::new(p.x - win_w * 0.5, win_h * 0.5 - p.y);
     let content_origin =
         rect.pos + Vec2::new(jim_pane::MARGIN, jim_pane::TITLE_H + jim_pane::MARGIN);
     let local_to_window =
-        |l: Vec2| viewport.canvas_to_window(content_origin + Vec2::new(l.x, l.y - scroll_y));
+        |l: Vec2| viewport.canvas_to_window(content_origin + l - scroll_off);
     hits.trigger_rect = Rect::from_corners(
         local_to_window(target.anchor.min),
         local_to_window(target.anchor.max),
@@ -1700,7 +1820,7 @@ fn render_popover_overlay(
         content_size: Vec2::new(width, win_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
-        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+        ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -1716,12 +1836,18 @@ fn render_popover_overlay(
     let consumed = render::render(
         &mut commands,
         &pctx,
+        &mut shaper,
         &mut body_targets,
         &content,
         Vec2::splat(pad),
         width - 2.0 * pad,
         0.02,
     );
+    // Rebuilt every run, like the dialog overlay.
+    if body_targets.layout_incomplete {
+        request_main_loop_wakeup();
+    }
+    body_targets.reject_scroll_regions("a widget popover");
     let surf_h = consumed.y + 2.0 * pad;
     if let Some(plan) = target.style.as_ref().and_then(|s| s.surface.as_ref()) {
         render::paint_style_background(
@@ -1939,7 +2065,7 @@ fn render_toast_overlay(
             content_size: Vec2::new(toast_w, th),
             palette: render::WidgetPalette::from_theme(&theme),
             theme: theme.clone(),
-            ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+            ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
             fonts: fonts.clone(),
             focused_input: None,
             caret_visible: false,
@@ -2139,8 +2265,7 @@ fn update_tooltip_hover(
     let Ok((_, rect, _, targets, scroll)) = panes.get(pane) else {
         return;
     };
-    let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-    let local = jim_pane::pt_to_content_local(pt_canvas, rect) + Vec2::new(0.0, scroll_y);
+    let local = jim_pane::pt_to_content_local(pt_canvas, rect) + scroll_offset(scroll);
     if let Some(t) = targets.tooltips.iter().find(|t| t.anchor.contains(local)) {
         active.0 = Some(ActiveTip {
             pane,
@@ -2183,12 +2308,12 @@ fn render_tooltip_overlay(
         return;
     };
     let (win_w, win_h) = (window.width(), window.height());
-    let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
+    let scroll_off = scroll_offset(scroll);
     let to_world = |p: Vec2| Vec2::new(p.x - win_w * 0.5, win_h * 0.5 - p.y);
     let content_origin =
         rect.pos + Vec2::new(jim_pane::MARGIN, jim_pane::TITLE_H + jim_pane::MARGIN);
     let bubble_top_window = viewport.canvas_to_window(
-        content_origin + Vec2::new(tip.anchor.min.x, tip.anchor.max.y - scroll_y + 6.0),
+        content_origin + Vec2::new(tip.anchor.min.x, tip.anchor.max.y + 6.0) - scroll_off,
     );
     let anchor_world = to_world(bubble_top_window);
 
@@ -2214,7 +2339,7 @@ fn render_tooltip_overlay(
         content_size: Vec2::new(bubble_w, bubble_h),
         palette: render::WidgetPalette::from_theme(&theme),
         theme: theme.clone(),
-        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+        ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
         fonts: fonts.clone(),
         focused_input: None,
         caret_visible: false,
@@ -2398,6 +2523,16 @@ impl Plugin for WidgetPlugin {
             .init_resource::<ActiveTooltip>()
             .init_resource::<WidgetOverlayHits>()
             .init_resource::<WidgetOpenPopover>()
+            .init_resource::<scroll_region::ScrollRegions>()
+            // Region cameras track their content's final world position:
+            // after propagation, before frusta are computed from them.
+            .add_systems(
+                PostUpdate,
+                scroll_region::sync_region_cameras
+                    .after(bevy::transform::TransformSystems::Propagate)
+                    .before(bevy::camera::visibility::VisibilitySystems::UpdateFrusta),
+            )
+            .add_systems(Last, scroll_region::forget_dead_region_panes)
             .init_resource::<PopoverHits>()
             .init_resource::<ToastHits>()
             .init_resource::<anim::WidgetAnim>()
@@ -2529,7 +2664,7 @@ fn update_widget_hover(
         // Find this pane's rect (we already have it in `candidates`,
         // but cheaper to re-query than threading it through).
         let pane_rect = candidates.iter().find(|(e, _)| *e == pane).map(|(_, r)| *r);
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
+        let scroll_off = scroll_offset(scroll);
         let new_id: Option<String> = match (topmost, pane_rect, cursor) {
             (Some((pt, top)), Some(rect), Some(_)) if top == pane => {
                 // Click rects are content-local (unscrolled); add the scroll
@@ -2544,7 +2679,7 @@ fn update_widget_hover(
                 // which is why clicking was right while hovering was not.
                 let title_h = jim_pane::override_title_h(chrome_ov);
                 let local =
-                    jim_pane::pt_to_content_local_th(pt, &rect, title_h) + Vec2::new(0.0, scroll_y);
+                    jim_pane::pt_to_content_local_th(pt, &rect, title_h) + scroll_off;
                 if let Ok(t) = targets.get(pane) {
                     // An I-beam over an embedded editor portal. Presses there
                     // are owned by the real editor (not a click target), so the
@@ -2598,7 +2733,27 @@ fn update_widget_hover(
                     pane_targets.and_then(|t| t.hover_washes.iter().find(|w| w.id == id))
                 })
                 .filter(|w| !w.selected);
-            if let (Some(w), Ok(chrome)) = (wash, chromes.get(pane)) {
+            if let (Some(w), Some(region)) = (wash, wash.and_then(|w| w.region.as_ref())) {
+                // A row in a scroll region: paint the wash in the region, on
+                // its layer, where the row is — its camera draws it behind
+                // the row's text and scrolls it along. The region root is
+                // respawned by every re-render, taking this wash with it;
+                // the next cursor move paints it again.
+                let ent = commands
+                    .spawn((
+                        ChildOf(region.root),
+                        Sprite {
+                            color: w.color,
+                            custom_size: Some(region.rect.size()),
+                            ..default()
+                        },
+                        Anchor::TOP_LEFT,
+                        Transform::from_xyz(region.rect.min.x, -region.rect.min.y, region.z + 0.001),
+                        bevy::camera::visibility::RenderLayers::from_layers(&[region.layer]),
+                    ))
+                    .id();
+                hover.hover_overlay = Some(ent);
+            } else if let (Some(w), Ok(chrome)) = (wash, chromes.get(pane)) {
                 // A plain blended Sprite, NOT an SDF panel: the wash sits ON
                 // TOP of the row's own fills, so it must genuinely blend —
                 // the SDF material now renders opaque and flattens against a
@@ -2707,8 +2862,8 @@ fn forward_pinch_to_widgets(
 
 /// Read mouse wheel events, route to whichever widget pane (any kind:
 /// the protocol-driven `widget` or the `script_widget`) is topmost
-/// under the cursor, and update its `WidgetScroll.y` clamped to
-/// `[0, max_y]`. Lines are converted to pixels via `LINE_PX` since we
+/// under the cursor, and update its `WidgetScroll` (y, or x for a
+/// sideways swipe / Shift+wheel) clamped to its extent. Lines are converted to pixels via `LINE_PX` since we
 /// don't carry per-widget font metrics here.
 fn handle_widget_wheel(
     mut wheel: MessageReader<bevy::input::mouse::MouseWheel>,
@@ -2723,11 +2878,12 @@ fn handle_widget_wheel(
             &mut WidgetScroll,
             &jim_pane::PaneKindMarker,
             &jim_pane::PaneRect,
-            Option<&WidgetTargets>,
+            Option<&mut WidgetTargets>,
             Option<&crate::script_widget::ScriptWidget>,
         ),
         With<jim_pane::PaneTag>,
     >,
+    mut regions: scroll_region::ScrollRegionHost,
 ) {
     // Cmd+scroll is canvas pan in the host; don't double-scroll widgets.
     if keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight) {
@@ -2766,7 +2922,7 @@ fn handle_widget_wheel(
         return;
     };
 
-    if let Ok((_, mut scroll, kind, rect, targets, sw)) = widgets.get_mut(target) {
+    if let Ok((_, mut scroll, kind, rect, mut targets, sw)) = widgets.get_mut(target) {
         if kind.0 != PANE_KIND && kind.0 != script_widget::PANE_KIND {
             return;
         }
@@ -2774,8 +2930,8 @@ fn handle_widget_wheel(
         // editor's own (overflowing) content — not the widget page. Critical
         // for a read-only dump, which has no caret to drive caret-scroll.
         let canvas_pt = viewport.window_to_canvas(pt);
-        let doc_pt = jim_pane::pt_to_content_local(canvas_pt, rect) + Vec2::new(0.0, scroll.y);
-        if let (Some(targets), Some(sw)) = (targets, sw) {
+        let doc_pt = jim_pane::pt_to_content_local(canvas_pt, rect) + scroll.offset();
+        if let (Some(targets), Some(sw)) = (targets.as_deref(), sw) {
             if let Some(t) = targets
                 .editor_portals
                 .iter()
@@ -2786,6 +2942,17 @@ fn handle_widget_wheel(
                         editor: entry.container,
                         dy: dy_px,
                     });
+                    return;
+                }
+            }
+        }
+        // Over an overflowing `Element::Scroll`, a vertical wheel scrolls
+        // that region and nothing else — not the page behind it, and not
+        // the worker's `on_wheel`, which would otherwise act on the same
+        // gesture twice.
+        if dy_px != 0.0 && dy_px.abs() >= dx_px.abs() {
+            if let Some(targets) = targets.as_deref_mut() {
+                if regions.scroll_at(target, doc_pt, -dy_px, targets) {
                     return;
                 }
             }
@@ -2803,14 +2970,30 @@ fn handle_widget_wheel(
                 dy: dy_px,
             });
         }
-        let new_y = (scroll.y - dy_px).clamp(0.0, scroll.max_y);
+        // Horizontal: a sideways trackpad swipe, or Shift + a vertical
+        // wheel (the usual mouse convention). Axis-lock the trackpad case so
+        // the small sideways drift of an ordinary vertical scroll doesn't
+        // nudge a wide pane left and right.
+        let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+        let (dx_eff, dy_eff) = if shift && dx_px == 0.0 {
+            (dy_px, 0.0)
+        } else if dx_px.abs() > dy_px.abs() {
+            (dx_px, 0.0)
+        } else {
+            (0.0, dy_px)
+        };
+        let new_y = (scroll.y - dy_eff).clamp(0.0, scroll.max_y);
         if (new_y - scroll.y).abs() > 0.001 {
             scroll.y = new_y;
+        }
+        let new_x = (scroll.x - dx_eff).clamp(0.0, scroll.max_x);
+        if (new_x - scroll.x).abs() > 0.001 {
+            scroll.x = new_x;
         }
     }
 }
 
-/// Apply the per-pane scroll offset to `content_root.transform.y` and
+/// Apply the per-pane scroll offset to `content_root`'s transform and
 /// hide any direct children whose translation falls into the title-bar
 /// region after the shift. Without the visibility pass, scrolled
 /// content paints over the pane title; the per-pane camera viewport
@@ -2853,6 +3036,12 @@ fn apply_widget_scroll(
             let want = -(jim_pane::override_title_h(chrome_ov) + MARGIN) + scroll.y;
             if t.translation.y != want {
                 t.translation.y = want;
+            }
+            // Horizontal: content_root sits at MARGIN (see
+            // `jim_pane::spawn_pane`); scrolling right slides it left.
+            let want_x = MARGIN - scroll.x;
+            if t.translation.x != want_x {
+                t.translation.x = want_x;
             }
         }
         // Clipping (hiding children that scroll into the title bar)
@@ -3003,6 +3192,7 @@ fn clip_widget_sprites(
             continue;
         };
         let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
+        let scroll_x = scroll.map(|s| s.x).unwrap_or(0.0);
         let content_w = (rect.size.x - 2.0 * MARGIN).max(0.0);
         // The pane's real header height — a docked pane's is slim, and
         // assuming `TITLE_H` makes its content box short by the
@@ -3029,7 +3219,13 @@ fn clip_widget_sprites(
             // content_root is translated up by `scroll_y` (apply_widget_scroll),
             // but `offset` is local to content_root, so subtract scroll here.
             let eff_top = -offset.y - scroll_y;
-            let left_offset = offset.x.max(0.0);
+            // Likewise horizontally: content_root slides left by `scroll_x`,
+            // so measure the sprite's left edge against the VISIBLE left
+            // edge. It goes negative once the sprite starts off-screen to
+            // the left (a table's header row after scrolling right), and
+            // the sprite then has that much MORE room to reach the right
+            // edge — clamping it at 0 cut such rows short by the scroll.
+            let left_offset = offset.x - scroll_x;
             let avail_w = (content_w - left_offset).max(0.0);
             let avail_h = (content_h - eff_top).max(0.0);
 
@@ -3241,6 +3437,14 @@ pub fn spawn_widget_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A Finder/Dock-launched .app inherits launchd's minimal PATH, which
+    // holds neither our own bundled sibling binaries (`glaze_ui`, …) nor
+    // /opt/homebrew/bin. Without this a widget whose command is a bare name
+    // dies with "command not found" and respawns forever. Same fix as
+    // `subprocess::spawn` uses for a widget's own `proc_spawn`.
+    if let Some(path) = crate::subprocess::augmented_path() {
+        command.env("PATH", path);
+    }
     if let Some(p) = cwd {
         command.current_dir(p);
     }
@@ -3459,8 +3663,8 @@ fn tick_widget_io(
 /// in edit mode (the overlay owns the content_root subtree).
 fn rerender_widgets(
     mut commands: Commands,
-    pane_font: Res<PaneFont>,
-    metrics: Res<PaneFontMetrics>,
+    // Grouped so the system stays under Bevy's 16-param limit.
+    (pane_font, metrics): (Res<PaneFont>, Res<PaneFontMetrics>),
     theme: Res<jim_style::Theme>,
     themes: Res<jim_style::ProjectThemes>,
     fonts: Res<jim_style::FontRegistry>,
@@ -3484,6 +3688,8 @@ fn rerender_widgets(
         Option<&jim_pane::PaneProject>,
     )>,
     children_q: Query<&Children>,
+    mut shaper: text_shape::TextShaper,
+    mut regions: scroll_region::ScrollRegionHost,
 ) {
     // Per-project theming: each widget renders in its OWN project's theme
     // (so the cube overview shows every project faithfully), falling back
@@ -3603,7 +3809,7 @@ fn rerender_widgets(
                 content_size,
                 palette: palette.clone(),
                 theme: w_theme.clone(),
-                ground: Color::LinearRgba(w_theme.color(jim_style::tokens::PANE_BG)),
+                ground: std::cell::Cell::new(Color::LinearRgba(w_theme.color(jim_style::tokens::PANE_BG))),
                 fonts: fonts.clone(),
                 focused_input: input_focus.cloned(),
                 caret_visible,
@@ -3613,11 +3819,26 @@ fn rerender_widgets(
             let consumed = render::render(
                 &mut commands,
                 &ctx,
+                &mut shaper,
                 &mut targets,
                 &frame_clone,
                 Vec2::ZERO,
                 content_size.x,
                 0.0,
+            );
+            // A font not loaded yet left some text unmeasured: lay this pane
+            // out again next frame instead of keeping zero-sized boxes.
+            if targets.layout_incomplete {
+                render_state.force_render = true;
+                request_main_loop_wakeup();
+            }
+            regions.reconcile(
+                &mut commands,
+                &mut images,
+                pane,
+                root.0,
+                &mut targets,
+                shaper.scale_factor(),
             );
             anim_store.apply_requests(pane, &targets.anims);
             // Nested Canvas regions: drawn after the flow walk, here where
@@ -3638,13 +3859,7 @@ fn rerender_widgets(
                     Color::from(w_theme.color(jim_style::tokens::PANE_BG)),
                 );
             }
-            let new_max = (consumed.y - content_size.y).max(0.0);
-            if (scroll.max_y - new_max).abs() > 0.1 {
-                scroll.max_y = new_max;
-            }
-            if scroll.y > new_max {
-                scroll.y = new_max;
-            }
+            scroll.set_extent(consumed, content_size);
         }
 
         render_state.last_size = content_size;
@@ -4036,7 +4251,7 @@ fn update_widget_hot_zones(
 ) {
     for (rect, targets, scroll, sw, mut zones) in &mut q {
         zones.clear();
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
+        let scroll_off = scroll_offset(scroll);
         let content_size = Vec2::new(
             (rect.size.x - 2.0 * MARGIN).max(0.0),
             (rect.size.y - TITLE_H - 2.0 * MARGIN).max(0.0),
@@ -4044,8 +4259,8 @@ fn update_widget_hot_zones(
         let visible = Rect::from_corners(Vec2::ZERO, content_size);
         for c in &targets.clicks {
             let visual = Rect::from_corners(
-                Vec2::new(c.rect.min.x, c.rect.min.y - scroll_y),
-                Vec2::new(c.rect.max.x, c.rect.max.y - scroll_y),
+                c.rect.min - scroll_off,
+                c.rect.max - scroll_off,
             );
             let clipped = visual.intersect(visible);
             if !clipped.is_empty() {
@@ -4054,8 +4269,8 @@ fn update_widget_hot_zones(
         }
         for l in &targets.links {
             let visual = Rect::from_corners(
-                Vec2::new(l.rect.min.x, l.rect.min.y - scroll_y),
-                Vec2::new(l.rect.max.x, l.rect.max.y - scroll_y),
+                l.rect.min - scroll_off,
+                l.rect.max - scroll_off,
             );
             let clipped = visual.intersect(visible);
             if !clipped.is_empty() {
@@ -4116,8 +4331,7 @@ fn handle_widget_press(
         // scroll offset to the hit-test point so it lands on the rect
         // that's currently under the cursor, not the one that USED to
         // be there at scroll=0.
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-        let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_y);
+        let hit_pt = ev.local_pt + scroll_offset(scroll);
 
         // First: normal widget-frame click handling (buttons, links).
         let click = targets.clicks.iter().find(|t| t.rect.contains(hit_pt));
@@ -4788,5 +5002,68 @@ fn error_frame(msg: &str) -> Element {
             },
         ],
         style: None,
+    }
+}
+
+#[cfg(test)]
+mod clip_tests {
+    use super::*;
+    use bevy::ecs::system::RunSystemOnce;
+
+    /// Width `clip_widget_sprites` leaves on a full-width row sprite (a
+    /// table header) in a 1000px-wide pane, after scrolling right by
+    /// `scroll_x`. The row starts 22px into the content and is 2000px long.
+    fn clipped_row_width(scroll_x: f32) -> f32 {
+        let mut world = World::new();
+        world.insert_resource(WidgetClipDirty(true));
+        let root = world.spawn((Transform::default(), Visibility::default())).id();
+        let row = world
+            .spawn((
+                ChildOf(root),
+                Sprite {
+                    custom_size: Some(Vec2::new(2000.0, 20.0)),
+                    ..default()
+                },
+                bevy::sprite::Anchor::TOP_LEFT,
+                Transform::from_xyz(22.0, -50.0, 0.0),
+                Visibility::default(),
+            ))
+            .id();
+        let pane = world
+            .spawn((
+                PaneKindMarker(PANE_KIND),
+                PaneRect {
+                    pos: Vec2::ZERO,
+                    size: Vec2::new(1000.0 + 2.0 * MARGIN, 600.0),
+                    z: 0.0,
+                },
+                WidgetContentRoot(root),
+                WidgetScroll::default(),
+            ))
+            .id();
+        // First pass at scroll 0, as right after a render: records the
+        // sprite's intended size and clamps it to the pane.
+        world.run_system_once(clip_widget_sprites).unwrap();
+        if scroll_x != 0.0 {
+            let mut scroll = world.get_mut::<WidgetScroll>(pane).unwrap();
+            scroll.max_x = 1500.0;
+            scroll.x = scroll_x;
+            world.run_system_once(clip_widget_sprites).unwrap();
+        }
+        world.get::<Sprite>(row).unwrap().custom_size.unwrap().x
+    }
+
+    #[test]
+    fn row_clamps_to_pane_edge_unscrolled() {
+        assert!((clipped_row_width(0.0) - (1000.0 - 22.0)).abs() < 0.5);
+    }
+
+    /// After scrolling right, the row starts off-screen to the left and must
+    /// still reach the pane's right edge — not stop short by the scroll.
+    #[test]
+    fn row_reaches_pane_edge_after_horizontal_scroll() {
+        let w = clipped_row_width(500.0);
+        let want = 1000.0 + (500.0 - 22.0);
+        assert!((w - want).abs() < 0.5, "row width {w}, want {want}");
     }
 }

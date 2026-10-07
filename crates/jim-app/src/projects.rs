@@ -238,6 +238,10 @@ struct PersistedState {
     active_workspace: Option<u64>,
     #[serde(default)]
     next_workspace_id: u64,
+    /// Soft-deleted workspaces, oldest first. See
+    /// [`Projects::delete_workspace`].
+    #[serde(default)]
+    deleted_workspaces: Vec<WorkspaceData>,
     #[serde(default)]
     sidebar_width: Option<f32>,
     /// Legacy field — populated when reading old saves; never written.
@@ -327,6 +331,12 @@ pub struct Projects {
     /// empty only for the placeholder resource inserted before Startup,
     /// so every accessor tolerates that.
     pub workspaces: Vec<WorkspaceData>,
+    /// Soft-deleted workspaces, oldest first. Kept whole — name, parked
+    /// set, last project — so a restore brings back exactly what was
+    /// deleted. Kept OUT of `workspaces` so nothing that walks the swipe
+    /// order (swiping, the header bars, cycling, lookups by name) can land
+    /// on one without having to remember to filter it.
+    pub deleted_workspaces: Vec<WorkspaceData>,
     /// Which workspace the sidebar is showing. See
     /// [`Projects::switch_workspace`].
     pub active_workspace: u64,
@@ -439,9 +449,19 @@ impl Projects {
         }
         // Same guard as every other counter here: never hand out an id a
         // hand-edited or older save already uses.
+        let deleted_workspaces = p.deleted_workspaces;
+        // Deleted workspaces keep their ids for a restore, so a new one
+        // must not reuse them either.
         let next_workspace_id = p
             .next_workspace_id
-            .max(workspaces.iter().map(|w| w.id + 1).max().unwrap_or(1))
+            .max(
+                workspaces
+                    .iter()
+                    .chain(&deleted_workspaces)
+                    .map(|w| w.id + 1)
+                    .max()
+                    .unwrap_or(1),
+            )
             .max(1);
         let active_workspace = p
             .active_workspace
@@ -452,6 +472,7 @@ impl Projects {
             active: p.active,
             next_id,
             workspaces,
+            deleted_workspaces,
             active_workspace,
             next_workspace_id,
             next_terminal_id,
@@ -504,7 +525,9 @@ impl Projects {
             legacy_hidden: false,
         });
         let current = self.active_workspace;
-        for w in &mut self.workspaces {
+        // Deleted workspaces too, so a restored one looks the way it did
+        // when it was deleted instead of suddenly listing new projects.
+        for w in self.workspaces.iter_mut().chain(&mut self.deleted_workspaces) {
             if w.id != current {
                 w.hidden.push(id);
             }
@@ -526,7 +549,7 @@ impl Projects {
         // entry would silently re-hide whatever project inherits the id,
         // and a stale `active` would restore a project that no longer
         // exists on the next swipe back.
-        for w in &mut self.workspaces {
+        for w in self.workspaces.iter_mut().chain(&mut self.deleted_workspaces) {
             w.hidden.retain(|&h| h != id);
             if w.active == Some(id) {
                 w.active = None;
@@ -752,15 +775,22 @@ impl Projects {
         id
     }
 
-    /// Remove a workspace. Refused (returning false) for the last one:
-    /// every hide decision in the app lives inside a workspace, so there
-    /// has to be somewhere to stand.
+    /// Delete a workspace — SOFTLY. It moves to `deleted_workspaces`
+    /// whole, so [`Self::restore_workspace`] can bring it back exactly as
+    /// it was. Refused (returning false) for the last one: every hide
+    /// decision in the app lives inside a workspace, so there has to be
+    /// somewhere to stand.
     pub fn delete_workspace(&mut self, id: u64) -> bool {
         if self.workspaces.len() <= 1 || !self.workspaces.iter().any(|w| w.id == id) {
             return false;
         }
         let idx = self.workspaces.iter().position(|w| w.id == id).unwrap_or(0);
-        self.workspaces.retain(|w| w.id != id);
+        let mut removed = self.workspaces.remove(idx);
+        // Record where it was left, like a switch away would.
+        if self.active_workspace == id {
+            removed.active = self.active;
+        }
+        self.deleted_workspaces.push(removed);
         if self.active_workspace == id {
             // Land on the neighbour that took its place, or the new last
             // one if we deleted off the end.
@@ -771,6 +801,36 @@ impl Projects {
         self.dirty = true;
         self.layout_dirty = true;
         true
+    }
+
+    /// Bring a soft-deleted workspace back, at the end of the swipe order,
+    /// and switch to it. False if no deleted workspace has that id.
+    pub fn restore_workspace(&mut self, id: u64) -> bool {
+        let Some(idx) = self.deleted_workspaces.iter().position(|w| w.id == id) else {
+            return false;
+        };
+        let ws = self.deleted_workspaces.remove(idx);
+        self.workspaces.push(ws);
+        self.switch_workspace(id);
+        self.dirty = true;
+        self.layout_dirty = true;
+        true
+    }
+
+    /// The most recently deleted workspace, if any — what "restore" means
+    /// with no name given.
+    pub fn last_deleted_workspace(&self) -> Option<u64> {
+        self.deleted_workspaces.last().map(|w| w.id)
+    }
+
+    pub fn deleted_workspace_id_by_name(&self, name: &str) -> Option<u64> {
+        // Newest first: deleting two workspaces with the same name and
+        // restoring by name should bring back the one deleted last.
+        self.deleted_workspaces
+            .iter()
+            .rev()
+            .find(|w| w.name.eq_ignore_ascii_case(name))
+            .map(|w| w.id)
     }
 
     pub fn rename_workspace(&mut self, id: u64, name: String) {
@@ -1376,9 +1436,10 @@ const SWIPE_AXIS_RATIO: f32 = 1.6;
 /// gesture so a long scroll can drift sideways without switching
 /// workspace, and a swipe can drift vertically without scrolling.
 const AXIS_LOCK_PX: f32 = 6.0;
-/// Quiet time that ends a gesture. A trackpad reports no "fingers
-/// lifted", so the gap between event bursts is the only signal that one
-/// swipe finished and the next began.
+/// Quiet time that ends a gesture on PHASE-LESS input (a mouse wheel).
+/// A trackpad's gestures are delimited by the phases macOS reports (see
+/// [`crate::trackpad`]); a wheel has none, so the gap between event bursts
+/// is the only signal that one gesture finished and the next began.
 ///
 /// Measured in WALL CLOCK, not accumulated per frame. The app is
 /// reactive: with nothing happening it renders every 5s, so a per-frame
@@ -1415,22 +1476,24 @@ struct SidebarSwipe {
     accum: f32,
     /// Vertical pixels in the same gesture, for the axis test.
     accum_y: f32,
-    /// Set once this gesture has switched. One continuous swipe moves
-    /// exactly ONE workspace however far it runs, so a long drag can't
-    /// blow through five of them.
+    /// Set once this gesture has switched. One gesture — fingers down,
+    /// fingers up, and all the momentum after — moves exactly ONE
+    /// workspace however far it runs.
     fired: bool,
     /// `Time::elapsed_secs_f64` of the last wheel event, or `None`
-    /// before the first one. A wall-clock stamp rather than a per-frame
-    /// accumulator — see [`SWIPE_IDLE_SECS`].
+    /// before the first one. Only phase-less input (a mouse wheel) needs
+    /// it — see [`SWIPE_IDLE_SECS`].
     last_event: Option<f64>,
-    /// Magnitude of the last horizontal wheel burst. Used to distinguish
-    /// a fresh same-direction finger stroke from decaying momentum.
-    last_dx_abs: f32,
-    /// Consecutive, clearly shrinking bursts after a workspace switch.
-    decay_bursts: u8,
-    /// Once momentum is visibly decaying, a sharp increase means fingers
-    /// touched down for another swipe, even in the same direction.
-    tail_armed: bool,
+}
+
+/// What one scroll event asks the sidebar to do.
+#[derive(Debug, PartialEq)]
+enum SwipeOutcome {
+    Nothing,
+    /// Step this many workspaces (±1).
+    Switch(i32),
+    /// Scroll the list by this many pixels (positive = fingers down).
+    Scroll(f32),
 }
 
 impl SidebarSwipe {
@@ -1439,9 +1502,6 @@ impl SidebarSwipe {
         self.accum_y = 0.0;
         self.fired = false;
         self.axis = GestureAxis::Undecided;
-        self.last_dx_abs = 0.0;
-        self.decay_bursts = 0;
-        self.tail_armed = false;
     }
 
     /// Commit to an axis once the gesture has moved far enough to mean
@@ -1466,42 +1526,105 @@ impl SidebarSwipe {
         self.axis
     }
 
-    /// Does `dx` belong to a NEW gesture rather than the one in
-    /// progress?
-    ///
-    /// This is what makes swiping back and forth work. macOS keeps
-    /// delivering momentum events for up to a second after your fingers
-    /// leave the trackpad, so the quiet gap that would otherwise end a
-    /// gesture never arrives between two swipes made in quick
-    /// succession. Momentum only ever decays in the direction of the
-    /// flick that caused it, so a sign flip is always a real new gesture
-    /// and never the tail of the old one.
+    /// Does `dx` contradict the gesture in progress? Only consulted for
+    /// phase-less input: a mouse wheel has no "fingers down" to start a
+    /// gesture, and a sign flip is the one unambiguous sign of a new one.
     fn is_reversal(&self, dx: f32) -> bool {
         dx != 0.0 && self.accum != 0.0 && dx.signum() != self.accum.signum()
     }
 
-    fn is_same_direction_restart(&self, dx: f32) -> bool {
-        const RESTART_MIN_PX: f32 = 3.0;
-        const RESTART_RATIO: f32 = 1.8;
-        self.fired
-            && self.tail_armed
-            && dx.abs() >= RESTART_MIN_PX
-            && dx.abs() >= self.last_dx_abs * RESTART_RATIO
-    }
+    /// Feed one scroll event (deltas in window pixels) and say what it
+    /// asks for.
+    ///
+    /// Gestures are delimited by what the OS reports, not guessed from
+    /// magnitudes: fingers touching down (`Began`) start one, and nothing
+    /// else does — in particular not momentum, which is only ever the tail
+    /// of the gesture before it. The old rule inferred "fingers came down
+    /// again" from a burst that was much bigger than the one before, and
+    /// momentum that happened to land two events in one frame looked
+    /// exactly like that: one flick, two workspaces.
+    fn feed(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        stage: crate::trackpad::ScrollStage,
+        now: f64,
+        over_sidebar: bool,
+    ) -> SwipeOutcome {
+        use crate::trackpad::ScrollStage;
+        match stage {
+            ScrollStage::Began => self.begin(),
+            ScrollStage::Unphased => {
+                let quiet = self.last_event.is_none_or(|t| now - t > SWIPE_IDLE_SECS);
+                if quiet || self.is_reversal(dx) {
+                    self.begin();
+                }
+            }
+            ScrollStage::Moving | ScrollStage::Ended | ScrollStage::Momentum => {}
+        }
+        self.last_event = Some(now);
 
-    fn observe_horizontal_burst(&mut self, dx: f32) {
-        let magnitude = dx.abs();
-        if self.fired {
-            // Two substantial drops distinguish the momentum tail from the
-            // acceleration at the beginning of one flick.
-            if magnitude < self.last_dx_abs * 0.85 {
-                self.decay_bursts = self.decay_bursts.saturating_add(1);
-                self.tail_armed |= self.decay_bursts >= 2;
-            } else if magnitude > self.last_dx_abs * 1.15 && !self.tail_armed {
-                self.decay_bursts = 0;
+        // A gesture that started off the sidebar accumulates nothing, so
+        // dragging out of the sidebar mid-gesture abandons it rather than
+        // completing it somewhere the user isn't looking.
+        if !over_sidebar {
+            return SwipeOutcome::Nothing;
+        }
+        self.accum += dx;
+        self.accum_y += dy;
+        match self.decide_axis() {
+            GestureAxis::Undecided => SwipeOutcome::Nothing,
+            GestureAxis::Scroll => SwipeOutcome::Scroll(dy),
+            GestureAxis::Swipe => {
+                // One switch per gesture, however far it runs.
+                if self.fired || self.accum.abs() < SWIPE_THRESHOLD_PX {
+                    return SwipeOutcome::Nothing;
+                }
+                self.fired = true;
+                // Positive x is fingers moving right — the same sign the
+                // canvas pan reads as "show me what's to the left" — so
+                // that goes back a workspace.
+                SwipeOutcome::Switch(if self.accum > 0.0 { -1 } else { 1 })
             }
         }
-        self.last_dx_abs = magnitude;
+    }
+}
+
+/// This frame's scroll events, in window pixels, with their gesture stage.
+///
+/// On macOS they come from the AppKit monitor in [`crate::trackpad`], which
+/// knows the real phases; Bevy's `MouseWheel` for the same events is
+/// discarded so nothing is counted twice. Elsewhere `MouseWheel` is all
+/// there is, and it carries no usable phase, so every event is `Unphased`.
+fn wheel_samples(
+    wheel: &mut MessageReader<MouseWheel>,
+    samples: &crate::trackpad::ScrollSamples,
+    scale_factor: f32,
+) -> Vec<(f32, f32, crate::trackpad::ScrollStage)> {
+    if cfg!(target_os = "macos") {
+        wheel.clear();
+        samples
+            .drain()
+            .into_iter()
+            .map(|s| {
+                // Precise deltas are logical points; Bevy's pixel wheel
+                // events (which the thresholds were tuned against) are
+                // physical, so scale the same way winit does.
+                let k = if s.precise { scale_factor } else { SWIPE_LINE_PX };
+                (s.dx * k, s.dy * k, s.stage)
+            })
+            .collect()
+    } else {
+        wheel
+            .read()
+            .map(|ev| {
+                let k = match ev.unit {
+                    MouseScrollUnit::Line => SWIPE_LINE_PX,
+                    MouseScrollUnit::Pixel => 1.0,
+                };
+                (ev.x * k, ev.y * k, crate::trackpad::ScrollStage::Unphased)
+            })
+            .collect()
     }
 }
 
@@ -1519,8 +1642,10 @@ impl SidebarSwipe {
 ///
 /// Swipe direction matches the canvas pan and macOS paging — fingers
 /// moving LEFT drag the next workspace in from the right.
+#[allow(clippy::too_many_arguments)]
 fn sidebar_wheel(
     mut wheel: MessageReader<MouseWheel>,
+    samples: Res<crate::trackpad::ScrollSamples>,
     mut swipe: ResMut<SidebarSwipe>,
     mut scroll: ResMut<SidebarScroll>,
     time: Res<Time>,
@@ -1530,86 +1655,46 @@ fn sidebar_wheel(
     keys: Res<ButtonInput<KeyCode>>,
     mut projects: ResMut<Projects>,
 ) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    // Always drained, so events from a frame we ignore can't pile up and
+    // replay later.
+    let events = wheel_samples(&mut wheel, &samples, window.scale_factor());
     // No sidebar, no gesture — during a talk the strip down the left is
     // the slide, and swiping it must not switch context behind the
     // presenter's back.
-    if !presentation.sidebar_visible() {
-        wheel.clear();
+    if !presentation.sidebar_visible() || events.is_empty() {
         return;
     }
     // Cmd+wheel is the canvas pan. Leave it alone.
     if keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight) {
-        wheel.clear();
         return;
     }
-    let Ok(window) = windows.single() else {
-        return;
-    };
     let over_sidebar = window
         .cursor_position()
         .is_some_and(|pt| pt.x < sidebar.width);
-
-    let mut dx = 0.0;
-    let mut dy = 0.0;
-    let mut had_event = false;
-    for ev in wheel.read() {
-        let scale = match ev.unit {
-            MouseScrollUnit::Line => SWIPE_LINE_PX,
-            MouseScrollUnit::Pixel => 1.0,
-        };
-        dx += ev.x * scale;
-        dy += ev.y * scale;
-        had_event = true;
-    }
-    if !had_event {
-        return;
-    }
     let now = time.elapsed_secs_f64();
-    let quiet = swipe.last_event.is_none_or(|t| now - t > SWIPE_IDLE_SECS);
-    swipe.last_event = Some(now);
 
-    // A direction reversal is unambiguous. For repeated swipes in the same
-    // direction, a new finger stroke shows up as a sharp rebound after the
-    // old stroke's momentum has begun decaying.
-    if quiet || swipe.is_reversal(dx) || swipe.is_same_direction_restart(dx) {
-        swipe.begin();
-    }
-
-    // A gesture that started off the sidebar accumulates nothing, so
-    // dragging out of the sidebar mid-gesture abandons it rather than
-    // completing it somewhere the user isn't looking.
-    if !over_sidebar {
-        return;
-    }
-    swipe.accum += dx;
-    swipe.accum_y += dy;
-    swipe.observe_horizontal_burst(dx);
-
-    match swipe.decide_axis() {
-        GestureAxis::Undecided => {}
-        GestureAxis::Scroll => {
-            let workspace = projects.active_workspace;
-            let rows = sidebar_rows_for(&projects, workspace).len();
-            // Positive y is fingers moving down, which under natural
-            // scrolling drags the content down — towards the top of the
-            // list, so the offset shrinks.
-            let want = (scroll.get(workspace) - dy).clamp(0.0, max_scroll(rows, window.height()));
-            if scroll.get(workspace) != want {
-                scroll.per_workspace.insert(workspace, want);
-                projects.layout_dirty = true;
+    for (dx, dy, stage) in events {
+        match swipe.feed(dx, dy, stage, now, over_sidebar) {
+            SwipeOutcome::Nothing => {}
+            SwipeOutcome::Scroll(dy) => {
+                let workspace = projects.active_workspace;
+                let rows = sidebar_rows_for(&projects, workspace).len();
+                // Positive y is fingers moving down, which under natural
+                // scrolling drags the content down — towards the top of the
+                // list, so the offset shrinks.
+                let want = (scroll.get(workspace) - dy).clamp(0.0, max_scroll(rows, window.height()));
+                if scroll.get(workspace) != want {
+                    scroll.per_workspace.insert(workspace, want);
+                    projects.layout_dirty = true;
+                }
             }
-        }
-        GestureAxis::Swipe => {
-            // One switch per gesture, however far it runs.
-            if swipe.fired || swipe.accum.abs() < SWIPE_THRESHOLD_PX {
-                return;
-            }
-            // Positive x is fingers moving right — the same sign the
-            // canvas pan reads as "show me what's to the left" — so that
-            // goes back a workspace.
-            let delta = if swipe.accum > 0.0 { -1 } else { 1 };
-            if projects.swipe_workspace(delta).is_some() {
-                swipe.fired = true;
+            SwipeOutcome::Switch(delta) => {
+                // Pushing past either end of the strip does nothing, and
+                // still counts as this gesture's one switch.
+                projects.swipe_workspace(delta);
             }
         }
     }
@@ -3225,10 +3310,7 @@ fn apply_pending_actions(world: &mut World) {
         }
         let moved = targets.len();
         for e in targets {
-            let mut ent = world.entity_mut(e);
-            ent.insert(PaneProject(dest_id));
-            ent.insert(jim_pane::PaneCanvas(0));
-            ent.remove::<jim_pane::PaneGroup>();
+            move_pane_to_project(world, e, dest_id);
         }
         eprintln!("[ipc] move_panes: moved {moved} pane(s) {src_id} -> {dest_id}");
     }
@@ -3479,7 +3561,28 @@ fn apply_pending_actions(world: &mut World) {
 
 /// Restore one persisted pane via the registry. Reserves any embedded
 /// session id in the allocator so subsequent spawns don't collide.
-fn restore_pane(world: &mut World, snap: PaneSnapshot) {
+/// The Glaze UI showcase was a subprocess widget running a `glaze_ui` binary
+/// beside `jim`; it is the funct widget `glaze_ui.ft` now and the binary is
+/// gone. A layout saved before the port would spawn `sh -c glaze_ui` forever
+/// ("command not found", respawn, repeat), so rewrite it on the way in.
+fn migrate_glaze_ui_pane(snap: &mut PaneSnapshot) {
+    if snap.kind != jim_widget::PANE_KIND {
+        return;
+    }
+    let is_glaze_ui = snap
+        .config
+        .get("command")
+        .and_then(|v| v.as_str())
+        .is_some_and(|c| c == "glaze_ui" || c.ends_with("/glaze_ui"));
+    if !is_glaze_ui {
+        return;
+    }
+    snap.kind = jim_widget::script_widget::PANE_KIND.to_string();
+    snap.config = serde_json::json!({ "script": "glaze_ui.ft", "title": "Glaze UI" });
+}
+
+fn restore_pane(world: &mut World, mut snap: PaneSnapshot) {
+    migrate_glaze_ui_pane(&mut snap);
     if snap.kind == "terminal" {
         if let Some(id) = snap.config.get("session_id").and_then(|v| v.as_u64()) {
             let mut projects = world.resource_mut::<Projects>();
@@ -3579,6 +3682,17 @@ fn kind_display_name(world: &World, kind: &str) -> String {
         .unwrap_or_else(|| kind.to_string())
 }
 
+/// Re-home one pane into `dest_id`. Shared by `jimctl move` and the pane
+/// context menu's "Move to project". See the comment on the `move_panes`
+/// loop in [`apply_pending_actions`] for why the canvas level and group are
+/// reset along with membership. Callers must refuse docked panes first.
+pub fn move_pane_to_project(world: &mut World, e: Entity, dest_id: u64) {
+    let mut ent = world.entity_mut(e);
+    ent.insert(PaneProject(dest_id));
+    ent.insert(jim_pane::PaneCanvas(0));
+    ent.remove::<jim_pane::PaneGroup>();
+}
+
 fn pane_count_in_project(world: &mut World, kind: &str, project_id: u64) -> usize {
     let mut q = world.query::<(&PaneProject, &PaneKindMarker)>();
     q.iter(world)
@@ -3661,6 +3775,31 @@ pub fn assert_pane_project_invariant(
 /// (`PaneClosing`) are excluded: they were force-hidden by the close
 /// and despawn at the start of next frame — flipping one back to
 /// Inherited here would show it for its final frame.
+/// Is this pane on screen when `project` is the project being shown?
+///
+/// The one rule for "which panes make up a project's canvas", shared by
+/// `sync_visibility` (the window) and `slide_view` (a slide's picture of a
+/// project that is not the active one), so the two can never disagree about
+/// what a project looks like.
+pub fn pane_on_project_canvas(
+    pane_project: u64,
+    canvas: Option<&jim_pane::PaneCanvas>,
+    group: Option<&jim_pane::PaneGroup>,
+    project: u64,
+    nav: &crate::canvas_pane::CanvasNav,
+    groups: &crate::pane_groups::VisibleGroups,
+) -> bool {
+    // A pane shows only when it sits on the nested-canvas level its own
+    // project is parked on (root = 0 / no marker) — descending swaps the
+    // visible set without moving any pane.
+    let level_visible = canvas.map_or(0, |c| c.0) == nav.level(pane_project);
+    // Third visibility dimension, orthogonal to project and canvas level: a
+    // pane in a named group also needs that group revealed (see
+    // `pane_groups`). Ungrouped panes are unaffected.
+    let group_ok = group.is_none_or(|g| groups.is_visible(&g.0));
+    pane_project == project && level_visible && group_ok
+}
+
 pub fn sync_visibility(
     projects: Res<Projects>,
     nav: Res<crate::canvas_pane::CanvasNav>,
@@ -3678,43 +3817,27 @@ pub fn sync_visibility(
     >,
 ) {
     let active = projects.active;
-    let presenting = presentation.active();
+    // Only while the deck COVERS the window. On an `application:` slide it
+    // steps aside and goes back to being an ordinary pane on the canvas (see
+    // `present::apply_presentation`) — and an ordinary pane belongs to its
+    // own project. Exempting it then pinned the deck onto every project you
+    // switched to during the demo.
+    let covering = presentation.active().filter(|_| !presentation.stepped_aside());
     for (entity, m, canvas, group, mut vis) in &mut panes {
         // The deck holding the window is chrome for the duration of a talk:
-        // it is screen-anchored, covers the display, and must survive the
-        // presenter switching projects inside the live view on the slide.
-        // Without this, clicking the mirrored sidebar hid the very deck
-        // doing the presenting.
-        if presenting == Some(entity) {
-            // A slide that hands the window to the real application does
-            // NOT hide the deck. The deck gets out of the way by going back
-            // to being an ordinary pane on the canvas (see
-            // `present::apply_presentation`) — it keeps rendering, in its
-            // own place, like any other pane.
-            //
-            // That is the whole point of such a slide: you are looking at
-            // the real app, you find the pane this deck lives in, and it is
-            // showing a slide of the app that contains it. Hiding the deck
-            // removed the one thing the slide was about.
+        // it is screen-anchored, covers the display, and must survive a
+        // `project:` slide switching the active project out from under it.
+        if covering == Some(entity) {
             let want = Visibility::Inherited;
             if *vis != want {
                 *vis = want;
             }
             continue;
         }
-        let pane_level = canvas.map_or(0, |c| c.0);
-        // Third visibility dimension, orthogonal to project and canvas
-        // level: a pane in a named group also needs that group revealed
-        // (see `pane_groups`). Ungrouped panes are unaffected.
-        let group_ok = group.is_none_or(|g| groups.is_visible(&g.0));
-        let project_visible = Some(m.0) == active;
-        // A pane shows only when it sits on the nested-canvas level its
-        // own project is parked on (root = 0 / no marker) — descending
-        // swaps the visible set without moving any pane. An embedded
-        // project view is a window onto that project as you left it, so
-        // it frames that project's level too, not a hardcoded root.
-        let level_visible = pane_level == nav.level(m.0);
-        let want = if project_visible && level_visible && group_ok {
+        let shown = active.is_some_and(|active| {
+            pane_on_project_canvas(m.0, canvas, group, active, &nav, &groups)
+        });
+        let want = if shown {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -3988,6 +4111,7 @@ fn save_if_dirty(world: &mut World) {
             .collect(),
         active_workspace: Some(projects.active_workspace),
         next_workspace_id: projects.next_workspace_id,
+        deleted_workspaces: projects.deleted_workspaces.clone(),
         sidebar_width: Some(sidebar_width),
         terminals: Vec::new(),
         panes,
@@ -4487,6 +4611,60 @@ mod tests {
         assert_eq!(p.active_workspace, only);
     }
 
+    /// Deleting is soft: the workspace leaves the swipe order but is kept
+    /// whole, and restoring brings back its name, parked set and last
+    /// project exactly.
+    #[test]
+    fn a_deleted_workspace_is_kept_and_restores_as_it_was() {
+        let mut p = seeded(3);
+        let main = p.active_workspace;
+        let extra = p.create_workspace(Some("Extra".into()));
+        let parked = p.list[1].id;
+        p.set_hidden(parked, true);
+        let was_active = p.active;
+
+        assert!(p.delete_workspace(extra));
+        assert_eq!(p.workspaces.len(), 1, "gone from the swipe order");
+        assert_eq!(p.active_workspace, main);
+        assert!(p.workspace_id_by_name("Extra").is_none(), "unreachable by name");
+        assert_eq!(p.deleted_workspace_id_by_name("extra"), Some(extra));
+
+        assert!(p.restore_workspace(extra));
+        assert!(p.deleted_workspaces.is_empty());
+        assert_eq!(p.active_workspace, extra, "restoring switches to it");
+        assert_eq!(p.workspace_name(), "Extra");
+        assert!(p.is_hidden(parked), "its parked set came back");
+        assert_eq!(p.active, was_active, "and the project you were in");
+    }
+
+    /// A project made while a workspace is deleted is parked in it, like in
+    /// every other workspace you weren't in; deleting a project sweeps it
+    /// out of deleted workspaces too, so a restore can't resurrect a stale
+    /// id.
+    #[test]
+    fn deleted_workspaces_track_project_creation_and_deletion() {
+        let mut p = seeded(1);
+        let extra = p.create_workspace(None);
+        let main = p.workspaces[0].id;
+        p.switch_workspace(main);
+        assert!(p.delete_workspace(extra));
+        let made = p.create();
+        assert!(p.deleted_workspaces[0].hidden.contains(&made));
+        p.delete(made);
+        assert!(!p.deleted_workspaces[0].hidden.contains(&made));
+    }
+
+    /// A new workspace never reuses a deleted one's id — the restore would
+    /// then collide with it.
+    #[test]
+    fn new_workspaces_do_not_reuse_deleted_ids() {
+        let mut p = seeded(1);
+        let extra = p.create_workspace(None);
+        assert!(p.delete_workspace(extra));
+        let next = p.create_workspace(None);
+        assert_ne!(next, extra);
+    }
+
     /// Explicit next/previous commands retain their ring behavior.
     #[test]
     fn cycling_wraps_in_both_directions() {
@@ -4599,42 +4777,73 @@ mod tests {
         );
     }
 
+    /// The double swipe: after a flick switches, its momentum keeps coming
+    /// — in bursts whose size varies with how many events land per frame.
+    /// However big a momentum burst is, it is never a new gesture.
     #[test]
-    fn a_new_same_direction_stroke_ends_the_momentum_gesture() {
-        let mut swipe = SidebarSwipe {
-            accum: -SWIPE_THRESHOLD_PX - 10.0,
-            fired: true,
-            last_dx_abs: 16.0,
-            ..Default::default()
+    fn momentum_never_switches_a_second_time() {
+        use crate::trackpad::ScrollStage::*;
+        let mut swipe = SidebarSwipe::default();
+        let mut switches = 0;
+        let mut feed = |swipe: &mut SidebarSwipe, dx, stage| {
+            if let SwipeOutcome::Switch(_) = swipe.feed(dx, 0.0, stage, 0.0, true) {
+                switches += 1;
+            }
         };
-
-        swipe.observe_horizontal_burst(-10.0);
-        assert!(!swipe.tail_armed);
-        swipe.observe_horizontal_burst(-6.0);
-        assert!(swipe.tail_armed, "two decaying bursts arm a new stroke");
-        assert!(
-            !swipe.is_same_direction_restart(-9.0),
-            "small momentum variation must stay in the old gesture"
-        );
-        assert!(
-            swipe.is_same_direction_restart(-12.0),
-            "a strong same-direction rebound is a fresh swipe"
-        );
+        feed(&mut swipe, -4.0, Began);
+        for _ in 0..8 {
+            feed(&mut swipe, -12.0, Moving);
+        }
+        feed(&mut swipe, -3.0, Ended);
+        // Momentum, including a burst far bigger than the one before it —
+        // the shape the old heuristic read as "fingers came down again".
+        for dx in [-20.0, -9.0, -6.0, -30.0, -12.0, -5.0, -2.0] {
+            feed(&mut swipe, dx, Momentum);
+        }
+        assert_eq!(switches, 1);
     }
 
+    /// A real second swipe — fingers down again, even mid-momentum and in
+    /// the same direction — switches again.
     #[test]
-    fn acceleration_within_one_flick_does_not_restart_it() {
-        let mut swipe = SidebarSwipe {
-            accum: -SWIPE_THRESHOLD_PX - 10.0,
-            fired: true,
-            last_dx_abs: 4.0,
-            ..Default::default()
-        };
-        for dx in [-7.0, -12.0, -18.0, -15.0] {
-            assert!(!swipe.is_same_direction_restart(dx));
-            swipe.observe_horizontal_burst(dx);
+    fn fingers_down_again_is_a_new_swipe() {
+        use crate::trackpad::ScrollStage::*;
+        let mut swipe = SidebarSwipe::default();
+        let mut outcomes = Vec::new();
+        for (dx, stage) in [(-4.0, Began), (-60.0, Moving), (-3.0, Ended), (-8.0, Momentum)] {
+            outcomes.push(swipe.feed(dx, 0.0, stage, 0.0, true));
         }
-        assert!(!swipe.tail_armed);
+        for (dx, stage) in [(-4.0, Began), (-60.0, Moving)] {
+            outcomes.push(swipe.feed(dx, 0.0, stage, 0.0, true));
+        }
+        let switches = outcomes.iter().filter(|o| **o == SwipeOutcome::Switch(1)).count();
+        assert_eq!(switches, 2);
+    }
+
+    /// A short flick whose fingers lift before the threshold still
+    /// completes on its momentum — the same gesture, so still once.
+    #[test]
+    fn momentum_can_finish_the_gesture_it_belongs_to() {
+        use crate::trackpad::ScrollStage::*;
+        let mut swipe = SidebarSwipe::default();
+        swipe.feed(-10.0, 0.0, Began, 0.0, true);
+        swipe.feed(-20.0, 0.0, Ended, 0.0, true);
+        assert_eq!(swipe.feed(-40.0, 0.0, Momentum, 0.0, true), SwipeOutcome::Switch(1));
+        assert_eq!(swipe.feed(-40.0, 0.0, Momentum, 0.0, true), SwipeOutcome::Nothing);
+    }
+
+    /// A mouse wheel has no phases: quiet time or a reversal delimits it.
+    #[test]
+    fn unphased_wheels_split_on_quiet_or_reversal() {
+        use crate::trackpad::ScrollStage::Unphased;
+        let mut swipe = SidebarSwipe::default();
+        assert_eq!(swipe.feed(-60.0, 0.0, Unphased, 0.0, true), SwipeOutcome::Switch(1));
+        assert_eq!(swipe.feed(-60.0, 0.0, Unphased, 0.05, true), SwipeOutcome::Nothing);
+        assert_eq!(
+            swipe.feed(-60.0, 0.0, Unphased, 0.05 + SWIPE_IDLE_SECS + 0.01, true),
+            SwipeOutcome::Switch(1)
+        );
+        assert_eq!(swipe.feed(60.0, 0.0, Unphased, 0.3, true), SwipeOutcome::Switch(-1));
     }
 
     /// A slide has to know which way to travel, and cycling off the end

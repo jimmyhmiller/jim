@@ -1,0 +1,224 @@
+// datalog_tunnel.ft — start/stop an SSH tunnel to the remote datalog-db.
+//
+// The server on computer.jimmyhmiller.com binds 127.0.0.1:5557 only, so
+// the widgets reach it by forwarding a local port over ssh:
+//
+//   ssh -L 127.0.0.1:15557:127.0.0.1:5557 computer.jimmyhmiller.com 'cat >/dev/null'
+//
+// Start spawns that ssh (event-driven via on_proc_output / on_proc_exit).
+// ssh's LocalCommand prints a marker once forwarding is listening; we then
+// run `datalog status` through the tunnel and, if it answers, publish the
+// connection for the dlide_* panes. Stop (or ssh dying) points them back
+// at the local default.
+//
+//   emits:   conn.state {host, token_file, ok, label}   (retained)
+//   listens: datalog.tunnel {action: "start" | "stop"}   same as the buttons,
+//            e.g. `jimctl msg emit -p Datalog --topic datalog.tunnel
+//                  --json '{"action":"start"}'`
+//
+// Params (all optional, set at spawn with --params):
+//   remote      ssh destination            computer.jimmyhmiller.com
+//   remote_port datalog port on the remote 5557
+//   local_port  local forwarded port       15557
+//   token_file  bearer token file (0600)   ~/.jim/secrets/datalog-computer.token
+//   autostart   bring the tunnel up on first spawn   false
+import "host"
+
+fn param(k, d) = if typeof(params) == "Record" { unwrap_or(get(params, k), d) } else { d }
+
+let ready_marker = "datalog-tunnel-ready"
+let local_default = "127.0.0.1:5557"
+
+fn home() = host_env("HOME")
+fn dl_path() { let h = home(); if h == "" { "datalog" } else { h + "/.cargo/bin/datalog" } }
+fn remote() = param("remote", "computer.jimmyhmiller.com")
+fn remote_port() = str(param("remote_port", 5557))
+fn local_port() = str(param("local_port", 15557))
+fn local_addr() = "127.0.0.1:" + local_port()
+fn token_file() = param("token_file", home() + "/.jim/secrets/datalog-computer.token")
+
+fn init_state() = {
+    want: param("autostart", false),  // user intent: tunnel should be up
+    phase: "down",   // down | connecting | probing | up | error
+    ssh: -1,
+    probe: -1,
+    log: [],         // recent ssh/probe output (stderr folded in)
+    error: "",
+}
+let state = atom(init_state())
+
+// proc_spawn discards stderr, and ssh reports every failure there, so run
+// it under sh to fold stderr into stdout.
+//
+// No `-N`: the remote side runs `cat >/dev/null`, which lives exactly as
+// long as our stdin pipe. The host holds that pipe open for the child's
+// lifetime, so if jim goes away without killing the child (restart, crash,
+// SIGKILL) the pipe closes, `cat` ends, and ssh exits instead of lingering
+// as an orphan that keeps the local port bound.
+fn spawn_ssh() {
+    proc_spawn("/bin/sh", [
+        "-c", "exec \"$0\" \"$@\" 2>&1", "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=15",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "PermitLocalCommand=yes",
+        "-o", "LocalCommand=echo " + ready_marker,
+        "-L", "127.0.0.1:" + local_port() + ":127.0.0.1:" + remote_port(),
+        remote(),
+        "cat >/dev/null",
+    ])
+}
+
+fn spawn_probe() {
+    proc_spawn("/bin/sh", [
+        "-c", "exec \"$0\" \"$@\" 2>&1", dl_path(),
+        "--host", local_addr(), "--auth-token-file", token_file(), "status",
+    ])
+}
+
+fn keep_tail(log, line) {
+    let l = push(log, line)
+    if len(l) > 8 { slice(l, len(l) - 8, 8) } else { l }
+}
+
+fn publish_remote() {
+    emit_retained("conn.state", { host: local_addr(), token_file: token_file(), ok: true, label: remote() })
+}
+
+fn publish_local() {
+    emit_retained("conn.state", { host: local_default, token_file: "", ok: false, label: "local" })
+}
+
+fn start() {
+    let s = @state
+    if s.ssh != -1 { return }
+    if not fs_exists(token_file()) {
+        reset!(state, { ..s, want: false, phase: "error",
+                        error: "token file missing: " + token_file() })
+        request_render()
+        return
+    }
+    let h = spawn_ssh()
+    if h == -1 {
+        reset!(state, { ..s, want: false, phase: "error", error: "could not spawn ssh" })
+    } else {
+        reset!(state, { ..s, want: true, phase: "connecting", ssh: h, probe: -1,
+                        log: [], error: "" })
+        host_log("[datalog_tunnel] ssh → " + remote() + " on " + local_addr())
+    }
+    request_render()
+}
+
+fn stop() {
+    let s = @state
+    if s.probe != -1 { proc_kill(s.probe) }
+    if s.ssh != -1 { proc_kill(s.ssh) }
+    reset!(state, { ..s, want: false, phase: "down", ssh: -1, probe: -1, error: "" })
+    publish_local()
+    host_log("[datalog_tunnel] stopped")
+    request_render()
+}
+
+// Children never survive a worker restart, but `state` does: clear the
+// stale handles and re-establish the tunnel if it was meant to be up.
+fn on_start() {
+    let s = @state
+    reset!(state, { ..s, ssh: -1, probe: -1, phase: "down" })
+    if s.want { start() } else { publish_local(); request_render() }
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    if id == "start" { start() }
+    else if id == "stop" { stop() }
+}
+
+fn on_message(topic, payload, sender) {
+    if topic != "datalog.tunnel" { return }
+    let action = unwrap_or(get(payload, "action"), "")
+    if action == "start" { start() }
+    else if action == "stop" { stop() }
+    else { host_log("[datalog_tunnel] unknown action: " + str(action)) }
+}
+
+fn on_proc_output(handle, line) {
+    let s = @state
+    if handle == s.ssh {
+        if line == ready_marker {
+            let p = spawn_probe()
+            reset!(state, { ..s, phase: "probing", probe: p })
+        } else {
+            reset!(state, { ..s, log: keep_tail(s.log, line) })
+        }
+        request_render()
+    } else if handle == s.probe {
+        reset!(state, { ..s, log: keep_tail(s.log, line) })
+    }
+}
+
+fn on_proc_exit(handle, code) {
+    let s = @state
+    if handle == s.probe {
+        if code == 0 {
+            reset!(state, { ..s, phase: "up", probe: -1, error: "" })
+            publish_remote()
+            host_log("[datalog_tunnel] up: " + local_addr())
+        } else {
+            // Tunnel is listening but the server refused us (bad token,
+            // server down): tear it down rather than advertise a dead host.
+            let last = if len(s.log) > 0 { s.log[len(s.log) - 1] } else { "exit " + str(code) }
+            if s.ssh != -1 { proc_kill(s.ssh) }
+            reset!(state, { ..s, want: false, phase: "error", probe: -1, ssh: -1,
+                            error: "datalog status failed: " + last })
+            publish_local()
+        }
+        request_render()
+    } else if handle == s.ssh {
+        let was_up = s.phase == "up"
+        let last = if len(s.log) > 0 { s.log[len(s.log) - 1] } else { "ssh exited " + str(code) }
+        reset!(state, { ..s, want: false, phase: "error", ssh: -1, probe: -1,
+                        error: (if was_up { "tunnel dropped: " } else { "ssh failed: " }) + last })
+        publish_local()
+        host_log("[datalog_tunnel] ssh exited " + str(code) + ": " + last)
+        request_render()
+    }
+}
+
+fn on_resize(w, h) { request_render() }
+
+fn render(w, h) {
+    let s = @state
+    let dot = if s.phase == "up" { "#6cc08a" }
+              else if s.phase == "error" { "#e0746f" }
+              else if s.phase == "down" { "fg_muted" }
+              else { "warn" }
+    let label = if s.phase == "up" { "connected" }
+                else if s.phase == "connecting" { "connecting…" }
+                else if s.phase == "probing" { "checking server…" }
+                else if s.phase == "error" { "error" }
+                else { "stopped" }
+    let busy = s.phase == "connecting" or s.phase == "probing"
+    let button = if s.phase == "up" or busy { { kind: "button", id: "stop", label: "Stop" } }
+                 else { { kind: "button", id: "start", label: "Start" } }
+
+    let mut body = [
+        { kind: "hstack", gap: 8.0, align: "center", children: [
+            { kind: "text", value: "●", size: 14.0, color: dot },
+            { kind: "text", value: "datalog tunnel", size: 13.0, color: "fg" },
+            { kind: "text", value: label, size: 12.0, color: "fg_muted" },
+        ] },
+        { kind: "text", value: local_addr() + "  →  " + remote() + ":" + remote_port(),
+          size: 11.0, color: "fg_muted", family: "mono" },
+        { kind: "hstack", gap: 6.0, align: "center", children: [button] },
+    ]
+    if s.error != "" {
+        body = push(body, { kind: "text", value: s.error, size: 11.0, color: "#e0746f", family: "mono" })
+    }
+
+    {
+        kind: "vstack", gap: 8.0,
+        style: { background: "surface_1", width: "100%", min_height: "100%",
+                 padding: { top: 10.0, right: 12.0, bottom: 12.0, left: 12.0 } },
+        children: body,
+    }
+}

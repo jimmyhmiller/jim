@@ -81,6 +81,7 @@ pub const RADIO_GAP: f32 = 8.0;
 pub const RADIO_PAD_Y: f32 = 5.0;
 pub const RADIO_GROUP_GAP: f32 = 6.0;
 
+#[derive(Clone)]
 pub struct LayoutCtx {
     /// Fallback font (mono). Per-element `family` overrides resolve
     /// through [`Self::font_for`].
@@ -98,11 +99,18 @@ pub struct LayoutCtx {
     /// Snapshot of the active theme — render fns use this to resolve
     /// token-named colors / numbers in `Style` overrides.
     pub theme: jim_style::Theme,
-    /// The pane body color behind this widget's content (`pane_bg` of the
-    /// pane's theme). SDF panels render opaque and flatten their corner
-    /// AA / shadows / translucent fills against this — see
+    /// The opaque color immediately BEHIND the element being rendered. SDF
+    /// panels render opaque and flatten their corner AA / shadows /
+    /// translucent fills against it — see
     /// [`crate::button_material::WidgetButtonMaterial::alpha_mode`].
-    pub ground: Color,
+    ///
+    /// Starts as the pane body (`pane_bg`) and is swapped, for the duration
+    /// of a subtree, whenever a container paints an opaque background of
+    /// its own: a button on a light card has to round its corners against
+    /// the CARD, not the pane, or each corner shows a pane-colored wedge.
+    /// A `Cell` so the tree walk can set and restore it without cloning the
+    /// whole ctx at every container.
+    pub ground: std::cell::Cell<Color>,
     /// Font registry; per-element `family` lookups go through here.
     pub fonts: jim_style::FontRegistry,
     /// While focused on this pane: id + buffered value + caret pos for
@@ -260,16 +268,51 @@ pub fn line_height(font_size: f32) -> f32 {
     font_size * mul
 }
 
+/// [`render`] from an exclusive system, which holds `&mut World` rather than
+/// `Commands` + a [`crate::text_shape::TextShaper`]. The commands are
+/// applied before returning.
+#[allow(clippy::too_many_arguments)]
+pub fn render_in_world(
+    world: &mut World,
+    ctx: &LayoutCtx,
+    targets: &mut WidgetTargets,
+    el: &Element,
+    origin: Vec2,
+    max_w: f32,
+    z: f32,
+) -> Vec2 {
+    let mut state: bevy::ecs::system::SystemState<(Commands, crate::text_shape::TextShaper)> =
+        bevy::ecs::system::SystemState::new(world);
+    // Only fails if Bevy's text resources are absent, i.e. the app was built
+    // without text support — a setup bug, not something to render around.
+    let (mut commands, mut shaper) = state
+        .get_mut(world)
+        .expect("widget render needs Bevy's TextPipeline/FontCx/LayoutCx resources");
+    let consumed = render(&mut commands, ctx, &mut shaper, targets, el, origin, max_w, z);
+    state.apply(world);
+    targets.reject_scroll_regions("an overlay outside any pane");
+    consumed
+}
+
 /// Render `el` at `origin` (pixels-from-content-top-left, y-down).
-/// Returns the consumed size.
+/// Returns the consumed size. Its width is the rightmost extent of any
+/// node, so content that overflows the root (and the pane) reports its
+/// real width — the host scrolls the pane sideways to reach it.
 ///
 /// Layout is computed via [`crate::layout`] (Taffy) before any
 /// entities are spawned. The render walk then reads each node's
 /// computed `(x, y, width, height)` from Taffy rather than recomputing
 /// stack positions by hand.
+///
+/// Text is measured by `shaper` — Bevy's own shaping, with the fonts the
+/// render walk will draw in — so every text box is exactly the size of its
+/// glyphs. If a font is not loaded yet, `targets.layout_incomplete` is set
+/// and the caller must render again.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     commands: &mut Commands,
     ctx: &LayoutCtx,
+    shaper: &mut crate::text_shape::TextShaper,
     targets: &mut WidgetTargets,
     el: &Element,
     origin: Vec2,
@@ -291,7 +334,16 @@ pub fn render(
     } else {
         f32::INFINITY
     };
-    crate::layout::compute(&mut laid, max_w, avail_h, &ctx.metrics);
+    // The font each leaf is drawn in, resolved exactly as the render walk
+    // resolves it: an explicit family through `font_for`, else the pane font.
+    let resolve = |family: Option<&str>| {
+        family
+            .and_then(|f| ctx.font_for(f))
+            .unwrap_or_else(|| ctx.font.clone())
+    };
+    let mut measure = crate::text_shape::ShapedMeasure::new(shaper, &resolve);
+    crate::layout::compute_with(&mut laid, max_w, avail_h, &mut measure);
+    targets.layout_incomplete = measure.incomplete();
     let root_layout = laid.layout(laid.root);
     let root_origin = origin + Vec2::new(root_layout.location.x, root_layout.location.y);
     render_node(
@@ -305,7 +357,10 @@ pub fn render(
         z,
         None,
     );
-    Vec2::new(root_layout.size.width, root_layout.size.height)
+    Vec2::new(
+        root_layout.size.width.max(laid.content_right()),
+        root_layout.size.height,
+    )
 }
 
 /// Walk the Taffy tree in lockstep with the Element tree, spawning the
@@ -338,6 +393,15 @@ fn render_node(
                             children: &[Element],
                             style: Option<&Style>| {
         paint_style_background(commands, ctx, style, origin, size, z);
+        // Children sit on whatever this container just painted, so they
+        // flatten against THAT. `slot_surface_color` returns None when the
+        // background isn't one flat color (absent, or Glaze layers / a
+        // shader, whose pixels vary across the rect) — then the ground we
+        // were handed still describes the neighbourhood better than a guess.
+        let outer_ground = ctx.ground.get();
+        if let Some(bg) = style.and_then(|st| slot_surface_color(ctx, st)) {
+            ctx.ground.set(bg);
+        }
         let child_clip = if style.and_then(|s| s.clip) == Some(true) {
             let edge = origin.x + size.x;
             Some(clip_right.map_or(edge, |c| c.min(edge)))
@@ -360,6 +424,7 @@ fn render_node(
                 child_clip,
             );
         }
+        ctx.ground.set(outer_ground);
     };
 
     match el {
@@ -374,8 +439,48 @@ fn render_node(
         } => {
             recurse_children(commands, targets, children, style.as_ref());
         }
-        Element::Scroll { children, .. } => {
-            recurse_children(commands, targets, children, None);
+        Element::Scroll {
+            id,
+            children,
+            style,
+            ..
+        } => {
+            // How far the children reach below the box's top, padding
+            // included: the scrollable content height.
+            let pad_bottom = laid.taffy.style(node_id).map_or(0.0, |st| {
+                st.padding.bottom.into_raw().value()
+            });
+            let content_h = laid
+                .taffy
+                .children(node_id)
+                .unwrap_or_default()
+                .iter()
+                .map(|c| {
+                    let l = laid.layout(*c);
+                    l.location.y + l.size.height
+                })
+                .fold(0.0_f32, f32::max)
+                + pad_bottom;
+            if content_h <= size.y + 0.5 {
+                // Fits: nothing to scroll, so it is just a vstack — no
+                // camera, no texture.
+                recurse_children(commands, targets, children, style.as_ref());
+            } else {
+                render_scroll_region(
+                    commands,
+                    ctx,
+                    targets,
+                    laid,
+                    node_id,
+                    id.as_deref(),
+                    children,
+                    style.as_ref(),
+                    origin,
+                    size,
+                    content_h,
+                    z,
+                );
+            }
         }
         Element::ListItem {
             id,
@@ -435,6 +540,7 @@ fn render_node(
                     .with_alpha(0.45),
                 radius: ctx.resolve_f32("radius_sm").unwrap_or(4.0),
                 selected: *selected,
+                region: None,
             });
             recurse_children(commands, targets, children, style.as_ref());
             let rect = Rect::new(origin.x, origin.y, origin.x + size.x, origin.y + size.y);
@@ -481,6 +587,7 @@ fn render_node(
             family,
             selectable,
             wrap,
+            break_words,
         } => render_richtext_at(
             commands,
             ctx,
@@ -491,6 +598,7 @@ fn render_node(
             family.as_deref(),
             *selectable,
             *wrap,
+            *break_words,
             origin,
             size,
             z,
@@ -995,8 +1103,14 @@ fn render_text_at(
         None => value.to_string(),
     };
     // For wrapping (multi-line) runs the box still bounds the wrap width.
+    // `PaneContentNoClip`: that box is this element's own laid-out width.
+    // Without the opt-out, jim-pane's `enforce_pane_content_bounds`
+    // overwrites it with "distance to the pane's right edge" the frame the
+    // text appears, so text in a column wraps at the PANE edge — straight
+    // across anything beside it (lsp_symbol's sidebar).
     let mut entity = commands.spawn((
         ChildOf(ctx.content_root),
+        jim_pane::PaneContentNoClip,
         Text2d::new(rendered.clone()),
         TextFont {
             font: font.into(),
@@ -1034,6 +1148,113 @@ fn render_text_at(
     }
 }
 
+/// An overflowing `Element::Scroll`: its children are rendered under a
+/// region root of their own, in coordinates local to the region's top-left,
+/// and their hit targets are collected separately. The host (see
+/// `scroll_region::reconcile_scroll_regions`) then gives the root its own
+/// render layer and a camera that draws it into a texture the size of the
+/// box, shows that texture in the pane, and merges the targets back in at
+/// the current scroll offset, clipped to the box.
+#[allow(clippy::too_many_arguments)]
+fn render_scroll_region(
+    commands: &mut Commands,
+    ctx: &LayoutCtx,
+    targets: &mut WidgetTargets,
+    laid: &crate::layout::LaidOut,
+    node_id: taffy::NodeId,
+    id: Option<&str>,
+    children: &[Element],
+    style: Option<&Style>,
+    origin: Vec2,
+    size: Vec2,
+    content_h: f32,
+    z: f32,
+) {
+    // The region's own background belongs INSIDE the texture (it scrolls
+    // with nothing, but the texture is opaque): the camera clears to it.
+    let ground = style
+        .and_then(|st| slot_surface_color(ctx, st))
+        .unwrap_or_else(|| ctx.ground.get());
+    let root = commands
+        .spawn((
+            ChildOf(ctx.content_root),
+            Transform::from_xyz(origin.x, -origin.y, z),
+            Visibility::default(),
+        ))
+        .id();
+    let region_ctx = LayoutCtx {
+        content_root: root,
+        ground: std::cell::Cell::new(ground),
+        ..ctx.clone()
+    };
+    let mut local = WidgetTargets::default();
+    let child_ids = laid.taffy.children(node_id).unwrap_or_default();
+    for (cid, child) in child_ids.iter().zip(children.iter()) {
+        let cl = laid.layout(*cid);
+        render_node(
+            commands,
+            &region_ctx,
+            &mut local,
+            laid,
+            *cid,
+            child,
+            Vec2::new(cl.location.x, cl.location.y),
+            0.01,
+            None,
+        );
+    }
+    // Things that live outside the flow render — persistent editor
+    // entities, canvas items drawn by the caller, a camera of their own —
+    // cannot follow a region's camera. Say so where it happens instead of
+    // drawing them unclipped in the wrong place.
+    let unsupported = [
+        (!local.editor_portals.is_empty(), "an editor"),
+        (!local.canvas_regions.is_empty(), "a canvas"),
+        (!local.scroll_regions.is_empty(), "another overflowing scroll region"),
+    ];
+    for (present, what) in unsupported {
+        if present {
+            eprintln!(
+                "[widget] scroll region {:?} contains {what}, which cannot be drawn inside a \
+                 scroll region; it is not shown",
+                id.unwrap_or("(no id)")
+            );
+            render_text_at(
+                commands,
+                &region_ctx,
+                &mut local,
+                &format!("⚠ {what} can't go inside a scroll region"),
+                Some("danger"),
+                DEFAULT_FONT_SIZE,
+                None,
+                None,
+                false,
+                true,
+                None,
+                Vec2::ZERO,
+                Vec2::new(size.x, line_height(DEFAULT_FONT_SIZE)),
+                0.9,
+            );
+            local.editor_portals.clear();
+            local.canvas_regions.clear();
+            local.scroll_regions.clear();
+        }
+    }
+    let key = match id {
+        Some(id) => id.to_string(),
+        None => format!("#{}", targets.scroll_regions.len()),
+    };
+    targets.scroll_regions.push(crate::ScrollRegionTarget {
+        key,
+        rect: Rect::from_corners(origin, origin + size),
+        content_h,
+        z,
+        root,
+        ground,
+        targets: local,
+    });
+}
+
 /// Render an `Element::RichText`: ONE `Text2d` block whose runs are
 /// `TextSpan` children.
 ///
@@ -1057,6 +1278,7 @@ fn render_richtext_at(
     base_family: Option<&str>,
     selectable: bool,
     wrap: bool,
+    break_words: bool,
     origin: Vec2,
     size: Vec2,
     z: f32,
@@ -1096,8 +1318,10 @@ fn render_richtext_at(
     };
 
     let (first_size, first_col, first_font) = resolve(first);
+    // Own bounds, not the pane's — see `render_text_at`.
     let mut root = commands.spawn((
         ChildOf(ctx.content_root),
+        jim_pane::PaneContentNoClip,
         Text2d::new(first.value.clone()),
         TextFont {
             font: first_font.into(),
@@ -1115,6 +1339,13 @@ fn render_richtext_at(
     ));
     if !wrap {
         root.insert(bevy::text::TextLayout::no_wrap());
+    } else if break_words {
+        // Must agree with `layout::measure_runs`, which sized this box on
+        // the same rule: words wrap whole, and only a word too long for a
+        // line of its own splits between characters.
+        root.insert(bevy::text::TextLayout::linebreak(
+            bevy::text::LineBreak::WordOrCharacter,
+        ));
     }
     let root = root.id();
     for run in rest {
@@ -1571,6 +1802,44 @@ pub(crate) fn paint_rounded_panel(
     shadow_offset_y: f32,
     z: f32,
 ) {
+    paint_rounded_panel_over(
+        commands,
+        ctx,
+        origin,
+        size,
+        corner_radius,
+        bg,
+        border_color,
+        border_width,
+        shadow_color,
+        shadow_blur,
+        shadow_offset_y,
+        z,
+        ctx.ground.get(),
+    );
+}
+
+/// [`paint_rounded_panel`] over an explicit `ground` instead of the pane
+/// body. For a panel that sits ON another panel (a toggle knob on its
+/// track, a radio dot in its ring): the opaque material paints everything
+/// outside the rounded corners in the ground color, so flattening against
+/// the pane body would frame a round knob in pane-colored corners.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_rounded_panel_over(
+    commands: &mut Commands,
+    ctx: &LayoutCtx,
+    origin: Vec2,
+    size: Vec2,
+    corner_radius: f32,
+    bg: Color,
+    border_color: Color,
+    border_width: f32,
+    shadow_color: Color,
+    shadow_blur: f32,
+    shadow_offset_y: f32,
+    z: f32,
+    ground: Color,
+) {
     let _ = paint_rounded_panel_root(
         commands,
         ctx.content_root,
@@ -1584,8 +1853,60 @@ pub(crate) fn paint_rounded_panel(
         shadow_blur,
         shadow_offset_y,
         z,
-        ctx.ground,
+        ground,
     );
+}
+
+/// The opaque color a slot presents to whatever is painted on top of it:
+/// its `background` flattened against the pane body. `None` when that
+/// isn't a single color (no background, or Glaze layers / a shader, whose
+/// pixels vary across the rect) — callers then keep the pane body.
+/// Ground for a slot painted on a parent slot: the parent plan's surface
+/// color when it has one, else the parent's built-in `fallback` color.
+fn parent_ground(ctx: &LayoutCtx, parent_plan: Option<&Style>, fallback: Color) -> Color {
+    match parent_plan {
+        Some(plan) => slot_surface_color(ctx, plan).unwrap_or(ctx.ground.get()),
+        None => crate::script_widget::flatten_alpha(fallback, ctx.ground.get()),
+    }
+}
+
+fn slot_surface_color(ctx: &LayoutCtx, plan: &Style) -> Option<Color> {
+    // A flat `background` is the whole answer.
+    if let Some(bg) = plan.background.as_deref().and_then(|c| ctx.resolve_color(c))
+        && plan.glaze_layers.is_empty()
+        && plan.shader.is_none()
+    {
+        return Some(crate::script_widget::flatten_alpha(bg, ctx.ground.get()));
+    }
+    // A Glaze plan puts its `fill` in the layer stack instead, and stacks
+    // more on top: a `:checked` block adds a SECOND fill after the resting
+    // one, and an `overlay shader {}` sits between them. Layers paint in
+    // order, so the surface a child lands on is the LAST fill, not the first
+    // — a checked toggle's stack is [fill surf2, overlay shader, fill rose],
+    // and taking the first one painted the resting dark fill into the knob's
+    // corners, a dark box over the live track.
+    //
+    // A gradient has no single color, so anything painted after one leaves us
+    // with no answer at all rather than a wrong one.
+    surface_fill(&plan.glaze_layers)
+        .and_then(|c| ctx.resolve_color(c))
+        .map(|c| crate::script_widget::flatten_alpha(c, ctx.ground.get()))
+}
+
+/// The color a Glaze layer stack leaves on top, or `None` when it isn't one
+/// flat color. Borders, shadows and overlay shaders tint what is already
+/// there; a gradient has no single color, so anything painted after one
+/// leaves no answer rather than a wrong one.
+fn surface_fill(layers: &[crate::protocol::GlazeLayer]) -> Option<&str> {
+    let mut surface = None;
+    for layer in layers {
+        match layer {
+            crate::protocol::GlazeLayer::Fill { color } => surface = Some(color.as_str()),
+            crate::protocol::GlazeLayer::LinearGradient { .. } => surface = None,
+            _ => {}
+        }
+    }
+    surface
 }
 
 /// [`paint_rounded_panel`] without a [`LayoutCtx`]: spawns the SDF panel
@@ -1750,6 +2071,51 @@ pub fn paint_style_background_for(
     element_id: Option<&str>,
     checked: f32,
 ) {
+    paint_style_background_over(
+        commands, ctx, style, origin, size, z, element_id, checked, ctx.ground.get(),
+    );
+}
+
+/// [`paint_style_background_for`] over an explicit `ground` — see
+/// [`paint_rounded_panel_over`] for when that matters.
+#[allow(clippy::too_many_arguments)]
+fn paint_style_background_over(
+    commands: &mut Commands,
+    ctx: &LayoutCtx,
+    style: Option<&Style>,
+    origin: Vec2,
+    size: Vec2,
+    z: f32,
+    element_id: Option<&str>,
+    checked: f32,
+    ground: Color,
+) {
+    // Everything painted for this plan — the panel itself, and any Glaze
+    // layers, which go through paths that read `ctx.ground` rather than take
+    // a ground argument — flattens against `ground`. A toggle knob sitting on
+    // a shader-glow track is the case that needs it: its `fill` is a Glaze
+    // LAYER, so the layer painter (not the panel painter) draws it, and it was
+    // flattening against the pane body — painting a pane-colored box over the
+    // track around the knob.
+    let outer = ctx.ground.replace(ground);
+    paint_style_background_over_inner(
+        commands, ctx, style, origin, size, z, element_id, checked, ground,
+    );
+    ctx.ground.set(outer);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_style_background_over_inner(
+    commands: &mut Commands,
+    ctx: &LayoutCtx,
+    style: Option<&Style>,
+    origin: Vec2,
+    size: Vec2,
+    z: f32,
+    element_id: Option<&str>,
+    checked: f32,
+    ground: Color,
+) {
     let Some(style) = style else { return };
     if size.x <= 0.0 || size.y <= 0.0 {
         return;
@@ -1782,7 +2148,7 @@ pub fn paint_style_background_for(
     // Nothing to paint if everything is transparent and there's no image.
     let has_panel = bg.is_some() || border_w > 0.0 || shadow_color.to_srgba().alpha > 0.0;
     if has_panel {
-        paint_rounded_panel(
+        paint_rounded_panel_over(
             commands,
             ctx,
             origin,
@@ -1795,6 +2161,7 @@ pub fn paint_style_background_for(
             shadow_blur,
             shadow_offset_y,
             z - 0.005,
+            ground,
         );
     }
     // Background image — load from disk through the shared
@@ -2062,6 +2429,12 @@ fn paint_shader_layer(
                 bevy::mesh::Mesh2d(mesh),
                 bevy::sprite_render::MeshMaterial2d(mat),
             ));
+            // The material lands too late for THIS frame's render — a brand
+            // new asset is prepared for the next one. Under the reactive
+            // render loop there may be no next one, so a re-render (focusing
+            // the pane is enough) left every gradient and shader layer blank
+            // until some unrelated event woke the loop. Ask for that frame.
+            crate::request_main_loop_wakeup();
         }
     });
 }
@@ -2298,20 +2671,24 @@ fn render_slider_at(
     let range_w = (thumb_center_x - origin.x).max(0.0);
     if range_w > 0.0 {
         let range_size = Vec2::new(range_w, track_h);
+        let track_ground = parent_ground(ctx, track_plan, ctx.palette.bar_track);
         if let Some(plan) = range_plan {
-            paint_style_background(
+            paint_style_background_over(
                 commands,
                 ctx,
                 Some(plan),
                 track_origin,
                 range_size,
                 z + 0.01,
+                None,
+                0.0,
+                track_ground,
             );
         } else {
             let accent = ctx
                 .resolve_color("accent")
                 .unwrap_or(Color::srgb(0.42, 0.62, 0.92));
-            paint_rounded_panel(
+            paint_rounded_panel_over(
                 commands,
                 ctx,
                 track_origin,
@@ -2324,6 +2701,7 @@ fn render_slider_at(
                 0.0,
                 0.0,
                 z + 0.01,
+                track_ground,
             );
         }
     }
@@ -2705,13 +3083,14 @@ fn render_bar_at(
     let track_plan = style.and_then(|s| s.track.as_ref());
     let fill_plan = style.and_then(|s| s.fill.as_ref());
 
+    let track_bg = track
+        .and_then(parse_hex_color)
+        .map(|[r, g, b]| Color::srgb(r, g, b))
+        .unwrap_or(ctx.palette.bar_track);
     if let Some(plan) = track_plan {
         paint_style_background(commands, ctx, Some(plan), origin, size, z);
     } else {
-        let bg = track
-            .and_then(parse_hex_color)
-            .map(|[r, g, b]| Color::srgb(r, g, b))
-            .unwrap_or(ctx.palette.bar_track);
+        let bg = track_bg;
         commands.spawn((
             ChildOf(ctx.content_root),
             Sprite {
@@ -2728,7 +3107,17 @@ fn render_bar_at(
         return;
     }
     if let Some(plan) = fill_plan {
-        paint_style_background(commands, ctx, Some(plan), origin, fill_size, z + 0.01);
+        paint_style_background_over(
+            commands,
+            ctx,
+            Some(plan),
+            origin,
+            fill_size,
+            z + 0.01,
+            None,
+            0.0,
+            parent_ground(ctx, track_plan, track_bg),
+        );
     } else {
         let fill = color
             .and_then(parse_hex_color)
@@ -2938,10 +3327,25 @@ fn render_radio_at(
             let inset = RADIO_RING * 0.3;
             let dot_pos = ring_pos + Vec2::splat(inset);
             let dot_size = Vec2::splat(RADIO_RING - inset * 2.0);
+            let ring_ground = parent_ground(
+                ctx,
+                style.and_then(|s| s.ring.as_ref()),
+                ctx.palette.bar_track,
+            );
             if let Some(plan) = style.and_then(|s| s.dot.as_ref()) {
-                paint_style_background(commands, ctx, Some(plan), dot_pos, dot_size, z + 0.01);
+                paint_style_background_over(
+                    commands,
+                    ctx,
+                    Some(plan),
+                    dot_pos,
+                    dot_size,
+                    z + 0.01,
+                    None,
+                    0.0,
+                    ring_ground,
+                );
             } else {
-                paint_rounded_panel(
+                paint_rounded_panel_over(
                     commands,
                     ctx,
                     dot_pos,
@@ -2954,6 +3358,7 @@ fn render_radio_at(
                     0.0,
                     0.0,
                     z + 0.01,
+                    ring_ground,
                 );
             }
         }
@@ -3287,7 +3692,10 @@ fn render_toggle_at(
     let track_plan = style.and_then(|s| {
         animated_slot_plan(ctx, s.track.as_ref(), s.track_checked.as_ref(), checked, t)
     });
+    // What the knob sits on, for its opaque corners.
+    let track_ground;
     if let Some(plan) = &track_plan {
+        track_ground = slot_surface_color(ctx, plan).unwrap_or(ctx.ground.get());
         paint_style_background_for(
             commands,
             ctx,
@@ -3300,6 +3708,7 @@ fn render_toggle_at(
         );
     } else {
         let track_color = mix_linear(ctx.palette.bar_track, accent, t);
+        track_ground = crate::script_widget::flatten_alpha(track_color, ctx.ground.get());
         paint_rounded_panel(
             commands,
             ctx,
@@ -3329,7 +3738,7 @@ fn render_toggle_at(
         animated_slot_plan(ctx, s.knob.as_ref(), s.knob_checked.as_ref(), checked, t)
     });
     if let Some(plan) = &knob_plan {
-        paint_style_background_for(
+        paint_style_background_over(
             commands,
             ctx,
             Some(plan),
@@ -3338,9 +3747,10 @@ fn render_toggle_at(
             z + 0.01,
             Some(id),
             t,
+            track_ground,
         );
     } else {
-        paint_rounded_panel(
+        paint_rounded_panel_over(
             commands,
             ctx,
             knob_pos,
@@ -3353,6 +3763,7 @@ fn render_toggle_at(
             2.0,
             1.0,
             z + 0.01,
+            track_ground,
         );
     }
 
@@ -3464,10 +3875,21 @@ fn render_checkbox_at(
         let check_pos = box_pos + inset;
         let check_size = (box_size - inset * 2.0).max(Vec2::ZERO);
         let check_plan = style.and_then(|s| s.check.as_ref());
+        let box_ground = parent_ground(ctx, box_plan, ctx.palette.bar_track);
         if let Some(plan) = check_plan {
-            paint_style_background(commands, ctx, Some(plan), check_pos, check_size, z + 0.01);
+            paint_style_background_over(
+                commands,
+                ctx,
+                Some(plan),
+                check_pos,
+                check_size,
+                z + 0.01,
+                None,
+                0.0,
+                box_ground,
+            );
         } else {
-            paint_rounded_panel(
+            paint_rounded_panel_over(
                 commands,
                 ctx,
                 check_pos,
@@ -3480,6 +3902,7 @@ fn render_checkbox_at(
                 0.0,
                 0.0,
                 z + 0.01,
+                box_ground,
             );
         }
     }
@@ -4212,5 +4635,77 @@ mod image_fit_tests {
             let f = fit_image(Vec2::ZERO, Vec2::new(10.0, 10.0), fit);
             assert!(f.draw.is_finite() && f.offset.is_finite());
         }
+    }
+}
+
+#[cfg(test)]
+mod surface_fill_tests {
+    use super::surface_fill;
+    use crate::protocol::{GlazeLayer, GradientStop, Sides};
+
+    fn fill(c: &str) -> GlazeLayer {
+        GlazeLayer::Fill { color: c.into() }
+    }
+
+    /// A `:checked` slot stacks its fill AFTER the resting one, with the
+    /// overlay shader in between: [surf2, glow, rose]. The knob painted on
+    /// top sits on ROSE. Taking the first fill drew the resting dark color
+    /// into the knob's corners — a dark box over a live toggle.
+    #[test]
+    fn last_fill_wins_over_earlier_ones_and_overlays() {
+        let layers = vec![
+            fill("#20242a"),
+            GlazeLayer::Shader {
+                body: "return vec4<f32>(1.0);".into(),
+                overlay: true,
+            },
+            fill("#f35868"),
+        ];
+        assert_eq!(surface_fill(&layers), Some("#f35868"));
+    }
+
+    #[test]
+    fn borders_and_shadows_dont_replace_the_surface() {
+        let layers = vec![
+            fill("#101317"),
+            GlazeLayer::Border {
+                color: "#333333".into(),
+                width: 1.0,
+                sides: Sides::default(),
+            },
+            GlazeLayer::Shadow {
+                color: "#00000055".into(),
+                blur: 8.0,
+                offset_x: 0.0,
+                offset_y: 2.0,
+                spread: 0.0,
+                inset: false,
+            },
+        ];
+        assert_eq!(surface_fill(&layers), Some("#101317"));
+    }
+
+    /// A gradient has no single color, so a child on top gets no answer —
+    /// better the caller's own ground than a wrong flat color.
+    #[test]
+    fn a_gradient_on_top_has_no_single_surface() {
+        let layers = vec![
+            fill("#101317"),
+            GlazeLayer::LinearGradient {
+                angle: 90.0,
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: "#ff0000".into(),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: "#0000ff".into(),
+                    },
+                ],
+            },
+        ];
+        assert_eq!(surface_fill(&layers), None);
+        assert_eq!(surface_fill(&[]), None);
     }
 }

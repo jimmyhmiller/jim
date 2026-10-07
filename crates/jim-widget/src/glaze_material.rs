@@ -369,7 +369,7 @@ fn update_glaze_materials(
             let pointer = match (topmost, pane_state) {
                 (Some((pane, pt)), Some((_, rect, _, scroll, _))) if pane == target.pane => {
                     let mut local = jim_pane::pt_to_content_local(pt, rect);
-                    local.y += scroll.map(|s| s.y).unwrap_or(0.0);
+                    local += crate::scroll_offset(scroll);
                     Some(local)
                 }
                 _ => None,

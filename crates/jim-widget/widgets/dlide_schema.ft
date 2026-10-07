@@ -1,18 +1,18 @@
 // dlide_schema.ft — datalog IDE: schema browser (types + enums).
 //
-// Lists types and enums. Click a type → editor prefills a browse + shows
-// its fields; click an enum → shows its variants. Per-selection actions:
-// browse (types only), drop (soft, confirmed), purge (hard, confirmed) —
-// emitted as datalog commands for the results pane to run.
+// Lists types and enums. Click a type → shows its fields and browses it
+// (editor prefilled, results pane runs `list <Type> limit 50`); click an
+// enum → shows its variants. Read-only: no drop/purge from here.
 //
 //   listens: schema.changed           reload the schema
-//            conn.state {host}         (retained) DB host
+//            conn.state {host, token_file}  (retained) DB connection → reload
 //   emits:   sql.use_table {table}     (click type → editor prefill)
-//            sql.run {sql}             (browse / drop / purge → results)
+//            sql.run {sql}             (click type / browse → results)
 import "host"
 
 fn init_state() = {
     host: "127.0.0.1:5557",
+    token_file: "",
     busy: false,
     proc: -1,
     out: [],
@@ -21,16 +21,21 @@ fn init_state() = {
     enums: [],
     selected: "",
     sel_kind: "",  // "type" | "enum"
-    confirm: "",
     loaded: false,
 }
 let state = atom(init_state())
 
 fn dl_path() { let home = host_env("HOME"); if home == "" { "datalog" } else { home + "/.cargo/bin/datalog" } }
-fn spawn_args(host, args) {
+// `token_file` comes from conn.state (datalog_tunnel.ft); empty = no token.
+fn spawn_args(host, token_file, args) {
     let mut argv = ["--host", host]
+    if token_file != "" { argv = push(push(argv, "--auth-token-file"), token_file) }
     for a in args { argv = push(argv, a) }
-    proc_spawn(dl_path(), argv)
+    // proc_spawn drops stderr, where the CLI reports connection failures;
+    // run it under sh so they show up in the output.
+    let mut sh = ["-c", "exec \"$0\" \"$@\" 2>&1", dl_path()]
+    for a in argv { sh = push(sh, a) }
+    proc_spawn("/bin/sh", sh)
 }
 fn is_name_line(line) { len(line) >= 3 and starts_with(line, "  ") and not starts_with(line, "   ") }
 fn parse_schema(lines) {
@@ -75,11 +80,11 @@ fn block_under(lines, header, name) {
     out
 }
 
-fn load_schema(host) { spawn_args(host, ["schema"]) }
+fn load_schema(s) { spawn_args(s.host, s.token_file, ["schema"]) }
 
 fn on_init() {
     let s = @state
-    let proc = load_schema(s.host)
+    let proc = load_schema(s)
     if proc != -1 { reset!(state, { ..s, proc: proc, busy: true, out: [] }) }
     else { reset!(state, { ..s, proc: proc }) }
     request_render()
@@ -103,7 +108,7 @@ fn on_proc_exit(handle, code) {
         let mut still = false
         if ns.sel_kind == "type" { for t in ns.types { if t == ns.selected { still = true } } }
         else if ns.sel_kind == "enum" { for e in ns.enums { if e == ns.selected { still = true } } }
-        if not still { ns = { ..ns, selected: "", sel_kind: "", confirm: "" } }
+        if not still { ns = { ..ns, selected: "", sel_kind: "" } }
     }
     ns = { ..ns, busy: false, proc: -1, out: [] }
     reset!(state, ns)
@@ -113,11 +118,21 @@ fn on_proc_exit(handle, code) {
 
 fn on_message(topic, payload, sender) {
     if sender == my_id() { return }
-    if topic == "conn.state" { reset!(state, { ..(@state), host: payload.host }); request_render(); return }
+    if topic == "conn.state" {
+        let s = { ..(@state), host: payload.host, token_file: unwrap_or(get(payload, "token_file"), "") }
+        // A load already in flight targets the old host; kill it so its exit
+        // can't overwrite the schema we are about to fetch.
+        if s.busy and s.proc != -1 { proc_kill(s.proc) }
+        let proc = load_schema(s)
+        if proc != -1 { reset!(state, { ..s, proc: proc, busy: true, out: [] }) }
+        else { reset!(state, { ..s, proc: proc, busy: false }) }
+        request_render()
+        return
+    }
     if topic == "schema.changed" {
         let s = @state
         if not s.busy {
-            let proc = load_schema(s.host)
+            let proc = load_schema(s)
             if proc != -1 { reset!(state, { ..s, proc: proc, busy: true, out: [] }) }
             else { reset!(state, { ..s, proc: proc }) }
         }
@@ -130,25 +145,26 @@ fn on_click(x, y, shift, cmd, id) {
     if id == "refresh" {
         let s = @state
         if not s.busy {
-            let proc = load_schema(s.host)
+            let proc = load_schema(s)
             if proc != -1 { reset!(state, { ..s, proc: proc, busy: true, out: [] }) }
             else { reset!(state, { ..s, proc: proc }) }
         }
         request_render()
         return
     }
-    if starts_with(id, "t:") {                 // type: select + prefill editor
+    if starts_with(id, "t:") {                 // type: select + browse it
         let s = @state
         let sel = slice(id, 2, len(id) - 2)
-        reset!(state, { ..s, selected: sel, sel_kind: "type", confirm: "" })
+        reset!(state, { ..s, selected: sel, sel_kind: "type" })
         emit("sql.use_table", { table: sel })
+        emit("sql.run", { sql: "list " + sel + " limit 50" })
         request_render()
         return
     }
     if starts_with(id, "e:") {                 // enum: select (inspect only)
         let s = @state
         let sel = slice(id, 2, len(id) - 2)
-        reset!(state, { ..s, selected: sel, sel_kind: "enum", confirm: "" })
+        reset!(state, { ..s, selected: sel, sel_kind: "enum" })
         request_render()
         return
     }
@@ -157,31 +173,6 @@ fn on_click(x, y, shift, cmd, id) {
         if s.selected != "" and s.sel_kind == "type" {
             emit("sql.run", { sql: "list " + s.selected + " limit 50" })
         }
-        return
-    }
-    if id == "drop" {
-        let s = @state
-        if s.selected != "" { reset!(state, { ..s, confirm: "drop:" + s.selected }) }
-        request_render()
-        return
-    }
-    if id == "purge" {
-        let s = @state
-        if s.selected != "" { reset!(state, { ..s, confirm: "purge:" + s.selected }) }
-        request_render()
-        return
-    }
-    if id == "cancel" { reset!(state, { ..(@state), confirm: "" }); request_render(); return }
-    if id == "confirm" {
-        let s = @state
-        let c = s.confirm
-        let kp = if s.sel_kind == "enum" { "enum " } else { "" }  // "drop enum X" vs "drop X"
-        if starts_with(c, "purge:") { emit("sql.run", { sql: "purge " + kp + s.selected }) }
-        else if starts_with(c, "drop:") { emit("sql.run", { sql: "drop " + kp + s.selected }) }
-        // The item is gone now — clear the selection so its card disappears
-        // instead of leaving a stale drop/purge target to re-click.
-        reset!(state, { ..s, confirm: "", selected: "", sel_kind: "" })
-        request_render()
         return
     }
 }
@@ -227,7 +218,6 @@ fn render(w, h) {
     // detail + actions for the selection (type or enum)
     if s.selected != "" {
         let is_enum = s.sel_kind == "enum"
-        let kw = if is_enum { "enum " } else { "" }
         let mut card = [
             { kind: "hstack", gap: 6.0, align: "center", children: [
                 { kind: "text", value: s.selected, size: 13.0, weight: "bold", color: "fg" },
@@ -246,29 +236,9 @@ fn render(w, h) {
             card = push(card, { kind: "text", value: d, size: 11.0, color: "fg_muted", family: "mono" })
         }
 
-        // actions
-        let mut actions = []
-        if not is_enum { actions = push(actions, { kind: "button", id: "browse", label: "browse" }) }
-        actions = push(actions, { kind: "button", id: "drop", label: "drop" })
-        actions = push(actions, { kind: "button", id: "purge", label: "purge" })
-        card = push(card, { kind: "hstack", gap: 6.0, children: actions })
-
-        // confirmations
-        if s.confirm == "drop:" + s.selected {
-            card = push(card, { kind: "text",
-                value: "Drop " + kw + "'" + s.selected + "'? Removes it from the schema. Re-define to restore.",
-                size: 11.0, color: "warn" })
+        if not is_enum {
             card = push(card, { kind: "hstack", gap: 6.0, children: [
-                { kind: "button", id: "confirm", label: "yes, drop" },
-                { kind: "button", id: "cancel", label: "cancel" },
-            ]})
-        } else if s.confirm == "purge:" + s.selected {
-            card = push(card, { kind: "text",
-                value: "Hard-purge " + kw + "'" + s.selected + "'? Deletes its definition (and data for types). Irreversible.",
-                size: 11.0, color: "#e0746f" })
-            card = push(card, { kind: "hstack", gap: 6.0, children: [
-                { kind: "button", id: "confirm", label: "yes, purge" },
-                { kind: "button", id: "cancel", label: "cancel" },
+                { kind: "button", id: "browse", label: "browse" },
             ]})
         }
 

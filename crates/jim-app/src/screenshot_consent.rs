@@ -207,7 +207,7 @@ fn render_consent(world: &mut World) {
         content_root: root,
         content_size: Vec2::new(TOAST_W, win_h),
         palette: colors,
-        ground: Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG)),
+        ground: std::cell::Cell::new(Color::LinearRgba(theme.color(jim_style::tokens::PANE_BG))),
         theme,
         fonts,
         focused_input: None,
@@ -216,24 +216,18 @@ fn render_consent(world: &mut World) {
         anim: Default::default(),
     };
     let mut targets = WidgetTargets::default();
-    {
-        let mut commands = world.commands();
-        render::render(
-            &mut commands,
-            &ctx,
-            &mut targets,
-            &el,
-            Vec2::ZERO,
-            TOAST_W,
-            0.0,
-        );
-    }
-    world.flush();
+    render::render_in_world(world, &ctx, &mut targets, &el, Vec2::ZERO, TOAST_W, 0.0);
     stamp_layer(world, root, MENU_OVERLAY_LAYER);
 
     let mut c = world.resource_mut::<ScreenshotConsent>();
     c.root = Some(root);
-    c.last_sig = sig;
+    // A font not loaded yet left text unmeasured: don't record the
+    // signature, so the next frame (which the wakeup guarantees) re-renders.
+    if targets.layout_incomplete {
+        jim_widget::request_main_loop_wakeup();
+    } else {
+        c.last_sig = sig;
+    }
 }
 
 /// Re-render only when the visible content changes: front identity + the

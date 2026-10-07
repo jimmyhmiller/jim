@@ -25,6 +25,8 @@
 //! you are demoing — leaving insert mode in vim must not end your talk.
 //! Plain →/↓/Space still advance while the deck itself holds focus.
 
+use std::path::{Path, PathBuf};
+
 use bevy::prelude::*;
 use jim_pane::{MARGIN, PaneChrome, PaneChromeOverride, PaneRect, PaneScreenAnchored, PaneTag};
 
@@ -134,10 +136,14 @@ pub struct PresentPlugin;
 
 impl Plugin for PresentPlugin {
     fn build(&self, app: &mut App) {
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        app.insert_non_send(DeckPickChannel { tx, rx });
         app.init_resource::<Presentation>()
+            .add_action(OPEN)
             .add_action(TOGGLE)
             .add_action(NEXT)
             .add_action(PREV)
+            .add_systems(Update, drain_deck_picks)
             .add_systems(
                 Update,
                 (
@@ -152,6 +158,16 @@ impl Plugin for PresentPlugin {
             );
     }
 }
+
+const OPEN: Action = Action {
+    id: "present.open",
+    title: "Open Slideshow…",
+    category: "View",
+    keywords: &["slideshow", "deck", "talk", "presentation", "markdown", "slides"],
+    radial_icon: None,
+    default_keys: &[],
+    run: ActionRun::Custom(action_open_slideshow),
+};
 
 const TOGGLE: Action = Action {
     id: "present.toggle",
@@ -183,11 +199,121 @@ const PREV: Action = Action {
     run: ActionRun::Custom(|ctx| nav(ctx, "ArrowLeft")),
 };
 
+/// The deck widget script every slideshow pane runs.
+const DECK_SCRIPT: &str = "deck.ft";
+
+/// Channel the async Open Slideshow sheet hands the chosen talk back on.
+/// Same shape and reasoning as `FilePickChannel` in lib.rs: the sheet is
+/// begun on the main thread, awaited off it, and drained here. NonSend
+/// because both mpsc ends are `!Sync`.
+struct DeckPickChannel {
+    tx: std::sync::mpsc::Sender<PathBuf>,
+    rx: std::sync::mpsc::Receiver<PathBuf>,
+}
+
+/// `present.open`: pick a Markdown talk and open it as a deck pane in the
+/// active project. Async sheet, never the blocking `pick_file` — see
+/// `action_open_file` in lib.rs for the re-entrancy crash that avoids.
+fn action_open_slideshow(ctx: &mut ActionCtx) {
+    let Some(tx) = ctx
+        .world
+        .get_non_send_resource::<DeckPickChannel>()
+        .map(|c| c.tx.clone())
+    else {
+        return;
+    };
+    let dir = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("talks"))
+        .filter(|talks| talks.is_dir())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| ".".into());
+    let fut = rfd::AsyncFileDialog::new()
+        .set_directory(dir)
+        .set_title("Open slideshow")
+        .add_filter("Markdown", &["md", "markdown"])
+        .pick_file();
+    bevy::tasks::IoTaskPool::get()
+        .spawn(async move {
+            if let Some(handle) = fut.await {
+                let _ = tx.send(handle.path().to_path_buf());
+            }
+        })
+        .detach();
+}
+
+fn drain_deck_picks(
+    channel: Option<NonSend<DeckPickChannel>>,
+    projects: Res<crate::projects::Projects>,
+    mut pending: ResMut<crate::projects::PendingActions>,
+) {
+    let Some(channel) = channel else { return };
+    while let Ok(path) = channel.rx.try_recv() {
+        let Some(project) = projects.active else {
+            warn!("[present] no active project to open {} in", path.display());
+            continue;
+        };
+        pending.new_panes.push(deck_pane_request(&path, project));
+    }
+}
+
+/// A new deck pane showing the talk at `path`.
+///
+/// Shared by the palette action and the `open_slideshow` IPC/bus action,
+/// so every way of opening a talk names its pane the same way.
+pub fn deck_pane_request(path: &Path, project_id: u64) -> crate::projects::NewPaneRequest {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        warn!("[present] reading {} for its title: {e}", path.display());
+        String::new()
+    });
+    crate::projects::NewPaneRequest {
+        kind: jim_widget::script_widget::PANE_KIND,
+        project_id,
+        origin: None,
+        size: None,
+        config: serde_json::json!({
+            "script": DECK_SCRIPT,
+            "title": deck_title(&text, path),
+            "params": { "path": path.to_string_lossy() },
+        }),
+    }
+}
+
+/// The talk's own `title:` from its front matter — the same key the deck
+/// shows in its footer — else the file name without its extension.
+fn deck_title(text: &str, path: &Path) -> String {
+    front_matter_title(text).unwrap_or_else(|| {
+        path.file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Slideshow".to_string())
+    })
+}
+
+/// `title:` from an opening `---` … `---` block, as `deck.ft` parses it.
+fn front_matter_title(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let line = line.trim();
+        if line == "---" {
+            return None;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            if key.trim() == "title" {
+                let value = value.trim();
+                return (!value.is_empty()).then(|| value.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Is this entity a deck widget (as opposed to any other funct widget)?
 fn is_deck(world: &World, entity: Entity) -> bool {
     world
         .get::<jim_widget::script_widget::ScriptWidget>(entity)
-        .is_some_and(|w| w.script_path.ends_with("deck.ft"))
+        .is_some_and(is_deck_widget)
 }
 
 /// Consume [`Presentation::pending_toggle`], the scripted form of F5.
@@ -243,7 +369,7 @@ fn apply_pending_nav(
 }
 
 fn is_deck_widget(widget: &jim_widget::script_widget::ScriptWidget) -> bool {
-    widget.script_path.ends_with("deck.ft")
+    widget.script_path.ends_with(DECK_SCRIPT)
 }
 
 fn toggle_presentation(ctx: &mut ActionCtx) {
@@ -508,6 +634,25 @@ mod tests {
             show_sidebar,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_deck_is_titled_from_its_front_matter() {
+        let text = "---\ntitle: An Editor for One\n---\n# Hi\n";
+        assert_eq!(
+            deck_title(text, Path::new("/t/live-view-test.md")),
+            "An Editor for One"
+        );
+    }
+
+    /// No front matter, or front matter without a title: the file name.
+    /// A `title:` in the BODY is slide text, not the deck's name.
+    #[test]
+    fn an_untitled_deck_falls_back_to_its_file_name() {
+        let path = Path::new("/t/live-view-test.md");
+        assert_eq!(deck_title("# Hi\ntitle: nope\n", path), "live-view-test");
+        assert_eq!(deck_title("---\nstyle: a.glz\n---\ntitle: nope\n", path), "live-view-test");
+        assert_eq!(deck_title("---\ntitle:\n---\n", path), "live-view-test");
     }
 
     /// Stepping aside must NOT hide the deck. The slide is about the real

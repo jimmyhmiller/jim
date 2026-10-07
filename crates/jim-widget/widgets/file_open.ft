@@ -186,6 +186,8 @@ fn visible_rows(dir, depth, expanded) {
     out
 }
 
+fn is_markdown(path) = ends_with(path, ".md") or ends_with(path, ".markdown")
+
 // The right-click menu for a row. Ids are `verb:path`, routed back through
 // `on_click` exactly like a button — the host turns a menu pick into a Click.
 fn row_context(path, is_dir) {
@@ -195,6 +197,9 @@ fn row_context(path, is_dir) {
         items = push(items, { label: "New Folder…", id: "newdir:" + path })
     } else {
         items = push(items, { label: "Open",        id: "open:" + path })
+        if is_markdown(path) {
+            items = push(items, { label: "Open as Slideshow", id: "slides:" + path })
+        }
         items = push(items, { label: "New File…",   id: "newfile:" + parent_of(path) })
         items = push(items, { label: "New Folder…", id: "newdir:" + parent_of(path) })
     }
@@ -362,6 +367,10 @@ fn on_click(x, y, shift, cmd, id) {
         clipboard_set(rel)
         reset!(state, { ..s, status: "Copied " + rel, status_err: false })
         request_render()
+    } else if starts_with(id, "slides:") {
+        // The host opens a deck pane in the active project and titles it
+        // from the talk's front matter (`open_slideshow` in jim-app).
+        emit("jim.action", { action: "open_slideshow", path: slice(id, 7, len(id)) })
     } else if starts_with(id, "finder:") {
         // `open -R` selects the item in Finder rather than opening it, which
         // is what "Reveal" means.

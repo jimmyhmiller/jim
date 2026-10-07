@@ -270,6 +270,17 @@ pub struct PanePinned;
 #[derive(Component, Copy, Clone, Debug, Default)]
 pub struct PaneScreenAnchored;
 
+/// Marker: this pane is NOT on screen, but something is photographing it
+/// (a slide's picture of another project), so its content must keep
+/// rendering as though it were.
+///
+/// The pane's own `Visibility` stays `Hidden` — that is what every hit-test
+/// checks, so a pictured pane can never take a click in the window. Kinds
+/// that pause work while hidden (the terminal grid, script widgets) treat
+/// this as "shown" for rendering purposes only.
+#[derive(Component, Copy, Clone, Debug, Default)]
+pub struct PanePictured;
+
 /// Membership in a **named, independently-revealable group of panes**.
 ///
 /// Absent = an ordinary pane, always visible in its project/canvas.

@@ -67,7 +67,8 @@ bevy = { version = "0.19", default-features = false, features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSDockTile", "NSWorkspace", "NSRunningApplication", "NSEvent", "libc"] }
+# `block2`: NSEvent's block-based local event monitor (see trackpad.rs).
+objc2-app-kit = { version = "0.2", features = ["NSDockTile", "NSWorkspace", "NSRunningApplication", "NSEvent", "libc", "block2"] }
 # NSNotification / NSOperation / block2 features enable the block-based
 # NSNotificationCenter observer API (addObserverForName:object:queue:usingBlock:)
 # used by `install_app_focus_observers` to make focus tracking event-driven.

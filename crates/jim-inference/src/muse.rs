@@ -165,7 +165,6 @@ pub const DEPTHS: &[&str] = &["flat", "soft", "floaty", "glow"];
 pub const GRADIENTS: &[&str] = &["none", "subtle", "bold"];
 pub const MOTIONS: &[&str] = &["instant", "snappy", "smooth"];
 pub const EASINGS: &[&str] = &["ease_out", "ease_in_out"];
-pub const EFFECTS: &[&str] = &["none", "sheen", "aurora", "scanline", "grain", "ring_pulse"];
 pub const HOVERS: &[&str] = &["tint", "glow", "outline", "lift"];
 pub const RADII: &[f32] = &[0.0, 2.0, 4.0, 6.0, 10.0, 14.0];
 
@@ -202,11 +201,6 @@ pub struct Genome {
     pub motion: String,
     #[serde(default = "d_easing")]
     pub easing: String,
-    /// Pane-chrome shader flavor.
-    #[serde(default = "d_effect")]
-    pub effect: String,
-    #[serde(default = "d_strength")]
-    pub effect_strength: f32,
     /// How interactive elements respond to the pointer.
     #[serde(default = "d_hover")]
     pub hover_style: String,
@@ -245,12 +239,6 @@ fn d_motion() -> String {
 fn d_easing() -> String {
     "ease_out".into()
 }
-fn d_effect() -> String {
-    "none".into()
-}
-fn d_strength() -> f32 {
-    0.2
-}
 fn d_hover() -> String {
     "tint".into()
 }
@@ -272,14 +260,12 @@ impl Genome {
         fix(&mut self.gradient, GRADIENTS, rng);
         fix(&mut self.motion, MOTIONS, rng);
         fix(&mut self.easing, EASINGS, rng);
-        fix(&mut self.effect, EFFECTS, rng);
         fix(&mut self.hover_style, HOVERS, rng);
         self.base_hue = self.base_hue.rem_euclid(360.0);
         self.accent_hue = self.accent_hue.rem_euclid(360.0);
         self.surface_chroma = self.surface_chroma.clamp(0.0, 0.04);
         self.accent_chroma = self.accent_chroma.clamp(0.04, 0.23);
         self.radius = self.radius.clamp(0.0, 16.0);
-        self.effect_strength = self.effect_strength.clamp(0.05, 0.5);
         if self.name.trim().is_empty() {
             self.name = gen_name(rng);
         }
@@ -422,7 +408,6 @@ fn aspect_of(gene: &str) -> &'static str {
         "depth" | "gradient" => "depth",
         "motion" | "easing" => "motion",
         "hover_style" => "hover",
-        "effect" => "effect",
         _ => "colors",
     }
 }
@@ -561,13 +546,6 @@ pub fn sample_genome(rng: &mut Rng, model: &TasteModelHandle, avoid_hues: &[f32]
     });
     let motion = m.pick_cat(rng, "motion", MOTIONS, &[0.15, 0.5, 0.35], |g| &g.motion);
     let easing = m.pick_cat(rng, "easing", EASINGS, &[0.6, 0.4], |g| &g.easing);
-    let effect = m.pick_cat(
-        rng,
-        "effect",
-        EFFECTS,
-        &[0.3, 0.2, 0.15, 0.1, 0.15, 0.1],
-        |g| &g.effect,
-    );
     let hover_style = m.pick_cat(rng, "hover_style", HOVERS, &[0.35, 0.25, 0.2, 0.2], |g| {
         &g.hover_style
     });
@@ -605,8 +583,6 @@ pub fn sample_genome(rng: &mut Rng, model: &TasteModelHandle, avoid_hues: &[f32]
         gradient,
         motion,
         easing,
-        effect,
-        effect_strength: rng.range(0.1, 0.35),
         hover_style,
     };
     g.sanitize(rng);
@@ -644,15 +620,12 @@ A genome has exactly these fields:
 - gradient: "none" | "subtle" | "bold" — gradient on primary buttons
 - motion: "instant" | "snappy" | "smooth" — UI transition speed
 - easing: "ease_out" | "ease_in_out"
-- effect: "none" | "sheen" | "aurora" | "scanline" | "grain" | "ring_pulse" — animated pane-chrome shader flavor
-- effect_strength: number 0.05-0.5
 - hover_style: "tint" | "glow" | "outline" | "lift" — how buttons react to the pointer (background shift / soft animated glow / accent outline / raised shadow)
 
 Design principles:
 - Aim for cohesive, restrained, professional looks with one memorable idea each.
 - Vary the batch widely: different hue families, at least one light theme sometimes, different shape/depth personalities.
 - Respect the user's feedback: stay close to genes they liked, avoid genes they disliked, and treat free-text notes as direct instructions.
-- Strong effects (scanline, aurora) pair best with low surface_chroma and hairline borders.
 
 Respond ONLY with JSON: {"candidates": [genome, ...]} with exactly the requested count."#;
 
@@ -1207,108 +1180,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Pane-chrome shader for the genome's effect, with theme colors baked
-/// in as literals. `none` yields a static scaffold (no `params.time`,
-/// so the app stays in reactive render mode).
-pub fn chrome_wgsl(g: &Genome) -> String {
-    let s = g.effect_strength;
-    let dark = g.mode != "light";
-    let al = if dark { 0.74 } else { 0.55 };
-    let accent = wgsl_vec3(al, g.accent_chroma, g.accent_hue);
-    let second = wgsl_vec3(al, g.accent_chroma * 0.9, secondary_hue(g));
-    let body = match g.effect.as_str() {
-        "sheen" => format!(
-            "    // static diagonal sheen (x*x, not pow: pow(neg, 2) is NaN in WGSL)\n\
-             \x20   let sx = (in.uv.x + in.uv.y * 0.35 - 0.42) * 3.8;\n\
-             \x20   let sweep = exp(-sx * sx);\n\
-             \x20   color = color + vec3<f32>(1.0) * sweep * {s:.3} * 0.12;\n"
-        ),
-        "aurora" => format!(
-            "    // slow aurora wash along the top edge\n\
-             \x20   let t = params.time * 0.11;\n\
-             \x20   let x1 = (in.uv.x - (0.30 + 0.24 * sin(t * 2.1))) * 2.6;\n\
-             \x20   let x2 = (in.uv.x - (0.68 + 0.20 * sin(t * 1.4 + 2.1))) * 2.3;\n\
-             \x20   let g1 = exp(-x1 * x1);\n\
-             \x20   let g2 = exp(-x2 * x2);\n\
-             \x20   let band = exp(-in.uv.y * 5.0);\n\
-             \x20   color = color + ({accent} * g1 + {second} * g2) * band * {s:.3};\n"
-        ),
-        "scanline" => format!(
-            "    // phosphor scanlines + faint flicker\n\
-             \x20   let sl = 0.5 + 0.5 * sin(p.y * 3.14159);\n\
-             \x20   let flicker = 1.0 + 0.012 * sin(params.time * 9.0);\n\
-             \x20   color = color * (1.0 - {s:.3} * 0.45 * sl) * flicker;\n\
-             \x20   color = color + {accent} * exp(-abs(d) * 0.18) * {s:.3} * 0.25;\n"
-        ),
-        "grain" => format!(
-            "    // static paper grain\n\
-             \x20   let n = hash21(floor(p * 1.4));\n\
-             \x20   color = color * (1.0 + (n - 0.5) * {s:.3} * 0.5);\n"
-        ),
-        "ring_pulse" => format!(
-            "    // breathing accent rim just inside the border\n\
-             \x20   let pulse = 0.5 + 0.5 * sin(params.time * 1.7);\n\
-             \x20   let rim = smoothstep(-params.border_width - 3.0, -params.border_width, d);\n\
-             \x20   color = color + {accent} * rim * pulse * {s:.3} * 0.8;\n"
-        ),
-        _ => String::new(),
-    };
-    CHROME_SCAFFOLD.replace("//EFFECT//", &body)
-}
-
-/// Small animated WGSL *glaze body* for the widget's per-card effect
-/// strip (`u.*` uniforms, `in.uv`; premultiplied output).
-pub fn preview_wgsl(g: &Genome) -> String {
-    let s = g.effect_strength;
-    let dark = g.mode != "light";
-    let al = if dark { 0.78 } else { 0.55 };
-    let accent = wgsl_vec3(al, g.accent_chroma, g.accent_hue);
-    let second = wgsl_vec3(al, g.accent_chroma * 0.9, secondary_hue(g));
-    match g.effect.as_str() {
-        "sheen" => format!(
-            "let x = fract(u.time * 0.22);\n\
-             let dx = (in.uv.x - x) * 7.0;\n\
-             let sw = exp(-dx * dx);\n\
-             let a = sw * {s:.3} * 1.6;\n\
-             return vec4<f32>(vec3<f32>(1.0) * a, a);"
-        ),
-        "aurora" => format!(
-            "let t = u.time * 0.3;\n\
-             let x1 = (in.uv.x - (0.3 + 0.25 * sin(t * 1.9))) * 2.6;\n\
-             let x2 = (in.uv.x - (0.7 + 0.22 * sin(t * 1.2 + 2.0))) * 2.2;\n\
-             let g1 = exp(-x1 * x1);\n\
-             let g2 = exp(-x2 * x2);\n\
-             let band = 0.4 + 0.6 * exp(-in.uv.y * 2.0);\n\
-             let col = ({accent} * g1 + {second} * g2) * band * {s:.3} * 2.2;\n\
-             let a = max(max(col.r, col.g), col.b) * 0.8;\n\
-             return vec4<f32>(col, a);"
-        ),
-        "scanline" => format!(
-            "let sl = 0.5 + 0.5 * sin(in.uv.y * u.size.y * 3.14159);\n\
-             let dy = (in.uv.y - fract(u.time * 0.21)) * 7.0;\n\
-             let scroll = exp(-dy * dy);\n\
-             let dim = sl * {s:.3} * 0.55;\n\
-             let glow = {accent} * scroll * {s:.3} * 1.2;\n\
-             return vec4<f32>(glow, clamp(dim + scroll * {s:.3} * 0.4, 0.0, 1.0));"
-        ),
-        "grain" => format!(
-            "let cell = floor(in.uv * u.size * 0.7) + floor(u.time * 6.0) * 13.7;\n\
-             var p3 = fract(vec3<f32>(cell.x, cell.y, cell.x) * 0.1031);\n\
-             p3 = p3 + dot(p3, p3.yzx + 33.33);\n\
-             let n = fract((p3.x + p3.y) * p3.z);\n\
-             let a = step(0.93, n) * {s:.3} * 1.8;\n\
-             return vec4<f32>({accent} * a, a * 0.8);"
-        ),
-        "ring_pulse" => format!(
-            "let pp = (in.uv - vec2<f32>(0.5)) * u.size;\n\
-             let pulse = 0.5 + 0.5 * sin(u.time * 2.2);\n\
-             let rad = mix(6.0, min(u.size.x, u.size.y) * 0.42, pulse);\n\
-             let ring = exp(-abs(length(pp) - rad) * 0.35);\n\
-             let a = ring * {s:.3} * 2.0;\n\
-             return vec4<f32>({accent} * a, a);"
-        ),
-        _ => String::new(),
-    }
+/// Pane chrome for a genome: the static scaffold, with nothing animated in
+/// it. There used to be an `effect` gene here (sheen / aurora / scanline /
+/// grain / ring_pulse) emitting a `params.time` shader body. Continuously
+/// animated chrome keeps the whole app in 60fps Continuous mode, which is
+/// exactly the battery cost the animation gating was added to remove, so the
+/// gene is gone and chrome is static.
+pub fn chrome_wgsl(_g: &Genome) -> String {
+    CHROME_SCAFFOLD.replace("//EFFECT//", "")
 }
 
 // ------------------------------------------------------------ ui pack
@@ -1591,7 +1470,6 @@ pub fn candidate_json(g: &Genome) -> Value {
         "tokens": Value::Object(tokens),
         "ui": ui_styles(g),
         "preview": {
-            "fx": preview_wgsl(g),
             "transition_ms": transition_ms(g),
             "easing": g.easing,
             "gradient": gradient_stops(g),
@@ -1611,8 +1489,8 @@ pub fn adopt(g: &Genome, preset: &str) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let mut out = String::new();
     out.push_str(&format!(
-        "// {} — generated by style-muse ({} / {} / {} / {})\n{{\n",
-        g.name, g.mode, g.harmony, g.depth, g.effect
+        "// {} — generated by style-muse ({} / {} / {})\n{{\n",
+        g.name, g.mode, g.harmony, g.depth
     ));
     for (k, v) in expand_tokens(g) {
         match v {
@@ -1761,8 +1639,6 @@ mod tests {
             gradient: "bold".into(),
             motion: "snappy".into(),
             easing: "ease_out".into(),
-            effect: "aurora".into(),
-            effect_strength: 0.3,
             hover_style: "glow".into(),
         };
         let mut rng = Rng(1);
@@ -1803,14 +1679,16 @@ mod tests {
         assert!(!g.name.is_empty());
     }
 
+    /// Chrome must never animate: a `params.time` reference puts the whole
+    /// app in continuous-render mode, which is the battery cost that got the
+    /// `effect` gene removed in the first place.
     #[test]
-    fn chrome_wgsl_static_for_none() {
+    fn chrome_wgsl_is_static() {
         let mut rng = Rng(9);
         let model = taste_model();
-        let mut g = sample_genome(&mut rng, &model, &[]);
-        g.effect = "none".into();
-        assert!(!chrome_wgsl(&g).contains("params.time"));
-        g.effect = "aurora".into();
-        assert!(chrome_wgsl(&g).contains("params.time"));
+        for _ in 0..8 {
+            let g = sample_genome(&mut rng, &model, &[]);
+            assert!(!chrome_wgsl(&g).contains("params.time"));
+        }
     }
 }

@@ -107,6 +107,7 @@ impl Plugin for DiagnosticsPlugin {
                 (
                     sample_memory,
                     update_warning_overlay,
+                    update_fd_warning_overlay,
                     dismiss_continuous_pin_on_click,
                     update_continuous_pin_overlay,
                 )
@@ -138,6 +139,81 @@ pub struct ContinuousWatch {
 pub struct MemReadout {
     pub footprint: Option<u64>,
     pub rate_mib_per_min: f32,
+    pub file_descriptors: Option<FdReadout>,
+}
+
+/// The process's current descriptor usage and actual soft limit.
+#[derive(Clone, Copy, Debug)]
+pub struct FdReadout {
+    pub open: u64,
+    pub limit: u64,
+}
+
+impl FdReadout {
+    fn warning_level(self) -> u8 {
+        if self.limit == 0 || self.limit == libc::RLIM_INFINITY {
+            return 0;
+        }
+        let ratio = self.open as f64 / self.limit as f64;
+        if ratio >= 0.90 {
+            2
+        } else if ratio >= 0.75 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sample_file_descriptors() -> Option<FdReadout> {
+    // Querying libproc opens no descriptors, so this still works at EMFILE.
+    // The sizing query includes slack; use the filled buffer's byte count,
+    // not its allocation size, and retry if concurrent opens fill it.
+    unsafe {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) != 0 {
+            return None;
+        }
+        let bytes = libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        );
+        if bytes <= 0 {
+            return None;
+        }
+        let entry_size = std::mem::size_of::<libc::proc_fdinfo>();
+        let mut capacity = bytes as usize / entry_size + 32;
+        loop {
+            let mut entries: Vec<libc::proc_fdinfo> = Vec::with_capacity(capacity);
+            let buffer_bytes = capacity.checked_mul(entry_size)?;
+            let filled = libc::proc_pidinfo(
+                libc::getpid(),
+                libc::PROC_PIDLISTFDS,
+                0,
+                entries.as_mut_ptr().cast(),
+                i32::try_from(buffer_bytes).ok()?,
+            );
+            if filled <= 0 {
+                return None;
+            }
+            if (filled as usize) < buffer_bytes {
+                return Some(FdReadout {
+                    open: filled as u64 / entry_size as u64,
+                    limit: limit.assume_init().rlim_cur,
+                });
+            }
+            capacity = capacity.checked_mul(2)?;
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sample_file_descriptors() -> Option<FdReadout> {
+    None
 }
 
 /// Physical footprint in bytes — the number macOS Activity Monitor shows
@@ -245,6 +321,16 @@ fn sample_memory(world: &mut World, mut st: Local<DiagState>) {
     }
 
     let footprint = phys_footprint_bytes();
+    let file_descriptors = sample_file_descriptors();
+    if let Some(fd) = file_descriptors {
+        append_log(&format!(
+            "[fd{}] open={} limit={} usage={:.1}%",
+            if fd.warning_level() > 0 { "-WARN" } else { "" },
+            fd.open,
+            fd.limit,
+            100.0 * fd.open as f64 / fd.limit.max(1) as f64
+        ));
+    }
 
     // --- entity count (catch-all for leaked panes / sprites) ---
     let entity_count = world.query::<Entity>().iter(world).count();
@@ -313,6 +399,7 @@ fn sample_memory(world: &mut World, mut st: Local<DiagState>) {
     // Publish for the on-screen overlay.
     if let Some(mut readout) = world.get_resource_mut::<MemReadout>() {
         readout.footprint = footprint;
+        readout.file_descriptors = file_descriptors;
         readout.rate_mib_per_min = rate_mib_min as f32;
     }
 
@@ -478,6 +565,96 @@ fn update_warning_overlay(
         let Some(font) = font else { return };
         commands.spawn((
             MemWarnOverlay,
+            Text2d::new(text),
+            TextFont {
+                font: (font.0.clone()).into(),
+                font_size: FontSize::Px(size),
+                ..default()
+            },
+            TextColor(color),
+            Anchor::TOP_LEFT,
+            Transform::from_xyz(x, y, OVERLAY_Z),
+            RenderLayers::layer(MENU_OVERLAY_LAYER),
+        ));
+    }
+}
+
+#[derive(Component)]
+struct FdWarnOverlay;
+
+fn update_fd_warning_overlay(
+    mut commands: Commands,
+    readout: Res<MemReadout>,
+    font: Option<Res<MonoFont>>,
+    windows: Query<&Window>,
+    mut existing: Query<
+        (
+            Entity,
+            &mut Text2d,
+            &mut TextColor,
+            &mut TextFont,
+            &mut Transform,
+        ),
+        With<FdWarnOverlay>,
+    >,
+    mut was_showing: Local<bool>,
+) {
+    let level = readout.file_descriptors.map_or(0, FdReadout::warning_level);
+    let show = level > 0;
+    if show != *was_showing {
+        *was_showing = show;
+        append_log(&format!(
+            "[fd-overlay] warning {}: {:?}",
+            if show { "SHOWN" } else { "cleared" },
+            readout.file_descriptors
+        ));
+    }
+
+    if !show {
+        for (e, ..) in &existing {
+            commands.entity(e).despawn();
+        }
+        return;
+    }
+
+    let fd = readout.file_descriptors.unwrap();
+    let crit = level == 2;
+    let color = if crit {
+        Color::srgb(1.0, 0.25, 0.2)
+    } else {
+        Color::srgb(1.0, 0.8, 0.2)
+    };
+    let size = if crit {
+        FONT_SIZE * 1.6
+    } else {
+        FONT_SIZE * 1.2
+    };
+    // ASCII only — the mono font has no warning glyph (would render tofu).
+    let text = format!(
+        "FILE DESCRIPTORS {}: {} / {} ({:.0}%)",
+        if crit { "CRITICAL" } else { "HIGH" },
+        fd.open,
+        fd.limit,
+        100.0 * fd.open as f64 / fd.limit as f64
+    );
+
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    // Top-left, so it doesn't collide with the top-right FPS meter.
+    let x = -window.width() * 0.5 + OVERLAY_MARGIN;
+    let y = window.height() * 0.5 - OVERLAY_MARGIN - PIN_BAR_HEIGHT - FONT_SIZE * 2.0;
+
+    if let Ok((_, mut t, mut tcolor, mut tfont, mut tx)) = existing.single_mut() {
+        t.0 = text;
+        tcolor.0 = color;
+        tfont.font_size = FontSize::Px(size);
+        tx.translation.x = x;
+        tx.translation.y = y;
+    } else {
+        let Some(font) = font else { return };
+        commands.spawn((
+            FdWarnOverlay,
             Text2d::new(text),
             TextFont {
                 font: (font.0.clone()).into(),
@@ -767,6 +944,34 @@ fn install_panic_breadcrumb() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fd_warning_uses_soft_limit_and_clears_after_recovery() {
+        for (open, level) in [(191, 0), (192, 1), (230, 1), (231, 2), (256, 2), (100, 0)] {
+            assert_eq!(FdReadout { open, limit: 256 }.warning_level(), level);
+        }
+        assert_eq!(
+            FdReadout {
+                open: 9999,
+                limit: libc::RLIM_INFINITY
+            }
+            .warning_level(),
+            0
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fd_sample_counts_real_descriptors_not_buffer_capacity() {
+        let fd = sample_file_descriptors().expect("libproc descriptor sample");
+        assert!(fd.open >= 3);
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::zeroed();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(fd.limit, unsafe { limit.assume_init() }.rlim_cur);
+    }
 
     fn temp_log(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

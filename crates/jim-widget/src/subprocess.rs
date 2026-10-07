@@ -131,7 +131,7 @@ struct Proc {
     /// also used here for `kill`. Wrapped so both sides can touch it
     /// without the reader holding the lock across a blocking `wait`.
     child: Arc<Mutex<Child>>,
-    stdin: Option<ChildStdin>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     /// Stdout lines pushed by the reader thread, popped by `read_line`.
     /// Retained for the back-compat polling API alongside the event push.
     out: Arc<Mutex<VecDeque<String>>>,
@@ -191,12 +191,14 @@ impl ProcRegistry {
         let out = Arc::new(Mutex::new(VecDeque::new()));
         let alive = Arc::new(AtomicBool::new(true));
         let child = Arc::new(Mutex::new(child));
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
         let id = self.next_id;
         self.next_id += 1;
         {
             let out = out.clone();
             let alive = alive.clone();
             let child = child.clone();
+            let stdin = stdin.clone();
             let notifier = self.notifier.clone();
             std::thread::spawn(move || {
                 let mut r = BufReader::new(stdout);
@@ -221,21 +223,21 @@ impl ProcRegistry {
                         });
                     }
                 }
-                alive.store(false, Ordering::Release);
-                // Best-effort exit code. `try_wait` is non-blocking and we
-                // never hold the lock across a blocking wait, so this can't
-                // deadlock with a concurrent `kill`. Poll briefly because
-                // stdout EOF can land a hair before the process is reaped.
-                let mut code = None;
-                for _ in 0..40 {
-                    if let Ok(mut c) = child.lock() {
-                        if let Ok(Some(status)) = c.try_wait() {
-                            code = status.code();
-                            break;
-                        }
+                // EOF releases stdout immediately, but a child may close its
+                // output before exiting. Keep polling without holding the child
+                // lock so kill/drop can still terminate it. On actual exit,
+                // release stdin even if the script retains the process handle.
+                drop(r);
+                let code = loop {
+                    let status = child.lock().unwrap().try_wait();
+                    match status {
+                        Ok(Some(status)) => break status.code(),
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                        Err(_) => break None,
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                };
+                stdin.lock().unwrap().take();
+                alive.store(false, Ordering::Release);
                 if let Some(n) = &notifier {
                     n(ProcEvent::Exit { handle: id, code });
                 }
@@ -245,7 +247,7 @@ impl ProcRegistry {
             id,
             Proc {
                 child,
-                stdin: Some(stdin),
+                stdin,
                 out,
                 alive,
             },
@@ -255,7 +257,8 @@ impl ProcRegistry {
 
     pub fn write_line(&mut self, id: i64, line: &str) -> bool {
         if let Some(p) = self.procs.get_mut(&id) {
-            if let Some(stdin) = p.stdin.as_mut() {
+            let mut guard = p.stdin.lock().unwrap();
+            if let Some(stdin) = guard.as_mut() {
                 return stdin.write_all(line.as_bytes()).is_ok()
                     && stdin.write_all(b"\n").is_ok()
                     && stdin.flush().is_ok();
@@ -274,7 +277,7 @@ impl ProcRegistry {
     pub fn close_stdin(&mut self, id: i64) -> bool {
         self.procs
             .get_mut(&id)
-            .is_some_and(|p| p.stdin.take().is_some())
+            .is_some_and(|p| p.stdin.lock().unwrap().take().is_some())
     }
 
     /// Next buffered stdout line, or "" if none is available right now.
@@ -379,5 +382,66 @@ mod tests {
             .filter(|p| p == &PathBuf::from("/opt/homebrew/bin"))
             .count();
         assert_eq!(count, 1);
+    }
+    #[test]
+    fn exited_commands_release_pipes_without_killing_handles() {
+        use std::time::{Duration, Instant};
+        let mut registry = ProcRegistry::new();
+        for _ in 0..300 {
+            let id = registry.spawn("/bin/sh", &["-c".into(), "printf 'result\\n'".into()]);
+            assert!(id > 0, "repeated commands must not exhaust descriptors");
+            let stdin = registry.procs[&id].stdin.clone();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while registry.alive(id) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!registry.alive(id));
+            assert!(
+                stdin.lock().unwrap().is_none(),
+                "exited child retained stdin pipe"
+            );
+            assert_eq!(registry.read_line(id), "result");
+        }
+    }
+    #[test]
+    fn stdout_eof_does_not_report_exit_and_kill_still_works() {
+        use std::time::{Duration, Instant};
+        let mut registry = ProcRegistry::new();
+        let id = registry.spawn("/bin/sh", &["-c".into(), "exec 1>&-; exec sleep 30".into()]);
+        assert!(id > 0);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(registry.alive(id), "stdout EOF is not process termination");
+        let stdin = registry.procs[&id].stdin.clone();
+        registry.kill(id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stdin.lock().unwrap().is_some() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stdin.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn closing_stdin_still_delivers_buffered_output_and_exit_status() {
+        use std::time::{Duration, Instant};
+        let mut registry = ProcRegistry::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        registry.set_notifier(Arc::new(move |event| {
+            tx.send(event).unwrap();
+        }));
+        let id = registry.spawn("/bin/sh", &["-c".into(), "cat; exit 7".into()]);
+        assert!(id > 0);
+        assert!(registry.write_line(id, "input"));
+        assert!(registry.close_stdin(id));
+        assert!(!registry.close_stdin(id));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while registry.alive(id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!registry.alive(id));
+        assert_eq!(registry.read_line(id), "input");
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ProcEvent::Output { handle, line } if handle == id && line == "input"));
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            ProcEvent::Exit { handle, code: Some(7) } if handle == id));
     }
 }

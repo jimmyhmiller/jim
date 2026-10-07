@@ -1,5 +1,12 @@
 # Glaze Components — expansion plan for the widget vocabulary
 
+
+> **Note (port):** the `glaze_ui` showcase referenced throughout this file is
+> no longer a Rust binary. It is the funct widget `widgets/glaze_ui.ft` plus
+> `widgets/glaze_ui.glz` — same sheet, same components, hot-reloading, and its
+> palette tokens now come from the live editor theme. The verification notes
+> below still describe what it covers.
+
 > Companion to `GLAZE.md` (the styling language) and `AUTHORING.md` (the handler
 > model). This doc inventories the widget `Element` set against the major component
 > libraries, identifies the gaps, and lays out a phased plan to close them **without

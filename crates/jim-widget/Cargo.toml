@@ -103,10 +103,6 @@ name = "glaze_gallery"
 path = "src/bin/glaze_gallery.rs"
 
 [[bin]]
-name = "glaze_ui"
-path = "src/bin/glaze_ui.rs"
-
-[[bin]]
 name = "widget-snapshot"
 path = "src/bin/snapshot.rs"
 

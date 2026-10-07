@@ -30,8 +30,10 @@
 //! deletes itself.
 //!
 //! The consequence, and it is deliberate: in a floating pane a `project:`
-//! or `application:` slide does NOTHING. "The whole project, in a pane" can
-//! only be a thumbnail of what is already behind the pane.
+//! or `application:` slide changes nothing about the app. The deck shows a
+//! non-interactive PICTURE of what full screen would show — the named
+//! project at its own pan/zoom, with or without the sidebar — drawn by
+//! `slide_view`, which never makes those panes interactive.
 
 use std::collections::HashMap;
 

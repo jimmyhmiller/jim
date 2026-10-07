@@ -1237,6 +1237,53 @@ pub fn insert_tab(state: &EditorState) -> Option<Transaction> {
     })
 }
 
+/// Tab for a soft-indenting editor: a selection spanning lines is
+/// indented as a block; otherwise each range is replaced by spaces up to
+/// the next indent stop (or a literal tab when `indent_unit` is one).
+pub fn insert_soft_tab(state: &EditorState) -> Option<Transaction> {
+    let doc = &state.doc;
+    let multiline = state.selection.ranges.iter().any(|r| {
+        !r.is_empty() && doc.char_to_line(r.from()) != doc.char_to_line(r.to())
+    });
+    if multiline {
+        return indent_more(state);
+    }
+    let unit = &state.indent_unit;
+    let unit_cols = visual_cols(unit).max(1);
+    let mut indexed: Vec<(usize, Range)> =
+        state.selection.ranges.iter().copied().enumerate().collect();
+    indexed.sort_by_key(|(_, r)| r.from());
+    let mut changes = Vec::new();
+    let mut new_positions: Vec<(usize, usize)> = Vec::new();
+    let mut shift: isize = 0;
+    for (orig_idx, r) in indexed {
+        let from = r.from();
+        let to = r.to();
+        let insert = if unit.contains('\t') {
+            unit.clone()
+        } else {
+            let line_start = doc.line_to_char(doc.char_to_line(from));
+            let before: String = doc.slice(line_start..from).chars().collect();
+            let col = visual_cols(&before);
+            " ".repeat(unit_cols - col % unit_cols)
+        };
+        let inserted = insert.chars().count() as isize;
+        let removed = (to - from) as isize;
+        changes.push(Change::new(from, to, insert));
+        new_positions.push((orig_idx, (from as isize + shift + inserted) as usize));
+        shift += inserted - removed;
+    }
+    new_positions.sort_by_key(|(idx, _)| *idx);
+    let new_ranges = new_positions
+        .iter()
+        .map(|(_, p)| Range::cursor(*p))
+        .collect();
+    Some(Transaction {
+        changes,
+        selection: Some(Selection::new(new_ranges, state.selection.primary)),
+    })
+}
+
 /// Smart Tab handler: if any range covers more than one line, indent_more;
 /// otherwise insert a tab/indent_unit at the cursor. CM6 calls this
 /// `indentWithTab`.

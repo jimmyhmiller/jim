@@ -834,6 +834,13 @@ pub enum Element {
         /// When false the whole block lays out on a single line.
         #[serde(default = "default_true")]
         wrap: bool,
+        /// CSS `overflow-wrap: anywhere`: a word too long for a line of its
+        /// own breaks between characters instead of overflowing, so the
+        /// block can shrink to any width. For code, where a chained call
+        /// like `a.b().c().d()` is one "word" wider than a narrow column.
+        /// Off for prose, which should never split a word.
+        #[serde(default)]
+        break_words: bool,
     },
     /// A raster image, sized by the flex tree and scaled to fit its box.
     ///
@@ -1135,14 +1142,28 @@ pub enum Element {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         style: Option<Style>,
     },
-    /// Vertical scroll region. v0 lays children out as a vstack and
-    /// clips to the available height (no actual scrolling yet — clipping
-    /// is enough to validate the protocol; wheel handling lands later).
+    /// Vertical scroll region: children laid out as a vstack inside a box
+    /// that scrolls on its own, independently of the pane.
+    ///
+    /// The box's height comes from `style` (`height`, or `flex_grow` with
+    /// `min_height: "0"` in a sized parent). Content that fits renders
+    /// inline, exactly like a vstack. Content taller than the box is drawn
+    /// through a camera of its own, clipped to the box, and the wheel over
+    /// the box scrolls it (see `scroll_region.rs`).
+    ///
+    /// `id` keeps the scroll position across re-renders; give every
+    /// scrolling region in a widget a distinct one. Without it the position
+    /// is keyed by the region's order in the tree, which moves if regions
+    /// come and go.
     Scroll {
+        #[serde(default)]
+        id: Option<String>,
         #[serde(default)]
         gap: f32,
         #[serde(default)]
         pad: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<Style>,
         children: Vec<Element>,
     },
     /// Filled horizontal bar with a background track. `value/max` sets

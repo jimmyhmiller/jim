@@ -232,7 +232,11 @@ extern fn oklch(l, c, h)
 //   glaze_load_file(widget_asset("talk.glz"))     // saving the .glz hot-reloads
 //   el("frame", { style: glaze("card"), children: [ … ] })
 //
-extern fn glaze_load(src)            // compile literal Glaze source -> true
+// glaze_load(src[, watch_path]) -> true. Compile literal Glaze source. Pass
+// the `.glz` it came from as `watch_path` when the source is ASSEMBLED (e.g.
+// a theme palette prepended to a sheet read with `read_file`) so editing that
+// file still hot-reloads the widget.
+extern fn glaze_load(src, watch_path)
 extern fn glaze_load_file(path)      // read + compile a .glz (~ expanded) -> true
 extern fn glaze_loaded()             // is a sheet loaded? -> bool
 extern fn glaze_styles()             // style names in the sheet -> [name]
@@ -247,6 +251,18 @@ extern fn glaze_at(name, variant, states, vw, vh)
 // component: toggle select tabs bar stepper radio checkbox slider table
 //            toast popover dialog tooltip
 extern fn glaze_slot(name, component, variant, states)
+// glaze_token(name) -> the sheet token's compiled color as a hex string
+// (#rrggbb), or its number for a numeric token.
+extern fn glaze_token(name)
+extern fn glaze_tokens()            // every token name in the sheet -> [name]
+
+// --- theme + files ---
+// theme_get(token) -> the ACTIVE theme's value for a token name (fg,
+// surface_1, accent, …): a hex color string, a number, or Unit when the
+// theme has no such token. Colors follow theme switches, so read it per
+// render rather than caching at load.
+extern fn theme_get(token)
+extern fn read_file(path)           // -> { ok, text, error } ("~" expanded)
 
 // --- widget<->widget message bus ---
 extern fn emit(topic, payload)
@@ -1975,6 +1991,269 @@ mod tests {
             .expect("render must return a tree");
         let _ = std::fs::remove_dir_all(&root);
         el
+    }
+
+    /// The Glaze UI showcase, end to end: the shipped `.ft` compiles, its
+    /// assembled sheet (theme palette + `glaze_ui.glz`) compiles, and every
+    /// element it emits survives the funct → JSON → `Element` hop. This is
+    /// the one test that would catch the showcase rotting after the port off
+    /// the old `glaze_ui` binary — a bad element field silently drops the
+    /// WHOLE frame at runtime, leaving a blank pane.
+    #[test]
+    fn glaze_ui_showcase_renders() {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let src = std::fs::read_to_string(widgets.join("glaze_ui.ft"))
+            .expect("glaze_ui.ft must ship with the crate");
+        let sheet = widgets.join("glaze_ui.glz");
+        assert!(sheet.exists(), "glaze_ui.glz must ship with the crate");
+        let root = scratch_root("glaze-ui");
+
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        let sheet_slot = crate::glaze_host::GlazeSheet::new();
+        crate::glaze_host::register(&mut vm, &sheet_slot);
+        vm.register0("request_render", || {});
+        // The widget reads its sheet from `$HOME/.jim/widgets/`, so point HOME
+        // at a scratch home whose widgets dir links to the crate's. The test
+        // then exercises the real path expression instead of a stub that
+        // resolves no matter what the widget asks for.
+        let home = root.join("home");
+        {
+            let link = home.join(".jim").join("widgets");
+            std::fs::create_dir_all(link.parent().expect("has a parent"))
+                .expect("scratch home");
+            std::os::unix::fs::symlink(&widgets, &link).expect("link the widgets dir");
+            let home = home.clone();
+            vm.register1("host_env", move |name: String| -> String {
+                if name == "HOME" {
+                    return home.to_string_lossy().into_owned();
+                }
+                String::new()
+            });
+        }
+        // Same shape as the real native: { ok, text, error }.
+        vm.register1("read_file", |path: String| -> Value {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Value::from_json(&serde_json::json!({ "ok": true, "text": text })),
+                Err(e) => Value::from_json(
+                    &serde_json::json!({ "ok": false, "text": "", "error": e.to_string() }),
+                ),
+            }
+        });
+        // A theme that answers for every palette token, so the preamble path
+        // (not the sheet's defaults) is what gets compiled here.
+        vm.register1("theme_get", |token: String| -> Value {
+            match token.as_str() {
+                "fg" => Value::str("#e6e8ec"),
+                "fg_muted" => Value::str("#9098a4"),
+                "surface_1" => Value::str("#1a1d24"),
+                "surface_2" => Value::str("#22262f"),
+                "pane_border" => Value::str("#39404d"),
+                "accent" => Value::str("#d8a657"),
+                "accent_600" => Value::str("#7cc7d0"),
+                "accent_300" => Value::str("#a48fe0"),
+                "status_success" => Value::str("#8fe3b0"),
+                "err" => Value::str("#e08a8a"),
+                _ => Value::Unit,
+            }
+        });
+        vm.eval(&src).expect("glaze_ui.ft must compile and run");
+        vm.call("on_start", vec![]).expect("on_start");
+
+        let frame = vm
+            .call("render", vec![Value::Float(700.0), Value::Float(900.0)])
+            .expect("call render");
+        let el = funct_frame_to_element(&frame)
+            .expect("the frame must convert — a rejected field blanks the pane")
+            .expect("render must return a tree");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Every section is present, and no style fell back to the red
+        // "no such style" tile.
+        let json = serde_json::to_string(&el).expect("serialize");
+        for needed in [
+            "Glaze UI",
+            "WIDENED LAYER STACK",
+            "SLOT-STYLED COMPONENT",
+            "SLOT-RETROFIT COMPONENTS",
+            "ANIMATED STATE",
+            "DRAGGABLE SLIDER",
+            "FLOATING OVERLAY",
+            "STATUS",
+        ] {
+            assert!(json.contains(needed), "showcase is missing `{needed}`");
+        }
+        assert!(
+            !json.contains("glaze: no style"),
+            "a style in glaze_ui.glz failed to resolve: {json}"
+        );
+        // The palette came from the theme, not the sheet's oklch defaults.
+        assert!(
+            json.contains("#d8a657"),
+            "the theme's accent should reach the frame as the `gold` token"
+        );
+    }
+
+    /// Lay out the shipped `lsp_symbol.ft` the way the pane does — the real
+    /// highlighter over real source, at a real pane width — and check the
+    /// source column keeps to its own half. A code run reaching into the
+    /// 320px navigation sidebar is the "text overlaps the sidebar" bug.
+    #[test]
+    fn lsp_symbol_source_stays_out_of_the_sidebar() {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let src = std::fs::read_to_string(widgets.join("lsp_symbol.ft"))
+            .expect("lsp_symbol.ft must ship with the crate");
+        let root = scratch_root("lsp-symbol");
+        std::fs::copy(widgets.join("df.ft"), root.join("df.ft")).expect("df.ft must ship");
+
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.register0("request_render", || {});
+        vm.register2("proc_spawn", |_c: String, _a: Value| -> i64 { -1 });
+        // `df`'s color helpers ask the host for theme tokens.
+        vm.register1("theme_get", |_name: String| -> Value { Value::Unit });
+        vm.register2("highlight", |code: String, lang: String| -> Value {
+            let lines = crate::syntax::highlight_lines(&code, &lang);
+            Value::from_json(&serde_json::Value::Array(
+                lines
+                    .into_iter()
+                    .map(|line| {
+                        serde_json::Value::Array(
+                            line.into_iter()
+                                .map(|(text, kind)| serde_json::json!({ "text": text, "kind": kind }))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ))
+        });
+        vm.set_global(
+            "params",
+            Value::from_json(&serde_json::json!({
+                "file": "/tmp/client.rs", "name": "ensure_running",
+                "kind": "function", "anchor_line": 136,
+            })),
+        );
+        vm.eval(&src).expect("lsp_symbol.ft must compile and run");
+
+        // Real source, with the doc comment that overflowed in the pane.
+        let code = "\
+/// Best-effort: ensure the daemon is running, spawning it if needed, and
+/// return once the socket accepts a connection (or on timeout). Callers
+/// at startup use this to boot the bus once before subscribing, so the
+/// subscriber connects to a live daemon instead of racing several spawns.
+pub fn ensure_running() -> std::io::Result<()> {
+    let socket = crate::socket_path()
+        .ok_or_else(|| std::io::Error::other(\"HOME not set; cannot locate bus socket\"))?;
+    let _ = connect_or_spawn(&socket)?;
+    Ok(())
+}";
+        // A populated sidebar, like the pane has once the daemon answers.
+        let refs = serde_json::json!([
+            { "file": "/x/main.rs", "line": 146, "symbol": "main", "kind": "function",
+              "container": "", "sym_line": 140, "count": 1 },
+            { "file": "/x/client.rs", "line": 136, "symbol": "ensure_running",
+              "kind": "function", "container": "", "sym_line": 136, "count": 2 },
+        ]);
+        vm.set_global("injected_code", Value::from_json(&serde_json::json!(code)));
+        vm.set_global("injected_refs", Value::from_json(&refs));
+        vm.eval(
+            "reset!(state, { ..cur_state(), found: true, status: \"function · client.rs\", \
+             lines: highlight(injected_code, \"rust\"), refs: injected_refs, \
+             defs: injected_refs, impls: [] })",
+        )
+        .expect("inject state");
+
+        // The pane this was reported in.
+        let pane_w = 749.0_f32;
+        let frame = vm
+            .call(
+                "render",
+                vec![Value::Float(pane_w as f64), Value::Float(283.0)],
+            )
+            .expect("call render");
+        let el = funct_frame_to_element(&frame)
+            .expect("frame must convert")
+            .expect("render must return a tree");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // `JIM_DUMP_FRAME=/path` writes the rendered tree as a widget-protocol
+        // frame, so `widget-snapshot` can draw this exact pane headlessly.
+        if let Ok(dump) = std::env::var("JIM_DUMP_FRAME") {
+            let msg = crate::protocol::WidgetMsg::Frame { root: el.clone() };
+            std::fs::write(&dump, serde_json::to_string(&msg).expect("frame json"))
+                .expect("write frame dump");
+        }
+
+        for cw in [5.0_f32, 6.0, 7.0, 7.8, 8.4, 9.2] {
+            let metrics = jim_pane::PaneFontMetrics {
+                cell_width: cw,
+                font_size: 14.0,
+            };
+            let mut laid = crate::layout::build_tree(&el, &metrics);
+            crate::layout::compute(&mut laid, pane_w, 283.0, &metrics);
+            let cols = laid.taffy.children(laid.root).unwrap()[0];
+            let ck = laid.taffy.children(cols).unwrap();
+            let col = *laid.taffy.layout(ck[0]).unwrap();
+            let mut widest = 0.0_f32;
+            let mut stack = vec![(ck[0], 0.0_f32)];
+            while let Some((node, ox)) = stack.pop() {
+                let l = *laid.taffy.layout(node).unwrap();
+                let x = ox + l.location.x;
+                let kids = laid.taffy.children(node).unwrap_or_default();
+                if kids.is_empty() {
+                    widest = widest.max(x + l.size.width);
+                }
+                for c in kids {
+                    stack.push((c, x));
+                }
+            }
+            println!(
+                "cell_width {cw}: column {:.0}, widest source leaf {widest:.0}{}",
+                col.size.width,
+                if widest > col.size.width + 0.5 { "  <-- OVERFLOW" } else { "" }
+            );
+        }
+        let metrics = jim_pane::PaneFontMetrics {
+            cell_width: 8.4,
+            font_size: 14.0,
+        };
+        let mut laid = crate::layout::build_tree(&el, &metrics);
+        crate::layout::compute(&mut laid, pane_w, 283.0, &metrics);
+
+        // root > cols > [source column, sidebar]
+        let cols = laid.taffy.children(laid.root).unwrap()[0];
+        let cols_kids = laid.taffy.children(cols).unwrap();
+        assert_eq!(cols_kids.len(), 2, "source column beside a sidebar");
+        let col = *laid.taffy.layout(cols_kids[0]).unwrap();
+        let bar = *laid.taffy.layout(cols_kids[1]).unwrap();
+        println!(
+            "column x={} w={} | sidebar x={} w={}",
+            col.location.x, col.size.width, bar.location.x, bar.size.width
+        );
+
+        // Widest leaf anywhere under the source column.
+        let col_x = col.location.x;
+        let mut widest = 0.0_f32;
+        let mut stack = vec![(cols_kids[0], 0.0_f32)];
+        while let Some((node, ox)) = stack.pop() {
+            let l = *laid.taffy.layout(node).unwrap();
+            let x = ox + l.location.x;
+            let kids = laid.taffy.children(node).unwrap_or_default();
+            if kids.is_empty() {
+                widest = widest.max(x + l.size.width);
+            }
+            for c in kids {
+                stack.push((c, x));
+            }
+        }
+        println!("widest source leaf ends at {widest} (column is {} wide)", col.size.width);
+        assert!(
+            widest <= col.size.width + 0.5,
+            "source content reaches {widest}, past the column's {} — it lands in the sidebar at {}",
+            col.size.width,
+            bar.location.x - col_x
+        );
     }
 
     /// Boot the shipped `file_open.ft` over a scratch directory tree, with

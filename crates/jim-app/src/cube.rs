@@ -1385,7 +1385,11 @@ fn suppress_window_pane_cams(
                     // with no camera renders nothing, and the cull below
                     // had already taken every other pane. Both halves of
                     // the exemption have to agree.
-                    let is_deck = presenting_deck == Some(owner.0);
+                    //
+                    // Stepped aside, the deck is an ordinary pane again and
+                    // follows its project like one — `sync_visibility` stops
+                    // exempting it at the same moment.
+                    let is_deck = deck_covers_window && presenting_deck == Some(owner.0);
                     if !is_deck {
                         if Some(proj.0) != active {
                             return false;

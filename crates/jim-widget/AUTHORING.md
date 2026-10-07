@@ -386,6 +386,13 @@ The block's line height comes from its tallest run. An hstack of `Text`s
 is *not* a substitute — each child wraps independently, so emphasis
 mid-sentence breaks the line.
 
+A block wraps at spaces, so it can never get narrower than its longest
+word. For **code** that is a problem: `self.a.lock().unwrap().entry(k)` is
+one word, and in a column beside a sidebar it overflows into the sidebar.
+Set `break_words: true` (CSS `overflow-wrap: anywhere`) and a word too long
+for a line of its own splits between characters instead. Leave it off for
+prose.
+
 Don't hand-parse Markdown. **`md_parse(text)`** runs `markdown_core` —
 the same parser the WYSIWYG editor uses — and returns blocks whose runs
 drop straight into `richtext`:

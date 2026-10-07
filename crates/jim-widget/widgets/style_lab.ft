@@ -408,7 +408,7 @@ fn on_message(topic, payload, sender) {
 // --------------------------------------------------------------- pieces
 
 fn gene_summary(g) {
-    g.mode + " · " + g.harmony + " · " + g.depth + " · r" + str(g.radius) + " · " + g.hover_style + " · " + g.effect
+    g.mode + " · " + g.harmony + " · " + g.depth + " · r" + str(g.radius) + " · " + g.hover_style
 }
 
 fn swatch_row(t) {
@@ -448,28 +448,6 @@ fn comp_cluster(cand, tog_on) {
     ]}
 }
 
-// animated effect strip (the genome's chrome shader, in miniature)
-fn fx_strip(cand) {
-    let t = cand.tokens
-    let p = cand.preview
-    let mut layers = [ el("fill", { color: t.bg }) ]
-    if p.fx != "" {
-        layers = push(layers, el("shader", { body: p.fx, overlay: true }))
-    } else { if p.gradient != () {
-        layers = push(layers, el("linear-gradient", { angle: 0.0, stops: [
-            { offset: 0.0, color: p.gradient[0] },
-            { offset: 1.0, color: p.gradient[1] },
-        ]}))
-    }}
-    let label = if p.fx != "" { cand.genes.effect } else { "static" }
-    { kind: "frame", pad: 0.0, style: {
-        height: "30", width: "100%", radius: "6",
-        glaze_layers: layers,
-    }, children: [
-        { kind: "text", value: " " + label, size: 10.0, color: t.fg_muted },
-    ]}
-}
-
 // feedback chips are styled with ACTIVE-theme token names (not the
 // candidate's), so they stay legible on every card
 fn aspect_chip(cid, aspect, v) {
@@ -484,7 +462,7 @@ fn aspect_chip(cid, aspect, v) {
 
 fn chips_row(cid, aspects) {
     let mut chips = []
-    for a in ["colors", "shape", "depth", "motion", "hover", "effect"] {
+    for a in ["colors", "shape", "depth", "motion", "hover"] {
         let v = get(aspects, a) |> unwrap_or("")
         chips = push(chips, aspect_chip(cid, a, v))
     }
@@ -535,7 +513,6 @@ fn card(cand, verdict, tog_on, card_w) {
             ]},
             swatch_row(t),
             comp_cluster(cand, tog_on),
-            fx_strip(cand),
         ]},
         chips_row(cid, aspects),
         verdict_row(cid, overall, false),
@@ -652,7 +629,6 @@ fn showcase(cand, demo, verdict, w) {
             border: { color: t.surface_2, width: 1.0 },
         }, children: [
             { kind: "hstack", gap: 18.0, children: [ left, right ] },
-            fx_strip(cand),
         ]},
         chips_row(cid, aspects),
         verdict_row(cid, overall, true),

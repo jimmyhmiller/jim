@@ -545,6 +545,9 @@ pub struct ScriptWidget {
     pub last_state: Value,
     pub last_size: Vec2,
     pub last_tick_at: Option<std::time::Instant>,
+    /// Last (pane width, content width) pair reported by the overflow
+    /// watchdog, so a widget that overflows every frame logs once.
+    pub last_overflow_warn: Option<(f32, f32)>,
     pub reload_gen: u32,
     pub applied_reload_gen: u32,
     /// Sprite id → entity. Lets us diff frames instead of
@@ -1154,6 +1157,7 @@ fn script_widget_spawn(world: &mut World, entity: Entity, _content_root: Entity,
             last_state: cfg.state,
             last_size: Vec2::ZERO,
             last_tick_at: None,
+            last_overflow_warn: None,
             reload_gen: 0,
             applied_reload_gen: 0,
             sprite_entities: HashMap::new(),
@@ -1371,8 +1375,7 @@ fn forward_clicks_to_workers(
         // local frame, which slides up by `scroll.y` when the user
         // scrolls. Add the scroll offset so the hit-test matches the
         // visually-rendered position of each rect.
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-        let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_y);
+        let hit_pt = ev.local_pt + crate::scroll_offset(scroll);
 
         // While this pane has an open dropdown / popover, the floating overlay
         // owns the pointer: `handle_overlay_input` picks the option or
@@ -1506,8 +1509,7 @@ fn forward_drags_to_workers(
         {
             continue;
         }
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-        let pt = ev.local_pt + Vec2::new(0.0, scroll_y);
+        let pt = ev.local_pt + crate::scroll_offset(scroll);
         w.handle.send(HostToWorker::Drag {
             local_x: pt.x,
             local_y: pt.y,
@@ -1533,8 +1535,7 @@ fn forward_releases_to_workers(
         {
             continue;
         }
-        let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-        let pt = ev.local_pt + Vec2::new(0.0, scroll_y);
+        let pt = ev.local_pt + crate::scroll_offset(scroll);
         w.handle.send(HostToWorker::Release {
             local_x: pt.x,
             local_y: pt.y,
@@ -1575,8 +1576,7 @@ fn forward_hovers_to_workers(
         // INFINITY is the "cursor left" sentinel — pass through
         // untouched so the script can detect it.
         let pt = if ev.local_pt.x.is_finite() {
-            let scroll_y = scroll.map(|s| s.y).unwrap_or(0.0);
-            ev.local_pt + Vec2::new(0.0, scroll_y)
+            ev.local_pt + crate::scroll_offset(scroll)
         } else {
             ev.local_pt
         };
@@ -1606,12 +1606,8 @@ fn route_editor_portal_input(
         Option<&crate::WidgetScroll>,
     )>,
 ) {
-    let scroll_of = |pane: Entity| -> f32 {
-        widgets
-            .get(pane)
-            .ok()
-            .and_then(|(_, _, _, s)| s.map(|s| s.y))
-            .unwrap_or(0.0)
+    let scroll_of = |pane: Entity| -> Vec2 {
+        crate::scroll_offset(widgets.get(pane).ok().and_then(|(_, _, _, s)| s))
     };
     // Portal container + its box top-left under a content-local hit point.
     let portal_at = |pane: Entity, hit_pt: Vec2| -> Option<(Entity, Vec2)> {
@@ -1646,7 +1642,7 @@ fn route_editor_portal_input(
     };
 
     for ev in presses.read() {
-        let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_of(ev.pane));
+        let hit_pt = ev.local_pt + scroll_of(ev.pane);
         match portal_at(ev.pane, hit_pt) {
             Some((container, rmin)) => {
                 focused.0 = Some(container);
@@ -1664,7 +1660,7 @@ fn route_editor_portal_input(
         let Some(rmin) = portal_min(ev.pane, container) else {
             continue;
         };
-        let hit_pt = ev.local_pt + Vec2::new(0.0, scroll_of(ev.pane));
+        let hit_pt = ev.local_pt + scroll_of(ev.pane);
         drag_w.write(jim_editor::EmbeddedEditorDrag {
             editor: container,
             local_pt: hit_pt - rmin,
@@ -1740,7 +1736,7 @@ fn forward_inputs_to_workers(
         &mut ScriptWidget,
         Option<&Visibility>,
         Option<&jim_pane::PaneChromeOverride>,
-        Has<RenderWhileHidden>,
+        (Has<RenderWhileHidden>, Has<jim_pane::PanePictured>),
     )>,
 ) {
     // A palette edit only updates the shared theme snapshot; canvas
@@ -1774,6 +1770,9 @@ fn forward_inputs_to_workers(
 
     let now = std::time::Instant::now();
     for (kind, rect, mut w, vis, chrome_ov, always_render) in &mut widgets {
+        // A pictured pane (see `jim_pane::PanePictured`) is being
+        // photographed off screen, so it renders like a shown one.
+        let always_render = always_render.0 || always_render.1;
         if kind.0 != PANE_KIND {
             continue;
         }
@@ -1943,9 +1942,11 @@ fn apply_latest_frames(
         Option<&crate::WidgetInputFocus>,
         Option<&Visibility>,
         Option<&jim_pane::PaneChromeOverride>,
-        Has<RenderWhileHidden>,
+        (Has<RenderWhileHidden>, Has<jim_pane::PanePictured>),
     )>,
     children_q: Query<&Children>,
+    mut shaper: crate::text_shape::TextShaper,
+    mut regions: crate::scroll_region::ScrollRegionHost,
 ) {
     let _t_prof = jim_pane::prof::sys_span("apply_latest_frames");
     let (theme, themes, fonts, mut theme_events) = style;
@@ -1984,6 +1985,7 @@ fn apply_latest_frames(
         always_render,
     ) in &mut q
     {
+        let always_render = always_render.0 || always_render.1;
         if kind.0 != PANE_KIND {
             continue;
         }
@@ -2123,6 +2125,10 @@ fn apply_latest_frames(
                 if scroll.y > scroll.max_y {
                     scroll.y = scroll.max_y;
                 }
+                // Absolute canvases size themselves to the pane width; they
+                // never scroll sideways.
+                scroll.max_x = 0.0;
+                scroll.x = 0.0;
                 // Reborrow once so the two disjoint fields below don't each go
                 // through `Mut`'s DerefMut (which would borrow `w` twice).
                 let w = &mut *w;
@@ -2203,7 +2209,7 @@ fn apply_latest_frames(
                     content_size,
                     palette: crate::render::WidgetPalette::from_theme(w_theme),
                     theme: w_theme.clone(),
-                    ground: Color::LinearRgba(w_theme.color(jim_style::tokens::PANE_BG)),
+                    ground: std::cell::Cell::new(Color::LinearRgba(w_theme.color(jim_style::tokens::PANE_BG))),
                     fonts: fonts.clone(),
                     focused_input: input_focus.cloned(),
                     caret_visible,
@@ -2231,12 +2237,48 @@ fn apply_latest_frames(
                 let consumed = crate::render::render(
                     &mut commands,
                     &ctx,
+                    &mut shaper,
                     &mut targets,
                     &other,
                     Vec2::ZERO,
                     content_size.x,
                     0.0,
                 );
+                // A font not loaded yet left some text unmeasured: retry next
+                // frame (and wake the loop to get one) rather than keep boxes
+                // sized from nothing.
+                if targets.layout_incomplete {
+                    w.force_render = true;
+                    deferred = true;
+                }
+                regions.reconcile(
+                    &mut commands,
+                    &mut images,
+                    entity,
+                    chrome.content_root,
+                    &mut targets,
+                    shaper.scale_factor(),
+                );
+                // Overflow watchdog: a widget's content must fit the width it
+                // was laid out at. Wider means some leaf refused to shrink and
+                // is now painting over whatever sits beside it (the lsp_symbol
+                // source running into its sidebar). Log it once per pane+size
+                // rather than every frame.
+                if consumed.x > content_size.x + 1.0 {
+                    let key = (content_size.x, consumed.x);
+                    if w.last_overflow_warn != Some(key) {
+                        w.last_overflow_warn = Some(key);
+                        eprintln!(
+                            "[widget] {} content is {:.0}px wide in a {:.0}px pane — \
+                             something didn't shrink",
+                            w.script_path.display(),
+                            consumed.x,
+                            content_size.x,
+                        );
+                    }
+                } else if w.last_overflow_warn.is_some() {
+                    w.last_overflow_warn = None;
+                }
                 anim_store.apply_requests(entity, &targets.anims);
                 reconcile_editor_portals(
                     &mut commands,
@@ -2303,17 +2345,11 @@ fn apply_latest_frames(
                         canvas_surface(w_theme),
                     );
                 }
-                // Update scroll bounds based on what the render
-                // actually consumed. Clamp current scroll to new max
-                // so resizing the pane shorter doesn't strand the
-                // user past the new bottom.
-                let new_max = (consumed.y - content_size.y).max(0.0);
-                if (scroll.max_y - new_max).abs() > 0.1 {
-                    scroll.max_y = new_max;
-                }
-                if scroll.y > new_max {
-                    scroll.y = new_max;
-                }
+                // Update scroll bounds (both axes) from what the render
+                // actually consumed; `set_extent` clamps the current
+                // offset so resizing the pane doesn't strand the user
+                // past the content's edge.
+                scroll.set_extent(consumed, content_size);
             }
         }
         // Apply a script-requested scroll jump (`set_scroll`) now that

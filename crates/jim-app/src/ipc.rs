@@ -129,6 +129,15 @@ pub enum IpcRequest {
         #[serde(default)]
         path: Option<String>,
     },
+    /// Open a Markdown talk as a slideshow (deck) pane. The pane is titled
+    /// from the talk's front-matter `title:`, else its file name. The file
+    /// tree's "Open as Slideshow" sends this over `jim.action`.
+    /// `project` defaults to the active project.
+    OpenSlideshow {
+        path: String,
+        #[serde(default)]
+        project: Option<String>,
+    },
     /// Start or stop a presentation. Unit variant → wire form is the bare
     /// JSON string `"TogglePresent"`. Mirrors F5 / `present.toggle`:
     /// starting needs the focused pane to be a deck, stopping does not.

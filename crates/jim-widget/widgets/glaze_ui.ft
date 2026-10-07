@@ -1,0 +1,517 @@
+// glaze_ui.ft — the Glaze UI showcase: real components (cards, stat tiles, a
+// pricing card, a glassy profile card, badges, bars, tabs, toggles, a slider,
+// checkboxes, radios, a stepper, a select, a tooltip, a popover, a dialog and
+// a toast) laid out with flex and styled entirely by `glaze_ui.glz`.
+//
+// This was a Rust binary (`crates/jim-widget/src/bin/glaze_ui.rs`) talking the
+// subprocess NDJSON protocol. It is a funct widget now: same sheet, same
+// components, no binary to build, ship in the app bundle or find on PATH.
+//
+// THEME. The sheet's palette tokens are defaults; `sheet_preamble` re-defines
+// them from the live editor theme and the first definition of a token wins, so
+// every Glaze-styled surface here follows theme switches (Style Lab's "Try
+// Live" included). The old binary did this by rewriting compiled hex back into
+// theme token names in the emitted frame; defining the tokens up front is the
+// same idea without the string surgery.
+import "host"
+
+// sheet token -> editor theme token.
+fn palette() = [
+    ["surface", "surface_1"], ["surf2", "surface_2"], ["line", "pane_border"],
+    ["fg", "fg"], ["muted", "fg_muted"], ["gold", "accent"],
+    ["teal", "accent_600"], ["violet", "accent_300"],
+    ["green", "status_success"], ["rose", "err"],
+]
+
+// Next to this script in the widgets dir (`widget_asset` points at the
+// crate's own assets dir, which is a different place).
+fn sheet_path() = host_env("HOME") + "/.jim/widgets/glaze_ui.glz"
+
+// `token <sheet name> = #rrggbb` for every palette entry the theme knows.
+// A token the theme lacks is left out, so the sheet's own default stands.
+fn sheet_preamble() {
+    let mut out = ""
+    for pair in palette() {
+        let c = theme_get(pair[1])
+        if typeof(c) == "Str" { out = out + "token " + pair[0] + " = " + c + "\n" }
+    }
+    out
+}
+
+// What the palette resolves to right now — recompile when this changes.
+fn theme_sig() {
+    let mut sig = ""
+    for pair in palette() {
+        let c = theme_get(pair[1])
+        sig = sig + (if typeof(c) == "Str" { c } else { "-" }) + ","
+    }
+    sig
+}
+
+// Compile the sheet with the theme's palette in front of it. The path goes to
+// `glaze_load` too: the source is assembled, but the watcher keys on the file,
+// so editing the `.glz` still hot-reloads.
+fn load_sheet() {
+    let path = sheet_path()
+    let r = read_file(path)          // -> { ok, text, error }
+    if typeof(r) != "Record" or not unwrap_or(get(r, "ok"), false) {
+        host_log("glaze_ui: cannot read " + path + ": " +
+                 str(unwrap_or(get(r, "error"), "unknown")))
+        return false
+    }
+    glaze_load(sheet_preamble() + r.text, path)
+    true
+}
+
+fn init_state() = {
+    tab: "a",
+    slider: 0.65,
+    radio: "pro",
+    qty: 3.0,
+    country: "ca",
+    dialog_open: false,
+    toast_shown: true,
+    sig: "",
+    checks: {
+        terms: true, news: false, beta: true,
+        notifications: true, autosync: false,
+        anim_eased: false, anim_slow: false, anim_glow: true,
+    },
+}
+let state = atom(init_state())
+
+fn cur_state() {
+    let s = @state
+    if typeof(s) == "Record" { merge(init_state(), s) } else { init_state() }
+}
+
+// Toggle/checkbox ids are element ids on the wire; the state record keys use
+// underscores because a funct record key cannot carry a dash.
+fn check_key(id) {
+    if id == "anim-eased" { "anim_eased" }
+    else if id == "anim-slow" { "anim_slow" }
+    else if id == "anim-glow" { "anim_glow" }
+    else { id }
+}
+fn checked(s, id) = unwrap_or(get(s.checks, check_key(id)), false)
+
+// ---- handlers ----
+
+fn on_init() { request_render() }
+fn on_start() {
+    load_sheet()
+    reset!(state, { ..init_state(), sig: theme_sig() })
+    request_render()
+}
+
+fn on_click(x, y, shift, cmd, id) {
+    let s = cur_state()
+    if id == "open-dialog" {
+        reset!(state, { ..s, dialog_open: true })
+    } else if id == "dlg-cancel" or id == "dlg-confirm" {
+        reset!(state, { ..s, dialog_open: false })
+    }
+    request_render()
+}
+
+fn on_toggle(id, checked_now) {
+    let s = cur_state()
+    reset!(state, { ..s, checks: assoc(s.checks, check_key(id), checked_now) })
+    request_render()
+}
+
+fn on_tab_select(id, tab) {
+    if id == "demo-tabs" { reset!(state, { ..cur_state(), tab: tab }) }
+    request_render()
+}
+
+fn on_slider_change(id, value) {
+    if id == "volume" { reset!(state, { ..cur_state(), slider: value }) }
+    request_render()
+}
+
+fn on_radio_select(id, option) {
+    if id == "plan" { reset!(state, { ..cur_state(), radio: option }) }
+    request_render()
+}
+
+fn on_number_change(id, value) {
+    if id == "seats" { reset!(state, { ..cur_state(), qty: value }) }
+    request_render()
+}
+
+fn on_select_change(id, value) {
+    if id == "country" { reset!(state, { ..cur_state(), country: value }) }
+    request_render()
+}
+
+fn on_dialog_close(id) {
+    if id == "settings" { reset!(state, { ..cur_state(), dialog_open: false }) }
+    request_render()
+}
+
+fn on_toast_dismiss(id) {
+    if id == "saved" { reset!(state, { ..cur_state(), toast_shown: false }) }
+    request_render()
+}
+
+// ---- helpers ----
+
+fn tok(name) {
+    let c = glaze_token(name)
+    if typeof(c) == "Str" { c } else { "#ffffff" }
+}
+
+fn text(value, color, size, bold) = {
+    kind: "text", value: value, color: color, size: size,
+    weight: if bold { "bold" } else { "normal" },
+    family: "font_family_body", selectable: false,
+}
+
+fn col(gap, children) = { kind: "vstack", gap: gap, children: children }
+fn row(gap, align, children) = { kind: "hstack", gap: gap, align: align, children: children }
+
+// A Glaze-styled frame. A style the sheet doesn't define renders as a loud red
+// tile rather than silently falling back — house rule: a broken style is a
+// visible error, not a plain box.
+fn glz(name, gap, children) {
+    let st = glaze(name, {}, [])
+    if typeof(st) != "Record" {
+        return { kind: "frame", gap: 4.0, style: {
+            background: "#2a1414", radius: "8",
+            border: { color: "#ff6b5a", width: 1.0 },
+            padding: { top: 10.0, right: 10.0, bottom: 10.0, left: 10.0 },
+        }, children: [ text("glaze: no style `" + name + "`", "#ff6b5a", 10.0, true) ] }
+    }
+    { kind: "frame", gap: gap, style: st, children: children }
+}
+
+fn badge(value, color) = { kind: "badge", value: value, color: color, selectable: false }
+
+// A progress bar that fills its container width (so it shrinks and grows with
+// the card) — a track frame at 100% holding a fill frame at `frac`%.
+fn bar(frac, accent, track) {
+    let pct = clamp(frac * 100.0, 0.0, 100.0)
+    let fill = { kind: "frame", gap: 0.0,
+                 style: { background: accent, radius: "3", width: str(pct) + "%" },
+                 children: [ { kind: "spacer", size: 6.0 } ] }
+    { kind: "frame", gap: 0.0,
+      style: { background: track, radius: "3", width: "100%" },
+      children: [ fill ] }
+}
+
+fn clamp(v, lo, hi) = if v < lo { lo } else if v > hi { hi } else { v }
+
+fn slot(name, component, states) {
+    let st = glaze_slot(name, component, {}, states)
+    if typeof(st) == "Record" { st } else { () }
+}
+
+fn glaze_bar(style_name, frac, width) = {
+    kind: "bar", value: frac, max: 1.0, width: width, height: 14.0,
+    style: slot(style_name, "bar", []),
+}
+
+fn glaze_slider(id, value) = {
+    kind: "slider", id: id, value: value, min: 0.0, max: 1.0, step: 0.0,
+    width: 320.0, height: 22.0, style: slot("slider", "slider", []),
+}
+
+fn glaze_toggle(style_name, id, label, on) = {
+    kind: "toggle", id: id, label: label, checked: on,
+    style: slot(style_name, "toggle", []),
+}
+
+fn glaze_checkbox(id, label, on) = {
+    kind: "checkbox", id: id, label: label, checked: on,
+    style: slot("checkbox", "checkbox", if on { ["checked"] } else { [] }),
+}
+
+fn glaze_tabs(id, items, selected) = {
+    kind: "tabs", id: id, items: items, selected: selected,
+    style: slot("tabbar", "tabs", []),
+}
+
+fn glaze_radio(id, options, selected) = {
+    kind: "radio-group", id: id, options: options, selected: selected,
+    style: slot("radiogroup", "radio", []),
+}
+
+fn glaze_stepper(id, value) = {
+    kind: "stepper", id: id, value: value, min: 0.0, max: 20.0, step: 1.0,
+    style: slot("stepper", "stepper", []),
+}
+
+fn glaze_select(id, options, value) = {
+    kind: "select", id: id, options: options, value: value,
+    placeholder: "Select…", width: 200.0, style: slot("picker", "select", []),
+}
+
+fn tooltip(label, hint) = {
+    kind: "tooltip", label: label, text: hint, style: slot("tip", "tooltip", []),
+}
+
+fn glaze_table() = {
+    kind: "table", zebra: true, selectable: true,
+    style: slot("datatable", "table", []),
+    columns: [
+        { header: "Service", width: 140.0, align: "start" },
+        { header: "Status", width: 90.0, align: "start" },
+        { header: "Latency", align: "start" },
+    ],
+    rows: [
+        ["api", "live", "42ms"],
+        ["worker", "live", "8ms"],
+        ["cache", "degraded", "120ms"],
+        ["db", "live", "5ms"],
+    ],
+}
+
+// Anchored floating card: a click opens it beside its trigger.
+fn glaze_popover(muted) = {
+    kind: "popover", id: "acct", label: "Account ▾", width: 200.0,
+    style: slot("pop", "popover", []),
+    content: col(6.0, [
+        text("ACCOUNT", muted, 10.0, true),
+        { kind: "button", id: "pop-profile", label: "View profile", kind_: "ghost" },
+        { kind: "button", id: "pop-signout", label: "Sign out", kind_: "ghost" },
+    ]),
+}
+
+// Modal on the overlay layer. Body buttons fire ordinary clicks; the scrim and
+// Escape send `dialog-close`.
+fn glaze_dialog(open, muted) = {
+    kind: "dialog", id: "settings", open: open, title: "Confirm change",
+    width: 360.0, style: slot("modal", "dialog", []),
+    body: col(16.0, [
+        text("Switch to the Team plan? Your card will be charged the prorated difference today.",
+             muted, 12.0, false),
+        row(10.0, "center", [
+            button_kind("dlg-cancel", "Cancel", "outline"),
+            { kind: "button", id: "dlg-confirm", label: "Confirm" },
+        ]),
+    ]),
+}
+
+// `kind` names the element, so a ButtonKind has to ride in under its own key:
+// `assoc` writes the element tag last, and the record's own `kind` stays the
+// button variant the host reads.
+fn button_kind(id, label, variant) =
+    assoc({ id: id, kind: variant, label: label }, "type", "button")
+
+fn stat_card(label, value, tone, frac) {
+    let accent = tok(tone)
+    glz("stat", 8.0, [
+        text(label, tok("muted"), 10.0, true),
+        text(value, accent, 26.0, true),
+        bar(frac, accent, tok("surface")),
+    ])
+}
+
+fn feature(label) = row(8.0, "center", [
+    badge("✓", tok("green")),
+    text(label, tok("fg"), 12.0, false),
+])
+
+fn cta(label) {
+    let st = glaze("cta", {}, [])
+    { kind: "button", id: "get-pro", label: label,
+      style: if typeof(st) == "Record" { st } else { () } }
+}
+
+// A row whose row/column behaviour is Glaze's call: `row_resp` carries a
+// `when vw < 560` breakpoint that flips its direction. We only feed it the
+// current viewport width.
+fn resp_row(width, gap, children) {
+    let st = glaze_at("row_resp", {}, [], width, 100000.0)
+    { kind: "hstack", gap: gap, align: "stretch", children: children,
+      style: if typeof(st) == "Record" { st } else { () } }
+}
+
+// ---- the showcase ----
+
+fn tab_panel(s, fg, muted) {
+    if s.tab == "b" {
+        col(8.0, [
+            text("RECENT ACTIVITY", muted, 10.0, true),
+            row(10.0, "center", [ text("Deploys", fg, 12.0, false), glaze_bar("progress", 0.82, 360.0) ]),
+            row(10.0, "center", [ text("Reviews", fg, 12.0, false), glaze_bar("progress_gold", 0.46, 360.0) ]),
+        ])
+    } else if s.tab == "c" {
+        col(10.0, [
+            text("SETTINGS", muted, 10.0, true),
+            row(20.0, "center", [
+                glaze_toggle("toggle", "notifications", "Notifications", checked(s, "notifications")),
+                glaze_toggle("toggle", "autosync", "Auto-sync", checked(s, "autosync")),
+            ]),
+        ])
+    } else {
+        glaze_table()
+    }
+}
+
+fn render(w, h) {
+    // Follow theme switches: the palette is compiled into the sheet, so a new
+    // theme means recompiling it.
+    let sig = theme_sig()
+    let s0 = cur_state()
+    if sig != s0.sig {
+        load_sheet()
+        reset!(state, { ..s0, sig: sig })
+    }
+    let s = cur_state()
+    let fg = tok("fg")
+    let muted = tok("muted")
+
+    let header = col(4.0, [
+        text("Glaze UI", tok("gold"), 30.0, true),
+        text("components · flex layout · shader-styled — all from one .glz", muted, 12.0, false),
+    ])
+
+    let stats = resp_row(w, 14.0, [
+        stat_card("REVENUE", "$48.2k", "gold", 0.72),
+        stat_card("ACTIVE USERS", "1,284", "teal", 0.55),
+        stat_card("CHURN", "2.1%", "rose", 0.21),
+    ])
+
+    let pricing = glz("card", 12.0, [
+        glz("banner", 2.0, [
+            text("PRO PLAN", "#fdf6ec", 10.0, true),
+            text("$29 / mo", "#fdf6ec", 22.0, true),
+        ]),
+        feature("Unlimited panes"),
+        feature("Shader-styled components"),
+        feature("Priority support"),
+        { kind: "spacer", size: 4.0 },
+        cta("Get Pro"),
+    ])
+
+    let profile = glz("glass", 12.0, [
+        row(12.0, "center", [
+            glz("avatar", 0.0, []),
+            col(2.0, [
+                text("Ada Lovelace", fg, 14.0, true),
+                text("Design Engineer", muted, 11.0, false),
+            ]),
+        ]),
+        text("Building delightful interfaces with a tiny staged style language.", muted, 11.0, false),
+        row(10.0, "center", [
+            { kind: "button", id: "follow", label: "Follow" },
+            { kind: "toggle", id: "notify", label: "Notify", checked: true },
+        ]),
+    ])
+
+    // Pure Glaze layers: gradients, a per-side border, inset and spread shadows.
+    let layers = col(8.0, [
+        text("WIDENED LAYER STACK · PHASE 1B", muted, 10.0, true),
+        resp_row(w, 12.0, [
+            glz("g_linear", 0.0, [ text("linear gradient", "#fdf6ec", 11.0, true) ]),
+            glz("g_diag", 0.0, [ text("angled gradient", "#fdf6ec", 11.0, true) ]),
+            glz("edged", 0.0, [ text("per-side border", fg, 11.0, true) ]),
+            glz("insets", 0.0, [ text("inset shadow", "#0c2226", 11.0, true) ]),
+            glz("raised", 0.0, [ text("drop shadow · spread", "#1a1407", 11.0, true) ]),
+        ]),
+    ])
+
+    let badges = col(8.0, [
+        text("STATUS", muted, 10.0, true),
+        row(8.0, "center", [
+            badge("● Live", tok("green")),
+            badge("Beta", tok("violet")),
+            badge("v0.3", tok("teal")),
+            badge("3 issues", tok("rose")),
+        ]),
+    ])
+
+    // Slot-styled bars: one element, track and fill surfaces styled apart.
+    let slots = col(8.0, [
+        text("SLOT-STYLED COMPONENT · PHASE 1C", muted, 10.0, true),
+        text("Bar · track + fill parts — gradient fill over an inset-shadow track", muted, 11.0, false),
+        glaze_bar("progress", 0.7, 520.0),
+        glaze_bar("progress_gold", 0.4, 520.0),
+    ])
+
+    let retrofit = col(10.0, [
+        text("SLOT-RETROFIT COMPONENTS · PHASE 1D — click the tabs", muted, 10.0, true),
+        glaze_tabs("demo-tabs", [
+            { id: "a", label: "Overview" },
+            { id: "b", label: "Activity" },
+            { id: "c", label: "Settings" },
+        ], s.tab),
+        tab_panel(s, fg, muted),
+    ])
+
+    // Glaze-declared animation: `transition checked …` tweens the knob and
+    // crossfades the track instead of snapping.
+    let animation = col(8.0, [
+        text("ANIMATED STATE · GLAZE `transition` — click the toggles", muted, 10.0, true),
+        text("transition checked 180ms ease_in_out · 700ms linear · 450ms + checked-driven shader glow",
+             muted, 11.0, false),
+        row(20.0, "center", [
+            glaze_toggle("toggle", "anim-eased", "Eased", checked(s, "anim-eased")),
+            glaze_toggle("toggle_slow", "anim-slow", "Slow linear", checked(s, "anim-slow")),
+            glaze_toggle("toggle_glow", "anim-glow", "Shader glow", checked(s, "anim-glow")),
+        ]),
+    ])
+
+    let phase2 = col(8.0, [
+        text("NEW COMPONENT · PHASE 2 — DRAGGABLE SLIDER", muted, 10.0, true),
+        row(14.0, "center", [
+            glaze_slider("volume", s.slider),
+            text(str(to_int(s.slider * 100.0 + 0.5)) + "%", tok("teal"), 13.0, true),
+        ]),
+        row(24.0, "center", [
+            glaze_checkbox("terms", "Accept terms", checked(s, "terms")),
+            glaze_checkbox("news", "Email updates", checked(s, "news")),
+            glaze_checkbox("beta", "Join beta", checked(s, "beta")),
+        ]),
+        row(40.0, "start", [
+            glaze_radio("plan", [
+                { id: "free", label: "Free" },
+                { id: "pro", label: "Pro" },
+                { id: "team", label: "Team" },
+            ], s.radio),
+            col(6.0, [
+                text("SEATS", muted, 10.0, true),
+                glaze_stepper("seats", s.qty),
+            ]),
+        ]),
+    ])
+
+    // Floating overlay components: a select whose dropdown escapes the pane,
+    // a tooltip, a popover, a modal and a toast.
+    let mut phase3_kids = [
+        text("FLOATING OVERLAY · PHASE 3 — SELECT", muted, 10.0, true),
+        row(14.0, "center", [
+            glaze_select("country", [
+                { id: "us", label: "United States" },
+                { id: "ca", label: "Canada" },
+                { id: "uk", label: "United Kingdom" },
+                { id: "de", label: "Germany" },
+            ], s.country),
+            text("→ " + s.country, tok("teal"), 12.0, true),
+        ]),
+        row(8.0, "center", [
+            text("Hover the hint:", muted, 12.0, false),
+            tooltip("what is this?", "A floating hint on the overlay layer — it escapes the pane."),
+        ]),
+    ]
+    let mut overlay_row = [
+        { kind: "button", id: "open-dialog", label: "Open dialog" },
+        glaze_dialog(s.dialog_open, muted),
+        glaze_popover(muted),
+    ]
+    if s.toast_shown {
+        overlay_row = push(overlay_row, {
+            kind: "toast", id: "saved", text: "Settings saved ✓",
+            style: slot("notif", "toast", []),
+        })
+    }
+    phase3_kids = push(phase3_kids, row(10.0, "center", overlay_row))
+    let phase3 = col(8.0, phase3_kids)
+
+    { kind: "vstack", gap: 18.0, pad: 4.0, children: [
+        header, stats, resp_row(w, 16.0, [ pricing, profile ]),
+        layers, slots, retrofit, animation, phase2, phase3, badges,
+    ]}
+}

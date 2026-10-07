@@ -171,6 +171,16 @@ fn main() -> ExitCode {
     // still need to register the message type so the reader doesn't
     // panic on first run.
     app.add_message::<claude_bus_bevy::ClaudeBusEvent>();
+    // The editor-portal bridge in `script_widget` reads and writes these; the
+    // GUI gets them from `EditorEmbedPlugin`, which a snapshot has no reason
+    // to install. Bevy 0.19 fails a system whose message type is unregistered,
+    // which is what bit-rotted this tool.
+    app.add_message::<jim_editor::EmbeddedEditorSubmit>()
+        .add_message::<jim_editor::EmbeddedEditorPress>()
+        .add_message::<jim_editor::EmbeddedEditorDrag>()
+        .add_message::<jim_editor::EmbeddedEditorRelease>()
+        .add_message::<jim_editor::EmbeddedEditorScroll>()
+        .add_message::<jim_widget::BusMessageObserved>();
 
     // Reserve the overlay layer (32) so no pane camera claims it, matching how
     // terminal-bevy reserves MENU_OVERLAY_LAYER for floating content.

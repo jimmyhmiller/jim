@@ -12,7 +12,7 @@
 // params: { project_root, file?, project? }   (project_root is host-injected)
 import "host"
 import { col_text, col_muted, col_accent, col_panel } from "df"
-import { virtual_list, should_rewindow } from "virtual"
+import { row_layout, virtual_list, should_rewindow } from "virtual"
 
 let state = atom(init_state())
 
@@ -20,6 +20,10 @@ fn init_state() = {
     query: "", results: [], status: "", file: "",
     busy_h: -1, busy_kind: "", collapsed: [], last_sy: 0.0,
     view: "file", hidden: [],   // view: "file" | "type"; hidden: filtered-out kind groups
+    // Derived from results/hidden/collapsed by `with_visible` — the rows the
+    // list shows and their virtualizer layout. Kept in state so a scroll
+    // re-window never re-filters thousands of rows (see virtual.ft).
+    visible: [], lay: row_layout([]),
 }
 
 // Fixed row heights — must match the forced style.height below so the
@@ -222,9 +226,9 @@ fn is_group_hidden(s, g) {
 fn toggle_filter(g) {
     let s = cur_state()
     if is_group_hidden(s, g) {
-        reset!(state, { ..s, hidden: filter(s.hidden, (x) => x != g) })
+        reset!(state, with_visible({ ..s, hidden: filter(s.hidden, (x) => x != g) }))
     } else {
-        reset!(state, { ..s, hidden: push(s.hidden, g) })
+        reset!(state, with_visible({ ..s, hidden: push(s.hidden, g) }))
     }
     request_render()
 }
@@ -236,9 +240,9 @@ fn is_collapsed(s, rel) {
 fn toggle_collapse(rel) {
     let s = cur_state()
     if is_collapsed(s, rel) {
-        reset!(state, { ..s, collapsed: filter(s.collapsed, (c) => c != rel) })
+        reset!(state, with_visible({ ..s, collapsed: filter(s.collapsed, (c) => c != rel) }))
     } else {
-        reset!(state, { ..s, collapsed: push(s.collapsed, rel) })
+        reset!(state, with_visible({ ..s, collapsed: push(s.collapsed, rel) }))
     }
     request_render()
 }
@@ -269,29 +273,29 @@ fn on_proc_output(handle, line) {
         }
     } else if s.busy_kind == "search" {
         let rows = parse_ws(unwrap_or(get(res, "symbols"), []))
-        reset!(state, { ..s, results: rows, busy_h: -1,
-                        status: str(len(rows)) + " result(s)" })
+        reset!(state, with_visible({ ..s, results: rows, busy_h: -1,
+                        status: str(len(rows)) + " result(s)" }))
         request_render()
     } else if s.busy_kind == "file" {
         let syms = unwrap_or(get(res, "symbols"), [])
         let rows = flatten_syms(syms, 0, s.file, "", [])
-        reset!(state, { ..s, results: rows, busy_h: -1,
-                        status: file_base(s.file) + " — " + str(len(rows)) + " symbols" })
+        reset!(state, with_visible({ ..s, results: rows, busy_h: -1,
+                        status: file_base(s.file) + " — " + str(len(rows)) + " symbols" }))
         request_render()
     } else if s.busy_kind == "outline" {
         let files = unwrap_or(get(res, "files"), [])
         let rows = build_outline_rows(files)
         let nfiles = if typeof(files) == "List" { len(files) } else { 0 }
-        reset!(state, { ..s, results: rows, busy_h: -1,
-                        status: str(nfiles) + " files — click a symbol to open it" })
+        reset!(state, with_visible({ ..s, results: rows, busy_h: -1,
+                        status: str(nfiles) + " files — click a symbol to open it" }))
         request_render()
     } else if s.busy_kind == "types" {
         let types = unwrap_or(get(res, "types"), [])
         let free = unwrap_or(get(res, "free"), [])
         let rows = build_type_rows(types, free)
         let nt = if typeof(types) == "List" { len(types) } else { 0 }
-        reset!(state, { ..s, results: rows, busy_h: -1, collapsed: [],
-                        status: str(nt) + " types — click a type or method to open it" })
+        reset!(state, with_visible({ ..s, results: rows, busy_h: -1, collapsed: [],
+                        status: str(nt) + " types — click a type or method to open it" }))
         request_render()
     }
 }
@@ -364,11 +368,15 @@ fn open_type(r) {
 }
 
 // ---- handlers ----
-fn on_init() {}
+// A hot reload runs only this (not on_start): rebuild the derived rows so a
+// snapshot carried across the reload keeps its list.
+fn on_init() { reset!(state, with_visible(cur_state())) }
 
 fn on_start() {
     let f = param("file", "")
-    reset!(state, { ..cur_state(), file: f, view: param("view", "file") })
+    // Re-derive the shown rows from whatever results a restored snapshot
+    // carried, rather than trusting a persisted layout.
+    reset!(state, with_visible({ ..cur_state(), file: f, view: param("view", "file") }))
     if root() == "" {
         reset!(state, { ..cur_state(),
             status: "no project root — open from a project whose folder is a Rust/Cargo workspace" })
@@ -397,16 +405,21 @@ fn refresh_view() {
     else { load_outline() }
 }
 
+fn on_tab_select(id, tab) {
+    if id != "view" { return }
+    let s = cur_state()
+    if tab == s.view { return }
+    if tab == "file" {
+        reset!(state, { ..s, query: "", view: "file" }); load_outline()
+    } else if tab == "type" {
+        reset!(state, { ..s, query: "", view: "type" }); load_types()
+    }
+}
+
 fn on_click(x, y, shift, cmd, id) {
     let s = cur_state()
     if id == "search" { run_search(); return }
     if id == "reload" { refresh_view(); return }
-    if id == "viewfile" {
-        reset!(state, { ..s, query: "", view: "file" }); load_outline(); return
-    }
-    if id == "viewtype" {
-        reset!(state, { ..s, query: "", view: "type" }); load_types(); return
-    }
     if starts_with(id, "filt:") { toggle_filter(slice(id, 5, len(id))); return }
     if starts_with(id, "grp:") { toggle_collapse(slice(id, 4, len(id))); return }
     if starts_with(id, "topen:") {
@@ -511,61 +524,65 @@ fn render(w, h) {
     ] }
     // View toggle + kind filters.
     let toolbar = { kind: "hstack", gap: 6.0, align: "center", children: [
-        { kind: "button", id: "viewfile", label: "By file",
-          style: { text_color: if s.view == "file" { col_accent() } else { col_muted() } } },
-        { kind: "button", id: "viewtype", label: "By type",
-          style: { text_color: if s.view == "type" { col_accent() } else { col_muted() } } },
+        { kind: "tabs", id: "view", selected: s.view, items: [
+            { id: "file", label: "By file" },
+            { id: "type", label: "By type" },
+        ] },
         { kind: "text", value: "  filter:", size: 10.0, color: col_muted(), selectable: false },
         filter_btn(s, "fn", "fn"), filter_btn(s, "struct", "struct"), filter_btn(s, "enum", "enum"),
         filter_btn(s, "trait", "trait"), filter_btn(s, "const", "const"), filter_btn(s, "mod", "mod"),
     ] }
     let status = { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false }
 
+    let list = if len(s.visible) == 0 {
+        { kind: "text", value: s.status, color: col_muted() }
+    } else {
+        virtual_list(s.visible, s.lay, scroll_y, h, (row, k) => render_entry(s, row))
+    }
+    { kind: "vstack", gap: 8.0, pad: 12.0, children: [ bar, toolbar, status, { kind: "divider" }, list ] }
+}
+
+// The rows the list currently shows, given results + kind filters + collapsed
+// groups, each tagged with its `results` index for stable ids, plus their
+// virtualizer layout. Call whenever any of those three change; `render` only
+// windows the result.
+fn with_visible(s) {
     // Type groups whose TYPE kind is filtered out → hide entirely (header + members).
-    let mut hidden_groups = []
+    let mut hidden_groups = {}
     for r in s.results {
         if r.kind_name == "__type__" and r.file != "" and is_kind_hidden(s, r.type_kind) {
-            hidden_groups = push(hidden_groups, r.group)
+            hidden_groups = assoc(hidden_groups, r.group, true)
         }
     }
     // Groups with ≥1 kind-visible member — so file/free headers with everything
     // filtered out are dropped.
-    let mut groups_live = []
+    let mut groups_live = {}
     for r in s.results {
         if r.depth > 0 {
             let g = unwrap_or(get(r, "group"), "")
-            if not contains_str(hidden_groups, g) and not is_kind_hidden(s, r.kind_name) {
-                if not contains_str(groups_live, g) { groups_live = push(groups_live, g) }
+            if not has(hidden_groups, g) and not is_kind_hidden(s, r.kind_name) {
+                groups_live = assoc(groups_live, g, true)
             }
         }
     }
-    // Build the CURRENTLY VISIBLE rows; tag each with its `results` index for stable ids.
     let mut visible = []
     let mut heights = []
     let mut j = 0
     for r in s.results {
         let g = unwrap_or(get(r, "group"), "")
-        if not contains_str(hidden_groups, g) {
+        if not has(hidden_groups, g) {
             if r.kind_name == "__type__" {
-                let show = if r.file != "" { true } else { contains_str(groups_live, g) }
+                let show = if r.file != "" { true } else { has(groups_live, g) }
                 if show { visible = push(visible, { ..r, _idx: j }); heights = push(heights, hdr_h()) }
             } else if r.kind_name == "__file__" {
-                if contains_str(groups_live, g) { visible = push(visible, { ..r, _idx: j }); heights = push(heights, hdr_h()) }
+                if has(groups_live, g) { visible = push(visible, { ..r, _idx: j }); heights = push(heights, hdr_h()) }
             } else if not is_collapsed(s, g) and not is_kind_hidden(s, r.kind_name) {
                 visible = push(visible, { ..r, _idx: j }); heights = push(heights, row_h())
             }
         }
         j = j + 1
     }
-    let list = if len(visible) == 0 {
-        { kind: "text", value: s.status, color: col_muted() }
-    } else {
-        virtual_list(visible, heights, scroll_y, h, (row, k) => render_entry(s, row))
-    }
-    { kind: "vstack", gap: 8.0, pad: 12.0, children: [ bar, toolbar, status, { kind: "divider" }, list ] }
+    { ..s, visible: visible, lay: row_layout(heights) }
 }
 
-fn contains_str(xs, v) {
-    for x in xs { if x == v { return true } }
-    false
-}
+fn has(set, k) = unwrap_or(get(set, k), false)

@@ -16,7 +16,8 @@
 //!   jimctl workspace switch NAME                show it
 //!   jimctl workspace next | prev                step along the swipe order
 //!   jimctl workspace rename [NAME] --to NEW     rename (default: the current one)
-//!   jimctl workspace rm NAME                    delete (never the last one)
+//!   jimctl workspace rm NAME                    delete, softly (never the last one)
+//!   jimctl workspace restore [NAME]             bring a deleted one back (default: the last)
 //!   jimctl workspace show PROJECT [--in NAME]   list PROJECT in a workspace
 //!   jimctl workspace hide PROJECT [--in NAME]   park PROJECT in a workspace
 //!
@@ -57,7 +58,10 @@ usage: jimctl workspace <command>
   switch NAME                   show that workspace
   next | prev                   step along the swipe order
   rename [NAME] --to NEW        rename a workspace (default: the current one)
-  rm NAME                       delete a workspace (never the last one)
+  rm NAME                       delete a workspace (never the last one); it is
+                                kept, and `restore` brings it back as it was
+  restore [NAME]                restore a deleted workspace (default: the most
+                                recently deleted)
   show PROJECT [--in NAME]      list PROJECT in a workspace
   hide PROJECT [--in NAME]      park PROJECT in a workspace
 
@@ -120,7 +124,8 @@ pub fn run() -> ExitCode {
     };
 
     match op {
-        "list" | "new" | "switch" | "next" | "prev" | "rename" | "rm" | "show" | "hide" => {}
+        "list" | "new" | "switch" | "next" | "prev" | "rename" | "rm" | "restore" | "show"
+        | "hide" => {}
         other => {
             eprintln!("jimctl workspace: unknown command {other:?}\n\n{USAGE}");
             return ExitCode::from(2);
@@ -207,6 +212,17 @@ fn print_list(reply: &str) -> ExitCode {
             println!("    (every project parked)");
         } else {
             println!("    {}", projects.join(", "));
+        }
+    }
+    let deleted: Vec<&str> = parsed
+        .get("deleted")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|w| w.get("name").and_then(|n| n.as_str())).collect())
+        .unwrap_or_default();
+    if !deleted.is_empty() {
+        println!("deleted (newest first; `jimctl workspace restore [NAME]`):");
+        for name in deleted {
+            println!("    {name}");
         }
     }
     ExitCode::SUCCESS

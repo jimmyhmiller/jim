@@ -909,6 +909,14 @@ fn handle_keyboard(
             continue;
         }
 
+        // Xterm encodes modifiers in the CSI parameter for navigation and
+        // function keys. Sending the plain arrow sequence here would make
+        // Option+Up indistinguishable from Up to terminal applications.
+        if let Some(bytes) = modified_key_bytes(ev.key_code, shift, alt, ctrl) {
+            out.extend_from_slice(bytes.as_bytes());
+            continue;
+        }
+
         // Named keys we know the VT encoding for. Arrows / Home / End
         // honor DECCKM.
         if let Some(bytes) = named_key_bytes(&ev.key_code, app_cursor) {
@@ -1560,8 +1568,119 @@ fn named_key_bytes(code: &KeyCode, app_cursor: bool) -> Option<&'static [u8]> {
                 b"\x1b[F"
             }
         }
+        KeyCode::F1 => b"\x1bOP",
+        KeyCode::F2 => b"\x1bOQ",
+        KeyCode::F3 => b"\x1bOR",
+        KeyCode::F4 => b"\x1bOS",
+        KeyCode::F5 => b"\x1b[15~",
+        KeyCode::F6 => b"\x1b[17~",
+        KeyCode::F7 => b"\x1b[18~",
+        KeyCode::F8 => b"\x1b[19~",
+        KeyCode::F9 => b"\x1b[20~",
+        KeyCode::F10 => b"\x1b[21~",
+        KeyCode::F11 => b"\x1b[23~",
+        KeyCode::F12 => b"\x1b[24~",
         _ => return None,
     })
+}
+
+/// Xterm's modified navigation/function-key protocol. The modifier parameter
+/// is 1 + Shift + 2*Alt + 4*Ctrl; unmodified keys use `named_key_bytes`.
+fn modified_key_bytes(code: KeyCode, shift: bool, alt: bool, ctrl: bool) -> Option<String> {
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    if modifier == 1 {
+        return None;
+    }
+
+    let sequence = match code {
+        KeyCode::ArrowUp => format!("\x1b[1;{modifier}A"),
+        KeyCode::ArrowDown => format!("\x1b[1;{modifier}B"),
+        KeyCode::ArrowRight => format!("\x1b[1;{modifier}C"),
+        KeyCode::ArrowLeft => format!("\x1b[1;{modifier}D"),
+        KeyCode::Home => format!("\x1b[1;{modifier}H"),
+        KeyCode::End => format!("\x1b[1;{modifier}F"),
+        KeyCode::F1 => format!("\x1b[1;{modifier}P"),
+        KeyCode::F2 => format!("\x1b[1;{modifier}Q"),
+        KeyCode::F3 => format!("\x1b[1;{modifier}R"),
+        KeyCode::F4 => format!("\x1b[1;{modifier}S"),
+        KeyCode::Insert => format!("\x1b[2;{modifier}~"),
+        KeyCode::Delete => format!("\x1b[3;{modifier}~"),
+        KeyCode::PageUp => format!("\x1b[5;{modifier}~"),
+        KeyCode::PageDown => format!("\x1b[6;{modifier}~"),
+        KeyCode::F5 => format!("\x1b[15;{modifier}~"),
+        KeyCode::F6 => format!("\x1b[17;{modifier}~"),
+        KeyCode::F7 => format!("\x1b[18;{modifier}~"),
+        KeyCode::F8 => format!("\x1b[19;{modifier}~"),
+        KeyCode::F9 => format!("\x1b[20;{modifier}~"),
+        KeyCode::F10 => format!("\x1b[21;{modifier}~"),
+        KeyCode::F11 => format!("\x1b[23;{modifier}~"),
+        KeyCode::F12 => format!("\x1b[24;{modifier}~"),
+        _ => return None,
+    };
+    Some(sequence)
+}
+
+#[cfg(test)]
+mod keyboard_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn f2_matches_xterm_terminfo() {
+        assert_eq!(
+            named_key_bytes(&KeyCode::F2, false),
+            Some(b"\x1bOQ".as_slice())
+        );
+        assert_eq!(modified_key_bytes(KeyCode::F2, false, false, false), None);
+    }
+
+    #[test]
+    fn option_up_is_distinct_from_plain_up() {
+        assert_eq!(
+            named_key_bytes(&KeyCode::ArrowUp, false),
+            Some(b"\x1b[A".as_slice())
+        );
+        assert_eq!(
+            modified_key_bytes(KeyCode::ArrowUp, false, true, false).as_deref(),
+            Some("\x1b[1;3A")
+        );
+    }
+
+    #[test]
+    fn modified_function_and_navigation_keys_use_xterm_modifier_bits() {
+        assert_eq!(
+            modified_key_bytes(KeyCode::F2, true, true, true).as_deref(),
+            Some("\x1b[1;8Q")
+        );
+        assert_eq!(
+            modified_key_bytes(KeyCode::ArrowDown, true, false, true).as_deref(),
+            Some("\x1b[1;6B")
+        );
+        assert_eq!(
+            modified_key_bytes(KeyCode::PageUp, false, true, false).as_deref(),
+            Some("\x1b[5;3~")
+        );
+    }
+
+    #[test]
+    fn function_keys_cover_f1_through_f12() {
+        let expected = [
+            (KeyCode::F1, b"\x1bOP".as_slice()),
+            (KeyCode::F2, b"\x1bOQ".as_slice()),
+            (KeyCode::F3, b"\x1bOR".as_slice()),
+            (KeyCode::F4, b"\x1bOS".as_slice()),
+            (KeyCode::F5, b"\x1b[15~".as_slice()),
+            (KeyCode::F6, b"\x1b[17~".as_slice()),
+            (KeyCode::F7, b"\x1b[18~".as_slice()),
+            (KeyCode::F8, b"\x1b[19~".as_slice()),
+            (KeyCode::F9, b"\x1b[20~".as_slice()),
+            (KeyCode::F10, b"\x1b[21~".as_slice()),
+            (KeyCode::F11, b"\x1b[23~".as_slice()),
+            (KeyCode::F12, b"\x1b[24~".as_slice()),
+        ];
+        for (code, bytes) in expected {
+            assert_eq!(named_key_bytes(&code, false), Some(bytes), "{code:?}");
+        }
+    }
 }
 
 // ---------- Mouse / chrome ----------
@@ -1923,6 +2042,7 @@ fn sync_grid(
             &mut TermGrid,
             &Visibility,
             Option<&jim_pane::PaneProject>,
+            Has<jim_pane::PanePictured>,
         ),
         With<PaneTag>,
     >,
@@ -1956,7 +2076,7 @@ fn sync_grid(
     // the dirty-row hot path.
     let mut pending_writes: Vec<(usize, GpuCell)> = Vec::new();
 
-    for (entity, cursor_marker, mut grid, vis, proj) in &mut terminals {
+    for (entity, cursor_marker, mut grid, vis, proj, pictured) in &mut terminals {
         // Per-pane theme defaults: this terminal's project theme if known,
         // else the global (active) theme.
         let (theme_default_fg, theme_default_bg) = proj
@@ -1980,7 +2100,9 @@ fn sync_grid(
         // processing pty bytes either way — the libghostty terminal
         // state stays correct — but inactive-project panes contribute
         // zero to per-frame schedule cost.
-        let is_hidden = matches!(vis, Visibility::Hidden);
+        // A pictured pane is off screen but being photographed (a slide's
+        // picture of another project), so it has to keep painting.
+        let is_hidden = matches!(vis, Visibility::Hidden) && !pictured;
         // Release-store so the worker's Acquire-load of the same edge
         // (worker.rs, top of `worker_loop`) can't miss the transition —
         // this is what guarantees the reveal publish is never skipped.

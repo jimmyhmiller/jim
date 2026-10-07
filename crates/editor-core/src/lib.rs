@@ -6,4 +6,5 @@ pub mod indent;
 pub mod selection;
 pub mod state;
 pub mod test_dsl;
+pub mod text_units;
 pub mod transaction;
