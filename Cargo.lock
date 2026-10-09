@@ -4345,6 +4345,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "toml_edit",
+ "tungstenite",
  "ureq 2.12.1",
  "whiteboard-core",
 ]

@@ -300,6 +300,31 @@ re-render on hover, so removing it would make hovering a selected row
 re-render the pane and flash its text. Hence the `selected` flag on
 `HoverWash` — in the list, but not painted.
 
+## Dictation engines (⌘⇧M / ⌘⇧T)
+
+`crates/jim-app/src/dictation/` has two engines behind one `Transcriber`
+trait, switched at runtime by the palette ("Dictation: Use Phonon" / "Use
+Whisper") or `~/.jim/dictation.json` (`{"engine": "phonon"}`), read when each
+dictation starts. Both servers are shared services that outlive the GUI
+(`server.rs`; records in `~/.jim/{whisper,phonon}-server`) — like
+`jim-daemon`, don't kill them on restart.
+
+- **Phonon-2** (`phonon.rs`): `phonon serve` from the pinned venv
+  `scripts/install-phonon.sh` builds in `~/.jim/phonon/venv`, forced onto the
+  CPU engine (`FERMION_DEVICE=cpu`). Streams over its WebSocket
+  `/v1/audio/stream`. Never MLX: it grew to 9 GB and never released it.
+  The script is compiled in (`include_str!`): jim runs it in the background
+  whenever Phonon is selected and `~/.jim/phonon/installed` doesn't match the
+  script's `PIN=` line, so bumping `PIN` reinstalls everywhere. Log:
+  `~/.jim/phonon/install.log`.
+- **Whisper** (`whisper.rs`): LocalAgreement over short windows. Gotchas,
+  all measured: the prompt must hold only committed text whose audio has
+  LEFT the window (whisper skips what it's prompted with); `verbose_json`
+  token timestamps cost +0.3–0.7 s a pass and drift too much to diff on —
+  use `srt` and edit-distance alignment; `audio_ctx` breaks turbo (12 s
+  passes of garbage); `temperature_inc=0` keeps a repetition loop from
+  running a pass into the timeout.
+
 ## Docked panes have a SLIM header, not `TITLE_H`
 
 Anything mapping a cursor position into a pane's content space must use

@@ -1,10 +1,10 @@
 //! Dictation into whatever owns the keyboard, transcribed live.
 //!
 //! Hold **⌘⇧M** and talk. Words appear at the caret while you're still
-//! speaking and settle as whisper gets more context; release and the final
-//! text lands. It goes into whatever was focused when you started talking —
-//! a widget `Input`/`TextArea`, an editor pane, the command palette, or a
-//! terminal.
+//! speaking and settle as the engine gets more context; release and the
+//! final text lands. It goes into whatever was focused when you started
+//! talking — a widget `Input`/`TextArea`, an editor pane, the command
+//! palette, or a terminal.
 //!
 //! For hands-free dictation, press **⌘⇧T** once and release the keys.
 //! Press **Escape** (or **⌘⇧T** again) to stop. Escape is consumed by
@@ -12,36 +12,23 @@
 //!
 //! There is no time limit. Talk for as long as you like.
 //!
-//! ## How "live" works
+//! ## Engines
 //!
-//! Each pass re-transcribes the *uncommitted tail* of the clip and rewrites
-//! everything written since the last commit. Re-running a whole span rather
-//! than appending chunks means every pass has full context over that span,
-//! so the text converges on the best transcript instead of accumulating
-//! boundary mistakes it could never go back and fix.
+//! Two, switchable at runtime from the palette ("Dictation: Use Phonon" /
+//! "Use Whisper") or `~/.jim/dictation.json` — see [`engine`]:
 //!
-//! The tail can't grow without bound, because pass cost grows with it
-//! (measured against a warm [`whisper`] server: 5s → ~0.35s, 10s → ~0.43s,
-//! 30s → ~1.2s, 60s → ~2.1s). So once the tail passes
-//! [`COMMIT_TARGET_SECS`] we look for a pause in it — a low-energy stretch
-//! of at least [`SILENCE_MIN_SECS`], which is a gap between phrases and so
-//! never mid-word — transcribe everything before it, and *commit* that
-//! text: it's frozen, and its audio is dropped. What's displayed is
-//! `committed + tail`.
+//! - [`whisper`] — whisper.cpp large-v3-turbo. Multilingual. Not a
+//!   streaming model, so it is driven with LocalAgreement: short re-decoded
+//!   windows, words frozen once two passes agree on them.
+//! - [`phonon`] — Phonon-2 on its CPU engine. English-only, ~10× faster on
+//!   dictation-length audio, half the memory, and a real streaming endpoint:
+//!   audio goes out as it's captured and phrases come back as they close.
 //!
-//! That keeps the per-pass cost flat no matter how long you talk, and it
-//! makes release *faster* on a long clip than it used to be on a short
-//! one, because the final pass only has the tail left to do.
-//!
-//! Committing is the one irreversible step, so it deliberately stays
-//! [`COMMIT_KEEP_SECS`] back from the end — the last few seconds are where
-//! whisper is still revising itself, and a commit there would freeze a
-//! guess that the next pass would have fixed.
-//!
-//! The consequence you can see: text near the caret churns. "config fill"
-//! becomes "config file" a pass later. That's inherent to previewing a
-//! non-streaming model, and it's the tradeoff this mode chooses. Text
-//! behind a commit point stops moving.
+//! Both sit behind [`Transcriber`]: the worker feeds 16 kHz audio in (via
+//! [`resample`]) and gets back the *whole transcript so far* whenever it
+//! changes. Text near the caret may still churn — "config fill" becomes
+//! "config file" a moment later — but text an engine has frozen never moves
+//! again, so the rewrite below only ever touches a short tail in practice.
 //!
 //! ## The things that make it safe
 //!
@@ -65,6 +52,10 @@
 //! A child that fails the test never gets preview bytes at all; its
 //! transcript shows in the status pill and lands as one paste on release.
 
+mod engine;
+mod phonon;
+mod resample;
+mod server;
 mod whisper;
 
 use std::path::PathBuf;
@@ -90,7 +81,7 @@ use jim_widget::script_widget::ScriptWidget;
 use jim_widget::{WidgetIO, WidgetInputFocus, WidgetTargets, audio};
 
 use crate::MENU_OVERLAY_LAYER;
-use crate::actions::{ActionRegistry, Keymap};
+use crate::actions::{ActionRegistry, AppActionsExt, Keymap};
 use crate::command_palette::{self, CommandPalette, PaletteUsage};
 
 /// Push-to-talk key, held with ⌘ and ⇧.
@@ -100,32 +91,28 @@ const HOLD_HOTKEY: KeyCode = KeyCode::KeyM;
 const TOGGLE_HOTKEY: KeyCode = KeyCode::KeyT;
 /// How long a failure message stays on screen.
 const ERROR_SECS: f64 = 5.0;
-/// Don't transcribe a fragment shorter than this — there's nothing in it
-/// yet, and whisper tends to hallucinate on near-silence.
-const MIN_LIVE_SECS: f32 = 0.8;
-/// Floor on the gap between live passes, so a short clip (~0.35s a pass)
-/// can't pin a core at 100% duty cycle.
-const MIN_PASS_GAP: Duration = Duration::from_millis(250);
+/// How long a confirmation (an engine switch) stays on screen.
+const NOTICE_SECS: f64 = 2.5;
+/// The rate both engines consume. Capture runs at the device's native rate
+/// and is resampled on the way in.
+const RATE: u32 = 16_000;
+/// How often the worker moves captured audio to the engine and checks for
+/// new text. Whisper's passes take far longer than this and pace
+/// themselves; for Phonon this is the streaming granularity.
+const POLL: Duration = Duration::from_millis(30);
 
-/// Start looking for somewhere to commit once the uncommitted tail passes
-/// this. Sets the steady-state pass cost: a ~20s window is ~0.7s a pass,
-/// which still reads as live.
-const COMMIT_TARGET_SECS: f32 = 20.0;
-/// Never commit within this much of the end. The last few seconds are
-/// exactly where whisper is still revising itself, so committing them
-/// would freeze a guess the next pass would have corrected.
-const COMMIT_KEEP_SECS: f32 = 6.0;
-/// If the tail reaches this with no pause to cut at, cut at the quietest
-/// point anyway — a rising pass cost is worse than one clipped word.
-const COMMIT_FORCE_SECS: f32 = 45.0;
-/// A low-energy stretch at least this long reads as a pause between
-/// phrases, so cutting in the middle of it can't split a word.
-const SILENCE_MIN_SECS: f32 = 0.45;
-/// Per-frame RMS below this counts as silence. Set well above the noise
-/// floor of a quiet room but below speech.
-const SILENCE_RMS: f32 = 0.01;
-/// Frame size for the RMS scan.
-const SILENCE_FRAME_SECS: f32 = 0.02;
+/// A live transcription session. Implementations own their engine-specific
+/// policy — when to run a pass, what to freeze — and all report the same
+/// thing: the whole transcript so far.
+trait Transcriber: Send {
+    /// Newly captured mono audio at [`RATE`].
+    fn push(&mut self, samples: &[f32]) -> Result<(), String>;
+    /// Do whatever is due. Returns the whole transcript when it changed.
+    /// May block for a decode.
+    fn step(&mut self) -> Result<Option<String>, String>;
+    /// All audio has been pushed: the final transcript.
+    fn finish(&mut self) -> Result<String, String>;
+}
 
 const PILL_W: f32 = 300.0;
 const PILL_TOP: f32 = 64.0;
@@ -180,6 +167,8 @@ enum Anchor {
 enum Phase {
     #[default]
     Idle,
+    /// Whisper is loading; the microphone remains closed.
+    Starting,
     /// Key held: capturing, preview passes running.
     Recording,
     /// Key released: final pass in flight.
@@ -197,6 +186,7 @@ enum FinishReason {
 
 /// What the worker thread sends back.
 enum Msg {
+    Ready,
     /// A preview transcript of the clip so far.
     Update(String),
     /// The transcript of the whole clip; the session is over.
@@ -211,6 +201,7 @@ struct Session {
     /// Bevy resource must be both.
     rx: Mutex<Receiver<Msg>>,
     stop: Arc<AtomicBool>,
+    capture_started: Arc<AtomicBool>,
 }
 
 #[derive(Resource, Default)]
@@ -248,6 +239,10 @@ pub struct Dictation {
     submit_after_finish: bool,
     /// Failure text plus the `Time::elapsed` at which it should vanish.
     error: Option<(String, f64)>,
+    /// A confirmation (not a failure), same shape as `error`.
+    notice: Option<(String, f64)>,
+    /// The engine this session runs on, snapshotted at start for the pill.
+    engine: engine::Engine,
     /// Spawned overlay root, and a signature so it only re-renders when the
     /// visible content changes.
     root: Option<Entity>,
@@ -258,11 +253,23 @@ impl Dictation {
     /// True while the winit loop must keep waking us at its dictation cadence.
     ///
     /// Not decoration: the idle baseline is `reactive(5s)`, and the capture's
-    /// idle watchdog auto-stops a stream nobody polls within ~2s. Without a
-    /// A 30Hz reactive wake is sufficient; recording would die mid-sentence
-    /// at the normal five-second idle cadence if the user did not move.
+    /// idle watchdog auto-stops a stream nobody polls within ~2s. A 30Hz
+    /// reactive wake is sufficient; recording would die mid-sentence at the
+    /// normal five-second idle cadence if the user did not move.
     pub fn needs_frames(&self) -> bool {
-        self.phase != Phase::Idle || self.error.is_some()
+        self.phase != Phase::Idle || self.error.is_some() || self.notice.is_some()
+    }
+
+    fn is_active(&self) -> bool {
+        self.phase != Phase::Idle
+    }
+
+    fn notice(&mut self, msg: String, now: f64) {
+        self.notice = Some((msg, now + NOTICE_SECS));
+    }
+
+    fn set_error(&mut self, msg: String, now: f64) {
+        self.error = Some((msg, now + ERROR_SECS));
     }
 }
 
@@ -270,10 +277,18 @@ pub struct DictationPlugin;
 
 impl Plugin for DictationPlugin {
     fn build(&self, app: &mut App) {
-        // Before anything else: free the ~1GB a previous jim may have left
-        // behind if it died without running an exit hook.
+        // Free any per-GUI whisper server an older jim left behind, then get
+        // the selected engine warm (adopting its server if it outlived the
+        // last jim) so the first dictation doesn't wait on a model load.
         whisper::reap_orphans();
-        app.init_resource::<Dictation>()
+        match engine::selected() {
+            Ok(e) => e.prewarm(),
+            // Reported again, on screen, when a dictation starts.
+            Err(e) => eprintln!("[dictation] no engine to prewarm: {e}"),
+        }
+        app.add_action(engine::USE_PHONON)
+            .add_action(engine::USE_WHISPER)
+            .init_resource::<Dictation>()
             // Run immediately after Bevy gathers input. A hands-free Escape
             // is removed here before any Update keyboard consumer can see it.
             .add_systems(
@@ -282,8 +297,7 @@ impl Plugin for DictationPlugin {
                     .after(bevy::input::InputSystems)
                     .after(crate::reconcile_macos_modifiers),
             )
-            .add_systems(Update, dictation_tick)
-            .add_systems(Last, shutdown_whisper_on_exit);
+            .add_systems(Update, dictation_tick);
     }
 }
 
@@ -299,15 +313,6 @@ fn dictation_tick(world: &mut World) {
     render_pill(world);
 }
 
-/// Don't let a ~1GB model outlive the GUI — the graceful path only. Almost
-/// nothing reaches it (SIGTERM, ⌘Q and SIGKILL all skip `AppExit`); see the
-/// "Outliving jim" section of `whisper.rs` for the paths that catch those.
-fn shutdown_whisper_on_exit(mut exit: MessageReader<AppExit>) {
-    if exit.read().next().is_some() {
-        whisper::shutdown();
-    }
-}
-
 // ============================================================
 // Hotkey
 // ============================================================
@@ -321,7 +326,7 @@ fn dictation_hotkey(world: &mut World) {
         let cmd = keys.pressed(KeyCode::SuperLeft) || keys.pressed(KeyCode::SuperRight);
         let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
         let d = world.resource::<Dictation>();
-        let recording = d.phase == Phase::Recording;
+        let recording = matches!(d.phase, Phase::Starting | Phase::Recording);
         (
             keys.just_pressed(HOLD_HOTKEY) && cmd && shift,
             keys.just_pressed(TOGGLE_HOTKEY) && cmd && shift,
@@ -366,9 +371,19 @@ fn dictation_hotkey(world: &mut World) {
 }
 
 fn start_recording(world: &mut World, hands_free: bool) {
+    if world.resource::<Dictation>().phase != Phase::Idle {
+        return;
+    }
     let Some((target, anchor)) = resolve_target(world) else {
         fail(world, "nothing focused to dictate into".into());
         return;
+    };
+    let engine = match engine::selected() {
+        Ok(e) => e,
+        Err(e) => {
+            fail(world, e);
+            return;
+        }
     };
     let Some(dir) = dictation_dir() else {
         fail(world, "no HOME — can't stage the recording".into());
@@ -381,9 +396,63 @@ fn start_recording(world: &mut World, hands_free: bool) {
     let now = world.resource::<Time>().elapsed_secs_f64();
     let wav = dir.join(format!("dictate-{}.wav", (now * 1000.0) as u64));
 
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop_w = stop.clone();
+    let capture_started = Arc::new(AtomicBool::new(false));
+    let capture_w = capture_started.clone();
+    if std::thread::Builder::new()
+        .name("dictate-worker".into())
+        .spawn(move || worker(engine, stop_w, capture_w, tx))
+        .is_err()
+    {
+        audio::record_stop();
+        audio::set_pcm_tap(false);
+        fail(world, "could not start the transcription worker".into());
+        return;
+    }
+
+    eprintln!(
+        "[dictation] startup requested: engine={} mode={} target={target:?} wav={}",
+        engine.label(),
+        if hands_free {
+            "hands-free"
+        } else {
+            "push-to-talk"
+        },
+        wav.display()
+    );
+    let mut d = world.resource_mut::<Dictation>();
+    d.phase = Phase::Starting;
+    d.engine = engine;
+    d.notice = None;
+    d.hands_free = hands_free;
+    d.target = Some(target);
+    d.anchor = Some(anchor);
+    d.inserted.clear();
+    d.detached = false;
+    d.session = Some(Session {
+        rx: Mutex::new(rx),
+        stop,
+        capture_started,
+    });
+    d.wav = Some(wav);
+    d.started = now;
+    d.level = 0.0;
+    d.error = None;
+    d.preview.clear();
+    d.in_place = true;
+    d.submit_after_finish = false;
+}
+
+fn begin_capture(world: &mut World) {
+    if world.resource::<Dictation>().phase != Phase::Starting {
+        return;
+    }
+    let wav = world.resource::<Dictation>().wav.clone().unwrap();
     // The tap is what live passes read; enabling clears any stale audio.
     audio::set_pcm_tap(true);
-    // "" = system default input. Mono is what whisper wants, so there's no
+    // "" = system default input. Mono is what both engines want, so there's no
     // reason to duplicate up to stereo the way a clip meant for playback would.
     if !audio::record_start("", &wav.to_string_lossy(), false) {
         audio::set_pcm_tap(false);
@@ -400,52 +469,23 @@ fn start_recording(world: &mut World, hands_free: bool) {
     }
     let _ = audio::take_levels(); // drop anything stale from a prior clip
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = std::sync::mpsc::channel();
-    let stop_w = stop.clone();
-    if std::thread::Builder::new()
-        .name("dictate-worker".into())
-        .spawn(move || worker(stop_w, tx))
-        .is_err()
-    {
-        audio::record_stop();
-        audio::set_pcm_tap(false);
-        fail(world, "could not start the transcription worker".into());
-        return;
-    }
-
-    eprintln!(
-        "[dictation] recording started: mode={} target={target:?} wav={}",
-        if hands_free {
-            "hands-free"
-        } else {
-            "push-to-talk"
-        },
-        wav.display()
-    );
+    let now = world.resource::<Time>().elapsed_secs_f64();
     let mut d = world.resource_mut::<Dictation>();
     d.phase = Phase::Recording;
-    d.hands_free = hands_free;
-    d.target = Some(target);
-    d.anchor = Some(anchor);
-    d.inserted.clear();
-    d.detached = false;
-    d.session = Some(Session {
-        rx: Mutex::new(rx),
-        stop,
-    });
-    d.wav = Some(wav);
     d.started = now;
-    d.level = 0.0;
-    d.error = None;
-    d.preview.clear();
-    d.in_place = true;
-    d.submit_after_finish = false;
+    d.session
+        .as_ref()
+        .unwrap()
+        .capture_started
+        .store(true, Ordering::Release);
 }
 
-/// Key released: stop the mic and let the worker do its final pass. The
-/// session stays alive until that lands.
+/// Stop capture and request the final pass, or cancel a pending startup.
 fn begin_finish(world: &mut World, reason: FinishReason) {
+    if world.resource::<Dictation>().phase == Phase::Starting {
+        end_session(world);
+        return;
+    }
     let (elapsed, audio_status) = {
         let d = world.resource::<Dictation>();
         (
@@ -467,8 +507,12 @@ fn begin_finish(world: &mut World, reason: FinishReason) {
 
 /// Tear down a finished (or failed) session.
 fn end_session(world: &mut World) {
+    audio::record_stop();
     audio::set_pcm_tap(false);
     let mut d = world.resource_mut::<Dictation>();
+    if let Some(session) = &d.session {
+        session.stop.store(true, Ordering::Release);
+    }
     d.phase = Phase::Idle;
     d.hands_free = false;
     d.session = None;
@@ -532,32 +576,59 @@ fn fail(world: &mut World, msg: String) {
     eprintln!("[dictation] session failed: {msg}");
     let now = world.resource::<Time>().elapsed_secs_f64();
     end_session(world);
-    world.resource_mut::<Dictation>().error = Some((msg, now + ERROR_SECS));
+    world.resource_mut::<Dictation>().set_error(msg, now);
 }
 
 // ============================================================
 // Worker thread
 // ============================================================
 
-/// Accumulate tapped audio and transcribe it until told to stop.
-///
-/// Self-clocked rather than on a timer: the next pass starts when the last
-/// one returns (subject to [`MIN_PASS_GAP`]), so previews come as fast as
-/// the clip allows, with no queue building up behind a slow pass.
-///
-/// `samples` only ever holds the *uncommitted* tail — see the module docs.
-/// That's what keeps a pass costing the same on minute nine as on minute
-/// one, and it's why there's no recording limit to hit.
-fn worker(stop: Arc<AtomicBool>, tx: Sender<Msg>) {
-    let mut roll = Rolling::default();
+/// Start the engine and report readiness, then wait until the main thread
+/// opens the microphone. `None` when startup failed (already reported) or
+/// the session was cancelled first.
+fn await_capture<T>(
+    stop: &AtomicBool,
+    capture_started: &AtomicBool,
+    tx: &Sender<Msg>,
+    prepare: impl FnOnce() -> Result<T, String>,
+) -> Option<T> {
+    let ready = match prepare() {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tx.send(Msg::Error(e));
+            return None;
+        }
+    };
+    if tx.send(Msg::Ready).is_err() {
+        return None;
+    }
+    while !capture_started.load(Ordering::Acquire) {
+        if stop.load(Ordering::Acquire) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    (!stop.load(Ordering::Acquire)).then_some(ready)
+}
+
+/// Move tapped audio into the engine and report its transcript until told
+/// to stop, then report the final one.
+fn worker(
+    engine: engine::Engine,
+    stop: Arc<AtomicBool>,
+    capture_started: Arc<AtomicBool>,
+    tx: Sender<Msg>,
+) {
+    let Some(mut t) = await_capture(&stop, &capture_started, &tx, || engine.start()) else {
+        return;
+    };
+    let mut feed = Feed::default();
     // What we last sent, so an unchanged transcript doesn't wake the main
     // thread into re-rendering and re-writing identical text.
     let mut sent = String::new();
 
     loop {
-        roll.push(audio::take_pcm());
-        let rate = audio::pcm_rate().max(1);
-
         if stop.load(Ordering::Acquire) {
             // `record_stop` only *asks* the controller to stop; wait for it
             // to actually finish, so the last callbacks' audio is in the tap
@@ -565,127 +636,95 @@ fn worker(stop: Arc<AtomicBool>, tx: Sender<Msg>) {
             if !audio::wait_until_finalized(Duration::from_secs(5)) {
                 eprintln!("[dictation] timed out waiting 5s for audio finalization");
             }
-            roll.push(audio::take_pcm());
-            let rate = audio::pcm_rate().max(1);
-            let full = match roll.text(rate) {
-                Ok(t) => t,
-                // Losing the tail is only fatal if it's all we had;
-                // otherwise ship what was committed rather than the lot.
-                Err(e) if roll.committed.is_empty() => {
-                    eprintln!("[dictation] final transcription failed: {e}");
-                    let _ = tx.send(Msg::Error(e));
-                    return;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[dictation] final tail transcription failed; using committed text: {e}"
-                    );
-                    roll.committed.clone()
-                }
-            };
-            let _ = tx.send(if full.is_empty() {
-                Msg::Error("heard nothing".into())
-            } else {
-                Msg::Final(full)
+            let began = Instant::now();
+            let result = feed
+                .drain(t.as_mut(), true)
+                .and_then(|()| t.finish());
+            eprintln!(
+                "[dictation] {} final: took={:.2}s ok={}",
+                engine.label(),
+                began.elapsed().as_secs_f32(),
+                result.is_ok()
+            );
+            let _ = tx.send(match result {
+                Ok(full) if full.trim().is_empty() => Msg::Error("heard nothing".into()),
+                Ok(full) => Msg::Final(full),
+                Err(e) => Msg::Error(e),
             });
             return;
         }
 
-        if roll.secs(rate) < MIN_LIVE_SECS {
-            std::thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        // A commit costs this iteration's pass; the next one is short.
-        if roll.try_commit(rate) {
-            continue;
-        }
-
-        let began = Instant::now();
-        // A failed preview isn't worth reporting: the next pass may
-        // succeed, and the final pass reports for real if it can't.
-        match roll.text(rate) {
-            Ok(full) => {
-                eprintln!(
-                    "[dictation] preview pass: audio={:.2}s took={:.2}s chars={} changed={}",
-                    roll.secs(rate),
-                    began.elapsed().as_secs_f32(),
-                    full.chars().count(),
-                    !full.is_empty() && full != sent
-                );
-                if !full.is_empty() && full != sent {
-                    // A closed channel means the session ended (app quit,
-                    // error path) — stop working for nobody.
-                    if tx.send(Msg::Update(full.clone())).is_err() {
-                        return;
-                    }
-                    sent = full;
+        let update = feed.drain(t.as_mut(), false).and_then(|()| t.step());
+        match update {
+            Ok(Some(full)) if !full.is_empty() && full != sent => {
+                // A closed channel means the session ended (app quit, error
+                // path) — stop working for nobody.
+                if tx.send(Msg::Update(full.clone())).is_err() {
+                    return;
                 }
+                sent = full;
             }
-            Err(e) => eprintln!(
-                "[dictation] preview pass failed: audio={:.2}s took={:.2}s error={e}",
-                roll.secs(rate),
-                began.elapsed().as_secs_f32()
-            ),
+            Ok(_) => {}
+            Err(e) => {
+                let _ = tx.send(Msg::Error(e));
+                return;
+            }
         }
-        if let Some(rest) = MIN_PASS_GAP.checked_sub(began.elapsed()) {
-            std::thread::sleep(rest);
-        }
+        std::thread::sleep(POLL);
     }
 }
 
-/// The rolling transcript: text already frozen, plus the audio tail that
-/// hasn't been. Split out of [`worker`] so the commit-and-rejoin sequence
-/// can be driven against a real clip in a test without a mic.
+/// Captured audio on its way to the engine: drained from the tap and
+/// resampled from the device rate to [`RATE`].
 #[derive(Default)]
-struct Rolling {
-    committed: String,
-    samples: Vec<f32>,
+struct Feed {
+    resampler: Option<resample::Resampler>,
 }
 
-impl Rolling {
-    fn push(&mut self, s: impl IntoIterator<Item = f32>) {
-        self.samples.extend(s);
-    }
-
-    /// Length of the *uncommitted* tail — what a pass actually costs.
-    fn secs(&self, rate: u32) -> f32 {
-        self.samples.len() as f32 / rate as f32
-    }
-
-    /// Freeze the front of the tail if it's grown past
-    /// [`COMMIT_TARGET_SECS`] and there's a pause to cut at. True if
-    /// anything moved into `committed`.
-    ///
-    /// A transcription failure just leaves the audio alone: the tail stays
-    /// long, which is slow, but nothing is lost and the next pass retries.
-    fn try_commit(&mut self, rate: u32) -> bool {
-        let secs = self.secs(rate);
-        if secs <= COMMIT_TARGET_SECS {
-            return false;
+impl Feed {
+    /// Push everything captured since the last call. `last` also flushes the
+    /// resampler's look-ahead, so the final words aren't left in the filter.
+    fn drain(&mut self, t: &mut dyn Transcriber, last: bool) -> Result<(), String> {
+        let pcm = audio::take_pcm();
+        // 0 until the device has delivered its first buffer.
+        let rate = audio::pcm_rate();
+        if rate == 0 {
+            return Ok(());
         }
-        let latest = ((secs - COMMIT_KEEP_SECS).max(0.0) * rate as f32) as usize;
-        let Some(cut) = commit_point(&self.samples, rate, latest, secs > COMMIT_FORCE_SECS) else {
-            return false;
-        };
-        let Ok(t) = whisper::transcribe(&self.samples[..cut], rate) else {
-            return false;
-        };
-        // An empty result means that span really was silence — dropping
-        // its audio is exactly the point.
-        self.committed = join(&self.committed, t.trim());
-        self.samples.drain(..cut);
-        true
-    }
-
-    /// Everything transcribed so far: the committed text plus a fresh pass
-    /// over the tail. A tail too short to be worth a pass contributes
-    /// nothing rather than a hallucination.
-    fn text(&self, rate: u32) -> Result<String, String> {
-        if self.secs(rate) < MIN_LIVE_SECS {
-            return Ok(self.committed.clone());
+        if self.resampler.as_ref().is_some_and(|r| r.in_rate() != rate) {
+            // The device changed rate mid-session: finish the old stream of
+            // samples cleanly before starting a new filter.
+            let tail = self.resampler.take().map(|mut r| r.flush()).unwrap_or_default();
+            t.push(&tail)?;
         }
-        whisper::transcribe(&self.samples, rate).map(|t| join(&self.committed, t.trim()))
+        let r = self
+            .resampler
+            .get_or_insert_with(|| resample::Resampler::new(rate, RATE));
+        let mut out = r.process(&pcm);
+        if last {
+            out.extend(r.flush());
+        }
+        t.push(&out)
     }
+}
+
+/// Drop a space the engine left before closing punctuation — both emit it
+/// at segment joins ("the weekend .", "Platform2 ."). Only where the mark
+/// ends a word, so "a .5 inch" and "... and" are left alone.
+fn tidy_punctuation(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let closes = |j: usize| {
+            chars.get(j).is_some_and(|c| matches!(c, '.' | ',' | '!' | '?' | ';' | ':'))
+                && chars.get(j + 1).is_none_or(|c| c.is_whitespace())
+        };
+        if c == ' ' && i > 0 && closes(i + 1) {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Glue two transcript fragments, keeping exactly one space between them.
@@ -695,60 +734,6 @@ fn join(a: &str, b: &str) -> String {
         (a, "") => a.to_string(),
         (a, b) => format!("{a} {b}"),
     }
-}
-
-/// Where to split `samples` so the front can be transcribed and frozen.
-///
-/// Returns a point inside the last low-energy stretch ending at or before
-/// `latest`, so the cut lands within a pause and neither side starts or
-/// ends mid-word. `None` when the speaker hasn't paused — unless `force`,
-/// in which case the quietest single frame is used instead, which may clip
-/// a word but stops the pass cost from climbing forever.
-fn commit_point(samples: &[f32], rate: u32, latest: usize, force: bool) -> Option<usize> {
-    let frame = (rate as f32 * SILENCE_FRAME_SECS).max(1.0) as usize;
-    let need = (SILENCE_MIN_SECS / SILENCE_FRAME_SECS).ceil() as usize;
-    let end = latest.min(samples.len()) / frame;
-    if end == 0 {
-        return None;
-    }
-
-    let rms = |i: usize| -> f32 {
-        let s = &samples[i * frame..((i + 1) * frame).min(samples.len())];
-        if s.is_empty() {
-            return 0.0;
-        }
-        (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt()
-    };
-
-    // Walk backwards for the last run of quiet frames long enough to be a
-    // pause; the later the cut, the more we get to freeze.
-    let mut run_end: Option<usize> = None;
-    let mut quiet = 0usize;
-    for i in (0..end).rev() {
-        if rms(i) < SILENCE_RMS {
-            if quiet == 0 {
-                run_end = Some(i);
-            }
-            quiet += 1;
-            if quiet >= need {
-                // Cut mid-pause: leaves trailing silence on the frozen
-                // part and leading silence on the tail, which whisper is
-                // happy with either way.
-                let start = i;
-                let mid = (start + run_end.unwrap_or(start)) / 2;
-                return Some(((mid + 1) * frame).min(samples.len()));
-            }
-        } else {
-            quiet = 0;
-            run_end = None;
-        }
-    }
-
-    if !force {
-        return None;
-    }
-    let quietest = (0..end).min_by(|a, b| rms(*a).total_cmp(&rms(*b)))?;
-    Some(((quietest + 1) * frame).min(samples.len()))
 }
 
 // ============================================================
@@ -763,11 +748,18 @@ fn dictation_pump(world: &mut World) {
         if d.error.as_ref().map(|(_, at)| now >= *at).unwrap_or(false) {
             d.error = None;
         }
+        if d.notice.as_ref().map(|(_, at)| now >= *at).unwrap_or(false) {
+            d.notice = None;
+        }
+        match phonon::take_install_report() {
+            Some(Ok(())) => d.notice("Phonon is installed and ready".into(), now),
+            Some(Err(e)) => d.set_error(e, now),
+            None => {}
+        }
     }
 
     let phase = world.resource::<Dictation>().phase;
     if phase == Phase::Idle {
-        whisper::idle_shutdown();
         return;
     }
 
@@ -813,6 +805,7 @@ fn dictation_pump(world: &mut World) {
         };
         match msg {
             None => return,
+            Some(Msg::Ready) => begin_capture(world),
             Some(Msg::Update(text)) => write_text(world, &text, false),
             Some(Msg::Final(text)) => {
                 write_text(world, &text, true);
@@ -834,7 +827,7 @@ fn dictation_pump(world: &mut World) {
     }
 }
 
-/// Perform the Enter action that was held back while Whisper finalized.
+/// Perform the Enter action that was held back while the transcript finalized.
 /// The captured target is used rather than current focus, matching where the
 /// transcript itself was written.
 fn submit_target(world: &mut World, target: Option<Target>) {
@@ -902,11 +895,11 @@ fn write_text(world: &mut World, text: &str, final_pass: bool) {
     let (Some(target), Some(anchor)) = (target, anchor) else {
         return;
     };
-    // Whisper breaks its output into segments and can put newlines between
+    // Engines break their output into segments and can put newlines between
     // them. Speech has no line breaks in it, so those are an artifact — and
     // an actively harmful one at a shell prompt. Flatten to single spaces,
     // which also makes the character count we backspace over unambiguous.
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = tidy_punctuation(&text.split_whitespace().collect::<Vec<_>>().join(" "));
     let text = text.as_str();
 
     world.resource_mut::<Dictation>().preview = text.to_string();
@@ -938,7 +931,7 @@ fn write_text(world: &mut World, text: &str, final_pass: bool) {
             let now = world.resource::<Time>().elapsed_secs_f64();
             let mut d = world.resource_mut::<Dictation>();
             d.detached = true;
-            d.error = Some((e, now + ERROR_SECS));
+            d.set_error(e, now);
         }
     }
 }
@@ -1201,7 +1194,7 @@ fn render_pill(world: &mut World) {
 }
 
 fn pill_visible(d: &Dictation) -> bool {
-    d.phase != Phase::Idle || d.error.is_some()
+    d.phase != Phase::Idle || d.error.is_some() || d.notice.is_some()
 }
 
 fn pill_signature(d: &Dictation, now: f64) -> u64 {
@@ -1209,6 +1202,8 @@ fn pill_signature(d: &Dictation, now: f64) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     (d.phase as u8).hash(&mut h);
     d.error.as_ref().map(|(m, _)| m).hash(&mut h);
+    d.notice.as_ref().map(|(m, _)| m).hash(&mut h);
+    (d.engine as u8).hash(&mut h);
     d.detached.hash(&mut h);
     d.in_place.hash(&mut h);
     // Only when it's on screen — otherwise every pass would rebuild the
@@ -1231,20 +1226,29 @@ fn build_pill(world: &World) -> Element {
 
     let (icon, label, hint, accent) = if let Some((msg, _)) = &d.error {
         ("⚠", msg.clone(), String::new(), "fg_muted")
+    } else if let (Phase::Idle, Some((msg, _))) = (d.phase, &d.notice) {
+        ("✓", msg.clone(), String::new(), "accent")
     } else {
         match d.phase {
+            Phase::Starting => (
+                "◌",
+                format!("Starting {}…", d.engine.label()),
+                "Microphone is off".into(),
+                "accent",
+            ),
             Phase::Recording => {
                 let secs = (now - d.started).max(0.0);
                 (
                     "●",
                     format!("Listening… {secs:.1}s"),
                     format!(
-                        "{}{}",
+                        "{} · {}{}",
                         if d.hands_free {
                             "Esc to finish"
                         } else {
                             "release ⌘⇧M to finish"
                         },
+                        d.engine.label(),
                         target_hint(d)
                     ),
                     "accent",
@@ -1383,86 +1387,48 @@ fn frame_grow(children: Vec<Element>) -> Element {
 mod tests {
     use super::*;
 
-    const RATE: u32 = 16_000;
-
-    fn speech(secs: f32) -> Vec<f32> {
-        let n = (RATE as f32 * secs) as usize;
-        (0..n)
-            .map(|i| (i as f32 * 200.0 * std::f32::consts::TAU / RATE as f32).sin() * 0.3)
-            .collect()
-    }
-
-    /// Not digital silence — a real room floor, which has to read as quiet.
-    fn quiet(secs: f32) -> Vec<f32> {
-        let n = (RATE as f32 * secs) as usize;
-        (0..n)
-            .map(|i| (i as f32 * 60.0 * std::f32::consts::TAU / RATE as f32).sin() * 0.001)
-            .collect()
-    }
-
-    fn at(v: &[f32], secs: f32) -> usize {
-        (RATE as f32 * secs) as usize
-    }
-
     #[test]
-    fn cuts_inside_the_pause() {
-        let mut s = speech(2.0);
-        s.extend(quiet(1.0));
-        s.extend(speech(2.0));
-        let cut = commit_point(&s, RATE, s.len(), false).expect("a 1s pause is a commit point");
+    fn startup_failure_is_reported_without_starting_capture() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = AtomicBool::new(false);
+        let capture = AtomicBool::new(false);
         assert!(
-            cut > at(&s, 2.0) && cut < at(&s, 3.0),
-            "cut at {:.2}s landed outside the 2.0–3.0s pause",
-            cut as f32 / RATE as f32
+            await_capture(&stop, &capture, &tx, || Err::<(), _>("cannot spawn".into())).is_none()
         );
-    }
-
-    /// The point of `latest`: the last few seconds are still being revised,
-    /// so a pause inside them must not be committed yet.
-    #[test]
-    fn never_cuts_past_latest() {
-        let mut s = speech(2.0);
-        s.extend(quiet(1.0));
-        s.extend(speech(1.0));
-        s.extend(quiet(1.0));
-        let latest = at(&s, 3.5);
-        let cut = commit_point(&s, RATE, latest, false).expect("the first pause is still eligible");
-        assert!(
-            cut <= latest,
-            "cut at {cut} exceeded latest {latest} — committed audio whisper hadn't settled"
-        );
-        assert!(cut > at(&s, 2.0), "should have used the 2.0–3.0s pause");
-    }
-
-    /// A pause shorter than SILENCE_MIN_SECS is a gap between words, not
-    /// between phrases; cutting there could split one.
-    #[test]
-    fn ignores_a_gap_too_short_to_be_a_pause() {
-        let mut s = speech(2.0);
-        s.extend(quiet(0.1));
-        s.extend(speech(2.0));
-        assert!(commit_point(&s, RATE, s.len(), false).is_none());
+        assert!(matches!(rx.recv().unwrap(), Msg::Error(e) if e == "cannot spawn"));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(!capture.load(Ordering::Acquire));
     }
 
     #[test]
-    fn unbroken_speech_has_no_commit_point() {
-        let s = speech(30.0);
-        assert!(commit_point(&s, RATE, s.len(), false).is_none());
+    fn ready_worker_waits_for_microphone_start() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let capture = Arc::new(AtomicBool::new(false));
+        let capture_w = capture.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            done_tx
+                .send(await_capture(&stop, &capture_w, &tx, || Ok(7)))
+                .unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Msg::Ready
+        ));
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        capture.store(true, Ordering::Release);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap(), Some(7));
+        join.join().unwrap();
     }
 
-    /// ...but past COMMIT_FORCE_SECS we cut anyway, because a pass cost that
-    /// climbs forever is worse than one clipped word.
     #[test]
-    fn force_cuts_unbroken_speech() {
-        let s = speech(30.0);
-        let cut = commit_point(&s, RATE, s.len(), true).expect("force must always produce a cut");
-        assert!(cut > 0 && cut <= s.len());
-    }
-
-    #[test]
-    fn too_short_to_scan_is_none() {
-        let s = speech(0.01);
-        assert!(commit_point(&s, RATE, s.len(), false).is_none());
+    fn cancelling_startup_never_enters_capture_loop() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stop = AtomicBool::new(true);
+        let capture = AtomicBool::new(false);
+        assert!(await_capture(&stop, &capture, &tx, || Ok(())).is_none());
+        assert!(matches!(rx.recv().unwrap(), Msg::Ready));
     }
 
     #[test]
@@ -1474,145 +1440,14 @@ mod tests {
         assert_eq!(join("", ""), "");
     }
 
-    /// One distinctive noun per sentence, spread across a clip long enough
-    /// to force several commits. `[[slnc]]` is a macOS `say` directive that
-    /// inserts a real pause, which is what [`commit_point`] cuts at.
-    const SPOKEN: &[(&str, &str)] = &[
-        (
-            "elephant",
-            "The first thing I want to mention is the elephant in the garden.",
-        ),
-        (
-            "bicycle",
-            "Second, we should really talk about the bicycle in the hallway.",
-        ),
-        (
-            "kitchen",
-            "Third, somebody left the window open in the kitchen last night.",
-        ),
-        (
-            "mountain",
-            "Fourth, the photograph on the wall shows a mountain at sunrise.",
-        ),
-        (
-            "umbrella",
-            "Fifth, I could not find my umbrella anywhere this morning.",
-        ),
-        (
-            "computer",
-            "Sixth, the computer on the desk has been running all week.",
-        ),
-        (
-            "hospital",
-            "Seventh, the road that goes past the hospital is closed today.",
-        ),
-        (
-            "guitar",
-            "Eighth, there is an old guitar leaning against the bookshelf.",
-        ),
-        (
-            "garden",
-            "Ninth, the tomatoes in the garden are finally starting to ripen.",
-        ),
-        (
-            "letter",
-            "Tenth, I still have to write that letter before the weekend.",
-        ),
-        (
-            "morning",
-            "Eleventh, the train leaves early in the morning from platform two.",
-        ),
-        (
-            "coffee",
-            "Twelfth, and last, there is no coffee left in the entire house.",
-        ),
-    ];
-
-    /// Drives the real commit-and-rejoin path over a clip long enough to
-    /// force several commits, against a real whisper-server.
-    ///
-    /// This is the test that catches a commit point eating a word: the
-    /// spoken text is known, so a cut that swallowed one shows up as a
-    /// missing noun in the joined transcript. Asserting on the JOIN is the
-    /// whole point — transcribing the clip in one piece would prove
-    /// nothing about the windowing.
-    ///
-    /// Ignored by default: needs `say`, and spawns a server that loads a
-    /// ~1GB model. Run with:
-    ///   cargo test -p jim_app --lib dictation -- --ignored --nocapture --test-threads=1
     #[test]
-    #[ignore]
-    fn commits_across_a_long_clip_without_losing_words() {
-        let rate = 16_000u32;
-        let script = SPOKEN
-            .iter()
-            .map(|(_, s)| *s)
-            .collect::<Vec<_>>()
-            .join(" [[slnc 900]] ");
-        let path = std::env::temp_dir().join("jim-dictation-commit-test.wav");
-        let out = std::process::Command::new("say")
-            .args([
-                "--data-format=LEI16@16000",
-                "-o",
-                &path.to_string_lossy(),
-                &script,
-            ])
-            .output()
-            .expect("`say` should be available on macOS");
-        assert!(
-            out.status.success(),
-            "say failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-
-        let mut r = hound::WavReader::open(&path).expect("say should have written a readable wav");
-        let samples: Vec<f32> = r
-            .samples::<i16>()
-            .map(|s| s.expect("sample") as f32 / 32768.0)
-            .collect();
-        let total = samples.len() as f32 / rate as f32;
-        println!("clip is {total:.1}s");
-        assert!(
-            total > COMMIT_TARGET_SECS + COMMIT_KEEP_SECS,
-            "clip is {total:.1}s — too short to commit at all, so this test would prove nothing"
-        );
-
-        // Feed it the way the worker does: a chunk at a time, committing
-        // whenever the tail has grown enough and there's a pause to use.
-        let mut roll = Rolling::default();
-        let mut commits = 0;
-        for chunk in samples.chunks(rate as usize) {
-            roll.push(chunk.iter().copied());
-            while roll.try_commit(rate) {
-                commits += 1;
-                println!(
-                    "commit {commits}: tail now {:.1}s, committed {:?}",
-                    roll.secs(rate),
-                    roll.committed
-                );
-            }
-            assert!(
-                roll.secs(rate) <= COMMIT_FORCE_SECS + 2.0,
-                "tail reached {:.1}s — windowing isn't bounding pass cost",
-                roll.secs(rate)
-            );
-        }
-        let text = roll.text(rate).expect("final pass").to_lowercase();
-        println!("\nfinal transcript:\n{text}\n");
-
-        assert!(
-            commits >= 2,
-            "only {commits} commit(s) over {total:.1}s — the windowing path barely ran"
-        );
-        let missing: Vec<&str> = SPOKEN
-            .iter()
-            .map(|(w, _)| *w)
-            .filter(|w| !text.contains(w))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "commit boundaries lost {missing:?} from the transcript"
-        );
+    fn tidies_space_before_punctuation() {
+        assert_eq!(tidy_punctuation("from Platform2 . Twelfth"), "from Platform2. Twelfth");
+        assert_eq!(tidy_punctuation("the weekend ."), "the weekend.");
+        assert_eq!(tidy_punctuation("well , then ?"), "well, then?");
+        assert_eq!(tidy_punctuation("a .5 inch gap"), "a .5 inch gap");
+        assert_eq!(tidy_punctuation(". leading"), ". leading");
+        assert_eq!(tidy_punctuation("wait ... and"), "wait ... and");
     }
 
     #[test]
@@ -1621,6 +1456,108 @@ mod tests {
         assert_eq!(tail_of("abcdef", 3), "…def");
         // Multi-byte: must clip on a character, not a byte.
         assert_eq!(tail_of("héllo wörld", 5), "…wörld");
+    }
+
+    // ------------------------------------------------------------
+    // Shared harness for the engines' (ignored) end-to-end tests.
+    // ------------------------------------------------------------
+
+    /// One distinctive noun per sentence, spread across a clip long enough
+    /// to make an engine freeze and drop audio many times over. `[[slnc]]`
+    /// is a macOS `say` directive that inserts a real pause.
+    const SPOKEN: &[(&str, &str)] = &[
+        ("elephant", "The first thing I want to mention is the elephant in the garden."),
+        ("bicycle", "Second, we should really talk about the bicycle in the hallway."),
+        ("kitchen", "Third, somebody left the window open in the kitchen last night."),
+        ("mountain", "Fourth, the photograph on the wall shows a mountain at sunrise."),
+        ("umbrella", "Fifth, I could not find my umbrella anywhere this morning."),
+        ("computer", "Sixth, the computer on the desk has been running all week."),
+        ("hospital", "Seventh, the road that goes past the hospital is closed today."),
+        ("guitar", "Eighth, there is an old guitar leaning against the bookshelf."),
+        ("garden", "Ninth, the tomatoes in the garden are finally starting to ripen."),
+        ("letter", "Tenth, I still have to write that letter before the weekend."),
+        ("morning", "Eleventh, the train leaves early in the morning from platform two."),
+        ("coffee", "Twelfth, and last, there is no coffee left in the entire house."),
+    ];
+
+    pub(super) struct Report {
+        pub text: String,
+        pub missing: Vec<&'static str>,
+        pub updates: usize,
+    }
+
+    impl Report {
+        pub fn assert_complete(&self) {
+            println!("\n{} live updates; final transcript:\n{}\n", self.updates, self.text);
+            assert!(self.updates >= 5, "only {} live updates — nothing was live", self.updates);
+            assert!(
+                self.missing.is_empty(),
+                "the stream lost {:?} from the transcript",
+                self.missing
+            );
+        }
+    }
+
+    pub(super) fn stream_spoken_clip(t: &mut dyn Transcriber) -> Report {
+        stream_spoken_clip_with(t, &mut |_| {})
+    }
+
+    /// Speak [`SPOKEN`] with `say` at 48 kHz (a real microphone's rate, so
+    /// the resampler is in the loop), then feed it to `t` paced like a live
+    /// microphone: each step is followed by exactly as much audio as the
+    /// step took in wall time. `at` is called with the clip position before
+    /// every step, for tests that break something mid-stream.
+    pub(super) fn stream_spoken_clip_with(
+        t: &mut dyn Transcriber,
+        at: &mut dyn FnMut(f32),
+    ) -> Report {
+        let mic_rate = 48_000u32;
+        let script = SPOKEN.iter().map(|(_, s)| *s).collect::<Vec<_>>().join(" [[slnc 900]] ");
+        let path = std::env::temp_dir().join(format!("jim-dictation-{}.wav", std::process::id()));
+        let out = std::process::Command::new("say")
+            .args([&format!("--data-format=LEI16@{mic_rate}"), "-o", &path.to_string_lossy(), &script])
+            .output()
+            .expect("`say` should be available on macOS");
+        assert!(out.status.success(), "say failed: {}", String::from_utf8_lossy(&out.stderr));
+        let mut r = hound::WavReader::open(&path).expect("say should have written a wav");
+        let samples: Vec<f32> = r
+            .samples::<i16>()
+            .map(|s| s.expect("sample") as f32 / 32768.0)
+            .collect();
+        let _ = std::fs::remove_file(&path);
+        let total = samples.len() as f32 / mic_rate as f32;
+        println!("clip is {total:.1}s");
+
+        let mut rs = resample::Resampler::new(mic_rate, RATE);
+        let mut fed = 0usize;
+        let mut chunk = (mic_rate as f32 * POLL.as_secs_f32()) as usize;
+        let mut updates = 0;
+        let began = Instant::now();
+        while fed < samples.len() {
+            let n = chunk.min(samples.len() - fed);
+            t.push(&rs.process(&samples[fed..fed + n])).expect("push");
+            fed += n;
+            at(fed as f32 / mic_rate as f32);
+            let step = Instant::now();
+            if let Some(text) = t.step().expect("step") {
+                updates += 1;
+                println!("[{:5.1}s] {}", fed as f32 / mic_rate as f32, tail_of(&text, 100));
+            }
+            std::thread::sleep(POLL);
+            // The microphone kept capturing through the step and the sleep.
+            chunk = (mic_rate as f32 * step.elapsed().as_secs_f32()) as usize;
+        }
+        t.push(&rs.flush()).expect("push tail");
+        let fin = Instant::now();
+        let text = t.finish().expect("finish");
+        println!(
+            "streamed {total:.1}s in {:.1}s; finish took {:.2}s",
+            began.elapsed().as_secs_f32(),
+            fin.elapsed().as_secs_f32()
+        );
+        let lower = text.to_lowercase();
+        let missing = SPOKEN.iter().map(|(w, _)| *w).filter(|w| !lower.contains(w)).collect();
+        Report { text, missing, updates }
     }
 }
 

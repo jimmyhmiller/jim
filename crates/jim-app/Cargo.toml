@@ -28,6 +28,8 @@ rfd = "0.15"
 # Live dictation POSTs clips to a local whisper-server (dictation/whisper.rs).
 # Same version jim-inference already pins.
 ureq = { version = "2", default-features = false }
+# Phonon dictation streams over a WebSocket (same version jimctl uses).
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 # In-memory WAV encoding for those POSTs — no temp file in the live loop.
 hound = "3"
 nix = { version = "0.31", features = ["term", "fs", "signal", "process", "user", "ioctl", "poll"] }

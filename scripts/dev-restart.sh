@@ -105,21 +105,9 @@ jim_gui_pids() {
 
 KILL=$(jim_gui_pids)
 if [ -n "$KILL" ]; then
-    # whisper-server is a normal child process, not one of Jim's persistent
-    # daemons. macOS reparents it to PID 1 if the GUI is killed first, so old
-    # restarts used to accumulate ~1GB orphan servers. Reap direct Whisper
-    # children while their owning GUI PID is still available.
-    WHISPER_KILL=""
-    for gui_pid in $KILL; do
-        children=$(ps -ax -o pid=,ppid=,comm= \
-            | awk -v parent="$gui_pid" '$2 == parent && $3 ~ /whisper-server$/ { print $1 }')
-        WHISPER_KILL="$WHISPER_KILL $children"
-    done
-    if [ -n "$(echo "$WHISPER_KILL" | tr -d ' ')" ]; then
-        echo "[dev-restart] killing GUI-owned whisper server(s):$WHISPER_KILL"
-        kill $WHISPER_KILL 2>/dev/null || true
-    fi
-
+    # whisper-server is NOT killed here: it is a shared service that
+    # outlives the GUI (like jim-daemon/jim-bus) and the next jim adopts it
+    # via ~/.jim/whisper-server, so dictation stays warm across restarts.
     echo "[dev-restart] killing existing GUI(s): $KILL"
     kill $KILL 2>/dev/null || true
 
