@@ -281,7 +281,10 @@ fn context_open_close(
         return;
     }
 
-    if buttons.just_pressed(MouseButton::Right) {
+    let control_click = cfg!(target_os = "macos")
+        && buttons.just_pressed(MouseButton::Left)
+        && (key_state.pressed(KeyCode::ControlLeft) || key_state.pressed(KeyCode::ControlRight));
+    if buttons.just_pressed(MouseButton::Right) || control_click {
         // Close any previously open menu before considering a re-open.
         let was_open = menu.origin.is_some();
         if was_open {

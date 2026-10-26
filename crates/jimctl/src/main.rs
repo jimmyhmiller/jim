@@ -12,6 +12,7 @@
 use std::process::ExitCode;
 
 mod agent_bus;
+mod app_ipc;
 mod cmd_agent;
 mod cmd_channel;
 mod cmd_close;

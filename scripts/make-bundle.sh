@@ -140,23 +140,31 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Chromium Embedded Framework (webview panes)
-#
-# CEF is multi-process: the framework provides the engine, and the renderer /
-# GPU / utility processes are launched from separate helper .app bundles. The
-# layout below is mandated by Chromium and is not negotiable.
-#
-# Helper bundle ids are derived from (never equal to) the main id, so the
-# app's frozen LaunchServices identity and its TCC grants are untouched.
-# ---------------------------------------------------------------------------
-CEF_FRAMEWORK=$(find "target/$PROFILE/build" -maxdepth 4 -type d \
-    -name "Chromium Embedded Framework.framework" 2>/dev/null | head -1)
-HELPER_BIN="target/$PROFILE/jim-helper"
+# CEF is excluded from the normal development build. Clear artifacts from an
+# earlier CEF-enabled bundle so webview panes fail cleanly rather than launch a
+# stale host against an old framework.
+rm -f "$MACOS/jim-webview-host"
+rm -rf "$FRAMEWORKS/Chromium Embedded Framework.framework" \
+    "$FRAMEWORKS/Jim Helper.app" \
+    "$FRAMEWORKS/Jim Helper (GPU).app" \
+    "$FRAMEWORKS/Jim Helper (Renderer).app" \
+    "$FRAMEWORKS/Jim Helper (Plugin).app" \
+    "$FRAMEWORKS/Jim Helper (Alerts).app"
 
-if [ -n "$CEF_FRAMEWORK" ] && [ -x "$HELPER_BIN" ]; then
+# CEF can be bundled only after explicitly building its host/helper binaries
+# and opting in for this bundle with JIM_ENABLE_CEF=1.
+# ---------------------------------------------------------------------------
+if [ "${JIM_ENABLE_CEF:-0}" = "1" ]; then
+    CEF_FRAMEWORK=$(find "target/$PROFILE/build" -maxdepth 4 -type d \
+        -name "Chromium Embedded Framework.framework" 2>/dev/null | head -1)
+    HELPER_BIN="target/$PROFILE/jim-helper"
+    HOST_BIN="target/$PROFILE/jim-webview-host"
+
+if [ -n "$CEF_FRAMEWORK" ] && [ -x "$HELPER_BIN" ] && [ -x "$HOST_BIN" ]; then
     echo "[make-bundle] adding Chromium Embedded Framework"
     rm -rf "$FRAMEWORKS/Chromium Embedded Framework.framework"
     ditto "$CEF_FRAMEWORK" "$FRAMEWORKS/Chromium Embedded Framework.framework"
+    cp "$HOST_BIN" "$MACOS/jim-webview-host"
 
     # One bundle per Chromium process type. The suffix in the name is what
     # Chromium looks for; the ids only have to be unique and stable.
@@ -215,10 +223,11 @@ PLIST
     codesign --force --sign "$SIGN_ARG" \
         "$FRAMEWORKS/Chromium Embedded Framework.framework" >/dev/null 2>&1 \
         || echo "[make-bundle] WARNING: could not sign CEF framework" >&2
-elif [ -n "$CEF_FRAMEWORK" ] || [ -x "$HELPER_BIN" ]; then
+elif [ -n "$CEF_FRAMEWORK" ] || [ -x "$HELPER_BIN" ] || [ -x "$HOST_BIN" ]; then
     # Loudly: a half-present CEF is a webview pane that fails at runtime.
     echo "[make-bundle] WARNING: CEF incomplete — framework='$CEF_FRAMEWORK' helper='$HELPER_BIN'" >&2
     echo "[make-bundle]          webview panes will not work in this bundle" >&2
+fi
 fi
 
 # install_name_tool invalidated the existing signature. Re-sign nested

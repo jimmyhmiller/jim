@@ -959,6 +959,10 @@ fn setup_watcher(world: &mut World) {
         ),
         ("chess.ft", include_str!("../widgets/chess.ft")),
         ("file_open.ft", include_str!("../widgets/file_open.ft")),
+        (
+            "review_comments.ft",
+            include_str!("../widgets/review_comments.ft"),
+        ),
         ("style_lab.ft", include_str!("../widgets/style_lab.ft")),
     ] {
         let p = dir.join(name);

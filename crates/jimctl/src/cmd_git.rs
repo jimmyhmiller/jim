@@ -14,6 +14,10 @@
 //!   jimctl git log       [--repo P] [--limit N] [--path F]
 //!   jimctl git diff      [--repo P] [--mode working|staged|unstaged|range]
 //!                        [--base B] [--head H] [--no-text]
+//!   jimctl git diff-wall [--repo P] [--mode M] [--base B] [--head H]
+//!                        [--per file|hunk] [--name N] [--max N] [--no-activate]
+//!                        [--path PATH_OR_GLOB]... [--exclude PATH_OR_GLOB]...
+//!                        (creates a project and tiles the diff across it)
 //! Safe mutations:
 //!   jimctl git checkout  --ref R [--create] [--repo P]
 //!   jimctl git branch-new --name N [--from REF] [--repo P]
@@ -70,6 +74,7 @@ pub fn run() -> ExitCode {
         "unstage-hunk" => cmd_hunk(&named, false),
         "stage-file" => cmd_whole_file(&named, true),
         "unstage-file" => cmd_whole_file(&named, false),
+        "diff-wall" => cmd_diff_wall(&named, &switches),
         other => Err(format!(
             "unknown subcommand '{other}' (see jimctl git --help)"
         )),
@@ -383,6 +388,296 @@ fn cmd_diff(named: &[(String, String)], switches: &[String]) -> Result<Value, St
     Ok(json!({ "diff": diffset_json(&set, !has(switches, "no-text")) }))
 }
 
+// ---------------- diff wall ----------------
+
+/// Rough on-canvas cost of one diff row and of a tile's fixed chrome
+/// (title bar, padding, file header), matching diff.ft's compact mode.
+const WALL_ROW_H: f32 = 20.0;
+const WALL_TILE_CHROME_H: f32 = 120.0;
+const WALL_MAX_TILE_H: f32 = 900.0;
+const WALL_GAP: f32 = 24.0;
+const WALL_ORIGIN: f32 = 40.0;
+/// Target width:height of the whole wall, roughly a laptop screen.
+const WALL_ASPECT: f32 = 1.6;
+
+struct WallTile {
+    title: String,
+    patch: String,
+    rows: usize,
+    max_cols: usize,
+}
+
+struct WallPaths {
+    include: Vec<glob::Pattern>,
+    exclude: Vec<glob::Pattern>,
+}
+
+impl WallPaths {
+    fn parse(named: &[(String, String)], switches: &[String]) -> Result<Self, String> {
+        let patterns = |flag: &str| -> Result<Vec<glob::Pattern>, String> {
+            if has(switches, flag) {
+                return Err(format!("--{flag} needs a path or glob"));
+            }
+            named
+                .iter()
+                .filter(|(key, _)| key == flag)
+                .map(|(_, value)| {
+                    let pattern = value.strip_prefix("./").unwrap_or(value);
+                    let pattern = pattern.trim_end_matches('/');
+                    if pattern.is_empty() {
+                        return Err(format!(
+                            "--{flag} needs a nonempty repo-relative path or glob"
+                        ));
+                    }
+                    glob::Pattern::new(pattern).map_err(|e| format!("bad --{flag} '{value}': {e}"))
+                })
+                .collect()
+        };
+        Ok(Self {
+            include: patterns("path")?,
+            exclude: patterns("exclude")?,
+        })
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        let options = glob::MatchOptions {
+            require_literal_separator: true,
+            ..Default::default()
+        };
+        let matches = |patterns: &[glob::Pattern]| {
+            Path::new(path).ancestors().any(|ancestor| {
+                patterns
+                    .iter()
+                    .any(|pattern| pattern.matches_path_with(ancestor, options))
+            })
+        };
+        (self.include.is_empty() || matches(&self.include)) && !matches(&self.exclude)
+    }
+}
+
+/// One self-contained unified diff for `hunks` of `file`, in the shape
+/// diff.ft's parser expects (`diff --git` + `---`/`+++` + hunks).
+fn wall_patch(file: &diff_core::FileDiff, hunks: &[&Hunk]) -> String {
+    let old = file.old_path.as_deref().unwrap_or(&file.path);
+    let old_label = match file.change {
+        ChangeKind::Added | ChangeKind::Untracked => "/dev/null".to_string(),
+        _ => format!("a/{old}"),
+    };
+    let new_label = match file.change {
+        ChangeKind::Removed => "/dev/null".to_string(),
+        _ => format!("b/{}", file.path),
+    };
+    let mut out = format!(
+        "diff --git a/{old} b/{}\n--- {old_label}\n+++ {new_label}\n",
+        file.path
+    );
+    for h in hunks {
+        out.push_str(&apply_header(h));
+        out.push('\n');
+        for l in &h.lines {
+            out.push(match l.kind {
+                LineKind::Context => ' ',
+                LineKind::Added => '+',
+                LineKind::Removed => '-',
+            });
+            out.push_str(&l.text);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn wall_tile(title: String, file: &diff_core::FileDiff, hunks: &[&Hunk]) -> WallTile {
+    let rows = hunks
+        .iter()
+        .map(|h| h.lines.len() + 1)
+        .sum::<usize>()
+        .max(1);
+    let max_cols = hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .map(|l| l.text.replace('\t', "    ").chars().count())
+        .max()
+        .unwrap_or(0);
+    WallTile {
+        title,
+        patch: wall_patch(file, hunks),
+        rows,
+        max_cols,
+    }
+}
+
+/// `jimctl git diff-wall` — lay a diff out across a fresh project's
+/// canvas, one compact diff.ft tile per file (or per hunk), packed into
+/// columns and framed in view.
+fn cmd_diff_wall(named: &[(String, String)], switches: &[String]) -> Result<Value, String> {
+    let repo = resolve_repo(named)?;
+    let paths = WallPaths::parse(named, switches)?;
+    let mode = get(named, "mode").unwrap_or("working");
+    let base = get(named, "base");
+    let head = get(named, "head").unwrap_or("HEAD");
+    let set = match (mode, base) {
+        ("working", _) => diff_core::git_working_tree(&repo),
+        ("staged", _) => diff_core::git_staged(&repo),
+        ("unstaged", _) => diff_core::git_unstaged(&repo),
+        ("range", Some(b)) => diff_core::git_ref_range(&repo, b, head),
+        ("range", None) => return Err("--mode range needs --base".into()),
+        (other, _) => {
+            return Err(format!(
+                "bad --mode '{other}' (working|staged|unstaged|range)"
+            ));
+        }
+    }
+    .map_err(|e| e.to_string())?;
+
+    let per_hunk = match get(named, "per").unwrap_or("file") {
+        "file" => false,
+        "hunk" => true,
+        other => return Err(format!("bad --per '{other}' (file|hunk)")),
+    };
+    let max_tiles: usize = match get(named, "max") {
+        Some(m) => m.parse().map_err(|_| format!("bad --max: {m}"))?,
+        None => 150,
+    };
+
+    let mut tiles = Vec::new();
+    let mut filtered_files = 0;
+    for f in set.files.iter().filter(|f| !f.is_empty()) {
+        if !paths.matches(&f.path) {
+            filtered_files += 1;
+            continue;
+        }
+        if per_hunk && f.hunks.len() > 1 {
+            for h in &f.hunks {
+                let line = h.lines.iter().find_map(|l| l.new_lineno.or(l.old_lineno));
+                let title = format!("{}:{}", f.path, line.unwrap_or(h.new_start));
+                tiles.push(wall_tile(title, f, &[h]));
+            }
+        } else {
+            let hunks: Vec<&Hunk> = f.hunks.iter().collect();
+            tiles.push(wall_tile(f.path.clone(), f, &hunks));
+        }
+    }
+    if tiles.is_empty() {
+        return Err("no changes to show".into());
+    }
+    let total_tiles = tiles.len();
+    tiles.truncate(max_tiles);
+
+    let default_name = match (mode, base) {
+        ("range", Some(b)) => format!("diff {b}..{head}"),
+        _ => format!(
+            "diff {}",
+            repo.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "repo".into())
+        ),
+    };
+    let name = get(named, "name")
+        .map(str::to_string)
+        .unwrap_or(default_name);
+    let created = crate::app_ipc::request(
+        &json!({
+            "action": "create_project",
+            "name": name,
+            "cwd": repo,
+            "activate": !has(switches, "no-activate"),
+        }),
+        true,
+    )?
+    .ok_or("no reply to create_project")?;
+    let project_id = created["id"].as_u64().ok_or("create_project: no id")?;
+    let project = created["name"]
+        .as_str()
+        .ok_or("create_project: no name")?
+        .to_string();
+
+    let home = std::env::var_os("HOME").ok_or("$HOME not set")?;
+    let dir = Path::new(&home)
+        .join(".jim")
+        .join("diff-wall")
+        .join(project_id.to_string());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+
+    // Uniform column width (sized to the widest line, ~7.5px per mono
+    // char at diff.ft's 12.5pt plus the line-number gutter), then
+    // masonry: each tile drops into the currently shortest column.
+    let widest = tiles.iter().map(|t| t.max_cols).max().unwrap_or(80);
+    let col_w = (widest as f32 * 7.5 + 140.0).clamp(560.0, 1000.0);
+    let heights: Vec<f32> = tiles
+        .iter()
+        .map(|t| (t.rows as f32 * WALL_ROW_H + WALL_TILE_CHROME_H).min(WALL_MAX_TILE_H))
+        .collect();
+    let stacked: f32 = heights.iter().map(|h| h + WALL_GAP).sum();
+    let cols = ((WALL_ASPECT * stacked / (col_w + WALL_GAP)).sqrt().round() as usize)
+        .clamp(1, tiles.len());
+    let controls_h = 140.0;
+    crate::app_ipc::request(
+        &json!({
+            "action": "spawn_widget",
+            "kind": "script_widget",
+            "command": "review_comments.ft",
+            "project": project,
+            "title": "Review comments",
+            "position": [WALL_ORIGIN, WALL_ORIGIN],
+            "size": [col_w, controls_h],
+            "params": { "repo": repo },
+        }),
+        false,
+    )?;
+    let mut col_y = vec![WALL_ORIGIN + controls_h + WALL_GAP; cols];
+
+    for (i, (tile, h)) in tiles.iter().zip(&heights).enumerate() {
+        let path = dir.join(format!("{i:03}.diff"));
+        std::fs::write(&path, &tile.patch).map_err(|e| format!("write {}: {e}", path.display()))?;
+        let col = (0..cols)
+            .min_by(|&a, &b| col_y[a].total_cmp(&col_y[b]))
+            .unwrap_or(0);
+        let x = WALL_ORIGIN + col as f32 * (col_w + WALL_GAP);
+        let y = col_y[col];
+        col_y[col] += h + WALL_GAP;
+        crate::app_ipc::request(
+            &json!({
+                "action": "spawn_widget",
+                "kind": "script_widget",
+                "command": "diff.ft",
+                "project": project,
+                "title": tile.title,
+                "position": [x, y],
+                "size": [col_w, h],
+                "params": {
+                    "source": "file",
+                    "arg": path,
+                    "repo": repo,
+                    "compact": true,
+                },
+            }),
+            false,
+        )?;
+    }
+
+    let wall_w = cols as f32 * (col_w + WALL_GAP) - WALL_GAP;
+    let wall_h = col_y.iter().cloned().fold(0.0, f32::max) - WALL_GAP - WALL_ORIGIN;
+    crate::app_ipc::request(
+        &json!({
+            "action": "fit_canvas",
+            "project": project,
+            "bounds": [WALL_ORIGIN, WALL_ORIGIN, wall_w, wall_h],
+        }),
+        false,
+    )?;
+
+    Ok(json!({
+        "project": project,
+        "project_id": project_id,
+        "tiles": tiles.len(),
+        "skipped": total_tiles - tiles.len(),
+        "filtered_files": filtered_files,
+        "columns": cols,
+        "patch_dir": dir,
+    }))
+}
+
 // ---------------- safe mutations ----------------
 
 fn cmd_checkout(named: &[(String, String)], switches: &[String]) -> Result<Value, String> {
@@ -553,6 +848,12 @@ fn print_usage() {
          \tlog        [--repo P] [--limit N] [--path F] recent commits\n\
          \tdiff       [--repo P] [--mode working|staged|unstaged|range]\n\
          \t           [--base B] [--head H] [--no-text]  structured diff (hunks carry `header`)\n\
+         \tdiff-wall  [--repo P] [--mode M] [--base B] [--head H] [--per file|hunk]\n\
+         \t           [--name N] [--max N] [--no-activate]\n\
+         \t           [--path PATH_OR_GLOB]... [--exclude PATH_OR_GLOB]...\n\
+         \t           filters are repo-relative, match files/directories; exclusions win\n\
+         \t           quote globs, e.g. --exclude '**/tests/**' --exclude '**/*.test.*'\n\
+         \t           new project with the diff tiled across its canvas\n\
          safe mutations:\n\
          \tcheckout   --ref R [--create] [--repo P]\n\
          \tbranch-new --name N [--from REF] [--repo P]\n\
@@ -565,4 +866,66 @@ fn print_usage() {
          \t            header returns {{\"ok\":false,\"error\":\"stale\"}} — refresh and retry)\n\
          \tstage-file / unstage-file --file F [--repo P]   whole file (also: renames/binary/untracked)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wall_paths(args: &[&str]) -> Result<WallPaths, String> {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let (named, switches) = parse_flags(&args);
+        WallPaths::parse(&named, &switches)
+    }
+
+    #[test]
+    fn wall_paths_default_includes_everything() {
+        let paths = wall_paths(&[]).unwrap();
+        assert!(paths.matches("src/lib.rs"));
+        assert!(paths.matches("tests/deleted.rs"));
+        assert!(paths.matches(".github/workflows/test.yml"));
+    }
+
+    #[test]
+    fn wall_paths_include_files_and_directories() {
+        let paths = wall_paths(&["--path", "./src/", "--path=README.md"]).unwrap();
+        assert!(paths.matches("src/nested/lib.rs"));
+        assert!(paths.matches("README.md"));
+        assert!(!paths.matches("src-other/lib.rs"));
+        assert!(!paths.matches("docs/README.md"));
+    }
+
+    #[test]
+    fn wall_paths_exclude_test_directories_and_globs() {
+        let paths = wall_paths(&[
+            "--exclude",
+            "**/tests/**",
+            "--exclude",
+            "**/*.test.*",
+            "--exclude",
+            "**/__tests__",
+        ])
+        .unwrap();
+        assert!(!paths.matches("tests/root.rs"));
+        assert!(!paths.matches("crates/widget/tests/nested/test.rs"));
+        assert!(!paths.matches("src/widget.test.ts"));
+        assert!(!paths.matches("root.test.js"));
+        assert!(!paths.matches("src/__tests__/nested/widget.ts"));
+        assert!(paths.matches("src/widget.ts"));
+    }
+
+    #[test]
+    fn wall_paths_exclusions_win_and_globs_respect_separators() {
+        let paths = wall_paths(&["--path", "src", "--exclude", "src/*.test.ts"]).unwrap();
+        assert!(!paths.matches("src/widget.test.ts"));
+        assert!(paths.matches("src/nested/widget.test.ts"));
+        assert!(!paths.matches("other/widget.ts"));
+    }
+
+    #[test]
+    fn wall_paths_reject_missing_empty_and_invalid_patterns() {
+        for args in [vec!["--exclude"], vec!["--path="], vec!["--exclude", "["]] {
+            assert!(wall_paths(&args).is_err());
+        }
+    }
 }

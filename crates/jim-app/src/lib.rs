@@ -653,6 +653,7 @@ impl Plugin for AppShellPlugin {
             Update,
             (
                 handle_scroll,
+                sync_terminal_focus,
                 apply_bell_pulse,
                 apply_claude_notification_pulse,
                 clear_active_unread,
@@ -1155,6 +1156,52 @@ fn drain_ipc_open_requests(
                     "[ipc] set_project_default_cwd: project={} cwd={:?} changed={}",
                     project_id, cwd_str, changed
                 );
+            }
+            ipc::IpcRequest::CreateProject {
+                name,
+                cwd,
+                activate,
+            } => {
+                use std::io::Write as _;
+                let id = projects.create();
+                if let Some(base) = name.filter(|n| !n.trim().is_empty()) {
+                    let taken =
+                        |n: &str| projects.list.iter().any(|p| p.name.eq_ignore_ascii_case(n));
+                    let mut unique = base.clone();
+                    let mut n = 2;
+                    while taken(&unique) {
+                        unique = format!("{base} ({n})");
+                        n += 1;
+                    }
+                    projects.rename(id, unique);
+                }
+                if let Some(cwd) = cwd {
+                    projects.set_default_cwd(id, Some(cwd.to_string_lossy().into_owned()));
+                }
+                if activate {
+                    projects.set_active(id);
+                }
+                let name = projects
+                    .list
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                let body = serde_json::json!({ "id": id, "name": name });
+                if let Ok(bytes) = serde_json::to_vec(&body) {
+                    let _ = _stream.write_all(&bytes);
+                }
+                let _ = _stream.shutdown(std::net::Shutdown::Write);
+            }
+            ipc::IpcRequest::FitCanvas { project, bounds } => {
+                let target = match project.as_deref() {
+                    Some("active") | None => OpenProjectTarget::Active,
+                    Some(name) => OpenProjectTarget::ByName(name.to_string()),
+                };
+                match projects::resolve_project(&target, &projects) {
+                    Some(id) => pending.fit_canvas.push((id, bounds)),
+                    None => eprintln!("[ipc] fit_canvas: no matching project"),
+                }
             }
             ipc::IpcRequest::SendInbox {
                 project,
@@ -2305,10 +2352,30 @@ fn current_app_active() -> bool {
     true
 }
 
-/// Bell counter. Polls each terminal's worker `bell_count` and bumps
-/// the per-project unread counter for every fresh BEL the user can't
-/// currently see (window unfocused, or its project not active). No
-/// in-pane visual — only the sidebar badge + dock-tile badge react.
+/// Match terminal focus reports to the unread badge's project visibility gate.
+fn sync_terminal_focus(
+    store: Res<TerminalStore>,
+    app_focused: Res<AppFocused>,
+    projects: Res<Projects>,
+    panes: Query<(Entity, Option<&ProjectMembership>), With<TerminalSession>>,
+) {
+    for (entity, membership) in &panes {
+        let Some(data) = store.map.get(&entity) else {
+            continue;
+        };
+        let focused = app_focused.0 && membership.is_some_and(|p| projects.active == Some(p.0));
+        if data
+            .worker
+            .focused
+            .swap(focused, std::sync::atomic::Ordering::Relaxed)
+            != focused
+        {
+            data.worker.wake();
+        }
+    }
+}
+
+/// Bump project unread badges for fresh bells and terminal notifications the user can't see.
 fn apply_bell_pulse(
     store: Res<TerminalStore>,
     app_focused: Res<AppFocused>,

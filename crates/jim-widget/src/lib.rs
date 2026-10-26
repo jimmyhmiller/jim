@@ -712,6 +712,7 @@ pub struct WidgetInputFocus {
     pub id: String,
     pub value: String,
     pub caret: usize,
+    pub select_all: bool,
     /// Per-pane time accumulator for the caret blink. Reset to 0 every
     /// keystroke so the caret stays solid while typing.
     pub blink: f32,
@@ -727,9 +728,43 @@ impl WidgetInputFocus {
             id,
             value: String::new(),
             caret: 0,
+            select_all: false,
             blink: 0.0,
             multiline: false,
         }
+    }
+
+    fn paste_text(&mut self, text: &str) -> bool {
+        let text = if self.multiline {
+            text.replace('\r', "")
+        } else {
+            text.replace(['\r', '\n'], "")
+        };
+        if text.is_empty() {
+            return false;
+        }
+        self.insert_text(&text);
+        true
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        self.delete_selection();
+        let prev: String = self.value.chars().take(self.caret).collect();
+        let after: String = self.value.chars().skip(self.caret).collect();
+        self.value = format!("{prev}{text}{after}");
+        self.caret += text.chars().count();
+        self.blink = 0.0;
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        if !self.select_all {
+            return false;
+        }
+        self.value.clear();
+        self.caret = 0;
+        self.select_all = false;
+        self.blink = 0.0;
+        true
     }
 }
 
@@ -4655,6 +4690,7 @@ fn handle_widget_input_typing(
         || modifiers.pressed(KeyCode::SuperRight)
         || modifiers.pressed(KeyCode::ControlLeft)
         || modifiers.pressed(KeyCode::ControlRight);
+    let shift = modifiers.pressed(KeyCode::ShiftLeft) || modifiers.pressed(KeyCode::ShiftRight);
     for (pane, mut focus, io, sw) in &mut q {
         // A widget input can keep `WidgetInputFocus` while another pane is
         // focused; only consume keys when the keyboard owner allows this
@@ -4669,6 +4705,27 @@ fn handle_widget_input_typing(
             if !ev.state.is_pressed() {
                 continue;
             }
+            if ev.key_code == KeyCode::KeyA && submit_modifier {
+                focus.select_all = true;
+                focus.caret = focus.value.chars().count();
+                focus.blink = 0.0;
+                continue;
+            }
+            if matches!(ev.key_code, KeyCode::KeyC | KeyCode::KeyX) && submit_modifier {
+                if focus.select_all {
+                    crate::subprocess::clipboard_set(&focus.value);
+                    if ev.key_code == KeyCode::KeyX {
+                        value_changed |= focus.delete_selection();
+                    }
+                }
+                continue;
+            }
+            if ev.key_code == KeyCode::KeyV && submit_modifier && !shift {
+                if let Some(text) = crate::subprocess::clipboard_get() {
+                    value_changed |= focus.paste_text(&text);
+                }
+                continue;
+            }
             match &ev.logical_key {
                 Key::Character(s) => {
                     // Skip control combos; only insert the literal char.
@@ -4677,22 +4734,18 @@ fn handle_widget_input_typing(
                     if submit_modifier {
                         continue;
                     }
-                    let prev = focus.value.chars().take(focus.caret).collect::<String>();
-                    let after: String = focus.value.chars().skip(focus.caret).collect();
-                    focus.value = format!("{}{}{}", prev, s.as_str(), after);
-                    focus.caret += s.chars().count();
-                    focus.blink = 0.0;
+                    focus.insert_text(s.as_str());
                     value_changed = true;
                 }
                 Key::Space => {
-                    let prev = focus.value.chars().take(focus.caret).collect::<String>();
-                    let after: String = focus.value.chars().skip(focus.caret).collect();
-                    focus.value = format!("{} {}", prev, after);
-                    focus.caret += 1;
-                    focus.blink = 0.0;
+                    focus.insert_text(" ");
                     value_changed = true;
                 }
                 Key::Backspace => {
+                    if focus.delete_selection() {
+                        value_changed = true;
+                        continue;
+                    }
                     if focus.caret > 0 {
                         let mut chars: Vec<char> = focus.value.chars().collect();
                         chars.remove(focus.caret - 1);
@@ -4703,6 +4756,10 @@ fn handle_widget_input_typing(
                     }
                 }
                 Key::Delete => {
+                    if focus.delete_selection() {
+                        value_changed = true;
+                        continue;
+                    }
                     let mut chars: Vec<char> = focus.value.chars().collect();
                     if focus.caret < chars.len() {
                         chars.remove(focus.caret);
@@ -4712,15 +4769,26 @@ fn handle_widget_input_typing(
                     }
                 }
                 Key::ArrowLeft => {
-                    focus.caret = focus.caret.saturating_sub(1);
+                    focus.caret = if focus.select_all {
+                        0
+                    } else {
+                        focus.caret.saturating_sub(1)
+                    };
+                    focus.select_all = false;
                     focus.blink = 0.0;
                 }
                 Key::ArrowRight => {
                     let n = focus.value.chars().count();
-                    focus.caret = (focus.caret + 1).min(n);
+                    focus.caret = if focus.select_all {
+                        n
+                    } else {
+                        (focus.caret + 1).min(n)
+                    };
+                    focus.select_all = false;
                     focus.blink = 0.0;
                 }
                 Key::ArrowUp => {
+                    focus.select_all = false;
                     let chars: Vec<char> = focus.value.chars().collect();
                     let starts = line_starts(&chars);
                     let (line, col) = caret_line_col(&chars, focus.caret);
@@ -4732,6 +4800,7 @@ fn handle_widget_input_typing(
                     focus.blink = 0.0;
                 }
                 Key::ArrowDown => {
+                    focus.select_all = false;
                     let chars: Vec<char> = focus.value.chars().collect();
                     let starts = line_starts(&chars);
                     let (line, col) = caret_line_col(&chars, focus.caret);
@@ -4743,6 +4812,7 @@ fn handle_widget_input_typing(
                     focus.blink = 0.0;
                 }
                 Key::Home => {
+                    focus.select_all = false;
                     // Line-aware: jump to the start of the current line
                     // (same as start-of-value for single-line inputs).
                     let chars: Vec<char> = focus.value.chars().collect();
@@ -4752,6 +4822,7 @@ fn handle_widget_input_typing(
                     focus.blink = 0.0;
                 }
                 Key::End => {
+                    focus.select_all = false;
                     // Line-aware: jump to the end of the current line.
                     let chars: Vec<char> = focus.value.chars().collect();
                     let starts = line_starts(&chars);
@@ -4764,11 +4835,7 @@ fn handle_widget_input_typing(
                     // submit is Cmd/Ctrl+Enter. Single-line inputs submit
                     // on plain Enter.
                     if focus.multiline && !submit_modifier {
-                        let prev: String = focus.value.chars().take(focus.caret).collect();
-                        let after: String = focus.value.chars().skip(focus.caret).collect();
-                        focus.value = format!("{}\n{}", prev, after);
-                        focus.caret += 1;
-                        focus.blink = 0.0;
+                        focus.insert_text("\n");
                         value_changed = true;
                     } else {
                         submitted = true;
@@ -4823,6 +4890,138 @@ fn handle_widget_input_typing(
             }
             commands.entity(pane).remove::<WidgetInputFocus>();
         }
+    }
+}
+
+#[cfg(test)]
+mod input_paste_tests {
+    use super::*;
+
+    #[test]
+    fn cmd_a_selects_all_and_backspace_deletes() {
+        use bevy::input::{
+            ButtonState,
+            keyboard::{Key, KeyboardInput},
+        };
+        let mut app = App::new();
+        app.add_message::<KeyboardInput>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<jim_pane::KeyboardOwner>()
+            .add_systems(Update, handle_widget_input_typing);
+        let mut focus = WidgetInputFocus::new("repo".into());
+        focus.value = "/old/repo".into();
+        focus.caret = 9;
+        let pane = app.world_mut().spawn(focus).id();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::SuperLeft);
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::KeyA,
+            logical_key: Key::Character("a".into()),
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: pane,
+        });
+        app.update();
+        assert!(
+            app.world()
+                .get::<WidgetInputFocus>(pane)
+                .unwrap()
+                .select_all
+        );
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .release(KeyCode::SuperLeft);
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::Backspace,
+            logical_key: Key::Backspace,
+            state: ButtonState::Pressed,
+            text: None,
+            repeat: false,
+            window: pane,
+        });
+        app.update();
+        let focus = app.world().get::<WidgetInputFocus>(pane).unwrap();
+        assert_eq!(focus.value, "");
+        assert!(!focus.select_all);
+    }
+
+    #[test]
+    fn paste_replaces_selected_value() {
+        let mut focus = WidgetInputFocus::new("repo".into());
+        focus.value = "old repo".into();
+        focus.caret = 8;
+        focus.select_all = true;
+        assert!(focus.paste_text("/new/项目"));
+        assert_eq!(focus.value, "/new/项目");
+        assert_eq!(focus.caret, 7);
+        assert!(!focus.select_all);
+    }
+
+    #[test]
+    fn typing_replaces_selected_value() {
+        let mut focus = WidgetInputFocus::new("repo".into());
+        focus.value = "old repo".into();
+        focus.caret = 8;
+        focus.select_all = true;
+        focus.insert_text("n");
+        assert_eq!(focus.value, "n");
+        assert_eq!(focus.caret, 1);
+        assert!(!focus.select_all);
+    }
+
+    #[test]
+    fn delete_clears_selected_value() {
+        let mut focus = WidgetInputFocus::new("repo".into());
+        focus.value = "old repo".into();
+        focus.caret = 8;
+        focus.select_all = true;
+        assert!(focus.delete_selection());
+        assert_eq!(focus.value, "");
+        assert_eq!(focus.caret, 0);
+        assert!(!focus.select_all);
+    }
+
+    #[test]
+    fn inserts_at_unicode_caret() {
+        let mut focus = WidgetInputFocus::new("repo".into());
+        focus.value = "é/项目".into();
+        focus.caret = 2;
+        focus.blink = 1.0;
+        assert!(focus.paste_text("代码/"));
+        assert_eq!(focus.value, "é/代码/项目");
+        assert_eq!(focus.caret, 5);
+        assert_eq!(focus.blink, 0.0);
+    }
+
+    #[test]
+    fn single_line_strips_newlines() {
+        let mut focus = WidgetInputFocus::new("repo".into());
+        assert!(focus.paste_text("/Users/jim\r\n/project\n"));
+        assert_eq!(focus.value, "/Users/jim/project");
+        assert_eq!(focus.caret, focus.value.chars().count());
+    }
+
+    #[test]
+    fn multiline_preserves_line_breaks() {
+        let mut focus = WidgetInputFocus::new("draft".into());
+        focus.multiline = true;
+        assert!(focus.paste_text("first\r\nsecond\n"));
+        assert_eq!(focus.value, "first\nsecond\n");
+        assert_eq!(focus.caret, focus.value.chars().count());
+    }
+
+    #[test]
+    fn empty_paste_does_not_change_input() {
+        let mut focus = WidgetInputFocus::new("repo".into());
+        focus.value = "repo".into();
+        focus.caret = 2;
+        focus.blink = 1.0;
+        assert!(!focus.paste_text("\r\n"));
+        assert_eq!(focus.value, "repo");
+        assert_eq!(focus.caret, 2);
+        assert_eq!(focus.blink, 1.0);
     }
 }
 

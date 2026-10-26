@@ -1,8 +1,8 @@
 // pr_dashboard.ft — "my open PRs" dashboard.
 //
 // Lists every PR you have open (via the `gh` CLI), groups stacked PRs
-// together, shows a per-PR CI status dot, flags NEW activity since you
-// last looked, and opens straight to the PR on click.
+// together, shows CI activity, comment counts and approvals, flags NEW
+// comments since you last looked, and opens straight to the PR on click.
 //
 // SETTINGS — a JSON file at ~/.jim/pr-dashboard.json (auto-created on
 // first run, hot-reloaded on Refresh). Per-instance overrides can also be
@@ -15,9 +15,8 @@
 //   owners                  ["owner", ...]            filter to these owners
 //   include_drafts          show draft PRs            (default true)
 //   show_ci                 fetch + show CI status     (default true)
-//                           (one extra gh call per PR)
 //   show_stack              detect + group stacked PRs (default true)
-//                           (shares show_ci's gh call)
+//                           (shares the metadata call)
 //   ci_comment_marker       bot-comment marker whose   (default the
 //                           heading is the authoritative next.js one)
 //                           CI verdict; falls back to
@@ -29,9 +28,10 @@
 //
 // CI VERDICT. Raw check rollups are noisy — a cancelled Stats run or a
 // skipped deploy check makes a PR look "failed" when the tests actually
-// passed. So when a PR has a bot comment carrying `ci_comment_marker`
-// (next.js posts `__NEXT_TEST_REPORT_COMMENT__`), we take the verdict from
-// that comment's heading instead:
+// passed. A running test check always takes precedence over a possibly
+// stale bot verdict. Otherwise, when a PR has a bot comment carrying
+// `ci_comment_marker` (next.js posts `__NEXT_TEST_REPORT_COMMENT__`), we
+// take the verdict from that comment's heading:
 //   "## Tests Passed"                    -> pass
 //   "## Tests in progress"               -> pending
 //   "## Failing test suites|CI jobs"     -> fail
@@ -43,8 +43,8 @@
 // open PR's head branch (or vice-versa), within the same repo. Purely
 // branch-topology based, so it works regardless of stack tool.
 //
-// "New since last viewed" is a per-PR baseline (comment count + updatedAt)
-// in widget state; opening a PR — or "Mark all read" — re-baselines it.
+// "New since last viewed" is a per-PR comment-count baseline in widget
+// state; opening a PR — or "Mark all read" — re-baselines it.
 // The baseline survives app restarts.
 import "host"
 import { col_text, col_muted, col_accent, col_err, col_warn } from "df"
@@ -85,8 +85,8 @@ fn starts(s, p) = len(s) >= len(p) and slice(s, 0, len(p)) == p
 // ordering of timestamps isn't relied on; everything goes through this.
 fn ts_num(iso) {
     if len(iso) < 19 { return 0 }
-    let s = slice(iso, 0, 4) + slice(iso, 5, 7) + slice(iso, 8, 10) +
-            slice(iso, 11, 13) + slice(iso, 14, 16) + slice(iso, 17, 19)
+    let s = slice(iso, 0, 4) + slice(iso, 5, 2) + slice(iso, 8, 2) +
+            slice(iso, 11, 2) + slice(iso, 14, 2) + slice(iso, 17, 2)
     unwrap_or(parse_int(s), 0)
 }
 
@@ -138,31 +138,66 @@ fn build_list_cmd(cfg) {
 }
 
 fn build_comments_cmd(repo, number, gh, jq) {
-    let ep = shq("repos/" + repo + "/issues/" + str(number) + "/comments")
+    let issue = shq("repos/" + repo + "/issues/" + str(number) + "/comments")
+    let review = shq("repos/" + repo + "/pulls/" + str(number) + "/comments")
     let f  = shq("[.[]|{u:.user.login,at:.created_at}]")
-    gh + " api --paginate " + ep + " --jq " + f + " 2>/dev/null | " + jq + " -sc 'add // []'"
+    "set -o pipefail\n" +
+    "issues=$(" + gh + " api --paginate " + issue + " --jq " + f + ") || exit 1\n" +
+    "reviews=$(" + gh + " api --paginate " + review + " --jq " + f + ") || exit 1\n" +
+    "printf '%s\\n' \"$issues\" \"$reviews\" | " + jq + " -sc 'add // []'"
 }
 
 // jq that reduces `gh pr view`'s output to one compact object:
-//   {base, head, t, f, w, ci, src}
-// `ci` is "pass"|"fail"|"pending"|"none". It prefers the bot-comment
-// verdict (marker `m`) and falls back to the statusCheckRollup rollup;
-// `src` records which won ("comment" | "checks"). Uses only standard jq
+//   {base, head, t, f, w, ci, src, approved}
+// `ci` is "pass"|"fail"|"pending"|"none". Live running test checks win
+// over a bot-comment verdict (marker `m`), which otherwise wins over the
+// statusCheckRollup rollup. `src` records which won. Uses only standard jq
 // and no single quotes, so it survives shq's single-quote wrapping. `m`
 // (the marker) is interpolated in — keep it free of quotes/backslashes.
 fn meta_jq(m) =
 "def k: if .__typename==\"StatusContext\" then (if .state==\"SUCCESS\" then \"p\" elif (.state==\"PENDING\" or .state==\"EXPECTED\") then \"w\" else \"f\" end) else (if .status!=\"COMPLETED\" then \"w\" elif (.conclusion==\"SUCCESS\" or .conclusion==\"SKIPPED\" or .conclusion==\"NEUTRAL\") then \"p\" elif .conclusion==null then \"w\" else \"f\" end) end; " +
 "(.statusCheckRollup // []) as $r | ($r|map(k)) as $c | " +
 "($c|map(select(.==\"f\"))|length) as $f | ($c|map(select(.==\"w\"))|length) as $w | ($c|length) as $t | " +
+"($r|map(select(k==\"w\" and ((.name // .context // \"\")|test(\"test\";\"i\"))))|length) as $running_tests | " +
 "(if $t==0 then \"none\" elif $f>0 then \"fail\" elif $w>0 then \"pending\" else \"pass\" end) as $rv | " +
 "([.comments[]? | select(.body|contains(\"" + m + "\"))] | last) as $cm | " +
 "(if $cm==null then \"none\" elif ($cm.body|contains(\"## Tests Passed\")) then \"pass\" elif ($cm.body|contains(\"## Tests in progress\")) then \"pending\" elif ($cm.body|test(\"## Failing (test suites|CI jobs)\")) then \"fail\" else \"none\" end) as $cv | " +
-"{base:.baseRefName, head:.headRefName, t:$t, f:$f, w:$w, ci:(if $cv==\"none\" then $rv else $cv end), src:(if $cv==\"none\" then \"checks\" else \"comment\" end)}"
+"{base:.baseRefName, head:.headRefName, t:$t, f:$f, w:$w, ci:(if $running_tests>0 then \"pending\" elif $cv==\"none\" then $rv else $cv end), src:(if $running_tests>0 then \"tests\" elif $cv==\"none\" then \"checks\" else \"comment\" end), approved:(.reviewDecision==\"APPROVED\" or any(.latestReviews[]?; .state==\"APPROVED\"))}"
 
 fn build_meta_cmd(repo, number, gh, jq, marker) {
-    let flags = " --json baseRefName,headRefName,statusCheckRollup,comments"
-    gh + " pr view " + str(number) + " --repo " + shq(repo) + flags +
-        " 2>/dev/null | " + jq + " -c " + shq(meta_jq(marker))
+    let flags = " --json baseRefName,headRefName,statusCheckRollup,comments,reviewDecision,latestReviews"
+    "set -o pipefail\n" +
+    "meta=$(" + gh + " pr view " + str(number) + " --repo " + shq(repo) + flags +
+        " 2>/dev/null | " + jq + " -c " + shq(meta_jq(marker)) + ") || exit 1\n" +
+    "counts=$(" + gh + " api " + shq("repos/" + repo + "/pulls/" + str(number)) +
+        " --jq '{comments:(.comments + .review_comments)}' 2>/dev/null) || counts='{}'\n" +
+    "printf '%s\\n' \"$meta\" \"$counts\" | " + jq + " -sc '.[0] + .[1]'"
+}
+
+// Same discovery and failed-job rerun as rerun-build, scoped to this PR.
+// gh pr checks exits 1 for failures and 8 for pending checks, with valid JSON.
+fn build_rerun_cmd(pr, cfg) {
+    let runs_jq = "[.[] | select(.bucket==\"fail\") | (.link // \"\") | " +
+        "capture(\"^https://github[.]com/(?<repo>[^/]+/[^/]+)/actions/runs/(?<id>[0-9]+)(?:/job/[0-9]+)?\")? | " +
+        "{repo,id}] | unique_by([.repo,.id]) | .[] | .repo + \" \" + .id"
+    "exec 2>&1\n" +
+    "checks=$(" + cfg.gh + " pr checks " + str(pr.number) + " --repo " + shq(pr.repo) +
+        " --json name,bucket,link,workflow)\ncode=$?\n" +
+    "if [ \"$code\" != 0 ] && [ \"$code\" != 1 ] && [ \"$code\" != 8 ]; then exit \"$code\"; fi\n" +
+    "runs=$(printf '%s' \"$checks\" | " + cfg.jq + " -r " + shq(runs_jq) + ") || exit 1\n" +
+    "if [ -z \"$runs\" ]; then echo 'No failed GitHub Actions jobs to rerun (external checks cannot be retried here).'; exit 1; fi\n" +
+    "result=0\nwhile read -r repo run; do\n" +
+    cfg.gh + " run rerun \"$run\" --failed --repo \"$repo\" || result=1\n" +
+    "done <<EOF\n$runs\nEOF\nexit \"$result\""
+}
+
+fn active_reruns(reruns) {
+    let mut active = {}
+    for url in keys(reruns) {
+        let r = unwrap_or(get(reruns, url), ())
+        if get_or(r, "handle", -1) > 0 { active = assoc(active, url, r) }
+    }
+    active
 }
 
 // Number of comments by other people AFTER your most recent comment.
@@ -274,7 +309,8 @@ fn chain_down(meta, maps, rooturl) {
 
 // staged=true keeps the current view intact and fetches into stage_* for
 // an atomic swap (Refresh); staged=false is the initial progressive load.
-fn run_fetch(p, s, staged) {
+// Takes/returns both halves of the state (durable `d`, in-flight `l`).
+fn run_fetch(p, d, l, staged) {
     let home = host_env("HOME")
     let path = home + "/.jim/pr-dashboard.json"
     let rf = read_file(path)
@@ -289,16 +325,39 @@ fn run_fetch(p, s, staged) {
     let lp = proc_spawn(cfg.shell, ["-lc", build_list_cmd(cfg)])
     // Live prs/meta are left untouched on a staged refresh so the view
     // doesn't collapse mid-fetch; only the staging buffers reset here.
-    let mut ns = { ..s, cfg: cfg, error: "",
+    let mut nl = { ..l, error: "", reruns: active_reruns(l.reruns),
                    status: if staged { "refreshing…" } else { "fetching…" },
                    loading: not staged, refreshing: staged,
                    list_proc: lp, enrich: {}, me_proc: -1, meta_procs: {},
                    stage_prs: [], stage_meta: {}, stage_out: 0, spin: 0 }
-    if not staged { ns = { ..ns, meta: {} } }
-    if cfg.track_since_my_comment and s.me == "" {
-        ns = { ..ns, me_proc: proc_spawn(cfg.shell, ["-lc", cfg.gh + " api user --jq .login 2>/dev/null"]) }
+    let mut nd = { ..d, cfg: cfg }
+    if not staged { nd = { ..nd, meta: {} } }
+    if cfg.track_since_my_comment and d.me == "" {
+        nl = { ..nl, me_proc: proc_spawn(cfg.shell, ["-lc", cfg.gh + " api user --jq .login 2>/dev/null"]) }
     }
-    ns
+    { d: nd, l: nl }
+}
+
+fn comment_baseline(pr) = { comments: pr.comments, includes_reviews: get_or(pr, "includes_reviews", false) }
+
+// Search counts exclude inline review comments. Replace them with the REST
+// total, migrating old baselines once so existing reviews aren't flagged new.
+fn with_comment_counts(s) {
+    let mut prs = []
+    let mut seen = s.seen
+    for pr in s.prs {
+        let m = mget(s.meta, pr.url)
+        let mut p = pr
+        if typeof(m) == "Record" and has(m, "comments") {
+            p = { ..pr, comments: m.comments, includes_reviews: true }
+            let b = unwrap_or(get(seen, pr.url), ())
+            if typeof(b) == "Record" and not get_or(b, "includes_reviews", false) {
+                seen = assoc(seen, pr.url, comment_baseline(p))
+            }
+        }
+        prs = push(prs, p)
+    }
+    { ..s, prs: prs, seen: seen }
 }
 
 // Baseline any PR we've never seen, so its existing comments don't all
@@ -307,48 +366,36 @@ fn seed_seen(s) {
     let mut sn = s.seen
     for pr in s.prs {
         if not has(sn, pr.url) {
-            sn = assoc(sn, pr.url, { comments: pr.comments, updated: pr.updated })
+            sn = assoc(sn, pr.url, comment_baseline(pr))
         }
     }
     { ..s, seen: sn }
 }
 
-// One `gh api …/comments` per PR; results land in on_proc_output keyed by
+// Paginated issue + review comments; results land in on_proc_output keyed by
 // proc handle. Only fired when track_since_my_comment is on and `me` known.
-fn kick_enrich(s) {
-    let cfg = s.cfg
+// Returns the handle->url map for the caller to park in `live.enrich`.
+fn kick_enrich(cfg, prs) {
     let mut en = {}
-    for pr in s.prs {
+    for pr in prs {
         let h = proc_spawn(cfg.shell, ["-lc", build_comments_cmd(pr.repo, pr.number, cfg.gh, cfg.jq)])
         en = assoc(en, str(h), pr.url)
     }
-    { ..s, enrich: en }
+    en
 }
 
-// One `gh pr view` per PR for base/head branch + CI verdict. Fired after
-// the list lands when show_ci or show_stack is on. Keyed by proc handle.
-fn kick_meta(s) {
-    let cfg = s.cfg
+// `gh pr view` plus REST comment totals per PR. Fired after
+// the list lands. Returns the handle->url
+// map; the caller parks it in `live.meta_procs`. Used by both the initial
+// load (results go to `state.meta`) and a staged refresh (`live.stage_meta`).
+fn kick_meta(cfg, prs) {
     let mut mp = {}
-    for pr in s.prs {
+    for pr in prs {
         let cmd = build_meta_cmd(pr.repo, pr.number, cfg.gh, cfg.jq, cfg.ci_comment_marker)
         let h = proc_spawn(cfg.shell, ["-lc", cmd])
         mp = assoc(mp, str(h), pr.url)
     }
-    { ..s, meta: {}, meta_procs: mp }
-}
-
-// Same, but for a staged refresh: enrich the staged prs into stage_meta
-// (live meta keeps rendering). stage_out tracks outstanding procs.
-fn kick_meta_staged(s) {
-    let cfg = s.cfg
-    let mut mp = {}
-    for pr in s.stage_prs {
-        let cmd = build_meta_cmd(pr.repo, pr.number, cfg.gh, cfg.jq, cfg.ci_comment_marker)
-        let h = proc_spawn(cfg.shell, ["-lc", cmd])
-        mp = assoc(mp, str(h), pr.url)
-    }
-    { ..s, meta_procs: mp, stage_meta: {}, stage_out: len(s.stage_prs) }
+    mp
 }
 
 // Compact PR summary for the rest of the git suite (repo_hub badges a
@@ -374,15 +421,16 @@ fn emit_pr_index(prs, meta) {
 
 // Promote the staging buffers to the live view in one shot, then clear
 // staging and (re)baseline unseen PRs.
-fn swap_in(s) {
-    let mut ns = { ..s, prs: s.stage_prs, meta: s.stage_meta,
-                   refreshing: false, loading: false,
-                   status: str(len(s.stage_prs)) + " open",
+fn swap_in(d, l) {
+    let nd = seed_seen(with_comment_counts({ ..d, prs: l.stage_prs, meta: l.stage_meta }))
+    let mut nl = { ..l, refreshing: false, loading: false,
+                   status: str(len(l.stage_prs)) + " open",
                    stage_prs: [], stage_meta: {}, stage_out: 0, meta_procs: {} }
-    ns = seed_seen(ns)
-    if ns.cfg.track_since_my_comment and ns.me != "" { ns = kick_enrich(ns) }
-    emit_pr_index(ns.prs, ns.meta)
-    ns
+    if nd.cfg.track_since_my_comment and nd.me != "" {
+        nl = { ..nl, enrich: kick_enrich(nd.cfg, nd.prs) }
+    }
+    emit_pr_index(nd.prs, nd.meta)
+    { d: nd, l: nl }
 }
 
 // Parse the `gh search prs` JSON array into our flat PR records.
@@ -409,84 +457,143 @@ fn parse_prs(arr, include_drafts) {
 }
 
 // ---------------------------------------------------------------- state
+// State is split in two on purpose.
+//
+// `state` is DURABLE: the host snapshots this atom (and only this atom)
+// and rehydrates it on restart. Everything in here is data we want back.
+//
+// `live` is TRANSIENT: in-flight fetch bookkeeping — proc handles, the
+// refreshing/loading flags, the staging buffers, the spinner phase. None
+// of it survives the process that created it, so none of it may be
+// persisted. Putting it in `state` is what wedged the pane: quit the app
+// mid-Refresh and `refreshing: true` + a dead `list_proc` got written to
+// the snapshot; on restart the host rehydrates state but deliberately does
+// NOT re-run `on_start`, so no proc ever cleared the flag — the header
+// said "Refreshing…" forever and the Refresh button self-guarded off.
+// Persisted proc handles were a second hazard: handle ids restart at 1 in
+// a new process, so a stale one can collide with an unrelated live proc.
+//
+// A hot-reload re-runs top-level `let`s, so `live` also resets there
+// (orphaning any in-flight procs) while `state` is preserved — the view
+// keeps its data and the Refresh button stays usable.
 fn init_state() = {
-    cfg: (), prs: [], seen: {}, sincemine: {}, me: "",
+    cfg: (), prs: [], seen: {}, sincemine: {}, me: "", meta: {},
+}
+
+// Project a rehydrated snapshot down to exactly the durable keys. Handlers
+// read `@state` through this so (a) an older snapshot missing a key still
+// yields a well-formed record, and (b) the transient keys that pre-split
+// versions persisted (refreshing, list_proc, stage_*, …) are dropped on the
+// first write instead of riding along in the snapshot forever.
+fn durable(d) = {
+    cfg:       get_or(d, "cfg", ()),
+    prs:       get_or(d, "prs", []),
+    seen:      get_or(d, "seen", {}),
+    sincemine: get_or(d, "sincemine", {}),
+    me:        get_or(d, "me", ""),
+    meta:      get_or(d, "meta", {}),
+}
+
+// Refresh is double-buffered: the in-flight fetch accumulates into stage_*
+// while the live prs/meta keep rendering unchanged, then swaps in
+// atomically once complete. refreshing gates that; stage_out is the count
+// of meta procs still outstanding.
+fn init_live() = {
     loading: false, error: "", status: "",
-    list_proc: -1, me_proc: -1, enrich: {},
-    meta: {}, meta_procs: {},
-    // Refresh is double-buffered: the in-flight fetch accumulates into
-    // stage_* while the live prs/meta keep rendering unchanged, then swaps
-    // in atomically once complete. refreshing gates that; stage_out is the
-    // count of meta procs still outstanding.
+    list_proc: -1, me_proc: -1, enrich: {}, meta_procs: {},
     refreshing: false, stage_prs: [], stage_meta: {}, stage_out: 0,
-    spin: 0,
+    spin: 0, reruns: {},
 }
 
 let state = atom(init_state())
+let live = atom(init_live())
 
 // ---------------------------------------------------------------- lifecycle
 fn on_init() { request_render() }
 
-// Side effects belong in on_start (runs after state is rehydrated, on
-// every fresh spawn / restart / hot-reload).
+// Side effects belong in on_start — it runs after state is rehydrated, on
+// a fresh spawn only (a restart restores the snapshot instead of re-doing
+// the fetch; the user refreshes when they want fresh data).
 fn on_start() {
-    reset!(state, run_fetch(params, @state, false))
+    let r = run_fetch(params, durable(@state), @live, false)
+    reset!(state, r.d)
+    reset!(live, r.l)
     request_render()
 }
 
 // Spinner tick. Runs only while a refresh is in flight (started in
 // on_click); self-cancels the tick as soon as the swap clears refreshing.
 fn on_frame(dt) {
-    let s = @state
-    if not get_or(s, "refreshing", false) {
+    let l = @live
+    if not l.refreshing {
         set_tick_interval(0.0)
         return
     }
-    reset!(state, { ..s, spin: get_or(s, "spin", 0) + 1 })
+    reset!(live, { ..l, spin: l.spin + 1 })
     request_render()
 }
 
 // ---------------------------------------------------------------- procs
 fn on_proc_output(handle, line) {
-    let s = @state
+    let s = durable(@state)
+    let l = @live
 
-    if handle == s.list_proc {
+    for url in keys(l.reruns) {
+        let r = unwrap_or(get(l.reruns, url), ())
+        if handle == get_or(r, "handle", -1) {
+            reset!(live, { ..l, reruns: assoc(l.reruns, url, { ..r, output: line }) })
+            return
+        }
+    }
+
+    if handle == l.list_proc {
         let v = parse_json(line)
         if typeof(v) == "List" {
             let prs = parse_prs(v, s.cfg.include_drafts)
-            let do_meta = (s.cfg.show_ci or s.cfg.show_stack) and len(prs) > 0
-            if s.refreshing {
+            let do_meta = len(prs) > 0
+            if l.refreshing {
                 // Stage it; the live view keeps rendering until swap_in.
-                let mut ns = { ..s, stage_prs: prs }
-                if do_meta { ns = kick_meta_staged(ns) } else { ns = swap_in(ns) }
-                reset!(state, ns)
+                if do_meta {
+                    reset!(live, { ..l, stage_prs: prs, stage_meta: {},
+                                   stage_out: len(prs),
+                                   meta_procs: kick_meta(s.cfg, prs) })
+                } else {
+                    let r = swap_in(s, { ..l, stage_prs: prs })
+                    reset!(state, r.d)
+                    reset!(live, r.l)
+                }
                 request_render()
                 return
             }
-            let mut ns = seed_seen({ ..s, prs: prs, loading: false, error: "",
-                                     status: str(len(prs)) + " open" })
-            if s.cfg.track_since_my_comment and s.me != "" { ns = kick_enrich(ns) }
-            if do_meta { ns = kick_meta(ns) }
-            reset!(state, ns)
-            request_render()
-        }
-        return
-    }
-
-    if handle == s.me_proc {
-        if line != "" {
-            let mut ns = { ..s, me: line }
-            if s.cfg.track_since_my_comment and len(s.prs) > 0 and len(s.enrich) == 0 {
-                ns = kick_enrich(ns)
+            let nd = seed_seen({ ..s, prs: prs })
+            let mut nl = { ..l, loading: false, error: "",
+                           status: str(len(prs)) + " open" }
+            if s.cfg.track_since_my_comment and s.me != "" {
+                nl = { ..nl, enrich: kick_enrich(s.cfg, prs) }
             }
-            reset!(state, ns)
+            if do_meta { nl = { ..nl, meta_procs: kick_meta(s.cfg, prs) } }
+            reset!(state, if do_meta { { ..nd, meta: {} } } else { nd })
+            reset!(live, nl)
             request_render()
         }
         return
     }
 
-    if has(s.enrich, str(handle)) {
-        let url = unwrap_or(get(s.enrich, str(handle)), "")
+    if handle == l.me_proc {
+        if line != "" {
+            let mut nl = l
+            if s.cfg.track_since_my_comment and len(s.prs) > 0 and len(l.enrich) == 0 {
+                nl = { ..l, enrich: kick_enrich(s.cfg, s.prs) }
+            }
+            reset!(state, { ..s, me: line })
+            reset!(live, nl)
+            request_render()
+        }
+        return
+    }
+
+    if has(l.enrich, str(handle)) {
+        let url = unwrap_or(get(l.enrich, str(handle)), "")
         let arr = parse_json(line)
         if typeof(arr) == "List" {
             reset!(state, { ..s, sincemine: assoc(s.sincemine, url, since_my_comment(arr, s.me)) })
@@ -495,23 +602,28 @@ fn on_proc_output(handle, line) {
         return
     }
 
-    if has(s.meta_procs, str(handle)) {
-        let url = unwrap_or(get(s.meta_procs, str(handle)), "")
+    if has(l.meta_procs, str(handle)) {
+        let url = unwrap_or(get(l.meta_procs, str(handle)), "")
         let m = parse_json(line)
-        if s.refreshing {
+        if l.refreshing {
             // Accumulate into staging; swap once every staged PR has a
             // verdict (proc exits cover the ones that produced no output).
-            let mut sm = s.stage_meta
+            let mut sm = l.stage_meta
             if typeof(m) == "Record" { sm = assoc(sm, url, m) }
-            let mut ns = { ..s, stage_meta: sm }
-            if len(sm) >= len(s.stage_prs) { ns = swap_in(ns) }
-            reset!(state, ns)
+            let nl = { ..l, stage_meta: sm }
+            if len(sm) >= len(l.stage_prs) {
+                let r = swap_in(s, nl)
+                reset!(state, r.d)
+                reset!(live, r.l)
+            } else {
+                reset!(live, nl)
+            }
             request_render()
             return
         }
         if typeof(m) == "Record" {
             let nm = assoc(s.meta, url, m)
-            reset!(state, { ..s, meta: nm })
+            reset!(state, with_comment_counts({ ..s, meta: nm }))
             // Last outstanding meta on the initial (non-staged) load →
             // publish the index for repo_hub/branches badges.
             if len(nm) >= len(s.prs) { emit_pr_index(s.prs, nm) }
@@ -523,18 +635,33 @@ fn on_proc_output(handle, line) {
 }
 
 fn on_proc_exit(handle, code) {
-    let s = @state
-    if handle == s.list_proc {
-        if s.loading {
-            reset!(state, { ..s, loading: false,
-                            error: "fetch failed (gh exit " + str(code) + ") — is `gh` on PATH & authed?",
-                            status: "" })
+    let s = durable(@state)
+    let l = @live
+    for url in keys(l.reruns) {
+        let r = unwrap_or(get(l.reruns, url), ())
+        if handle == get_or(r, "handle", -1) {
+            if code == 0 {
+                reset!(live, { ..l, reruns: assoc(l.reruns, url, { ..r, handle: -1 }) })
+            } else {
+                let detail = if r.output == "" { "exit " + str(code) } else { r.output }
+                reset!(live, { ..l, reruns: dissoc(l.reruns, url),
+                               error: "Rerun failed for " + url + ": " + detail })
+            }
             request_render()
-        } else if s.refreshing and len(s.stage_prs) == 0 {
+            return
+        }
+    }
+    if handle == l.list_proc {
+        if l.loading {
+            reset!(live, { ..l, loading: false,
+                           error: "fetch failed (gh exit " + str(code) + ") — is `gh` on PATH & authed?",
+                           status: "" })
+            request_render()
+        } else if l.refreshing and len(l.stage_prs) == 0 {
             // A staged refresh whose list fetch died before producing any
             // rows — drop back to the (still-intact) live view.
-            reset!(state, { ..s, refreshing: false, status: "",
-                            error: "refresh failed (gh exit " + str(code) + ")" })
+            reset!(live, { ..l, refreshing: false, status: "",
+                           error: "refresh failed (gh exit " + str(code) + ")" })
             request_render()
         }
         return
@@ -542,11 +669,16 @@ fn on_proc_exit(handle, code) {
 
     // A staged meta proc finished. Decrement outstanding; swap once the
     // last one is done (covers procs that emitted no verdict line).
-    if s.refreshing and has(s.meta_procs, str(handle)) {
-        let out = s.stage_out - 1
-        let mut ns = { ..s, stage_out: out }
-        if out <= 0 { ns = swap_in(ns) }
-        reset!(state, ns)
+    if l.refreshing and has(l.meta_procs, str(handle)) {
+        let out = l.stage_out - 1
+        let nl = { ..l, stage_out: out }
+        if out <= 0 {
+            let r = swap_in(s, nl)
+            reset!(state, r.d)
+            reset!(live, r.l)
+        } else {
+            reset!(live, nl)
+        }
         request_render()
     }
 }
@@ -554,18 +686,37 @@ fn on_proc_exit(handle, code) {
 // ---------------------------------------------------------------- input
 fn on_click(x, y, shift, cmd, id) {
     if id == "" { return }
-    let s = @state
+    let s = durable(@state)
+
+    if starts(id, "rerun::") {
+        let url = slice(id, 7, len(id))
+        let l = @live
+        let pr = find_pr(s.prs, url)
+        if typeof(pr) != "Record" or has(l.reruns, url) or l.refreshing or l.loading { return }
+        if get_or(mget(s.meta, url), "ci", "none") != "fail" { return }
+        let h = proc_spawn(s.cfg.shell, ["-lc", build_rerun_cmd(pr, s.cfg)])
+        if h <= 0 {
+            reset!(live, { ..l, error: "Could not start rerun for " + url })
+        } else {
+            reset!(live, { ..l, error: "", reruns: assoc(l.reruns, url, { handle: h, output: "" }) })
+        }
+        request_render()
+        return
+    }
 
     if id == "refresh" {
-        if get_or(s, "refreshing", false) { return }   // already fetching; keep the view still
+        let l = @live
+        if l.refreshing { return }        // already fetching; keep the view still
         set_tick_interval(0.1)            // drive the spinner while refreshing
-        reset!(state, run_fetch(params, s, true))
+        let r = run_fetch(params, s, l, true)
+        reset!(state, r.d)
+        reset!(live, r.l)
         request_render()
         return
     }
     if id == "markall" {
         let mut sn = {}
-        for pr in s.prs { sn = assoc(sn, pr.url, { comments: pr.comments, updated: pr.updated }) }
+        for pr in s.prs { sn = assoc(sn, pr.url, comment_baseline(pr)) }
         reset!(state, { ..s, seen: sn })
         request_render()
         return
@@ -601,7 +752,7 @@ fn on_click(x, y, shift, cmd, id) {
     if url != "" {
         let pr = find_pr(s.prs, url)
         let mut sn = s.seen
-        if typeof(pr) == "Record" { sn = assoc(sn, url, { comments: pr.comments, updated: pr.updated }) }
+        if typeof(pr) == "Record" { sn = assoc(sn, url, comment_baseline(pr)) }
         if open_it { proc_spawn(s.cfg.open_cmd, [url]) }
         reset!(state, { ..s, seen: sn })
         request_render()
@@ -631,6 +782,24 @@ fn ci_dot(s, pr) {
     { kind: "text", value: dot_glyph(ci), color: dot_color(ci), size: 12.0, wrap: false }
 }
 
+// Counts include conversation and inline review comments. Approval
+// comes from GitHub's current review decision / latest reviewer states,
+// rather than guessing from changes in the diff or PR timestamp.
+fn pr_signals(s, pr) {
+    let mut signals = [ { label: str(pr.comments) + " comments", color: c_muted() } ]
+    let m = mget(s.meta, pr.url)
+    if typeof(m) == "Record" {
+        if get_or(m, "ci", "none") == "pending" and get_or(s.cfg, "show_ci", true) {
+            let label = if get_or(m, "src", "checks") == "checks" { "checks running" } else { "tests running" }
+            signals = push(signals, { label: label, color: c_warn() })
+        }
+        if get_or(m, "approved", false) {
+            signals = push(signals, { label: "✓ approved", color: c_new() })
+        }
+    }
+    signals
+}
+
 // Condensed "what changed" for this PR, or () when nothing's new. Returns
 // { label, color } so the caller can style it inline.
 fn activity(s, pr) {
@@ -639,7 +808,6 @@ fn activity(s, pr) {
     let mut newc = pr.comments - get_or(b, "comments", pr.comments)
     if newc < 0 { newc = 0 }
     if newc > 0 { return { label: str(newc) + " new", color: c_new() } }
-    if ts_num(pr.updated) > ts_num(get_or(b, "updated", "")) { return { label: "updated", color: c_warn() } }
     if has(s.sincemine, pr.url) {
         let sm = unwrap_or(get(s.sincemine, pr.url), -1)
         if sm > 0 { return { label: str(sm) + " since you", color: c_new() } }
@@ -658,9 +826,21 @@ fn title_text(pr, draft) =
     { kind: "text", value: pr.title, color: if draft { c_muted() } else { c_text() },
       size: 13.0, wrap: false }
 
+fn rerun_control(s, l, pr) {
+    if has(l.reruns, pr.url) {
+        let r = unwrap_or(get(l.reruns, pr.url), ())
+        return { kind: "text", value: if get_or(r, "handle", -1) > 0 { "Rerunning…" } else { "Rerun requested" },
+                 color: c_warn(), size: 11.0, wrap: false }
+    }
+    if get_or(s.cfg, "show_ci", true) and get_or(mget(s.meta, pr.url), "ci", "none") == "fail" {
+        return { kind: "button", id: if l.refreshing or l.loading { "" } else { "rerun::" + pr.url }, label: "Rerun failed" }
+    }
+    ()
+}
+
 // A standalone PR (not part of any stack): dot + title over a muted
 // "repo #num · activity" line.
-fn solo_row(s, pr) {
+fn solo_row(s, l, pr) {
     let mut head = []
     let d = ci_dot(s, pr)
     if typeof(d) == "Record" { head = push(head, d) }
@@ -675,11 +855,20 @@ fn solo_row(s, pr) {
     if pr.draft {
         meta_kids = push(meta_kids, { kind: "text", value: "· draft", color: c_muted(), size: 11.0 })
     }
+    for signal in pr_signals(s, pr) {
+        meta_kids = push(meta_kids, { kind: "text", value: "· " + signal.label,
+                                      color: signal.color, size: 11.0, wrap: false })
+    }
 
     head = push(head, { kind: "vstack", gap: 1.0, children: [
         title_text(pr, pr.draft),
         { kind: "hstack", gap: 5.0, align: "center", children: meta_kids },
     ]})
+    let rerun = rerun_control(s, l, pr)
+    if typeof(rerun) == "Record" {
+        head = push(head, { kind: "frame", style: { flex_grow: 1.0 } })
+        head = push(head, rerun)
+    }
 
     { kind: "list-item", id: pr.url, pad: 8.0, gap: 2.0, context: pr_context(pr.url),
       children: [ { kind: "hstack", gap: 8.0, align: "center", children: head } ] }
@@ -687,7 +876,7 @@ fn solo_row(s, pr) {
 
 // A row inside a stack group: rail glyph + dot + title (+ inline activity),
 // with the PR number pushed to the right. Repo lives in the group header.
-fn stack_row(s, pr, rail) {
+fn stack_row(s, l, pr, rail) {
     let mut kids = [ { kind: "text", value: rail, color: c_rail(), size: 13.0, wrap: false } ]
     let d = ci_dot(s, pr)
     if typeof(d) == "Record" { kids = push(kids, d) }
@@ -699,7 +888,13 @@ fn stack_row(s, pr, rail) {
     }
     kids = push(kids, { kind: "hstack", gap: 6.0, align: "center", children: title_kids })
     kids = push(kids, { kind: "frame", style: { flex_grow: 1.0 } })
+    for signal in pr_signals(s, pr) {
+        kids = push(kids, { kind: "text", value: signal.label, color: signal.color,
+                            size: 11.0, wrap: false })
+    }
     kids = push(kids, { kind: "text", value: "#" + str(pr.number), color: c_muted(), size: 11.0, wrap: false })
+    let rerun = rerun_control(s, l, pr)
+    if typeof(rerun) == "Record" { kids = push(kids, rerun) }
 
     { kind: "list-item", id: pr.url, pad: 6.0, gap: 2.0, context: pr_context(pr.url),
       children: [ { kind: "hstack", gap: 6.0, align: "center", children: kids } ] }
@@ -711,7 +906,7 @@ fn group_header(repo, n) = { kind: "hstack", gap: 6.0, align: "center", children
 ]}
 
 // Emit one stacked group (header + rows top→bottom) as a tight vstack.
-fn stack_group(s, prs, meta, maps, rooturl) {
+fn stack_group(s, l, prs, meta, maps, rooturl) {
     let chain = chain_down(meta, maps, rooturl)   // [bottom … top]
     let n = len(chain)
     let repo = { let pr = find_pr(prs, rooturl); if typeof(pr) == "Record" { pr.repo } else { "?" } }
@@ -723,7 +918,7 @@ fn stack_group(s, prs, meta, maps, rooturl) {
         let pr = find_pr(prs, url)
         if typeof(pr) == "Record" {
             let rail = if i == n - 1 { "┌" } else if i == 0 { "└" } else { "├" }
-            gkids = push(gkids, stack_row(s, pr, rail))
+            gkids = push(gkids, stack_row(s, l, pr, rail))
         }
         i = i - 1
     }
@@ -731,7 +926,8 @@ fn stack_group(s, prs, meta, maps, rooturl) {
 }
 
 fn render(w, h) {
-    let s = @state
+    let s = durable(@state)
+    let l = @live
 
     let mut kids = []
 
@@ -740,10 +936,10 @@ fn render(w, h) {
         { kind: "text", value: "Pull Requests", color: c_text(), size: 16.0, weight: "bold" },
         badge(str(len(s.prs)), c_muted()),
     ]
-    let refreshing = get_or(s, "refreshing", false)
+    let refreshing = l.refreshing
     if refreshing {
         hdr = push(hdr, { kind: "hstack", gap: 4.0, align: "center", children: [
-            { kind: "text", value: spinner_glyph(get_or(s, "spin", 0)), color: c_newpr(), size: 14.0, wrap: false },
+            { kind: "text", value: spinner_glyph(l.spin), color: c_newpr(), size: 14.0, wrap: false },
             { kind: "text", value: "refreshing…", color: c_muted(), size: 11.0, wrap: false },
         ]})
     }
@@ -752,15 +948,15 @@ fn render(w, h) {
     hdr = push(hdr, { kind: "button", id: "markall", label: "Mark all read" })
     kids = push(kids, { kind: "hstack", gap: 8.0, align: "center", children: hdr })
 
-    if s.error != "" {
-        kids = push(kids, { kind: "text", value: s.error, color: c_err(), size: 12.0 })
-    } else if s.loading {
+    if l.error != "" {
+        kids = push(kids, { kind: "text", value: l.error, color: c_err(), size: 12.0 })
+    } else if l.loading {
         kids = push(kids, { kind: "text", value: "Loading…", color: c_muted(), size: 12.0 })
     }
 
     kids = push(kids, { kind: "divider" })
 
-    if len(s.prs) == 0 and not s.loading and s.error == "" {
+    if len(s.prs) == 0 and not l.loading and l.error == "" {
         kids = push(kids, { kind: "text", value: "No open PRs.", color: c_muted(), size: 12.0 })
         return { kind: "vstack", pad: 10.0, gap: 6.0, children: kids }
     }
@@ -795,12 +991,12 @@ fn render(w, h) {
             let pr = find_pr(s.prs, rooturl)
             if typeof(pr) == "Record" {
                 let maps = unwrap_or(get(repomaps, pr.repo), { h: {}, b: {} })
-                kids = push(kids, stack_group(s, s.prs, s.meta, maps, rooturl))
+                kids = push(kids, stack_group(s, l, s.prs, s.meta, maps, rooturl))
             }
         } else {
             let url = slice(key, 6, len(key))
             let pr = find_pr(s.prs, url)
-            if typeof(pr) == "Record" { kids = push(kids, solo_row(s, pr)) }
+            if typeof(pr) == "Record" { kids = push(kids, solo_row(s, l, pr)) }
         }
     }
 

@@ -4616,6 +4616,7 @@ name = "jimctl"
 version = "0.1.0"
 dependencies = [
  "diff_core",
+ "glob",
  "jim_bus",
  "jim_daemon",
  "jim_git",

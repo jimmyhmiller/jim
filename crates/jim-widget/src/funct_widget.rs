@@ -2256,6 +2256,248 @@ pub fn ensure_running() -> std::io::Result<()> {
         );
     }
 
+    #[test]
+    fn diff_sources_ignore_whitespace_by_default() {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let root = scratch_root("diff-sources");
+        for name in ["df.ft", "git.ft"] {
+            std::fs::copy(widgets.join(name), root.join(name)).unwrap();
+        }
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.set_global("params", Value::from_json(&serde_json::json!({})));
+        vm.eval(&std::fs::read_to_string(widgets.join("diff.ft")).unwrap())
+            .expect("diff.ft must compile");
+        for (source, arg, expected) in [
+            (
+                "working",
+                "",
+                serde_json::json!(["git", "-C", "/repo", "diff", "--ignore-all-space"]),
+            ),
+            (
+                "range",
+                "main HEAD",
+                serde_json::json!([
+                    "git",
+                    "-C",
+                    "/repo",
+                    "diff",
+                    "--ignore-all-space",
+                    "main",
+                    "HEAD"
+                ]),
+            ),
+        ] {
+            let argv = vm
+                .call(
+                    "source_argv",
+                    vec![Value::from_json(&serde_json::json!({
+                        "source": source, "repo": "/repo", "arg": arg,
+                    }))],
+                )
+                .unwrap();
+            assert_eq!(argv.to_json().unwrap(), expected);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diff_code_is_selectable_and_comments_have_explicit_controls() {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let root = scratch_root("diff-selection");
+        for name in ["df.ft", "git.ft"] {
+            std::fs::copy(widgets.join(name), root.join(name)).unwrap();
+        }
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.set_global("params", Value::from_json(&serde_json::json!({})));
+        vm.register0("request_render", || {});
+        vm.register1("theme_get", |_token: String| -> Value { Value::Unit });
+        vm.eval(&std::fs::read_to_string(widgets.join("diff.ft")).unwrap())
+            .expect("diff.ft must compile");
+        let file = Value::from_json(&serde_json::json!({"new": "main.rs", "old": "main.rs"}));
+        let line = Value::from_json(&serde_json::json!({
+            "tag": "add", "o": 0, "nn": 1,
+            "runs": [{"text": "let", "kind": "keyword"}, {"text": " x = 1;", "kind": ""}],
+        }));
+        let state = vm.call("cur_state", vec![]).unwrap();
+        let frame = vm.call("uline", vec![file, line.clone(), state]).unwrap();
+        funct_frame_to_element(&frame).unwrap().expect("valid row");
+        let frame = frame.to_json().unwrap();
+        assert_eq!(
+            row_menu(&frame, "line:main.rs:1").unwrap(),
+            ["cmt:main.rs:1"]
+        );
+        assert_eq!(frame["children"][0]["children"][0]["id"], "cmt:main.rs:1");
+        assert_eq!(frame["children"][0]["children"][0]["kind"], "list-item");
+        let code = &frame["children"][0]["children"][2];
+        assert_eq!(code["kind"], "rich-text");
+        assert_eq!(code["selectable"], true);
+        assert_eq!(code["wrap"], false);
+        assert_eq!(code["runs"][0]["value"], "let");
+        assert_eq!(code["runs"][1]["value"], " x = 1;");
+        assert!(code["runs"][0]["color"].is_string());
+
+        click(&mut vm, "line:main.rs:1");
+        let state = vm.call("cur_state", vec![]).unwrap().to_json().unwrap();
+        assert_eq!(state["draft_key"], "");
+        click(&mut vm, "cmt:main.rs:1");
+        let state = vm.call("cur_state", vec![]).unwrap().to_json().unwrap();
+        assert_eq!(state["draft_key"], "main.rs:1");
+
+        let side = vm.call("side_cell", vec![line]).unwrap().to_json().unwrap();
+        assert_eq!(side["children"][0]["children"][1]["selectable"], true);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn diff_wall_can_save_and_copy_comments_and_retains_failed_drafts() {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let root = scratch_root("diff-wall-comments");
+        for name in ["df.ft", "git.ft"] {
+            std::fs::copy(widgets.join(name), root.join(name)).unwrap();
+        }
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.set_global(
+            "params",
+            Value::from_json(&serde_json::json!({"compact": true})),
+        );
+        vm.set_global("scroll_y", Value::Float(0.0));
+        vm.register0("request_render", || {});
+        vm.register1("theme_get", |_token: String| -> Value { Value::Unit });
+        vm.register1("parse_json", |text: String| -> Value {
+            Value::from_json(&serde_json::from_str::<serde_json::Value>(&text).unwrap())
+        });
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawned = calls.clone();
+        vm.register2("proc_spawn", move |cmd: String, args: Value| -> i64 {
+            spawned.lock().unwrap().push((cmd, args.to_json().unwrap()));
+            42
+        });
+        let clipboard = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let copied = clipboard.clone();
+        vm.register1("clipboard_set", move |text: String| -> bool {
+            *copied.lock().unwrap() = text;
+            true
+        });
+        vm.eval(&std::fs::read_to_string(widgets.join("diff.ft")).unwrap())
+            .unwrap();
+        vm.eval(
+            r#"reset!(state, { ..cur_state(), repo: "/repo", files: [
+            {new: "main.rs", old: "main.rs", adds: 1, dels: 0, lines: [
+                {tag: "add", o: 0, nn: 1, runs: [{text: "let x = 1;", kind: ""}]}
+            ]}
+        ] })"#,
+        )
+        .unwrap();
+        let frame = render_frame(&mut vm);
+        let mut has_copy = false;
+        walk_frame(&frame, &mut |n| {
+            has_copy |= n.get("id").and_then(|v| v.as_str()) == Some("copy_comments");
+        });
+        assert!(!has_copy, "compact tiles must not duplicate Copy comments");
+        click(&mut vm, "cmt:main.rs:1");
+        vm.call(
+            "on_input_change",
+            vec![Value::str("draft"), Value::str("Please rename x")],
+        )
+        .unwrap();
+        let frame = render_frame(&mut vm);
+        let mut has_draft = false;
+        walk_frame(&frame, &mut |n| {
+            has_draft |= n.get("id").and_then(|v| v.as_str()) == Some("draft");
+        });
+        assert!(has_draft);
+        click(&mut vm, "save_cmt");
+        assert_eq!(
+            calls.lock().unwrap()[0],
+            (
+                "jimctl".into(),
+                serde_json::json!([
+                    "review",
+                    "add",
+                    "--repo",
+                    "/repo",
+                    "--file",
+                    "main.rs",
+                    "--line",
+                    "1",
+                    "--body",
+                    "Please rename x",
+                    "--base-ref",
+                    "working",
+                    "--author",
+                    "user"
+                ])
+            )
+        );
+        vm.call(
+            "on_proc_output",
+            vec![
+                Value::Int(42),
+                Value::str(r#"{"ok":false,"error":"write failed"}"#),
+            ],
+        )
+        .unwrap();
+        vm.call("on_proc_exit", vec![Value::Int(42), Value::Int(1)])
+            .unwrap();
+        let state = vm.call("cur_state", vec![]).unwrap().to_json().unwrap();
+        assert_eq!(state["draft_text"], "Please rename x");
+        assert_eq!(state["draft_key"], "main.rs:1");
+        click(&mut vm, "save_cmt");
+        vm.call(
+            "on_proc_output",
+            vec![Value::Int(42), Value::str(r#"{"ok":true}"#)],
+        )
+        .unwrap();
+        vm.call("on_proc_exit", vec![Value::Int(42), Value::Int(0)])
+            .unwrap();
+        let state = vm.call("cur_state", vec![]).unwrap().to_json().unwrap();
+        assert_eq!(state["draft_key"], "");
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.set_global(
+            "params",
+            Value::from_json(&serde_json::json!({"repo": "/repo"})),
+        );
+        vm.register0("request_render", || {});
+        vm.register1("theme_get", |_token: String| -> Value { Value::Unit });
+        vm.register1("parse_json", |text: String| -> Value {
+            Value::from_json(&serde_json::from_str::<serde_json::Value>(&text).unwrap())
+        });
+        vm.register2("proc_spawn", |_cmd: String, _args: Value| -> i64 { 42 });
+        let copied = clipboard.clone();
+        vm.register1("clipboard_set", move |text: String| -> bool {
+            *copied.lock().unwrap() = text;
+            true
+        });
+        vm.eval(&std::fs::read_to_string(widgets.join("review_comments.ft")).unwrap())
+            .unwrap();
+        let frame = render_frame(&mut vm);
+        let mut copy_count = 0;
+        walk_frame(&frame, &mut |n| {
+            if n.get("id").and_then(|v| v.as_str()) == Some("copy_comments") {
+                copy_count += 1;
+            }
+        });
+        assert_eq!(copy_count, 1);
+        click(&mut vm, "copy_comments");
+        assert_eq!(
+            *clipboard.lock().unwrap(),
+            "",
+            "copy must wait for fresh comments"
+        );
+        vm.call("on_proc_output", vec![Value::Int(42), Value::str(r#"{"ok":true,"threads":[{"id":1,"file":"main.rs","line":1,"status":"open","author":"user","body":"Please rename x","context_line":"let x = 1;","replies":[]},{"id":2,"status":"resolved","body":"Do not copy this"}]}"#)]).unwrap();
+        vm.call("on_proc_exit", vec![Value::Int(42), Value::Int(0)])
+            .unwrap();
+        assert_eq!(
+            *clipboard.lock().unwrap(),
+            "Review comments for /repo:\n\nmain.rs:1 (thread #1)\nCode: let x = 1;\nuser: Please rename x"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Boot the shipped `file_open.ft` over a scratch directory tree, with
     /// the REAL `fs_*` host functions behind it (bar `fs_trash`, which would
     /// otherwise fill the developer's Trash on every test run).
@@ -2395,6 +2637,199 @@ pub fn ensure_running() -> std::io::Result<()> {
             ],
         )
         .expect("on_click");
+    }
+
+    fn boot_pr_dashboard() -> (Funct, std::path::PathBuf, Arc<Mutex<Vec<String>>>) {
+        let widgets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("widgets");
+        let root = scratch_root("pr-dashboard");
+        std::fs::copy(widgets.join("df.ft"), root.join("df.ft")).unwrap();
+        let mut vm = Funct::new();
+        vm.set_module_root(root.clone());
+        vm.set_global("params", Value::from_json(&serde_json::json!({})));
+        vm.register0("request_render", || {});
+        vm.register1("theme_get", |_token: String| -> Value { Value::Unit });
+        vm.register1("parse_json", |text: String| -> Value {
+            Value::from_json(&serde_json::from_str::<serde_json::Value>(&text).unwrap())
+        });
+        vm.register_raw("emit_retained", |_vm, _args| Ok(Value::Unit));
+        let spawns = Arc::new(Mutex::new(Vec::new()));
+        let captured = spawns.clone();
+        vm.register2("proc_spawn", move |_cmd: String, args: Value| -> i64 {
+            let mut calls = captured.lock().unwrap();
+            calls.push(args.to_json().unwrap().to_string());
+            calls.len() as i64
+        });
+        vm.eval(&std::fs::read_to_string(widgets.join("pr_dashboard.ft")).unwrap())
+            .unwrap();
+        vm.eval(r#"
+            let cfg = resolve_cfg({}, {})
+            let prs = [
+                {url: "https://github.com/o/r/pull/1", repo: "o/r", number: 1, title: "Failed", comments: 0, draft: false},
+                {url: "https://github.com/o/r/pull/2", repo: "o/r", number: 2, title: "Passed", comments: 0, draft: false},
+                {url: "https://github.com/o/r/pull/3", repo: "o/r", number: 3, title: "Pending", comments: 0, draft: false},
+            ]
+            let meta = assoc(assoc(assoc({},
+                "https://github.com/o/r/pull/1", {ci: "fail", head: "one", base: "main"}),
+                "https://github.com/o/r/pull/2", {ci: "pass", head: "two", base: "one"}),
+                "https://github.com/o/r/pull/3", {ci: "pending", head: "three", base: "main"})
+            reset!(state, {..init_state(), cfg: cfg, prs: prs, meta: meta})
+        "#).unwrap();
+        (vm, root, spawns)
+    }
+
+    #[test]
+    fn pr_dashboard_counts_reviews_and_migrates_unread_baselines() {
+        let (mut vm, root, _) = boot_pr_dashboard();
+        vm.eval(r#"
+            let url = "https://github.com/o/r/pull/1"
+            reset!(state, {..@state,
+                prs: [{..(@state).prs[0], comments: 1}],
+                seen: assoc({}, url, {comments: 1})})
+            reset!(live, {..init_live(), meta_procs: assoc({}, "10", url)})
+        "#).unwrap();
+        vm.call("on_proc_output", vec![Value::Int(10), Value::str(r#"{"comments":6,"ci":"pass","head":"one","base":"main"}"#)]).unwrap();
+        assert!(frame_texts(&render_frame(&mut vm)).contains(&"· 6 comments".to_owned()));
+        assert_eq!(vm.eval("activity(@state, (@state).prs[0])").unwrap(), Value::Unit);
+        vm.call("on_proc_output", vec![Value::Int(10), Value::str(r#"{"comments":7,"ci":"pass","head":"one","base":"main"}"#)]).unwrap();
+        let activity = vm.eval("activity(@state, (@state).prs[0])").unwrap().to_json().unwrap();
+        assert_eq!(activity["label"], "1 new");
+        click(&mut vm, "markall");
+        assert_eq!(vm.eval("activity(@state, (@state).prs[0])").unwrap(), Value::Unit);
+        // Staged refreshes must use the same totals and retain the baseline.
+        vm.eval(r#"
+            reset!(live, {..init_live(), refreshing: true, stage_out: 1,
+                stage_prs: [{..(@state).prs[0], comments: 1}],
+                meta_procs: assoc({}, "11", "https://github.com/o/r/pull/1")})
+        "#).unwrap();
+        vm.call("on_proc_output", vec![Value::Int(11), Value::str(r#"{"comments":8,"ci":"pass","head":"one","base":"main"}"#)]).unwrap();
+        assert!(frame_texts(&render_frame(&mut vm)).contains(&"· 8 comments".to_owned()));
+        let activity = vm.eval("activity(@state, (@state).prs[0])").unwrap().to_json().unwrap();
+        assert_eq!(activity["label"], "1 new");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pr_dashboard_fetches_review_totals_and_paginated_comment_activity() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut vm, root, _) = boot_pr_dashboard();
+        let gh = root.join("gh");
+        std::fs::write(&gh, r#"#!/bin/sh
+if [ "$1" = pr ]; then
+    echo '{"baseRefName":"main","headRefName":"fix","comments":[],"statusCheckRollup":[]}'
+elif [ "$2" = --paginate ]; then
+    case "$3" in
+        */issues/*) echo '[{"u":"me","at":"2026-10-15T20:00:00Z"}]' ;;
+        */pulls/*)
+            echo '[{"u":"reviewer","at":"2026-10-15T21:00:00Z"}]'
+            echo '[{"u":"reviewer","at":"2026-10-15T22:00:00Z"}]' ;;
+    esac
+else
+    echo '{"comments":1,"review_comments":5}' | jq -c "$4"
+fi
+"#).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        vm.set_global("fake_gh", Value::str(gh.to_string_lossy()));
+        let run = |command: Value| {
+            let command = command.to_json().unwrap().as_str().unwrap().to_owned();
+            let output = std::process::Command::new("/bin/zsh").args(["-lc", &command]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        };
+        let meta = run(vm.eval(r#"build_meta_cmd("o/r", 1, fake_gh, "jq", "__NEXT_TEST_REPORT_COMMENT__")"#).unwrap());
+        assert_eq!(meta["comments"], 6);
+        assert_eq!(meta["base"], "main");
+        let comments = run(vm.eval(r#"build_comments_cmd("o/r", 1, fake_gh, "jq")"#).unwrap());
+        assert_eq!(comments.as_array().unwrap().len(), 3);
+        assert_eq!(vm.eval(r#"ts_num("2026-10-15T20:00:00Z")"#).unwrap(), Value::Int(20261015200000));
+        let since = vm.call("since_my_comment", vec![Value::from_json(&comments), Value::str("me")]).unwrap();
+        assert_eq!(since, Value::Int(2));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pr_dashboard_rerun_is_scoped_and_guards_duplicate_clicks() {
+        let (mut vm, root, spawns) = boot_pr_dashboard();
+        let id = "rerun::https://github.com/o/r/pull/1";
+        for stacked in [true, false] {
+            vm.eval(&format!("reset!(state, {{..@state, cfg: {{..(@state).cfg, show_stack: {stacked}}}}})")).unwrap();
+            let frame = render_frame(&mut vm);
+            let mut buttons = Vec::new();
+            walk_frame(&frame, &mut |node| {
+                if node.get("label").and_then(|v| v.as_str()) == Some("Rerun failed") {
+                    buttons.push(node["id"].as_str().unwrap().to_owned());
+                }
+            });
+            assert_eq!(buttons, [id]);
+        }
+        click(&mut vm, "rerun::https://github.com/o/r/pull/2");
+        click(&mut vm, "rerun::https://github.com/o/r/pull/3");
+        assert!(spawns.lock().unwrap().is_empty());
+        click(&mut vm, id);
+        click(&mut vm, id);
+        assert_eq!(spawns.lock().unwrap().len(), 1);
+        let command = spawns.lock().unwrap()[0].clone();
+        assert!(command.contains("pr checks 1 --repo 'o/r'"));
+        assert!(command.contains("--failed --repo"));
+        assert!(frame_texts(&render_frame(&mut vm)).contains(&"Rerunning…".to_owned()));
+        vm.call("on_proc_output", vec![Value::Int(1), Value::str("permission denied")]).unwrap();
+        vm.call("on_proc_exit", vec![Value::Int(1), Value::Int(1)]).unwrap();
+        assert!(frame_texts(&render_frame(&mut vm)).iter().any(|text| text.contains("permission denied")));
+        click(&mut vm, id);
+        vm.call("on_proc_exit", vec![Value::Int(2), Value::Int(0)]).unwrap();
+        assert!(frame_texts(&render_frame(&mut vm)).contains(&"Rerun requested".to_owned()));
+        click(&mut vm, id);
+        assert_eq!(spawns.lock().unwrap().len(), 2);
+        vm.eval("reset!(live, init_live())").unwrap();
+        click(&mut vm, id);
+        assert_eq!(spawns.lock().unwrap().len(), 3, "transient state must not wedge reruns after restart");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pr_dashboard_rerun_command_deduplicates_runs_and_ignores_external_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut vm, root, _) = boot_pr_dashboard();
+        let gh = root.join("gh");
+        let calls = root.join("calls");
+        std::fs::write(&gh, format!(r#"#!/bin/sh
+if [ "$1" = pr ]; then
+    cat '{}'
+    exit 1
+fi
+echo "$*" >> '{}'
+if [ -f '{}' ]; then echo 'permission denied'; exit 1; fi
+"#, root.join("checks.json").display(), calls.display(), root.join("fail").display())).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        vm.set_global("fake_gh", Value::str(gh.to_string_lossy()));
+        let command = vm.eval("build_rerun_cmd((@state).prs[0], {..(@state).cfg, gh: fake_gh})").unwrap();
+        let command = command.to_json().unwrap().as_str().unwrap().to_owned();
+        let check = |bucket: &str, link: &str| serde_json::json!({"bucket": bucket, "link": link});
+        std::fs::write(root.join("checks.json"), serde_json::to_string(&vec![
+            check("fail", "https://github.com/o/r/actions/runs/123/job/1"),
+            check("fail", "https://github.com/o/r/actions/runs/123/job/2"),
+            check("fail", "https://github.com/fork/r/actions/runs/456"),
+            check("pass", "https://github.com/o/r/actions/runs/789"),
+            check("fail", "https://external.example/check"),
+        ]).unwrap()).unwrap();
+        let output = std::process::Command::new("/bin/zsh").args(["-lc", &command]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+        let mut lines: Vec<_> = std::fs::read_to_string(&calls).unwrap().lines().map(str::to_owned).collect();
+        lines.sort();
+        assert_eq!(lines, ["run rerun 123 --failed --repo o/r", "run rerun 456 --failed --repo fork/r"]);
+        std::fs::write(root.join("fail"), "").unwrap();
+        let output = std::process::Command::new("/bin/zsh").args(["-lc", &command]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("permission denied"));
+        std::fs::write(root.join("checks.json"), "not JSON").unwrap();
+        let output = std::process::Command::new("/bin/zsh").args(["-lc", &command]).output().unwrap();
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 4);
+        std::fs::write(root.join("checks.json"), "[]").unwrap();
+        let output = std::process::Command::new("/bin/zsh").args(["-lc", &command]).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("No failed GitHub Actions jobs"));
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 4);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

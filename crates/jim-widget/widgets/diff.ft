@@ -21,10 +21,10 @@
 // the pane scrolls, so a big diff is just a tall stack.
 import "host"
 import { col_text, col_muted, col_accent, col_panel } from "df"
-import { parse_diff, kind_color, tint, sign_color, gutter, sign_el, code_cell,
+import { parse_diff, kind_color, tint, sign_color, gutter, sign_el,
          line_style, hunk_row, line_h, hunk_h, comment_h, draft_h,
          lpad, parse_int, file_base, jimctl, jimctl_parse, rget,
-         review_topic, ago } from "git"
+          review_topic, review_comments_text, ago } from "git"
 
 let state = atom(init_state())
 
@@ -32,7 +32,7 @@ fn init_state() = {
     raw: "", files: [], source: "working", repo: "", arg: "",
     view: "unified", status: "", proc: -1, cat: [], file_idx: 0,
     comments: [], draft_key: "", draft_text: "", last_render_sy: 0.0,
-    focus_line: 0, rv_proc: -1, rv_cat: [], mut_proc: -1, mut_cat: [],
+    focus_line: 0, rv_proc: -1, rv_cat: [], mut_proc: -1, mut_cat: [], mut_draft_key: "",
 }
 
 fn cur_state() {
@@ -94,12 +94,12 @@ fn source_argv(s) {
         let parts = split(trim(s.arg), " ")
         let base = if len(parts) > 0 and parts[0] != "" { parts[0] } else { "HEAD~1" }
         let head = if len(parts) > 1 { parts[1] } else { "HEAD" }
-        ["git", "-C", repo, "diff", base, head]
+        ["git", "-C", repo, "diff", "--ignore-all-space", base, head]
     } else if src == "pr" {
         // gh has no -C; run it in the repo via a shell.
         ["sh", "-c", "cd " + repo + " && gh pr diff " + trim(s.arg)]
     } else {
-        ["git", "-C", repo, "diff"]
+        ["git", "-C", repo, "diff", "--ignore-all-space"]
     }
 }
 
@@ -205,11 +205,14 @@ fn on_proc_exit(handle, code) {
     if handle == s.mut_proc {
         let r = jimctl_parse(join(s.mut_cat, "\n"))
         if not rget(r, "ok", false) {
-            reset!(state, { ..s, mut_proc: -1, mut_cat: [],
+            reset!(state, { ..s, mut_proc: -1, mut_cat: [], mut_draft_key: "",
                             status: "review write: " + rget(r, "error", "failed") })
             request_render()
         } else {
-            reset!(state, { ..s, mut_proc: -1, mut_cat: [] })
+            let saved_draft = s.mut_draft_key != "" and s.draft_key == s.mut_draft_key
+            reset!(state, { ..s, mut_proc: -1, mut_cat: [], mut_draft_key: "",
+                            draft_key: if saved_draft { "" } else { s.draft_key },
+                            draft_text: if saved_draft { "" } else { s.draft_text } })
             // review.changed will trigger the reload; also reload now in
             // case the bus event raced past us.
             load_comments()
@@ -279,6 +282,7 @@ fn key_parts(key) {
 
 fn save_draft() {
     let s = cur_state()
+    if s.mut_proc != -1 { return }
     if s.draft_key == "" or trim(s.draft_text) == "" {
         reset!(state, { ..s, draft_key: "", draft_text: "" }); request_render(); return
     }
@@ -291,7 +295,20 @@ fn save_draft() {
                     "--file", kp.path, "--line", str(kp.line),
                     "--body", trim(s.draft_text),
                     "--base-ref", base_ref_of(s), "--author", "user"])
-    reset!(state, { ..s, mut_proc: h, mut_cat: [], draft_key: "", draft_text: "" })
+    if h == -1 { set_status("review write: spawn failed"); return }
+    reset!(state, { ..s, mut_proc: h, mut_cat: [], mut_draft_key: s.draft_key })
+    request_render()
+}
+
+fn copy_comments(s) {
+    let text = review_comments_text(s.comments, repo_arg(s))
+    if text == "" {
+        reset!(state, { ..s, status: "No open review comments to copy" })
+    } else {
+        let copied = clipboard_set(text)
+        reset!(state, { ..s, status: if copied { "Copied review comments" }
+                                  else { "Could not copy review comments" } })
+    }
     request_render()
 }
 
@@ -299,6 +316,7 @@ fn on_click(x, y, shift, cmd, id) {
     let s = cur_state()
     if id == "load" { run_source(); return }
     if id == "refresh" { run_source(); return }
+    if id == "copy_comments" { copy_comments(s); return }
     if id == "view" {
         reset!(state, { ..s, view: if s.view == "unified" { "split" } else { "unified" } })
         request_render(); return
@@ -320,6 +338,7 @@ fn on_click(x, y, shift, cmd, id) {
     if id == "save_cmt" { save_draft(); return }
     if id == "cancel_cmt" { reset!(state, { ..s, draft_key: "", draft_text: "" }); request_render(); return }
     if starts_with(id, "rv_res:") {
+        if s.mut_proc != -1 { return }
         let tid = slice(id, 7, len(id))
         // Toggle: look the thread up to decide resolve vs reopen.
         let mut resolved = false
@@ -383,10 +402,16 @@ fn draft_view(s) {
         { kind: "textarea", id: "draft", value: s.draft_text, rows: 3, width: 520.0,
           placeholder: "Comment… (⌘/Ctrl+Enter to save)" },
         { kind: "hstack", gap: 6.0, children: [
-          { kind: "button", id: "save_cmt", label: "Save" },
+          { kind: "button", id: "save_cmt", label: if s.mut_proc == -1 { "Save" } else { "Saving…" } },
           { kind: "button", id: "cancel_cmt", label: "Cancel" },
         ] },
       ] }
+}
+
+fn selectable_code_cell(runs) {
+    let colored = map(runs, (r) => { value: r.text, color: kind_color(r.kind) })
+    { kind: "rich-text", runs: if len(colored) == 0 { [{ value: " " }] } else { colored },
+      family: "mono", size: 12.5, selectable: true, wrap: false }
 }
 
 fn uline(file, l, s) {
@@ -395,10 +420,13 @@ fn uline(file, l, s) {
     } else {
         let key = line_key(file, l)
         let row = { kind: "hstack", gap: 8.0, align: "start",
-                    children: [ gutter(l), sign_el(l), code_cell(l.runs) ] }
+                    children: [ { kind: "list-item", id: "cmt:" + key, pad: 0.0,
+                                  children: [gutter(l)] },
+                                sign_el(l), selectable_code_cell(l.runs) ] }
         let focused = s.focus_line > 0 and (l.nn == s.focus_line or (l.nn == 0 and l.o == s.focus_line))
         let sty = if focused { merge(line_style(l.tag), { background: "#2b3a52" }) } else { line_style(l.tag) }
-        let li = { kind: "list-item", id: "cmt:" + key, selected: false, pad: 0.0,
+        let li = { kind: "list-item", id: "line:" + key, selected: false, pad: 0.0,
+                   context: [{ label: "Add comment", id: "cmt:" + key }],
                    style: sty, children: [row] }
         let ts = threads_for(s.comments, file, l)
         let mut kids = [li]
@@ -448,7 +476,7 @@ fn side_cell(l) {
             background: tint(l.tag),
             padding: { top: 1.0, bottom: 1.0, left: 6.0, right: 6.0 } },
           children: [ { kind: "hstack", gap: 8.0, align: "start",
-                        children: [ sign_el(l), code_cell(l.runs) ] } ] }
+                        children: [ sign_el(l), selectable_code_cell(l.runs) ] } ] }
     }
 }
 fn sline(row) {
@@ -548,6 +576,7 @@ fn toolbar(s) {
         { kind: "button", id: "src_file", label: "File" },
         { kind: "button", id: "view", label: if s.view == "unified" { "Split" } else { "Unified" } },
         { kind: "button", id: "refresh", label: "↻" },
+        { kind: "button", id: "copy_comments", label: "Copy comments" },
         { kind: "text", value: s.status, size: 11.0, color: col_muted(), selectable: false },
     ] }
     let arg_ph = if s.source == "range" { "base head  (e.g. main HEAD)" }
@@ -609,11 +638,32 @@ fn files_sidebar(s, idx) {
       children: rows }
 }
 
+// params.compact: a review tile for `jimctl git diff-wall` — no source
+// controls or file sidebar, every loaded file stacked.
+fn render_compact(s, h) {
+    if len(s.files) == 0 {
+        return { kind: "vstack", pad: 8.0, children: [
+            { kind: "text", value: if s.status == "" { "loading…" } else { s.status },
+              color: col_muted(), selectable: false } ] }
+    }
+    // file_block windows rows as if it started at y=0, which only holds
+    // for the first file; with several, render them all (vh=0 disables).
+    let vh = if len(s.files) == 1 { h } else { 0.0 }
+    let mut kids = []
+    if starts_with(s.status, "review write:") or starts_with(s.status, "reviews:") {
+        kids = push(kids, { kind: "text", value: s.status, size: 11.0,
+                            color: col_muted(), selectable: false })
+    }
+    for f in s.files { kids = push(kids, file_block(f, s, scroll_y, vh)) }
+    { kind: "vstack", gap: 0.0, pad: 8.0, children: kids }
+}
+
 fn render(w, h) {
     let s = cur_state()
     // Remember the scroll offset we windowed at, so on_scroll knows when the
     // view has drifted far enough to warrant another (coalesced) re-window.
     reset!(state, { ..s, last_render_sy: scroll_y })
+    if param("compact", false) { return render_compact(s, h) }
     let mut kids = [ toolbar(s), { kind: "divider" } ]
     if len(s.files) == 0 {
         kids = push(kids, { kind: "text", value: "No diff loaded. Pick a source and Load.",

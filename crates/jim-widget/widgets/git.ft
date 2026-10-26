@@ -91,6 +91,24 @@ export fn jimctl_parse(text) {
     if typeof(v) == "Record" { v } else { { ok: false, error: "bad reply: " + trunc(t, 120) } }
 }
 
+export fn review_comments_text(comments, repo) {
+    let mut blocks = []
+    for t in comments {
+        if rget(t, "status", "open") == "open" {
+            let mut block = rget(t, "file", "") + ":" + str(rget(t, "line", 0)) +
+                            " (thread #" + str(rget(t, "id", 0)) + ")"
+            let context = rget(t, "context_line", "")
+            if context != "" { block = block + "\nCode: " + context }
+            block = block + "\n" + rget(t, "author", "user") + ": " + rget(t, "body", "")
+            for reply in rget(t, "replies", []) {
+                block = block + "\n" + rget(reply, "author", "") + ": " + rget(reply, "body", "")
+            }
+            blocks = push(blocks, block)
+        }
+    }
+    if len(blocks) == 0 { "" } else { "Review comments for " + repo + ":\n\n" + join(blocks, "\n\n") }
+}
+
 // ---- spawning sibling widgets (the lsp_explorer pattern) ----
 export fn spawn_widget(script, project, title, p) {
     let mut argv = ["widget", "--kind", "script_widget", "--title", title]

@@ -1,10 +1,11 @@
 //! `jimctl project` — manage projects in the running terminal-bevy app
 //! over its Unix socket.
 //!
-//! Today there's one subcommand: `set-cwd`, which writes a project's
-//! `default_cwd` (the directory new terminals are spawned in for that
-//! project, also the cwd a Claude widget falls back to). Without an
-//! explicit path, the current shell cwd is used.
+//! `set-cwd` writes a project's `default_cwd` (the directory new
+//! terminals are spawned in for that project, also the cwd a Claude
+//! widget falls back to). Without an explicit path, the current shell
+//! cwd is used. `new` creates a project and prints `{"id","name"}`;
+//! `fit` pans/zooms a project's canvas to show its panes.
 //!
 //! Usage:
 //!     jimctl project set-cwd                     # active project ← $PWD
@@ -12,6 +13,8 @@
 //!     jimctl project set-cwd /some/path
 //!     jimctl project set-cwd --project Recursion /some/path
 //!     jimctl project set-cwd --project Recursion --clear
+//!     jimctl project new [--name N] [--cwd P] [--activate]
+//!     jimctl project fit [--project P] [--bounds x,y,w,h]
 //!
 //! Stays lib-free for the same reason as `open` / `inbox` — we don't
 //! want to drag libghostty-vt into a tiny CLI.
@@ -42,11 +45,92 @@ fn socket_path() -> Option<PathBuf> {
 fn print_usage() {
     eprintln!(
         "usage: jimctl project set-cwd [--project NAME] [PATH | --clear]\n\
+         \x20      jimctl project new [--name NAME] [--cwd PATH] [--activate]\n\
+         \x20      jimctl project fit [--project NAME] [--bounds x,y,w,h]\n\
          \n\
-         Sets a project's default_cwd. PATH defaults to the current\n\
-         shell directory. --project defaults to the active project.\n\
-         --clear removes the override so new terminals fall back to $HOME."
+         set-cwd  Sets a project's default_cwd. PATH defaults to the current\n\
+         \x20        shell directory. --project defaults to the active project.\n\
+         \x20        --clear removes the override so new terminals fall back to $HOME.\n\
+         new      Creates a project and prints {{\"id\":N,\"name\":\"…\"}}. A taken\n\
+         \x20        name gets a \" (2)\"-style suffix; use the printed name.\n\
+         fit      Pans/zooms the project's root canvas to show all its panes,\n\
+         \x20        or the canvas-space rect given by --bounds."
     );
+}
+
+fn new_project(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut name: Option<String> = None;
+    let mut cwd: Option<PathBuf> = None;
+    let mut activate = false;
+    let mut it = args;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--name" => name = it.next(),
+            "--cwd" => {
+                cwd = it
+                    .next()
+                    .map(|p| std::fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
+            }
+            "--activate" => activate = true,
+            other => {
+                eprintln!("jimctl project new: unknown arg {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let req = serde_json::json!({
+        "action": "create_project",
+        "name": name,
+        "cwd": cwd,
+        "activate": activate,
+    });
+    match crate::app_ipc::request(&req, true) {
+        Ok(Some(reply)) => {
+            println!("{reply}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("jimctl project new: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn fit(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut project: Option<String> = None;
+    let mut bounds: Option<[f32; 4]> = None;
+    let mut it = args;
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--project" => project = it.next(),
+            "--bounds" => {
+                let parsed: Vec<f32> = it
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                let [x, y, w, h] = parsed[..] else {
+                    eprintln!("jimctl project fit: --bounds wants x,y,w,h");
+                    return ExitCode::from(2);
+                };
+                bounds = Some([x, y, w, h]);
+            }
+            other => {
+                eprintln!("jimctl project fit: unknown arg {other:?}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let req = serde_json::json!({ "action": "fit_canvas", "project": project, "bounds": bounds });
+    match crate::app_ipc::request(&req, false) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("jimctl project fit: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 pub fn run() -> ExitCode {
@@ -57,6 +141,8 @@ pub fn run() -> ExitCode {
     };
     match sub.as_str() {
         "set-cwd" => set_cwd(args),
+        "new" => new_project(args),
+        "fit" => fit(args),
         "-h" | "--help" => {
             print_usage();
             ExitCode::SUCCESS

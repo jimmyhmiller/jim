@@ -29,8 +29,8 @@ use bevy::prelude::*;
 use bevy::sprite::Anchor;
 
 use jim_pane::{
-    FocusedPane, MARGIN, PaneContentPressed, PaneFont, PaneKindMarker, PaneRect, PaneRegistry,
-    PaneTag, SpawnedPane, TITLE_H, spawn_pane,
+    FocusedPane, MARGIN, PaneChromeOverride, PaneContentPressed, PaneFont, PaneKindMarker,
+    PaneRect, PaneRegistry, PaneTag, SpawnedPane, TITLE_H, override_title_h, spawn_pane,
 };
 use libghostty_vt::style::RgbColor;
 use serde_json::Value;
@@ -41,6 +41,7 @@ pub mod command_watch;
 pub mod daemon_client;
 pub mod osc52;
 pub mod osc7;
+pub mod osc_notify;
 pub mod pty;
 pub mod selection;
 pub mod term_material;
@@ -1894,7 +1895,14 @@ fn handle_terminal_mouse_report(
     viewport: Res<jim_pane::PaneViewport>,
     store: Res<TerminalStore>,
     force_local: Res<jim_pane::ForceLocalSelect>,
-    panes: Query<(Entity, &PaneRect, &PaneKindMarker, &Visibility)>,
+    panes: Query<(
+        Entity,
+        &PaneRect,
+        &PaneKindMarker,
+        &Visibility,
+        Option<&PaneChromeOverride>,
+        Has<jim_pane::dock::DockMember>,
+    )>,
     mut state: Local<MouseReportState>,
 ) {
     let Ok(window) = windows.single() else { return };
@@ -1938,14 +1946,19 @@ fn handle_terminal_mouse_report(
 
     // Hit-test against ALL panes (respecting z-order) so a widget sitting
     // on top of a terminal correctly swallows the click; only proceed when
-    // the topmost pane under the cursor is itself a terminal.
-    let mut all_panes: Vec<(Entity, PaneRect)> = Vec::new();
+    // the topmost pane under the cursor is itself a terminal AND the
+    // cursor is over its content area. Presses on a pane's chrome (title
+    // bar, close button, resize edge) must never reach the child — that's
+    // how the user drags/resizes the pane itself, and forwarding a
+    // title-bar press to a mouse-tracking child (opencode, vim) makes it
+    // start a bogus click-drag selection.
+    let mut all_panes: Vec<(Entity, PaneRect, (f32, bool))> = Vec::new();
     let mut term_entities: Vec<Entity> = Vec::new();
-    for (e, r, _k, vis) in &panes {
+    for (e, r, _k, vis, ov, member) in &panes {
         if matches!(vis, Visibility::Hidden) {
             continue;
         }
-        all_panes.push((e, *r));
+        all_panes.push((e, *r, (override_title_h(ov), !member)));
         // Any VT-backed pane (terminal, emacs) can be a mouse-report
         // target; the per-pane `mouse_tracking` snapshot flag still
         // gates whether a report is actually sent.
@@ -1953,14 +1966,31 @@ fn handle_terminal_mouse_report(
             term_entities.push(e);
         }
     }
-    let hovered =
-        jim_pane::topmost_pane_at(canvas_pt, &all_panes).filter(|e| term_entities.contains(e));
+    let hovered = jim_pane::topmost_pane_at(
+        canvas_pt,
+        &all_panes
+            .iter()
+            .map(|(e, r, _)| (*e, *r))
+            .collect::<Vec<_>>(),
+    )
+    .filter(|e| term_entities.contains(e))
+    .filter(|e| {
+        let (rect, (title_h, resizable)) = all_panes
+            .iter()
+            .find(|(pane, _, _)| pane == e)
+            .map(|(_, r, g)| (*r, *g))
+            .unwrap();
+        matches!(
+            jim_pane::region_at_ex(canvas_pt, &rect, title_h, resizable),
+            Some(jim_pane::PaneRegion::Content)
+        )
+    });
 
     let report = |pane: Entity, action: MouseAction, button: Option<MouseBtn>| {
-        let Some((_, rect)) = all_panes.iter().find(|(e, _)| *e == pane) else {
+        let Some((_, rect, (title_h, _))) = all_panes.iter().find(|(e, _, _)| *e == pane) else {
             return;
         };
-        let local = jim_pane::pt_to_content_local(canvas_pt, rect) * scale;
+        let local = jim_pane::pt_to_content_local_th(canvas_pt, rect, *title_h) * scale;
         if let Some(data) = store.map.get(&pane) {
             data.worker.send(WorkerMsg::Mouse {
                 action,

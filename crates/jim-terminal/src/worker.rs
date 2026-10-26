@@ -325,7 +325,7 @@ pub enum WorkerMsg {
 /// Handle the main thread keeps for each terminal.
 pub struct WorkerHandle {
     pub snapshot: Arc<Mutex<GridSnapshot>>,
-    /// Monotonic count of BEL characters processed by the VT parser.
+    /// Monotonic count of bells and terminal notifications.
     /// The renderer compares it against its own per-terminal `last_seen`
     /// to fire a one-shot visual flash. Atomic so the worker thread
     /// can bump it from inside libghostty's bell callback without the
@@ -338,6 +338,8 @@ pub struct WorkerHandle {
     /// Saves the full per-frame schedule cost for inactive-project
     /// terminals running TUIs like `top` or Claude.
     pub visible: Arc<AtomicBool>,
+    /// App/project visibility for DEC mode 1004 focus reports.
+    pub focused: Arc<AtomicBool>,
     tx: Sender<WorkerMsg>,
     /// Write end of the worker's wake pipe. Every channel send pokes
     /// one byte here so the worker's blocking `poll(2)` returns even
@@ -448,6 +450,8 @@ impl WorkerHandle {
         let bell_count_w = bell_count.clone();
         let visible = Arc::new(AtomicBool::new(true));
         let visible_w = visible.clone();
+        let focused = Arc::new(AtomicBool::new(true));
+        let focused_w = focused.clone();
 
         let (tx, rx) = channel::<WorkerMsg>();
 
@@ -476,6 +480,7 @@ impl WorkerHandle {
                     snapshot_w,
                     bell_count_w,
                     visible_w,
+                    focused_w,
                     rx,
                     wakeup,
                     wake_r,
@@ -487,11 +492,28 @@ impl WorkerHandle {
             snapshot,
             bell_count,
             visible,
+            focused,
             tx,
             wake_w,
             join: Some(join),
         })
     }
+}
+
+fn focus_report(
+    enabled: bool,
+    focused: bool,
+    reported: &mut Option<bool>,
+) -> Option<&'static [u8]> {
+    if !enabled {
+        *reported = None;
+        return None;
+    }
+    if *reported == Some(focused) {
+        return None;
+    }
+    *reported = Some(focused);
+    Some(if focused { b"\x1b[I" } else { b"\x1b[O" })
 }
 
 fn set_nonblock(fd: &OwnedFd) -> std::io::Result<()> {
@@ -567,6 +589,7 @@ fn worker_loop(
     snapshot: Arc<Mutex<GridSnapshot>>,
     bell_count: Arc<AtomicU64>,
     visible: Arc<AtomicBool>,
+    focused: Arc<AtomicBool>,
     rx: Receiver<WorkerMsg>,
     wakeup: Option<EventLoopProxy<WinitUserEvent>>,
     wake_r: OwnedFd,
@@ -654,6 +677,8 @@ fn worker_loop(
     // stream, same replay suppression: re-running a prior session's
     // copies on restart would silently clobber the user's clipboard.
     let mut osc52 = crate::osc52::Osc52Watcher::default();
+    let mut osc_notify = crate::osc_notify::OscNotifyWatcher::default();
+    let mut reported_focus = None;
     let session_id = client.session_id();
 
     let mut render_state = RenderState::new().expect("RenderState");
@@ -839,6 +864,19 @@ fn worker_loop(
                                         eprintln!("[osc52] copied {n} bytes to clipboard");
                                     } else {
                                         eprintln!("[osc52] clipboard write failed ({n} bytes)");
+                                    }
+                                });
+                                osc_notify.feed(&bytes, |event| match event {
+                                    crate::osc_notify::Event::Capabilities => {
+                                        pty_response
+                                            .borrow_mut()
+                                            .extend_from_slice(b"\x1b]1337;Capabilities=No\x1b\\");
+                                    }
+                                    crate::osc_notify::Event::Notification => {
+                                        bell_count.fetch_add(1, Ordering::Relaxed);
+                                        if let Some(p) = &wakeup {
+                                            let _ = p.send_event(WinitUserEvent::WakeUp);
+                                        }
                                     }
                                 });
                             }
@@ -1080,6 +1118,13 @@ fn worker_loop(
         }
 
         // 3b. Push queued outbound frames to the socket.
+        if let Some(bytes) = focus_report(
+            !in_replay && terminal.mode(Mode::FOCUS_EVENT).unwrap_or(false),
+            focused.load(Ordering::Relaxed),
+            &mut reported_focus,
+        ) {
+            client.send(&ClientMessage::Input(bytes.to_vec()));
+        }
         client.try_flush();
 
         // 4. Publish snapshot if anything changed, except during the
@@ -1862,6 +1907,56 @@ mod tests {
     }
 
     #[test]
+    fn notification_terminators_do_not_double_count_as_bells() {
+        let (mut terminal, _) = vt::build_terminal(
+            80,
+            24,
+            0,
+            CellPx {
+                width: 8,
+                height: 18,
+            },
+        );
+        let count = Arc::new(AtomicU64::new(0));
+        let bells = count.clone();
+        terminal
+            .on_bell(move |_| {
+                bells.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        let bytes = b"\x1b]9;done\x07\x1b]777;notify;OpenCode;done\x1b\\\x1b[?1004h";
+        terminal.vt_write(bytes);
+        let mut watcher = crate::osc_notify::OscNotifyWatcher::default();
+        watcher.feed(bytes, |event| {
+            if matches!(event, crate::osc_notify::Event::Notification) {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+        assert!(terminal.mode(Mode::FOCUS_EVENT).unwrap());
+    }
+
+    #[test]
+    fn focus_reports_initial_state_changes_and_mode_reenable() {
+        let mut reported = None;
+        assert_eq!(focus_report(false, false, &mut reported), None);
+        assert_eq!(
+            focus_report(true, false, &mut reported),
+            Some(b"\x1b[O".as_slice())
+        );
+        assert_eq!(focus_report(true, false, &mut reported), None);
+        assert_eq!(
+            focus_report(true, true, &mut reported),
+            Some(b"\x1b[I".as_slice())
+        );
+        assert_eq!(focus_report(false, true, &mut reported), None);
+        assert_eq!(
+            focus_report(true, true, &mut reported),
+            Some(b"\x1b[I".as_slice())
+        );
+    }
+
+    #[test]
     fn dropping_handle_stops_worker_and_closes_wake_pipe() {
         let (tx, rx) = channel();
         let (wake_r, wake_w) = nix::unistd::pipe().expect("wake pipe");
@@ -1892,6 +1987,7 @@ mod tests {
             snapshot,
             bell_count: Arc::new(AtomicU64::new(0)),
             visible: Arc::new(AtomicBool::new(true)),
+            focused: Arc::new(AtomicBool::new(true)),
             tx,
             wake_w,
             join: Some(join),

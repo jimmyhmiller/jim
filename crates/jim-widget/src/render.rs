@@ -4022,6 +4022,18 @@ fn render_input_at(
         let start = caret_pos.saturating_sub(max_chars);
         let end = (start + max_chars).min(chars.len());
         let visible: String = chars[start..end].iter().collect();
+        if focus_match.is_some_and(|f| f.select_all) && end > start {
+            commands.spawn((
+                ChildOf(ctx.content_root),
+                Sprite {
+                    color: accent.with_alpha(0.3),
+                    custom_size: Some(Vec2::new((end - start) as f32 * char_w, line_h)),
+                    ..default()
+                },
+                Anchor::TOP_LEFT,
+                Transform::from_xyz(origin.x + INPUT_PAD_X, -(origin.y + text_y), z + 0.005),
+            ));
+        }
         if !visible.is_empty() {
             commands.spawn((
                 ChildOf(ctx.content_root),
@@ -4185,6 +4197,25 @@ fn render_textarea_at(
             let seg: String = chars[s..e].iter().collect();
             if seg.is_empty() {
                 continue;
+            }
+            if focus_match.is_some_and(|f| f.select_all) {
+                commands.spawn((
+                    ChildOf(ctx.content_root),
+                    Sprite {
+                        color: accent.with_alpha(0.3),
+                        custom_size: Some(Vec2::new(
+                            ctx.metrics.measure(&seg, DEFAULT_FONT_SIZE),
+                            line_h,
+                        )),
+                        ..default()
+                    },
+                    Anchor::TOP_LEFT,
+                    Transform::from_xyz(
+                        origin.x + INPUT_PAD_X,
+                        -(origin.y + TEXTAREA_PAD_Y + li as f32 * line_h),
+                        z + 0.005,
+                    ),
+                ));
             }
             commands.spawn((
                 ChildOf(ctx.content_root),

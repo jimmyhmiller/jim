@@ -186,6 +186,29 @@ pub enum IpcRequest {
         #[serde(default)]
         cwd: Option<PathBuf>,
     },
+    /// `jimctl project new [--name N] [--cwd P] [--activate]` — create a
+    /// project. A taken name gets a ` (2)`, ` (3)`, … suffix so a script
+    /// can always address the project it just made. Writes back
+    /// `{"id":N,"name":"…"}`.
+    CreateProject {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
+        #[serde(default)]
+        activate: bool,
+    },
+    /// `jimctl project fit [--project P] [--bounds x,y,w,h]` — pan/zoom a
+    /// project's root canvas so `bounds` (canvas space) fills the view.
+    /// Without `bounds`, fits every pane on the root canvas. Callers that
+    /// just spawned panes should pass `bounds`: spawns arrive on separate
+    /// connections and may not have landed yet.
+    FitCanvas {
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        bounds: Option<[f32; 4]>,
+    },
     /// `tbsuggest [--kind K] [--title T] [--command CMD] [--cwd D]
     /// [--reason R] [--config JSON] [--project P]` — park a *suggested*
     /// pane in the drawer (the Quake-style dropdown) rather than

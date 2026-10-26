@@ -1,0 +1,64 @@
+import "host"
+import { col_text, col_muted } from "df"
+import { jimctl, jimctl_parse, rget, review_topic, review_comments_text } from "git"
+
+let state = atom({ comments: [], proc: -1, cat: [], status: "", copying: false })
+
+fn repo() = rget(params, "repo", rget(params, "project_root", "."))
+
+fn load_comments(copying) {
+    let s = @state
+    if s.proc != -1 {
+        if copying { reset!(state, { ..s, copying: true }) }
+        return
+    }
+    let h = jimctl(["review", "list", "--repo", repo(), "--status", "open"])
+    reset!(state, { ..s, proc: h, cat: [], copying: copying,
+                    status: if h == -1 { "Could not load comments" } else { "" } })
+    request_render()
+}
+
+fn on_start() { load_comments(false) }
+fn on_message(topic, payload, sender) {
+    if topic == review_topic() { load_comments(false) }
+}
+fn on_proc_output(handle, line) {
+    let s = @state
+    if handle == s.proc { reset!(state, { ..s, cat: push(s.cat, line) }) }
+}
+fn on_proc_exit(handle, code) {
+    let s = @state
+    if handle != s.proc { return }
+    let r = jimctl_parse(join(s.cat, "\n"))
+    if not rget(r, "ok", false) {
+        reset!(state, { ..s, proc: -1, cat: [], copying: false,
+                        status: rget(r, "error", "Could not load comments") })
+    } else {
+        let comments = rget(r, "threads", [])
+        let mut status = ""
+        if s.copying {
+            let text = review_comments_text(comments, repo())
+            status = if text == "" { "No open comments to copy" }
+                     else if clipboard_set(text) { "Copied " + str(len(comments)) + " comments" }
+                     else { "Could not copy comments" }
+        }
+        reset!(state, { ..s, comments: comments, proc: -1, cat: [], copying: false, status: status })
+    }
+    request_render()
+}
+fn on_click(x, y, shift, cmd, id) {
+    if id == "copy_comments" { load_comments(true) }
+}
+fn render(w, h) {
+    let s = @state
+    { kind: "vstack", gap: 10.0, pad: 14.0, children: [
+        { kind: "hstack", gap: 12.0, align: "center", children: [
+            { kind: "button", id: "copy_comments", label: if s.copying { "Copying…" } else { "Copy comments" } },
+            { kind: "text", value: str(len(s.comments)) + " open", size: 12.0,
+              color: col_text(), selectable: false },
+        ] },
+        { kind: "text", value: if s.status != "" { s.status }
+                               else { "Click a line number to comment · right-click also works" },
+          size: 11.0, color: col_muted(), selectable: false },
+    ] }
+}

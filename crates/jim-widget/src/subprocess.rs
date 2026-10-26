@@ -347,6 +347,18 @@ pub fn clipboard_set(text: &str) -> bool {
     child.wait().map(|s| s.success()).unwrap_or(false)
 }
 
+pub fn clipboard_get() -> Option<String> {
+    let output = Command::new("pbpaste")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

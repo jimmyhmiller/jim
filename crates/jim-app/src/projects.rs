@@ -1035,6 +1035,10 @@ pub struct PendingActions {
     /// a template skeleton of `slots` empty cells; otherwise dock the
     /// matched `titles` (empty titles = all free top-level panes).
     pub dock_panes: Vec<(u64, Vec<String>, Option<String>, bool, Option<usize>)>,
+    /// `jimctl project fit`: `(project_id, canvas-space [x, y, w, h])`.
+    /// `None` bounds = every pane on the project's root canvas. Applied
+    /// after `new_panes` so same-frame spawns are included.
+    pub fit_canvas: Vec<(u64, Option<[f32; 4]>)>,
 }
 
 /// Request to spawn one new pane of a given kind.
@@ -3557,6 +3561,54 @@ fn apply_pending_actions(world: &mut World) {
             world.resource_mut::<Projects>().layout_dirty = true;
         }
     }
+
+    for (project_id, bounds) in actions.fit_canvas {
+        fit_canvas(world, project_id, bounds, sidebar_width);
+    }
+}
+
+/// Pan/zoom `project_id`'s root canvas so `bounds` (canvas-space
+/// `[x, y, w, h]`) fills the visible canvas region with a small margin.
+/// `None` fits every root-level pane in the project.
+fn fit_canvas(world: &mut World, project_id: u64, bounds: Option<[f32; 4]>, sidebar_width: f32) {
+    let (min, max) = match bounds {
+        Some([x, y, w, h]) => (Vec2::new(x, y), Vec2::new(x + w, y + h)),
+        None => {
+            let mut q = world.query_filtered::<(
+                &PaneRect,
+                &PaneProject,
+                Option<&jim_pane::PaneCanvas>,
+            ), With<PaneTag>>();
+            let mut min = Vec2::splat(f32::MAX);
+            let mut max = Vec2::splat(f32::MIN);
+            for (rect, project, canvas) in q.iter(world) {
+                if project.0 != project_id || canvas.is_some_and(|c| c.0 != 0) {
+                    continue;
+                }
+                min = min.min(rect.pos);
+                max = max.max(rect.pos + rect.size);
+            }
+            if min.x > max.x {
+                return;
+            }
+            (min, max)
+        }
+    };
+    let Some(window) = world.query::<&Window>().iter(world).next().map(|w| w.size()) else {
+        return;
+    };
+    const FIT_MARGIN: f32 = 40.0;
+    let view_size = Vec2::new(window.x - sidebar_width, window.y) - Vec2::splat(2.0 * FIT_MARGIN);
+    let content = (max - min).max(Vec2::ONE);
+    let zoom = (view_size.x / content.x)
+        .min(view_size.y / content.y)
+        .clamp(crate::canvas::MIN_ZOOM, 1.0);
+    let mut view = world.resource_mut::<crate::canvas::CanvasView>();
+    let state = view.state_mut((project_id, 0));
+    state.zoom = zoom;
+    state.pan = min - Vec2::splat(FIT_MARGIN / zoom);
+    state.clamp_pan();
+    world.resource_mut::<Projects>().layout_dirty = true;
 }
 
 /// Restore one persisted pane via the registry. Reserves any embedded

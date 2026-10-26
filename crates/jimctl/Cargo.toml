@@ -13,6 +13,7 @@ jim_lsp = { path = "../jim-lsp" }
 jim_git = { path = "../jim-git" }
 jim_review = { path = "../jim-review" }
 diff_core = { path = "../diff-core" }
+glob = "0.3"
 libc = "0.2"
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 tiny_http = "0.12"
